@@ -11,6 +11,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
+    <ProjectReference Include="..\MelangeDB.Protocol\MelangeDB.Protocol.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
   </ItemGroup>
 
 </Project>
