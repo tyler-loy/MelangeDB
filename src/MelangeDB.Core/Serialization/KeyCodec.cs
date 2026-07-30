@@ -111,4 +111,34 @@ public static class KeyCodec
             _ => throw new NotSupportedException($"Column kind {column.Kind} is not key-encodable."),
         };
     }
+
+    /// <summary>
+    /// Boxed decoding: the inverse of <see cref="Encode(ColumnSchema, object)"/>, recovering the
+    /// column value from its order-preserving key form. What lets a delete op — which carries only
+    /// the encoded primary key, no row — be applied to a projection keyed by natural values, the
+    /// relational tier being the case in point.
+    /// </summary>
+    public static object Decode(ColumnSchema column, in RowKey key)
+    {
+        ArgumentNullException.ThrowIfNull(column);
+        var span = key.Span;
+        object value = column.Kind switch
+        {
+            ColumnKind.Bool => span[0] != 0,
+            ColumnKind.Int8 => (sbyte)(span[0] ^ 0x80),
+            ColumnKind.UInt8 => span[0],
+            ColumnKind.Int16 => (short)(BinaryPrimitives.ReadUInt16BigEndian(span) ^ unchecked((ushort)short.MinValue)),
+            ColumnKind.UInt16 => BinaryPrimitives.ReadUInt16BigEndian(span),
+            ColumnKind.Int32 => (int)BinaryPrimitives.ReadUInt32BigEndian(span) ^ int.MinValue,
+            ColumnKind.UInt32 => BinaryPrimitives.ReadUInt32BigEndian(span),
+            ColumnKind.Int64 => (long)BinaryPrimitives.ReadUInt64BigEndian(span) ^ long.MinValue,
+            ColumnKind.UInt64 => BinaryPrimitives.ReadUInt64BigEndian(span),
+            ColumnKind.String => Encoding.UTF8.GetString(span),
+            ColumnKind.Bytes => span.ToArray(),
+            ColumnKind.Identity => new Identity(span),
+            ColumnKind.Timestamp => new Timestamp((long)BinaryPrimitives.ReadUInt64BigEndian(span) ^ long.MinValue),
+            _ => throw new NotSupportedException($"Column kind {column.Kind} is not key-encodable."),
+        };
+        return column.IsEnum ? Enum.ToObject(column.ClrType, value) : value;
+    }
 }

@@ -71,6 +71,17 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         // recovered timer rows, and overdue timers fire per Scheduler:CatchUpAfterDowntime.
         _scheduler = (MelangeScheduler?)_provider.GetService(typeof(MelangeScheduler));
         _scheduler?.Start();
+
+        // A relational table with no relational tier is a projection that will never exist. The
+        // rows still live in the hot store, so nothing is lost — but the declared intent isn't
+        // being served, and silence here would look exactly like a working deployment.
+        if (string.IsNullOrEmpty(_monitor.CurrentValue.Postgres.ConnectionString))
+        {
+            var relational = engine.Schema.Tables.Where(t => t.Tier == StorageTier.Relational).Select(t => t.Name).ToList();
+            if (relational.Count > 0)
+                LogRelationalWithoutPostgres(_logger, relational.Count, string.Join(", ", relational));
+        }
+
         _state.Started = true;
         LogStarted(_logger, engine.Log.HeadLsn, engine.Schema.Tables.Count);
         return Task.CompletedTask;
@@ -186,6 +197,11 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     [LoggerMessage(EventId = 1507, EventName = "ResidencyChangeFailed", Level = LogLevel.Error,
         Message = "Applying the Residency:{Table} override ({Residency}) to the running store failed; the table keeps its previous residency until restart.")]
     private static partial void LogResidencyChangeFailed(ILogger logger, string table, Residency residency, Exception exception);
+
+    [LoggerMessage(EventId = 1607, EventName = "RelationalTablesWithoutPostgres", Level = LogLevel.Warning,
+        Message = "{Count} table(s) declare Tier = Relational but no Postgres:ConnectionString is configured: {Tables}. " +
+            "Rows stay in the hot store; the relational projection (and ad-hoc SQL aggregates) will not exist until AddPostgres(...) is configured.")]
+    private static partial void LogRelationalWithoutPostgres(ILogger logger, int count, string tables);
 
     [LoggerMessage(EventId = 1101, EventName = "MelangeStarted", Level = LogLevel.Information,
         Message = "MelangeDB started: recovered to LSN {HeadLsn} with {TableCount} table(s).")]
