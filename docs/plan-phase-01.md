@@ -66,13 +66,16 @@ Codegen (02), networking (03), auth (04), scheduling (05), events (06), FASTER a
   determines how much phase 07 has to reimplement.
 - **Nested reducer calls** — allowed (sharing one transaction) or forbidden? Forbidding is simpler and can
   be relaxed later; allowing it later is a breaking change to nothing, so default to forbidding.
-- **AutoInc id encoding must be cluster-proof from record one.** The documented contract is **unique, not
-  dense** — never promise contiguity, because phase 09 gives each shard its own log and "the" per-table
-  sequence stops existing. Leaning: 64-bit ids with an originator prefix in the high bits
-  (Snowflake-shaped) rather than GUIDs — a GUID solves allocation but doubles key size on the hottest
-  tables and, unless time-ordered, destroys index locality. A single-node deployment allocates with
-  prefix zero and never notices. Only the *contract* must be right in this phase; the prefix mechanics
-  land in 09.
+- ~~**AutoInc id encoding must be cluster-proof from record one.**~~ **Settled: 64-bit
+  originator-prefixed ids, allocated within 63 bits.** The documented contract is **unique, not dense** —
+  never promise contiguity, because phase 09 gives each shard its own log and "the" per-table sequence
+  stops existing. GUIDs were rejected: they double key size on the hottest tables and, unless
+  time-ordered, destroy index locality. Layout: top bit always zero, 16-bit originator, 47-bit per-shard
+  sequence — the sign bit stays clear because **Postgres `bigint` is signed** (as are Java/Kotlin longs),
+  and an id must round-trip through the relational tier unchanged. Columns may be declared `long` or
+  `ulong`; the allocator never mints a value above 2⁶³−1 either way. A single-node deployment allocates
+  with originator zero and never notices any of this. The originator-assignment mechanics land in 09 via
+  the membership store.
 
 ## Done when
 

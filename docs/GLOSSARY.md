@@ -93,6 +93,8 @@ it may lag independently and resume where it stopped.
 **AutoInc** — A column whose value is assigned from a durable per-table sequence, allocated into the write set
 *before* the log append so replay never reassigns different ids. The contract is **unique, not dense** — gaps
 are normal, which is what lets each shard allocate from an originator-prefixed range with no coordination.
+Ids are 64-bit but allocated within 63 (sign bit clear: 16-bit originator, 47-bit sequence), so a value
+round-trips through Postgres `bigint` and signed-only client languages unchanged.
 
 **Border band** — In the spatial strategy, the ring of chunks a shard node holds read-only copies of so it can
 serve entities just beyond its own boundary. Derived from `InterestOf`.
