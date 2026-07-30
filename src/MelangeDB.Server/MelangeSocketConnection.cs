@@ -37,6 +37,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private uint _nextPingId;
     private ITimer? _heartbeat;
     private bool _handshaken;
+    private volatile bool _senderBusy;
 
     public MelangeSocketConnection(WebSocket socket, MelangeTransport transport, string httpProtocol)
     {
@@ -61,16 +62,25 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(requestAborted, _closed.Token, _transport.Stopping);
         var sender = Task.Run(() => SendLoopAsync(linked.Token), CancellationToken.None);
         StartHeartbeat();
+        var protocolFault = false;
         try
         {
             await ReadLoopAsync(linked.Token).ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is OperationCanceledException or WebSocketException or MelangeProtocolException)
+        catch (MelangeProtocolException)
         {
-            // An aborted socket, a heartbeat kill, or garbage on the wire all end the same way.
+            // Garbage on the wire ends the connection — but the explanatory error frame already
+            // queued on the priority lane must reach the client first, or the failure is mute.
+            protocolFault = true;
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or WebSocketException)
+        {
+            // An aborted socket or a heartbeat kill; nothing left to say to anyone.
         }
         finally
         {
+            if (protocolFault)
+                await DrainPriorityLaneAsync().ConfigureAwait(false);
             _heartbeat?.Dispose();
             await _closed.CancelAsync().ConfigureAwait(false);
             UnregisterAllSubscriptions();
@@ -82,7 +92,26 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             catch (OperationCanceledException)
             {
             }
+
+            if (protocolFault && _socket.State == WebSocketState.Open)
+            {
+                try
+                {
+                    using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await _socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "protocol error", closeTimeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or WebSocketException or ObjectDisposedException)
+                {
+                }
+            }
         }
+    }
+
+    /// <summary>Waits briefly for the priority lane — error frames included — to hit the socket.</summary>
+    private async Task DrainPriorityLaneAsync()
+    {
+        for (var i = 0; i < 400 && (!_priority.IsEmpty || _senderBusy); i++)
+            await Task.Delay(5).ConfigureAwait(false);
     }
 
     /// <summary>Queues one transaction's deltas. Called under the engine's write lock, in LSN order.</summary>
@@ -484,9 +513,17 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         while (!ct.IsCancellationRequested)
         {
             await _sendSignal.WaitAsync(ct).ConfigureAwait(false);
-            while (TryDequeueNext(out var bytes))
+            _senderBusy = true;
+            try
             {
-                await _socket.SendAsync(bytes, WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
+                while (TryDequeueNext(out var bytes))
+                {
+                    await _socket.SendAsync(bytes, WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                _senderBusy = false;
             }
         }
     }

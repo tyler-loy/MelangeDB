@@ -10,6 +10,7 @@
     <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\..\samples\MelangeDB.Sample.Worker\MelangeDB.Sample.Worker.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
   </ItemGroup>
 
   <ItemGroup>
