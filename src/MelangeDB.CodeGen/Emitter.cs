@@ -209,6 +209,15 @@ internal static class Emitter
         builder.AppendLine($"        public void Update({row} row) => _db.Update(row);");
         builder.AppendLine();
         builder.AppendLine($"        public global::System.Collections.Generic.IEnumerable<{row}> Iter() => _db.Scan<{row}>();");
+        builder.AppendLine();
+        builder.AppendLine("        /// <summary>Whether the table has any row. An existence check, not a scan: nothing pages in.</summary>");
+        builder.AppendLine($"        public bool Any() => _db.Any<{row}>();");
+        builder.AppendLine();
+        builder.AppendLine("        /// <summary>The table's row count, answered from the store's counter — never by scanning.</summary>");
+        builder.AppendLine($"        public long Count => _db.Count<{row}>();");
+        builder.AppendLine();
+        builder.AppendLine("        /// <summary>The first row in primary-key order, or null. Materializes exactly one row.</summary>");
+        builder.AppendLine($"        public {row}? First() => _db.First<{row}>();");
         foreach (var column in table.Columns.Items)
         {
             if (column.IsKeyEncodable && (column.IsPrimaryKey || column.HasIndexAccessor))
