@@ -15,8 +15,15 @@ it worth doing early for its own sake.
 
 **Identity**
 - JWT bearer validation using the host's existing ASP.NET Core authentication — no bespoke token system.
-  `Identity` is a stable hash of the token subject.
-- Signed **guest identities** for anonymous play, issued by the server and durable across reconnects.
+  `Identity` is a stable hash of the token's **issuer and subject**. Issuer included deliberately: hashing
+  the subject alone would let a subject from one token source collide into another source's identity,
+  which bypasses the entire policy layer without triggering any of it.
+- **Every connection presents a valid token — the IdP is the gate.** MelangeDB mints no identities, guest
+  or otherwise. Guest play is a token the IdP issues with a guest role claim (`Auth:GuestRole`); a guest
+  is an ordinary identity that policies and caps can treat differently, nothing more. Guest issuance
+  limits — who gets an anonymous token, and how fast — are the IdP's job, which is where account-creation
+  throttling belongs anyway. For local dev without an IdP, `dotnet user-jwts` or a dev-only issuer in the
+  host covers it; MelangeDB stays entirely out of the identity-minting business.
 - `ctx.Caller` (identity) and `ctx.ConnectionId` (this session) are distinct, and the distinction is
   documented — one identity may hold several connections.
 
@@ -44,10 +51,13 @@ identity A arriving at identity B — a leak, in the phase whose entire job is p
 token resolves to a different identity, the correct response is to close the connection and make the client
 reconnect, not to re-evaluate state in place.
 
-**Guest conversion needs no merge machinery.** A guest holds a signed token like anyone else. When they sign up,
-account linking is the **identity provider's** job: if the IdP preserves the subject when linking a guest id to a
-new account, the resulting JWT resolves to the *same* `Identity`, MelangeDB sees no change, and the live session
-picks the new token up through `Reauthenticate`. Nothing merges because nothing moved.
+**Guest conversion needs no merge machinery.** A guest holds an IdP-issued token like anyone else. When they
+sign up, account linking is the **identity provider's** job: if the IdP preserves the subject when linking a
+guest id to a new account, the resulting JWT resolves to the *same* `Identity`, MelangeDB sees no change, and
+the live session picks the new token up through `Reauthenticate`. Nothing merges because nothing moved. Since
+identity hashes issuer *and* subject, the linked token must come from the **same issuer** — automatic when one
+IdP handles both guest and full accounts, and one more reason guests belong on the IdP rather than on a second
+token source.
 
 This keeps MelangeDB out of the identity business, consistent with using the host's ASP.NET Core authentication
 rather than inventing a parallel one. The obligation it creates is a **documented contract** rather than a
@@ -125,9 +135,9 @@ transaction opens. The reference workload implements this *as table rows* (`Play
 bucket), paying a row write on every gathered rock purely for defense. Game-semantic checks like movement
 plausibility stay in the module — that's gameplay — but "no more than N calls/second" shouldn't need schema.
 
-**Identity and connection caps.** `AllowGuests` currently grants an identity to anyone who asks, so every
-per-identity defense in this phase is bypassed by acquiring a new identity. Needs a connection cap per identity
-and a guest-issuance limit.
+**Connection caps.** With the IdP as the gate, identity-issuance abuse is throttled where accounts are made —
+at the IdP. What remains MelangeDB's is `Auth:MaxConnectionsPerIdentity`: a valid token still must not hold
+unlimited sockets, subscriptions, and rate-limit buckets.
 
 ## Out of scope
 
@@ -144,9 +154,9 @@ does with data it legitimately receives.
   declare their dependencies, or admin changes force a resubscribe. The second is cruder and probably right.
 - **Do policies apply to ad-hoc SQL (phase 08)?** They must, or RLS is trivially bypassable — but an owner/
   admin path needs to bypass them deliberately. Two explicit modes, no ambiguity.
-- **Guest identity durability.** Cookie, local token file, or client-persisted key? This is the one part of
-  guest continuity that *is* MelangeDB's problem — a guest token the client can't persist means a lost character
-  on every client restart, regardless of how well conversion works.
+- **Guest token persistence in the client SDK.** With the IdP minting guest tokens, durability means the
+  client persists that token (or its refresh token) across restarts. The client SDK should ship a pluggable
+  token store — a guest token the client loses is a lost character, regardless of how well conversion works.
 - ~~**Guest → authenticated upgrade.**~~ **Settled: not MelangeDB's concern.** Guest conversion is IdP-side
   account linking; if the subject is preserved the identity never changes. See the deliverable above.
 - **Reducer authorization default posture.** Deny-by-default is safer but makes every ordinary gameplay reducer
@@ -158,8 +168,11 @@ does with data it legitimately receives.
 
 ## Done when
 
-- A client with no token connects as a guest, gets an identity, and keeps it across a reconnect.
+- A client presenting an IdP-issued guest-role token connects, resolves to a stable identity, and keeps it
+  across reconnects; a client with **no** token is rejected — the IdP is the gate.
 - A client with a JWT resolves to a stable identity across reconnects and across server restarts.
+- Two tokens sharing a subject but from **different** issuers resolve to **different** identities — the
+  collision test for hashing issuer and subject together.
 - A browser-style client with **no ability to set headers** authenticates successfully via the ticket flow.
 - A ticket is rejected on second use, and after its TTL expires.
 - A session whose token expires mid-connection survives if the client re-authenticates within the grace window,
@@ -167,8 +180,8 @@ does with data it legitimately receives.
   variant ships.
 - `Reauthenticate` with a token resolving to a **different** identity closes the connection rather than switching
   in place. This is the leak test for the frame, so it gets written before the happy path.
-- A guest token and a later account-linked token sharing a subject resolve to the same `Identity`, and the live
-  session continues across the swap with its subscriptions intact.
+- A guest token and a later account-linked token sharing an issuer and subject resolve to the same `Identity`,
+  and the live session continues across the swap with its subscriptions intact.
 - Revoking an identity terminates its live sessions and prevents re-auth, without restarting the server.
 - Player A cannot see Player B's inventory rows, skills, or attributes — asserted at the protocol level, not
   just the API level.
@@ -186,7 +199,7 @@ does with data it legitimately receives.
   asserted in a test so it can't silently regress.
 - A reducer over its rate limit is rejected **before** a transaction opens — verified by asserting no log
   record was appended, not just that an error came back.
-- One identity cannot exceed the connection cap; guest issuance is limited.
+- One identity cannot exceed the connection cap.
 
 ## Risks
 

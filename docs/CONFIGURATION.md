@@ -36,12 +36,12 @@ design register that becomes a reference.
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `HotStore:Path` | string | `./data/hot` | restart | 01 | Directory for the hot store's files. |
-| `HotStore:Engine` | enum | `Auto` | restart | 07 | `InMemory` \| `Faster` \| `Auto`. `Auto` picks `Faster` when a path is set. `InMemory` is a legitimate choice, not just a test double. |
+| `HotStore:Engine` | enum | `Auto` | restart | 07 | `InMemory` \| `Faster` \| `Auto`. `Auto` picks `Faster` when the FASTER storage package is registered, else `InMemory` — selection by registration, not by path, since `HotStore:Path` always has a default. `InMemory` is a legitimate choice, not just a test double. |
 | `HotStore:MemoryBudgetBytes` | long | — | restart | 07 | Cap on the paging buffer pool. **Excludes** resident tables, which are accounted separately — total footprint is this plus the residency report. |
 | `CommitLog:Path` | string | `./data/log` | restart | 01 | |
 | `CommitLog:FsyncPolicy` | enum | `OnCommit` | live | 01 | `OnCommit` \| `Interval` \| `OsBuffered`. `OnCommit` is the only durable choice; the others trade a bounded window of committed-but-lost transactions for throughput and must say so in their XML docs. |
 | `CommitLog:FsyncIntervalMs` | int | `100` | live | 01 | Only read when `FsyncPolicy = Interval`. This is the size of the data-loss window. |
-| `CommitLog:GroupCommit` | bool | `true` | live | 01 | Batch concurrent commits into one fsync. Improves throughput without weakening durability. |
+| `CommitLog:GroupCommit` | bool | `true` | live | 07 | Batch concurrent commits into one fsync. Improves throughput without weakening durability. Deliberately **not** phase 01 — group commit is an optimization phase 01 explicitly defers; 01 only makes the fsync policy configurable. |
 | `Snapshots:Enabled` | bool | `true` | live | 07 | |
 | `Snapshots:IntervalTransactions` | long | `100000` | live | 07 | |
 | `Snapshots:TruncateLog` | bool | `true` | live | 07 | Truncation never passes the slowest applier or event-subscriber checkpoint regardless of this setting. |
@@ -115,12 +115,10 @@ to fix it without a code change and a redeploy.
 | --- | --- | --- | --- | --- | --- |
 | `Auth:Authority` | string | — | restart | 04 | Uses the host's existing ASP.NET Core authentication. |
 | `Auth:Audience` | string | — | restart | 04 | |
-| `Auth:AllowGuests` | bool | `true` | live | 04 | |
-| `Auth:GuestSigningKey` | string | — | restart | 04 | **Secret.** Belongs in a secret store, never `appsettings.json`. Guest identities are forgeable without it being secret. |
+| `Auth:GuestRole` | string | `guest` | live | 04 | Role claim value marking IdP-issued guest tokens. **The IdP is the gate**: every connection presents a valid token, MelangeDB mints no identities, and guest-issuance throttling is the IdP's job. This setting only lets policies and caps treat guests differently; empty disables guest-specific treatment. |
 | `Auth:TicketTtlSeconds` | int | `30` | live | 04 | Connect tickets are single-use and short-lived, so a leaked one is near-worthless. Exists because browsers cannot set WebSocket headers. |
 | `Auth:ReauthGraceSeconds` | int | `120` | live | 04 | How long past token expiry a connection survives while awaiting `Reauthenticate`. Zero means expiry drops the socket — correct for a bank, wrong for a game. |
-| `Auth:MaxConnectionsPerIdentity` | int | `4` | live | 04 | Without this, every per-identity defense is bypassed by opening more connections. |
-| `Auth:GuestIssuancePerMinute` | int | `60` | live | 04 | Unlimited guest identities bypass every per-identity limit by rotating identity. |
+| `Auth:MaxConnectionsPerIdentity` | int | `4` | live | 04 | Without this, a valid token holds unlimited sockets, subscriptions, and rate-limit buckets. |
 | `Policies:UnpolicedReducerReport` | enum | `Warn` | restart | 04 | `Off` \| `Warn` \| `Fail`. Lists client-callable reducers with no authorization policy. Turns "did we forget one?" into a build artifact. |
 | `Policies:DefaultReducerPosture` | enum | `Allow` | restart | 04 | `Allow` \| `Deny`. `Deny` is safer but annotates every ordinary gameplay reducer; pair `Allow` with the report above. |
 | `RateLimit:Enabled` | bool | `true` | live | 04 | |
@@ -146,6 +144,7 @@ to fix it without a code change and a redeploy.
 | `Events:RetryBackoffMs` | int | `500` | live | 06 | |
 | `Events:DeadLetterPath` | string | `./data/deadletter` | restart | 06 | |
 | `Events:MaxPublishDepth` | int | `4` | live | 06 | Cycle guard for handlers that call reducers that publish. |
+| `Events:SubscriberExpirySeconds` | int | `604800` | live | 06 | A checkpoint whose subscriber no longer exists (handler deleted, service retired) would pin log truncation forever — a full disk on a timer. Idle past this window, it is evicted with a loud log; a returning subscriber has lost its place and starts from current state. Seven days default. |
 
 ## Cluster
 
@@ -156,7 +155,7 @@ Ignored entirely by single-node deployments.
 | `Cluster:Enabled` | bool | `false` | restart | 09 | |
 | `Cluster:Role` | enum | `Standalone` | restart | 09 | `Standalone` \| `Hub` \| `Shard`. |
 | `Cluster:HubAddress` | string | — | restart | 09 | |
-| `Cluster:Shards` | string | — | restart | 09 | Which shard keys this node owns. Static assignment; dynamic rebalancing is out of scope for 09–10. |
+| `Cluster:Shards` | string | — | restart | 09 | **Seed** assignment only — ownership lives in the membership store, which failover updates when a dead node's shards are reassigned. "Static" means no load-based rebalancing, not immutable. |
 | `Cluster:MembershipStore` | string | — | restart | 09 | Ownership registry. Likely the hub's Postgres rather than a new consensus dependency. |
 | `Cluster:ShardSpanCheck` | enum | `ThrowInDevelopment` | live | 09 | `Off` \| `Warn` \| `ThrowInDevelopment` \| `Throw`. Catches the one contract MelangeDB cannot verify statically: rows mutated in one transaction must resolve to one shard. |
 | `Cluster:FencingTokenTimeoutMs` | int | `5000` | live | 09 | Stops a wrongly-suspected-dead node from continuing to write a player it no longer owns. |

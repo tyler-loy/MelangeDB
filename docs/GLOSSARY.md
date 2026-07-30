@@ -91,7 +91,8 @@ policy-enforced and owner. Not a subscription.
 it may lag independently and resume where it stopped.
 
 **AutoInc** — A column whose value is assigned from a durable per-table sequence, allocated into the write set
-*before* the log append so replay never reassigns different ids.
+*before* the log append so replay never reassigns different ids. The contract is **unique, not dense** — gaps
+are normal, which is what lets each shard allocate from an originator-prefixed range with no coordination.
 
 **Border band** — In the spatial strategy, the ring of chunks a shard node holds read-only copies of so it can
 serve entities just beyond its own boundary. Derived from `InterestOf`.
@@ -134,9 +135,9 @@ longer owns.
 
 **Global** — Placement: the table lives on the hub only. In practice the relational tier.
 
-**Guest identity** — A server-signed identity issued to an unauthenticated client, durable across reconnects.
-Ordinary in every respect: a guest holds a token like anyone else, so "converting" a guest is IdP-side account
-linking rather than anything MelangeDB does. Preserve the subject and the `Identity` never changes.
+**Guest identity** — An ordinary identity whose token the IdP issued with a guest role claim. MelangeDB mints
+nothing — **the IdP is the gate** for guests as for everyone — so "converting" a guest is IdP-side account
+linking rather than anything MelangeDB does. Preserve the issuer and subject and the `Identity` never changes.
 
 **Handoff** — Transferring a player's ownership from one shard node to another. Explicit and discrete under
 instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction.
@@ -147,7 +148,8 @@ pattern*, not volatility: it is durable, and it is not a cache.
 **Hub** — The node holding `Global` and `Replicated` tables, identity, the relational tier, and shard
 assignment. Every client holds a permanent hub attachment. Originally "master node."
 
-**Identity** — The stable identifier for who is acting: a hash of a token subject, or a signed guest identity.
+**Identity** — The stable identifier for who is acting: a hash of a token's **issuer and subject**. Issuer
+included so subjects from two token sources can never collide into one identity.
 
 **Instance** — Under the instancing strategy, a shard identified by an explicit id column. Instances are
 causally disjoint — no interest overlap between them.
@@ -190,9 +192,14 @@ accounts, registration, statistics. Eventually consistent with the log by design
 **Resident** — Residency: the table is pinned wholly in memory. Opt-in, because a resident-by-default store
 reproduces the RAM ceiling MelangeDB exists to remove.
 
-**Resume** — Reconnecting by naming the last LSN a client acknowledged and receiving only the deltas it missed,
-rather than recomputing a full initial set. Falls back to full resync when the gap can no longer be served —
-a decision the *server* makes, since a client assuming it can resume would silently diverge.
+**Log epoch** — The identifier naming one commit log incarnation, carried in `Resume` alongside the LSN so a
+cursor can never be applied against the wrong log. A client holds one cursor per attachment; a stale or unknown
+epoch is an explicit failure answered with full resync.
+
+**Resume** — Reconnecting by naming the log epoch and last LSN a client acknowledged, per attachment, and
+receiving only the deltas it missed rather than recomputing a full initial set. Falls back to full resync when
+the gap can no longer be served — a decision the *server* makes, since a client assuming it can resume would
+silently diverge.
 
 **Residency** — Whether a table must stay in memory. Declared, so the memory budget is computable from source
 rather than discovered under load.

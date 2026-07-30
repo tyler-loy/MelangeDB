@@ -149,10 +149,16 @@ can and should reject the class of inputs that corrupts state regardless of game
 
 ## Gap 6 — Identity abuse and session identity binding
 
-`Auth:AllowGuests` grants an identity to anyone who asks, with no cap. Unlimited guest identities means
-unlimited connections, unlimited subscriptions, and unlimited rate-limit buckets — every per-identity defense
-above is bypassed by getting a new identity. Needs a connection cap per identity and a guest-issuance limit
-keyed on something scarcer than "asked nicely."
+**The IdP is the gate.** Every connection presents a valid token; MelangeDB mints no identities, guest or
+otherwise — guests are IdP-issued tokens carrying a guest role. That places issuance abuse (unlimited fresh
+identities rotating past every per-identity defense above) where it belongs: at the IdP, which is where
+account-creation throttling lives anyway. What remains MelangeDB's side of the line:
+
+- **A connection cap per identity** (`Auth:MaxConnectionsPerIdentity`) — a valid token still must not hold
+  unlimited sockets, subscriptions, and rate-limit buckets.
+- **Identity derivation includes the issuer.** `Identity` is a hash of the token's issuer *and* subject.
+  Hashing the subject alone would let a subject from one token source collide into another source's identity —
+  a full policy-layer bypass that triggers nothing.
 
 Related, and easy to implement permissively by accident: **a connection is bound to one identity for its
 lifetime.** `Reauthenticate` refreshes a token; it must not switch identity. Every initial set and delta on that

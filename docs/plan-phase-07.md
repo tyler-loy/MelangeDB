@@ -56,6 +56,12 @@ are rare and player_state is small), so this scan is the only thing keeping two 
 nameplate."* That is a latent index bug an all-in-RAM database permitted. `FindBookByItemDef`,
 `FindPlayerByName`, and `HitchVehicle` are the same shape.
 
+One in this group needs care rather than an attribute: **`[Unique]` is a single-writer guarantee and is
+restricted to non-partitioned tables**, and `PlayerState` becomes `Partitioned` in phase 11 — a unique index
+cannot span shards. A globally-unique name is a *claim*, and claims live in a small `Global` table on the hub:
+claim the name there, then write the shard-local row. Renames are rare, so the two-step is fine — unlike
+gathering, which is exactly why the placement rule exists.
+
 The sharding group — `DecayBuildings` materialising all of `PlacedBuilding` into a `List` every tick,
 `RecountCensus` scanning `Creature` and `CreatureCorpse` — is unbounded and residency cannot help it. Per-shard,
 those tables are small. **Do not over-engineer residency for scans that partitioning fixes.**
@@ -106,7 +112,9 @@ Large values are stored out of line so scanning a table by key does not fault in
 one transaction per row.
 
 **Snapshots and log compaction** — required before the log outgrows disk. Snapshot at an LSN, truncate behind
-it, respecting the slowest applier's *and* the slowest event subscriber's checkpoint.
+it, respecting the slowest applier's *and* the slowest event subscriber's checkpoint — *live* subscribers only:
+checkpoints idle past `Events:SubscriberExpirySeconds` are evicted (phase 06) precisely so an abandoned one
+cannot pin retention forever.
 
 ## Out of scope
 

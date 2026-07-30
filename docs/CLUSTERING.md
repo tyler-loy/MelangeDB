@@ -91,8 +91,8 @@ So `InventoryItem`, `PlayerSkill`, `PlayerAttribute`, `EquipmentSlot`, `PlayerCo
 transfer on handoff. Handoff is comparatively rare; gathering is not.
 
 What genuinely belongs on the hub: `Registration`, accounts and auth, `AdminIdentity`, `WorldStat`,
-social/guild/friends state, trade *history*, and `PlayerRateLimit`. None of those are written by a
-gather, a swing, or a step.
+social/guild/friends state, and trade *history*. None of those are written by a gather, a swing, or a
+step.
 
 The general form of the rule: **place tables so that transaction boundaries fall inside a node.** If two
 tables are mutated together, they belong in the same place. That single sentence is most of what a
@@ -182,6 +182,12 @@ from continuing to write a player it no longer owns.
 - **One commit log per shard.** No global total order across the cluster — only per-shard order plus
   causal ordering via handoffs and the event bus. You cannot ask "what was the whole world's state at
   instant T." Games don't need that; ledgers do. Accepting it is what makes writes scale.
+- **`[Unique]` is a single-writer guarantee.** A unique index is enforceable only inside one shard's
+  writer, so unique columns are restricted to non-partitioned tables (`Global`, `Replicated`, `Local`) —
+  a compile-time diagnostic, not a runtime surprise. A globally-unique *claim* over partitioned data
+  (player names) lives in a small `Global` claims table on the hub. `[AutoInc]` stays coordination-free
+  for the same structural reason: its contract is unique-not-dense, so each shard allocates from an
+  originator-prefixed range and no cross-shard sequence exists.
 - **Scheduled reducers partition with their rows.** Timers are rows (DESIGN.md §3), so a timer fires on
   whichever node owns its shard — no global timer wheel, no leader election. Vibe Shaft's single global
   `CreatureAiTick` row becomes one row per shard, and the hand-written "only chunks near a player"

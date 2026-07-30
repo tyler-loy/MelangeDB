@@ -42,6 +42,11 @@ public void Attack(ReducerContext ctx, Identity target, int weaponId)
   transport without touching handler code.
 - Handler failure policy: retry with backoff, then a dead-letter path. A handler must not be able to wedge the
   log's applier pipeline.
+- **Subscriber checkpoints expire.** A checkpoint belonging to a subscriber that no longer exists — handler
+  deleted from the code, service retired — would otherwise pin log truncation at a frozen LSN forever, which
+  is a full disk on a timer. Checkpoints idle past `Events:SubscriberExpirySeconds` are evicted with a loud
+  log; a subscriber returning after eviction has lost its place and starts from current state rather than
+  silently resuming. Deliberate, bounded data loss, chosen over unbounded disk growth.
 
 ## Out of scope
 
@@ -71,6 +76,8 @@ idempotent handlers is the contract, and saying so plainly is better than implyi
 - A subscriber stopped for N transactions and restarted receives all missed events from its checkpoint.
 - Two handlers for the same event both receive it, and one failing does not prevent the other.
 - Publishing from inside a handler is either rejected or depth-limited, with a test either way.
+- A subscriber checkpoint idle past expiry stops pinning compaction and is evicted loudly; the returning
+  subscriber is told it lost its place rather than silently resuming from a truncated log.
 
 ## Risks
 

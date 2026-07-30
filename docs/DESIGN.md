@@ -82,7 +82,9 @@ Four orthogonal knobs, and conflating any two of them is a design error:
   Single-node deployments ignore it. See [CLUSTERING.md](CLUSTERING.md).
 
 `[AutoInc]` sequence values are assigned into the write set **before** the log append, from a durable
-per-table sequence recovered on startup — otherwise replay would reassign different ids.
+per-table sequence recovered on startup — otherwise replay would reassign different ids. The contract is
+**unique, not dense**: gaps are normal, which is what lets a clustered deployment allocate from
+originator-prefixed ranges without coordination (see [CLUSTERING.md](CLUSTERING.md)).
 
 ## 3. Scheduled and lifecycle reducers
 
@@ -269,8 +271,10 @@ Subscriptions can only name `Public = true` tables (§2).
 ## 7. Identity and auth
 
 Because MelangeDB lives in your ASP.NET Core host, it uses that host's authentication. A JWT bearer
-token on the websocket handshake resolves to a stable `Identity`; unauthenticated clients can be
-issued a signed guest identity.
+token on the websocket handshake resolves to a stable `Identity` — a hash of the token's issuer *and*
+subject, so two token sources can never collide into one identity. Every connection presents a valid
+token: **the IdP is the gate.** Guest play is a token the IdP issues with a guest role, not a parallel
+identity system — MelangeDB mints nothing.
 
 Row-level access rules are **policy objects resolved from DI**, not a bespoke rules language. Two
 properties are load-bearing:

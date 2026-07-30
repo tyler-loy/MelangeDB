@@ -73,7 +73,7 @@ Source name: `MelangeDB`.
 | `melange.subscription.initial` | 03 | `melange.table`, `melange.rows`, `melange.bytes` | The expensive half of a subscription; worth its own span. |
 | `melange.subscription.delta` | 03 | `melange.table`, `melange.subscribers` | Sampled — this is the highest-frequency operation in the system and must not be traced per row op at full rate. |
 | `melange.event.handle` | 06 | `melange.event.type`, `melange.handler` | **Linked, not parented** — see below. |
-| `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` | A tick has no client parent, so it starts a new trace. |
+| `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
 ### Context propagation
@@ -120,8 +120,8 @@ Meter name: `MelangeDB`.
 | `melange.scheduler.tick.duration` | histogram | `ms` | `reducer` | 05 |
 | `melange.events.queue_depth` | gauge | `{event}` | — | 06 |
 | `melange.events.deadlettered` | counter | `{event}` | `event_type` | 06 |
-| `melange.handoff.duration` | histogram | `ms` | — | 10 |
-| `melange.handoff.failed` | counter | `{handoff}` | `reason` | 10 |
+| `melange.handoff.duration` | histogram | `ms` | — | 09 |
+| `melange.handoff.failed` | counter | `{handoff}` | `reason` | 09 |
 | `melange.shard.owned` | gauge | `{shard}` | — | 09 |
 | `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 |
 

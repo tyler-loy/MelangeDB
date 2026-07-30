@@ -18,7 +18,8 @@ demonstrable, so it should be reached before anything in 04–08 is started.
   interface once there's something to measure.
 - Framed binary protocol: `CallReducer`, `Subscribe`, `Unsubscribe`, `SubscriptionApplied` (initial set),
   `TransactionUpdate` (deltas), `ReducerResult`, `Error`, `Ping`/`Pong`, `Resume`, `Reauthenticate`.
-  Versioned handshake. `CallReducer` carries a `traceparent` (see [OBSERVABILITY.md](OBSERVABILITY.md)).
+  Versioned handshake. **Every frame carries a channel tag from version one** (see the ordering
+  constraint below). `CallReducer` carries a `traceparent` (see [OBSERVABILITY.md](OBSERVABILITY.md)).
 - `Reauthenticate` exists in this phase even though phase 04 owns its *semantics*, because a frame type cannot
   be retrofitted without a protocol version bump. A game session outlives a one-hour JWT; dropping the
   connection at expiry is unacceptable and ignoring expiry means revocation never takes effect, so in-band
@@ -52,6 +53,13 @@ outage. Requirements: the client tracks its acked LSN, the server retains enough
 is an explicit fallback to full resync when a client is too far behind (or the log has been truncated past its
 position). Getting this wrong is silent state divergence, so the fallback must be detected by the server rather
 than assumed by the client.
+
+An LSN is meaningful only within one commit log, and a clustered client (phase 09) holds attachments to more
+than one — hub plus shard, with the shard log changing entirely on handoff. So the resume cursor is
+**per attachment**, and the `Resume` frame names the **log epoch id** it is resuming against, never a bare LSN.
+A stale or unknown epoch is an explicit **failure**, answered with full resync — never a partial answer, never
+guessed at by the client. This costs one field now; retrofitting it in phase 09 would be a protocol break for
+every client, same argument as the channel tag.
 
 **`MelangeDB.Server`**
 - `MapMelangeSocket(path)` on `IEndpointRouteBuilder` — an endpoint in the developer's own ASP.NET Core app,
@@ -153,6 +161,8 @@ must never assume it got the transport it asked for.
 - A client disconnected for a few seconds during active writes reconnects via `Resume` and converges **without**
   refetching its initial set — asserted by measuring bytes transferred, since the whole point is the saving.
 - A client disconnected past the retention window is told to full-resync rather than silently diverging.
+- A `Resume` naming a stale or unknown log epoch fails cleanly into full resync — the cross-log case
+  phase 09's handoff will rely on.
 - A large initial set does not delay a concurrent reducer response beyond a stated bound.
 - One-shot HTTP reducer invocation and bulk ingestion work without opening a websocket.
 - A client connects over **HTTP/2** (via `CONNECT`) as well as HTTP/1.1, with the negotiated version asserted —

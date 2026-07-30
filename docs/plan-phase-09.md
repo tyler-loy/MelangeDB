@@ -66,6 +66,12 @@ client sees one endpoint and never learns the topology.
 a write set spans shard keys. Without it, violations surface as mysterious latency under load instead of as a
 test failure.
 
+**Id allocation under partitioning.** Phase 01's AutoInc contract (unique-not-dense, originator-prefixed
+64-bit) gets exercised here: the membership store assigns each shard owner an originator id, and two shards can
+never mint the same value with no coordination on the hot path. Relatedly, **`[Unique]` is restricted to
+non-partitioned tables** (compile-time diagnostic, phase 02) — a unique index is a single-writer guarantee, and
+globally-unique claims over partitioned data live in a `Global` claims table instead.
+
 **Explicit handoff.** Freeze on origin → append on destination → confirm → release on origin, as a small saga
 recoverable because both logs record their half. A fencing token prevents a wrongly-suspected-dead node from
 continuing to write a player it no longer owns.
@@ -93,6 +99,12 @@ the hub.
 - **Client protocol during dual attachment.** A client holds a hub session and a shard session; the gateway
   must present that as one endpoint, including which node answers which subscription.
 - **Does `Replicated` need write support from shards?** Say no as long as possible.
+- **Where do policies evaluate, and what can they read there?** Subscription fan-out for `Partitioned` tables
+  runs on shard nodes, but the flagship phase 04 policy reads `AdminIdentity` — a `Global` hub table that
+  isn't present there. Options: tables read by policies must be `Replicated`; policy evaluation moves to the
+  gateway; or the hub pushes policy-relevant state to shard nodes with the identity assertion. Undecided, and
+  must be settled before row policies work in a cluster — "policies may freely read private tables" needs a
+  placement qualifier or it's overclaimed.
 - **How do reducers that touch only `Global` tables get routed** — hub-executed, or shard-executed with a
   remote call? Hub-executed is simpler.
 

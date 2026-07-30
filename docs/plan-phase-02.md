@@ -21,9 +21,10 @@ It also removes the reflection path from phase 01, which matters for startup tim
 - Emit serializers per table (no reflection, no boxing) behind the versioned format from phase 01.
 - Discover `[Reducer]` methods; emit an argument-decoding dispatcher keyed by reducer name.
 - **Diagnostics are a first-class deliverable, not polish.** Report at compile time: a table with no
-  `[PrimaryKey]`; `[AutoInc]` on a non-integer column; a reducer whose parameters aren't serializable;
-  `DateTime.Now` / `new Random()` in a reducer body (use `ctx.Timestamp` / `ctx.Random`); a subscription-
-  visible table that is not `Public`. Each with a stable `MELANGE####` id.
+  `[PrimaryKey]`; `[AutoInc]` on a non-integer column; `[Unique]` on a `Partitioned` table (a unique
+  index is a single-writer guarantee — see [CLUSTERING.md](CLUSTERING.md)); a reducer whose parameters
+  aren't serializable; `DateTime.Now` / `new Random()` in a reducer body (use `ctx.Timestamp` /
+  `ctx.Random`); a subscription-visible table that is not `Public`. Each with a stable `MELANGE####` id.
 
 **`MelangeDB.Core` — host integration**
 - `AddMelangeDb(Action<MelangeDbBuilder>)` with `UseHotStore`, `AddTablesFrom`, `AddReducersFrom`.

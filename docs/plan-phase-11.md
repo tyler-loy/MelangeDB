@@ -26,18 +26,23 @@ and a visibility. The classes, from the audit:
   those scans legitimate again.
 - **`Partitioned`, following the player** — `PlayerState`, `InventoryItem`, `PlayerSkill`, `PlayerAttribute`,
   `EquipmentSlot`, `PlayerCombatState`. **Not hub tables** — see phase 09's trap.
-- **`Global`, relational tier** — `AdminIdentity`, `WorldStat`, `PlayerRateLimit`, trade history.
+- **`Global`, relational tier** — `AdminIdentity`, `WorldStat`, trade history. (`PlayerRateLimit` is not
+  ported at all — see the delete-on-port list.)
 
 **Reducer port** — 119 reducers from `public static` + `ReducerContext` to DI-resolved classes. Mostly
-mechanical, with three real changes:
+mechanical, with four real changes:
 - The 14 scheduled reducers move from one global timer row to **one timer row per shard**, and the hand-written
   "only chunks near an online player" filtering becomes implicit in the partition.
 - The 9 `ClientVisibilityFilter` SQL strings become `IRowPolicy<T>` objects, with `inventory_item`'s three
   filters unioning as before.
 - Reducers whose write set spans shards must be resolved — the shard-span check from phase 09 finds them.
+- `SetPlayerName`'s uniqueness scan becomes a `Global` name-claims table on the hub, because `[Unique]` cannot
+  span shards and `PlayerState` is partitioned (phase 09).
 
 **Delete-on-port list** — code that exists only because SpacetimeDB lacked something:
 - `tools/admin-web/Services/PostgresStore.cs` + `ScrapeWorker` → `Tier = StorageTier.Relational`.
+- `PlayerRateLimit` + the token-bucket half of `RateLimit.cs` → `RateLimit:*` configuration (phase 04). The
+  movement-plausibility check stays in the module — that's gameplay, not infrastructure.
 - The NativeAOT-LLVM WASM toolchain → gone; the module is just a library in the host.
 - `spacetime publish` + `spacetime generate` across three binding trees → `dotnet publish`.
 - The admin-console-restart-after-publish dance → gone.
