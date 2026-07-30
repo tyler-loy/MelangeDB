@@ -76,7 +76,10 @@ public class HttpEndpointTests
     [Fact]
     public async Task Adhoc_sql_runs_the_four_shapes_and_respects_table_visibility()
     {
-        await using var host = await TransportTestHost.StartAsync();
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
+        {
+            ["MelangeDb:Sql:AdHocEnabled"] = "true",
+        });
         host.Call("AddSkill", 7L, "mining", 10L, 1);
         host.Call("AddSkill", 7L, "logging", 20L, 2);
         host.Call("AddSkill", 8L, "smithing", 30L, 3);
