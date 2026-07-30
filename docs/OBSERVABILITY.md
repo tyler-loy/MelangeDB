@@ -19,7 +19,12 @@ same meter. Neither carries an identity dimension, per the cardinality rule belo
 belongs on the span and in the log, never on a time series. The phase 05 rows — the `melange.scheduler.tick`
 span (a new trace root, with the fire's `melange.reducer` span as its child), `melange.scheduler.overruns`
 (dimension: reducer; one increment per overrun event), and `melange.scheduler.tick.duration` — shipped with
-the scheduler. `melange.shard` stays off the tick span until phase 09 gives timer tables a placement.
+the scheduler. `melange.shard` stays off the tick span until phase 09 gives timer tables a placement. The
+phase 06 rows — the `melange.event.handle` span (a new trace **linked** to the emitting transaction's span,
+never parented under it, exactly as specified below; a subscriber catching up from the log gets no link, since
+the emitting trace is gone), `melange.events.queue_depth` (the bounded in-memory delivery window), and
+`melange.events.deadlettered` (dimension: `event_type` — bounded, being a code-declared set) — shipped with the
+event bus on the same source and meter.
 
 ## The dependency decision
 
@@ -164,7 +169,9 @@ No parallel logging abstraction — the host's configured providers are the whol
 Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
-`1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05).
+`1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,
+`1403 SubscriberCheckpointEvicted` — the loud eviction the expiry design promises — and
+`1404 SubscriberLostPlace`, how a returning subscriber is told it starts from current state (06).
 
 ## Health checks
 

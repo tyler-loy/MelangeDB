@@ -44,6 +44,13 @@ a single-threaded dispatch loop on purpose, because reducer transactions seriali
 single-writer lock and a tick worker pool would parallelize nothing that matters (see
 docs/plan-phase-05.md, scheduler fairness). Values above 1 bind and validate but do not change dispatch.
 
+**Shipped as of phase 06** (defaults verified against `EventsOptions`): every `Events:*` key. Two notes made
+when it shipped: (1) `Events:RetryBackoffMs` is the **base of an exponential backoff** — each retry doubles it,
+capped at 30 seconds — not a fixed delay, and the doc now says so; (2) `Events:MaxQueueDepth` bounds the
+in-memory delivery *window*, not delivery itself: overflow evicts the oldest window entries and a lagging
+subscriber replays from the commit log, which is the buffer that actually holds the events. Nothing is dropped;
+the subscriber's checkpoint lag is the honest measure of how far behind it is.
+
 **Shipped as of phase 04** (defaults verified against `AuthOptions`, `PoliciesOptions`, `RateLimitOptions`,
 and `SqlOptions`): every `Auth:*`, `Policies:*`, and `RateLimit:*` key, plus `Sql:AdHocMode` — shipped ahead
 of its phase-08 row because `/melange/sql` already returns rows, so the policy contract could not wait. Three
@@ -180,11 +187,11 @@ to fix it without a code change and a redeploy.
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Events:MaxQueueDepth` | int | `10000` | live | 06 | Bounded on purpose: a slow handler must not be able to grow memory without limit. |
-| `Events:HandlerRetries` | int | `3` | live | 06 | |
-| `Events:RetryBackoffMs` | int | `500` | live | 06 | |
-| `Events:DeadLetterPath` | string | `./data/deadletter` | restart | 06 | |
-| `Events:MaxPublishDepth` | int | `4` | live | 06 | Cycle guard for handlers that call reducers that publish. |
+| `Events:MaxQueueDepth` | int | `10000` | live | 06 | Bounded on purpose: a slow handler must not be able to grow memory without limit. Bounds the in-memory delivery window; overflow evicts the oldest entries and a lagging subscriber replays from the log — the log is the buffer, so nothing is lost. |
+| `Events:HandlerRetries` | int | `3` | live | 06 | Retries after the first failed attempt; exhaustion dead-letters the event and delivery moves on. |
+| `Events:RetryBackoffMs` | int | `500` | live | 06 | The **base** of an exponential backoff: each retry doubles it, capped at 30 seconds. |
+| `Events:DeadLetterPath` | string | `./data/deadletter` | restart | 06 | One JSON line per poisoned event in `melange.deadletter.ndjson`: subscriber, event type, LSN, attempts, error, payload. |
+| `Events:MaxPublishDepth` | int | `4` | live | 06 | Cycle guard for handlers that call reducers that publish. Each event carries its publish depth durably; a publish at the limit throws, aborting the reducer, and the handler failure dead-letters — the cycle ends loudly. |
 | `Events:SubscriberExpirySeconds` | int | `604800` | live | 06 | A checkpoint whose subscriber no longer exists (handler deleted, service retired) would pin log truncation forever — a full disk on a timer. Idle past this window, it is evicted with a loud log; a returning subscriber has lost its place and starts from current state. Seven days default. |
 
 ## Cluster

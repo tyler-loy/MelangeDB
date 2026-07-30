@@ -109,6 +109,11 @@ generation and similar mass loads.
 **Cold world** — The overwhelming majority of a world's data that no player is near, whose size grows with area
 (the N² term). Addressed by paging, not sharding.
 
+**Dead letter** — The durable record of a poisoned event delivery: which subscriber gave up on which event,
+after how many attempts, and why — one JSON line under `Events:DeadLetterPath`, payload included. Written when
+retries exhaust; delivery then advances past the event, so a poison message can never wedge a subscriber's
+checkpoint.
+
 **Column mask** — The set of columns visible to a particular caller for a particular row.
 
 **Commit log** — The ordered, append-only, LSN-addressed record of committed transactions. **The system of
@@ -143,6 +148,14 @@ stops meeting it directly at that point.
 
 **Event bus** — The delivery mechanism for domain events, implemented as a transactional outbox over the commit
 log. A projection, not a second source of truth.
+
+**Event handler** — A DI-resolved class implementing `IEventHandler<TEvent>`, invoked outside the emitting
+transaction, after the commit point. Delivery is at-least-once, so handlers must be idempotent. Each handler
+*type* is one logical subscriber with its own subscriber checkpoint.
+
+**Event transport (`IEventTransport`)** — The seam between the commit point and event delivery: in-process by
+default, distributed in phase 09. Handler code never sees it, which is what lets the transport change
+underneath unchanged handlers.
 
 **Fencing token** — A guard ensuring a node wrongly suspected of being dead cannot keep writing rows it no
 longer owns.
@@ -296,6 +309,12 @@ that contract cannot be verified statically.
 
 **Snapshot** — A materialized state capture at an LSN, allowing the log behind it to be truncated — never past
 the slowest applier or event subscriber.
+
+**Subscriber checkpoint** — An event subscriber's durable applied-LSN, the same shape as an applier's: a
+subscriber that was down catches up from it instead of losing events, and log truncation (phase 07) never
+passes the slowest live one (`MelangeEventBus.MinimumLiveCheckpointLsn`). Idle past
+`Events:SubscriberExpirySeconds` it is evicted loudly, leaving a tombstone; the returning subscriber is told it
+lost its place and starts from current state. Persisted in a sidecar beside the log, per the epoch precedent.
 
 **Subscription** — A standing single-table query producing an initial result set and then a delta stream.
 Anchored to one LSN across that boundary so a client observes no gap or duplicate.
