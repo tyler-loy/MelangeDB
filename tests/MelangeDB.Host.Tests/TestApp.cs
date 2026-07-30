@@ -8,7 +8,7 @@ using Microsoft.Extensions.Options;
 
 namespace MelangeDB.Host.Tests;
 
-[Table(Public = true)]
+[Table(Public = true, Residency = Residency.Resident)]
 public partial struct Note
 {
     [PrimaryKey]
@@ -23,7 +23,7 @@ public partial struct Note
     public double Score;
 }
 
-[Table]
+[Table(Residency = Residency.Resident)]
 public partial struct Audit
 {
     [PrimaryKey]
@@ -34,7 +34,7 @@ public partial struct Audit
 }
 
 /// <summary>Repeating timer rows: the world tick. Implicitly private, implicitly Local.</summary>
-[Table(Scheduled = nameof(TickReducers.WorldTick))]
+[Table(Scheduled = nameof(TickReducers.WorldTick), Residency = Residency.Resident)]
 public partial struct WorldTickTimer
 {
     [PrimaryKey]
@@ -47,7 +47,7 @@ public partial struct WorldTickTimer
 }
 
 /// <summary>One-shot timer rows; each fire deletes its row transactionally with its work.</summary>
-[Table(Scheduled = nameof(TickReducers.RunOnce))]
+[Table(Scheduled = nameof(TickReducers.RunOnce), Residency = Residency.Resident)]
 public partial struct OneShotTimer
 {
     [PrimaryKey]
@@ -60,7 +60,7 @@ public partial struct OneShotTimer
 }
 
 /// <summary>What scheduled fires commit, so tick work is observable as ordinary rows.</summary>
-[Table]
+[Table(Residency = Residency.Resident)]
 public partial struct TickLog
 {
     [PrimaryKey]

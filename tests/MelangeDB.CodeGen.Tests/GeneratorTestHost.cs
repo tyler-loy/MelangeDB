@@ -47,6 +47,21 @@ internal static class GeneratorTestHost
         return await withAnalyzers.GetAnalyzerDiagnosticsAsync(CancellationToken.None);
     }
 
+    /// <summary>
+    /// Runs the scan analyzer over the compilation <em>after</em> the generator, since the typed
+    /// accessors it analyzes are themselves generated.
+    /// </summary>
+    public static async Task<ImmutableArray<Diagnostic>> RunScanAnalyzerAsync(string source)
+    {
+        var compilation = Compile(source);
+        CSharpGeneratorDriver
+            .Create(new MelangeServerGenerator())
+            .WithUpdatedParseOptions(ParseOptions)
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out _);
+        var withAnalyzers = output.WithAnalyzers([new TableScanAnalyzer()]);
+        return await withAnalyzers.GetAnalyzerDiagnosticsAsync(CancellationToken.None);
+    }
+
     private static CSharpParseOptions ParseOptions => new(LanguageVersion.Preview);
 
     private static CSharpCompilation Compile(string source) =>

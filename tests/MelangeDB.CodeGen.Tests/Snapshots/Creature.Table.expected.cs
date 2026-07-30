@@ -184,6 +184,15 @@ namespace MelangeDB.Generated
 
         public global::System.Collections.Generic.IEnumerable<global::Snapshot.Creature> Iter() => _db.Scan<global::Snapshot.Creature>();
 
+        /// <summary>Whether the table has any row. An existence check, not a scan: nothing pages in.</summary>
+        public bool Any() => _db.Any<global::Snapshot.Creature>();
+
+        /// <summary>The table's row count, answered from the store's counter — never by scanning.</summary>
+        public long Count => _db.Count<global::Snapshot.Creature>();
+
+        /// <summary>The first row in primary-key order, or null. Materializes exactly one row.</summary>
+        public global::Snapshot.Creature? First() => _db.First<global::Snapshot.Creature>();
+
         public CreatureIdAccessor Id => new CreatureIdAccessor(_db);
 
         public CreatureChunkIdAccessor ChunkId => new CreatureChunkIdAccessor(_db);

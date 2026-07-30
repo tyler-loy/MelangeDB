@@ -42,6 +42,18 @@ internal sealed class CommittedReadView : IDbView
         where TRow : struct
         => _reads.FilterRange<TRow>(column, low, high);
 
+    public bool Any<TRow>()
+        where TRow : struct
+        => _reads.Any<TRow>();
+
+    public long Count<TRow>()
+        where TRow : struct
+        => _reads.Count<TRow>();
+
+    public TRow? First<TRow>()
+        where TRow : struct
+        => _reads.First<TRow>();
+
     private static InvalidOperationException ReadOnly() =>
         new("This view is read-only committed state; policies must not write. Mutate through a reducer.");
 }

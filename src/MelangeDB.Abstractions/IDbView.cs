@@ -44,4 +44,38 @@ public interface IDbView
     /// </summary>
     IEnumerable<TRow> FilterRange<TRow>(string column, object low, object high)
         where TRow : struct;
+
+    /// <summary>
+    /// Whether the table has any row. An existence check, not a scan: the engine's views answer
+    /// from the store's row count and the overlay, so no row is materialized and nothing pages in.
+    /// </summary>
+    bool Any<TRow>()
+        where TRow : struct
+    {
+        foreach (var _ in Scan<TRow>())
+            return true;
+        return false;
+    }
+
+    /// <summary>Counts the table's rows without materializing them; see <see cref="Any{TRow}"/>.</summary>
+    long Count<TRow>()
+        where TRow : struct
+    {
+        long count = 0;
+        foreach (var _ in Scan<TRow>())
+            count++;
+        return count;
+    }
+
+    /// <summary>
+    /// The first row in primary-key order, or null for an empty table. Materializes exactly one
+    /// row, never the table.
+    /// </summary>
+    TRow? First<TRow>()
+        where TRow : struct
+    {
+        foreach (var row in Scan<TRow>())
+            return row;
+        return null;
+    }
 }

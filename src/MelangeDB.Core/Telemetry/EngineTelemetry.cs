@@ -28,6 +28,7 @@ internal sealed class EngineTelemetry : IDisposable
     private readonly Histogram<double> _schedulerTickDuration;
     private readonly Counter<long> _deadLettered;
     private Func<long>? _eventQueueDepth;
+    private Func<HotStoreStatistics>? _storeStatistics;
 
     public EngineTelemetry(TelemetryOptions options, Func<ulong> headLsn, Func<IEnumerable<(string Applier, long Lag)>> applierLags)
     {
@@ -49,7 +50,33 @@ internal sealed class EngineTelemetry : IDisposable
             () => applierLags().Select(l => new Measurement<long>(l.Lag, new KeyValuePair<string, object?>("applier", l.Applier))),
             "{tx}",
             "Transactions between the log head and each applier's checkpoint.");
+        _meter.CreateObservableGauge(
+            "melange.store.resident_bytes",
+            () => StoreMeasurements(static t => t.ResidentBytes),
+            "By",
+            "Managed bytes each table pins in memory — full rows for resident tables, bookkeeping for paged ones.");
+        _meter.CreateObservableCounter(
+            "melange.store.page_faults",
+            () => StoreMeasurements(static t => t.PageFaults),
+            "{fault}",
+            "Row reads served from disk instead of the buffer pool.");
+        _meter.CreateObservableCounter(
+            "melange.store.scan_rows",
+            () => StoreMeasurements(static t => t.RowsScanned),
+            "{row}",
+            "Rows returned by full table scans.");
     }
+
+    private IEnumerable<Measurement<long>> StoreMeasurements(Func<HotStoreTableStatistics, long> select)
+    {
+        if (_storeStatistics is null)
+            yield break;
+        foreach (var table in _storeStatistics().Tables)
+            yield return new Measurement<long>(select(table), new KeyValuePair<string, object?>("table", table.Name));
+    }
+
+    /// <summary>Wires the hot store's per-table statistics into the <c>melange.store.*</c> instruments.</summary>
+    public void SetHotStoreStatisticsProvider(Func<HotStoreStatistics> provider) => _storeStatistics = provider;
 
     public Activity? StartReducer(
         string reducerName,

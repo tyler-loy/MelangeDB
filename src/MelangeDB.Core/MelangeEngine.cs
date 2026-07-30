@@ -22,13 +22,18 @@ public sealed class MelangeEngine : IDisposable
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
     private readonly List<ICommitObserver> _commitObservers = [];
+    private readonly List<Func<ulong?>> _truncationFloors = [];
+    private readonly IDisposable? _storeLifetime;
+    private long _commitsSinceSnapshot;
+    private Timestamp? _tailTimestamp;
     private bool _disposed;
 
     public MelangeEngine(
         MelangeDbOptions options,
         SchemaRegistry schema,
         ILoggerFactory? loggerFactory = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IHotStoreProvider? hotStoreProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(schema);
@@ -49,33 +54,128 @@ public sealed class MelangeEngine : IDisposable
         {
             _log = new FileCommitLog(options.CommitLog, loggers.CreateLogger<FileCommitLog>(), _telemetry);
             _sequencer = new AutoIncSequencer();
-            var store = new InMemoryHotStore(schema);
+            SnapshotPath = Path.Combine(options.CommitLog.Path, SnapshotFile.FileName);
+            var store = CreateStore(options, schema, hotStoreProvider, loggers);
+            _storeLifetime = store as IDisposable;
 
-            // Recovery: one pass over the log rebuilds the projection and re-observes every durably
-            // allocated AutoInc id, so replay never reassigns different ids. The tail record's
-            // timestamp is kept as the scheduler's downtime anchor — when the world last moved.
-            foreach (var record in _log.ReadFrom(1))
+            // Recovery: the snapshot (when one exists) bootstraps the projection and the AutoInc
+            // sequences at its LSN, then one pass over the log tail rebuilds the rest — replaying
+            // re-observes every durably allocated AutoInc id, so replay never reassigns different
+            // ids. The tail record's timestamp is kept as the scheduler's downtime anchor — when
+            // the world last moved.
+            var replayFrom = RecoverSnapshot(store);
+            foreach (var record in _log.ReadFrom(replayFrom))
             {
                 store.Apply(record);
                 _sequencer.Observe(record, schema);
                 RecoveredTailTimestamp = record.Timestamp;
             }
 
+            _tailTimestamp = RecoveredTailTimestamp;
             HotStore = store;
             Appliers = new ApplierPipeline(_log, _telemetry);
             Appliers.Register(new HotStoreApplier(store));
+            _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
+            if (options.Residency.ReportOnStartup)
+                ReportResidency(store);
         }
         catch
         {
+            _storeLifetime?.Dispose();
             _log?.Dispose();
             _telemetry?.Dispose();
             throw;
         }
     }
 
+    /// <summary>
+    /// Selects the hot store per <c>HotStore:Engine</c>: selection by registration, not by path —
+    /// <c>Auto</c> picks the registered provider when one exists, else the in-memory store, and
+    /// asking for an engine whose package is not registered fails loudly rather than silently
+    /// substituting.
+    /// </summary>
+    private IHotStore CreateStore(
+        MelangeDbOptions options,
+        SchemaRegistry schema,
+        IHotStoreProvider? provider,
+        ILoggerFactory loggers)
+    {
+        var residency = ResidencyResolver.Resolve(schema, options.Residency);
+        var engine = options.HotStore.Engine;
+        if (engine == HotStoreEngine.InMemory || (engine == HotStoreEngine.Auto && provider is null))
+            return new InMemoryHotStore(schema, residency);
+        if (provider is null || (engine != HotStoreEngine.Auto && provider.Engine != engine))
+        {
+            throw new InvalidOperationException(
+                $"HotStore:Engine is {engine} but no matching store provider is registered. " +
+                "Reference the storage package and register it on the builder (UseFasterHotStore()), " +
+                "or set HotStore:Engine to InMemory or Auto.");
+        }
+
+        return provider.Create(new HotStoreContext
+        {
+            Schema = schema,
+            Options = options,
+            Residency = residency,
+            LoggerFactory = loggers,
+        });
+    }
+
+    /// <summary>
+    /// Loads the snapshot if a valid one exists, returning the LSN log replay resumes from. A
+    /// snapshot from another log epoch is stale and ignored — unless the log has been truncated,
+    /// in which case state below the base is gone and recovery must fail loudly rather than
+    /// silently rebuild a partial world.
+    /// </summary>
+    private ulong RecoverSnapshot(IHotStore store)
+    {
+        if (!File.Exists(SnapshotPath))
+        {
+            if (_log.BaseLsn > 0)
+            {
+                throw new InvalidDataException(
+                    $"The commit log was truncated up to LSN {_log.BaseLsn} but no snapshot exists at " +
+                    $"'{SnapshotPath}'. The truncated history is unrecoverable; restore the snapshot from backup.");
+            }
+
+            return 1;
+        }
+
+        using var reader = SnapshotFile.Open(SnapshotPath);
+        var header = reader.Header;
+        if (header.Epoch != _log.EpochId)
+        {
+            if (_log.BaseLsn > 0)
+            {
+                throw new InvalidDataException(
+                    $"Snapshot '{SnapshotPath}' belongs to log epoch {header.Epoch}, but the truncated log's " +
+                    $"epoch is {_log.EpochId}. The truncated history is unrecoverable; restore from backup.");
+            }
+
+            LogMessages.StaleSnapshotIgnored(_logger, SnapshotPath, header.Epoch, _log.EpochId);
+            return 1;
+        }
+
+        if (header.Lsn < _log.BaseLsn)
+        {
+            throw new InvalidDataException(
+                $"Snapshot '{SnapshotPath}' captures LSN {header.Lsn} but the log was truncated up to " +
+                $"LSN {_log.BaseLsn}; records between the two are gone. Restore from backup.");
+        }
+
+        store.LoadSnapshot(header.Lsn, reader.Rows());
+        foreach (var (table, next) in header.Sequences)
+            _sequencer.RestoreSequence(table, next);
+        RecoveredTailTimestamp = header.Timestamp;
+        return header.Lsn + 1;
+    }
+
     public SchemaRegistry Schema { get; }
 
     public ICommitLog Log => _log;
+
+    /// <summary>The full path of the current snapshot file, beside the log.</summary>
+    public string SnapshotPath { get; }
 
     /// <summary>The options instance the engine reads live keys from; the host's reload bridge mutates it.</summary>
     internal MelangeDbOptions Options => _options;
@@ -258,11 +358,132 @@ public sealed class MelangeEngine : IDisposable
             stage.Commit();
             NotifyCommitObservers(record);
             Appliers.NotifyAppended(record);
+            AfterCommit(timestamp);
             activity?.SetTag("melange.outcome", "commit");
             activity?.SetTag("melange.writeset.rows", ops.Count);
             _telemetry?.RecordTransaction(BulkReducerName, "commit", Elapsed(started), ops.Count);
             return record;
         }
+    }
+
+    /// <summary>
+    /// Registers a truncation floor: a provider of the highest LSN log compaction may remove from
+    /// that consumer's perspective (its checkpoint). Null means the consumer pins nothing. The
+    /// event bus registers <c>MinimumLiveCheckpointLsn</c> here so truncation never strands a
+    /// subscriber that is merely behind.
+    /// </summary>
+    public void AddTruncationFloor(Func<ulong?> floor)
+    {
+        ArgumentNullException.ThrowIfNull(floor);
+        lock (_writeLock)
+        {
+            _truncationFloors.Add(floor);
+        }
+    }
+
+    /// <summary>
+    /// Takes a snapshot at the current head LSN and, when <c>Snapshots:TruncateLog</c> is on,
+    /// truncates the log behind it — never past the slowest applier checkpoint, the slowest live
+    /// event-subscriber checkpoint, or the Resume retention window. Runs under the write lock, so
+    /// the capture is consistent at one LSN; commits wait behind it. Returns the snapshot LSN, or
+    /// null when snapshots are disabled or there is nothing to capture.
+    /// </summary>
+    public ulong? TakeSnapshot()
+    {
+        lock (_writeLock)
+        {
+            return TakeSnapshotCore();
+        }
+    }
+
+    private ulong? TakeSnapshotCore()
+    {
+        if (!_options.Snapshots.Enabled)
+            return null;
+        var lsn = _log.HeadLsn;
+        if (lsn == 0)
+            return null;
+
+        var header = new SnapshotFile.Header
+        {
+            Epoch = _log.EpochId,
+            Lsn = lsn,
+            Timestamp = _tailTimestamp ?? Timestamp.FromDateTimeOffset(_time.GetUtcNow()),
+            Sequences = [.. _sequencer.ExportSequences()],
+        };
+        SnapshotFile.Write(SnapshotPath, header, Schema.Tables.Select(t => (t.Id, HotStore.Scan(t.Id))));
+        _commitsSinceSnapshot = 0;
+        LogMessages.SnapshotWritten(_logger, lsn, SnapshotPath);
+        if (_options.Snapshots.TruncateLog)
+            TruncateLogCore(lsn);
+        return lsn;
+    }
+
+    /// <summary>
+    /// The truncation floors, applied in one place so no configuration can override them: the
+    /// snapshot LSN itself, every applier's checkpoint, every registered floor (live event
+    /// subscribers), and the Resume retention window — a reconnecting client's gap must stay
+    /// servable from the log for <c>Resume:RetentionWindowSeconds</c>.
+    /// </summary>
+    private void TruncateLogCore(ulong snapshotLsn)
+    {
+        var floor = snapshotLsn;
+        foreach (var applier in Appliers.Appliers)
+            floor = Math.Min(floor, applier.AppliedLsn);
+        foreach (var provider in _truncationFloors)
+        {
+            if (provider() is { } pinned)
+                floor = Math.Min(floor, pinned);
+        }
+
+        var retentionCutoff = _time.GetUtcNow().AddSeconds(-_options.Resume.RetentionWindowSeconds);
+        var cutoffMicros = Timestamp.FromDateTimeOffset(retentionCutoff).UnixTimeMicroseconds;
+        foreach (var record in _log.ReadFrom(_log.BaseLsn + 1))
+        {
+            if (record.Lsn > floor)
+                break;
+            if (record.Timestamp.UnixTimeMicroseconds >= cutoffMicros)
+            {
+                floor = Math.Min(floor, record.Lsn - 1);
+                break;
+            }
+        }
+
+        if (floor <= _log.BaseLsn)
+            return;
+        _log.TruncateBefore(floor);
+        LogMessages.LogTruncated(_logger, floor, snapshotLsn);
+    }
+
+    /// <summary>
+    /// The startup residency report (EventId 1501): each resident table's row count and measured
+    /// bytes, the buffer-pool cap, and the total they sum to. The memory budget is a declared,
+    /// computable artifact — this makes it an observed one.
+    /// </summary>
+    private void ReportResidency(IHotStore store)
+    {
+        var statistics = store.Statistics();
+        var lines = new System.Text.StringBuilder();
+        long residentBytes = 0;
+        long overheadBytes = 0;
+        var residentTables = 0;
+        foreach (var table in statistics.Tables)
+        {
+            if (table.Residency == Residency.Resident)
+            {
+                residentTables++;
+                residentBytes += table.ResidentBytes;
+                lines.Append($"\n  {table.Name}: {table.RowCount} row(s), {table.ResidentBytes} bytes resident");
+            }
+            else
+            {
+                overheadBytes += table.ResidentBytes;
+            }
+        }
+
+        var total = residentBytes + overheadBytes + statistics.BufferPoolCapacityBytes;
+        LogMessages.ResidencyReport(
+            _logger, residentTables, residentBytes, overheadBytes, statistics.BufferPoolCapacityBytes, total, lines.ToString());
     }
 
     /// <summary>Blocks until any in-flight invocation has completed. Used by graceful shutdown.</summary>
@@ -289,6 +510,7 @@ public sealed class MelangeEngine : IDisposable
             return;
         _disposed = true;
         _log.Dispose();
+        _storeLifetime?.Dispose();
         _telemetry?.Dispose();
         _inReducer.Dispose();
     }
@@ -326,6 +548,28 @@ public sealed class MelangeEngine : IDisposable
             : HotStore.TryGetRow(schema.Id, key, out _);
         var bytes = RowSerializer.SerializeValues(schema, values);
         writeSet.Stage(new RowOp(exists ? RowOpKind.Update : RowOpKind.Insert, schema.Id, key, bytes));
+    }
+
+    /// <summary>
+    /// Post-commit bookkeeping under the write lock: the tail timestamp for the next snapshot's
+    /// downtime anchor, and the automatic snapshot trigger. A snapshot failure must not fail the
+    /// committed transaction — the commit is durable in the log regardless.
+    /// </summary>
+    private void AfterCommit(Timestamp timestamp)
+    {
+        _tailTimestamp = timestamp;
+        _commitsSinceSnapshot++;
+        if (!_options.Snapshots.Enabled || _commitsSinceSnapshot < _options.Snapshots.IntervalTransactions)
+            return;
+        try
+        {
+            TakeSnapshotCore();
+        }
+        catch (Exception exception)
+        {
+            _commitsSinceSnapshot = 0; // Back off a full interval rather than failing every commit.
+            LogMessages.SnapshotFailed(_logger, exception);
+        }
     }
 
     private void NotifyCommitObservers(CommitRecord record)
@@ -392,6 +636,7 @@ public sealed class MelangeEngine : IDisposable
                 stage.Commit();
                 NotifyCommitObservers(record);
                 Appliers.NotifyAppended(record);
+                AfterCommit(timestamp);
                 committedLsn = record.Lsn;
             }
         }
@@ -433,6 +678,58 @@ public sealed class MelangeEngine : IDisposable
 
         public static void CommitObserverFailed(ILogger logger, ulong lsn, Exception failure) =>
             CommitObserverFailedMessage(logger, lsn, failure);
+
+        private static readonly Action<ILogger, int, long, long, long, long, string, Exception?> ResidencyReportMessage =
+            LoggerMessage.Define<int, long, long, long, long, string>(
+                LogLevel.Information,
+                new EventId(1501, "ResidencyReport"),
+                "Residency report: {ResidentTables} resident table(s) holding {ResidentBytes} bytes, " +
+                "{OverheadBytes} bytes of paged-table bookkeeping, buffer-pool cap {BufferPoolBytes} bytes — " +
+                "total declared footprint {TotalBytes} bytes.{Tables}");
+
+        public static void ResidencyReport(
+            ILogger logger, int residentTables, long residentBytes, long overheadBytes, long bufferPoolBytes, long totalBytes, string tables) =>
+            ResidencyReportMessage(logger, residentTables, residentBytes, overheadBytes, bufferPoolBytes, totalBytes, tables, null);
+
+        private static readonly Action<ILogger, ulong, string, Exception?> SnapshotWrittenMessage =
+            LoggerMessage.Define<ulong, string>(
+                LogLevel.Information,
+                new EventId(1502, "SnapshotWritten"),
+                "Snapshot captured at LSN {Lsn} to '{Path}'.");
+
+        public static void SnapshotWritten(ILogger logger, ulong lsn, string path) =>
+            SnapshotWrittenMessage(logger, lsn, path, null);
+
+        private static readonly Action<ILogger, ulong, ulong, Exception?> LogTruncatedMessage =
+            LoggerMessage.Define<ulong, ulong>(
+                LogLevel.Information,
+                new EventId(1503, "LogTruncated"),
+                "Commit log truncated up to LSN {Floor} behind the snapshot at LSN {SnapshotLsn}; " +
+                "the floor is the minimum of the snapshot, every applier checkpoint, every live " +
+                "event-subscriber checkpoint, and the Resume retention window.");
+
+        public static void LogTruncated(ILogger logger, ulong floor, ulong snapshotLsn) =>
+            LogTruncatedMessage(logger, floor, snapshotLsn, null);
+
+        private static readonly Action<ILogger, Exception?> SnapshotFailedMessage =
+            LoggerMessage.Define(
+                LogLevel.Error,
+                new EventId(1504, "SnapshotFailed"),
+                "Automatic snapshot failed; the committed transaction is durable and unaffected. " +
+                "The next attempt is one full Snapshots:IntervalTransactions away.");
+
+        public static void SnapshotFailed(ILogger logger, Exception failure) =>
+            SnapshotFailedMessage(logger, failure);
+
+        private static readonly Action<ILogger, string, Guid, Guid, Exception?> StaleSnapshotIgnoredMessage =
+            LoggerMessage.Define<string, Guid, Guid>(
+                LogLevel.Warning,
+                new EventId(1506, "StaleSnapshotIgnored"),
+                "Snapshot '{Path}' belongs to log epoch {SnapshotEpoch}, not the current epoch {LogEpoch}; " +
+                "ignored and recovery replays the full log.");
+
+        public static void StaleSnapshotIgnored(ILogger logger, string path, Guid snapshotEpoch, Guid logEpoch) =>
+            StaleSnapshotIgnoredMessage(logger, path, snapshotEpoch, logEpoch, null);
     }
 }
 

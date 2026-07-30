@@ -4,7 +4,7 @@ namespace MelangeDB.CodeGen;
 
 /// <summary>
 /// Every diagnostic MelangeDB reports at compile time. Ids are stable public API: MELANGE0001
-/// through MELANGE0016, never renumbered, each with a fires-test and a compiles-clean test.
+/// through MELANGE0017, never renumbered, each with a fires-test and a compiles-clean test.
 /// </summary>
 public static class Diagnostics
 {
@@ -143,5 +143,16 @@ public static class Diagnostics
         "Table '{0}' {1}",
         Category,
         DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(
+        "MELANGE0017",
+        "Full scan over a table that is not Resident",
+        "Iter() scans every row of table '{0}', which is not declared Resident — on a paging store that is I/O per page, " +
+        "not a memory walk. If the table is small, bounded, and scan-heavy, declare Residency.Resident; if this site " +
+        "looks up by a column, add [Index] and use Filter; if it only checks existence, use Any(), Count, or First(). " +
+        "An operator can also pin it per deployment via MelangeDb:Residency:{0}.",
+        Category,
+        DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
 }

@@ -69,6 +69,15 @@ public sealed class AutoIncSequencer
             _nextSequence[table] = nextSequence;
     }
 
+    /// <summary>The durable sequence state a snapshot captures.</summary>
+    internal IReadOnlyDictionary<TableId, ulong> ExportSequences() => _nextSequence;
+
+    /// <summary>
+    /// Restores one table's sequence from a snapshot. Recovery restores the snapshot's state first,
+    /// then re-observes the log tail — so ids allocated after the snapshot still advance past.
+    /// </summary>
+    internal void RestoreSequence(TableId table, ulong nextSequence) => Advance(table, nextSequence);
+
     internal static ulong? ToUInt64(object? value) => value switch
     {
         ulong u => u,

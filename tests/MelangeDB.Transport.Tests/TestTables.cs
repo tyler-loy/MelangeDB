@@ -90,7 +90,7 @@ public partial struct AdminIdentity
 }
 
 /// <summary>AI-shaped: [ServerOnly] columns are a complete AI oracle if they ever reach a frame.</summary>
-[Table(Public = true)]
+[Table(Public = true, Residency = Residency.Resident)]
 public partial struct Creature
 {
     [PrimaryKey]

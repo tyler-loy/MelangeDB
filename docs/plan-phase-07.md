@@ -125,10 +125,59 @@ for tests.
 
 - ~~**Residency default.**~~ **Settled: opt-in `Resident`, default `Paged`** — see above for the reasoning and
   the four supports it ships with.
-- **Eviction policy.** LRU by page is the obvious start; a spatial workload might do better with
-  eviction hints from the shard strategy. Don't build the clever version first.
-- **Does the store own indexes, or the applier?** Deferred from phase 01; must be answered here.
-- **Snapshot format** — full table dump versus incremental. Full is simpler and probably fine at this scale.
+- ~~**Eviction policy.**~~ **Settled: FASTER's own log eviction, nothing cleverer.** FASTER's hybrid log
+  evicts by address order — the in-memory tail of the log is the buffer pool, and records fall out of it
+  oldest-written-first as the tail advances past `HotStore:MemoryBudgetBytes`. That is LRU-by-page-of-write,
+  not LRU-by-access, and it ships as-is: what MelangeDB adds on top is only the *split* of the budget (main
+  records and out-of-line blobs get separate hybrid logs, so blob churn cannot evict hot main records) and the
+  residency tiers around it (resident tables never enter the pool at all; the key directory and indexes are
+  pinned bookkeeping, so a miss costs one read, never an index walk on disk). Read-hot-record copy-to-tail
+  stays off. The spatial eviction-hint idea stays unbuilt, as the plan ordered — measure first.
+- ~~**Does the store own indexes, or the applier?**~~ **Settled: the store, reaffirmed for FASTER.** The
+  phase-01 arrangement survives contact with a paging engine unchanged: `FasterHotStore` maintains its key
+  directory and every secondary index (equality and range) behind the same `IHotStore.Apply` seam, and the
+  applier pipeline stayed untouched by the engine swap — which was the point of the seam. The paging engine
+  adds one refinement that settles the question for good: each row's directory entry records its encoded
+  index values, so index maintenance on update and delete never reads the old row back from disk. An
+  applier-driven index would have to do exactly that fault, on every update, from outside the store.
+- ~~**Snapshot format**~~ — **Settled: full.** One CRC-guarded file beside the log (epoch, LSN, AutoInc
+  sequence table, every row), written to a temp file and atomically swapped, streamed in both directions so a
+  snapshot larger than memory neither buffers on write nor materializes on load. Incremental was rejected
+  because a chain of increments is a second replay mechanism living beside the log — which already is one —
+  and restart cost would grow with chain length. At the reference scale a full dump is seconds of sequential
+  I/O; revisit only if snapshot pause time ever shows up in a measurement.
+
+### Implementation decisions recorded
+
+- **FASTER is a projection; recovery is ours.** The engineering timebox came due exactly where the risk
+  section predicted — FASTER's checkpoint machinery versus our log — and the simpler composition won, taken
+  further than the fallback the plan allowed: `FasterHotStore` rebuilds from snapshot + log replay on *every*
+  start, clean shutdown included, and FASTER's checkpoint/recovery is not used at all. One recovery story
+  covers both store engines, crash consistency is inherited from the log (there is no FASTER-side state to
+  tear), and the seam stays clean. The recorded cost: startup time proportional to snapshot size — sequential
+  I/O, seconds at the reference scale (~24.6k blob rows bulk-load in under half a second in the recorded
+  benchmark, and snapshot load is the same write path).
+- **Out-of-line blobs split the serialized row byte-exactly.** A `byte[]` payload of 256 bytes or more moves
+  to the blob log; the main record keeps the column's null flag and length prefix, and the splice on read
+  reproduces the original bytes exactly — serialized bytes are a row's identity, and the same test suite
+  proves both stores byte-identical. The threshold is a constant, not configuration: below it the indirection
+  costs more than it saves, and a knob would be folklore.
+- **`Residency.Auto` starts resident and demotes loudly** (EventId 1505) when the table crosses
+  `Residency:AutoThresholdBytes` — threshold behaviour by explicit request only, never the default, exactly
+  as the residency decision ordered.
+- **`CommitLog:GroupCommit` shipped accepted-and-reserved** (the `Scheduler:MaxConcurrentTicks` precedent):
+  the engine's single-writer lock serializes commits, so there are never two appends in flight for one fsync
+  to cover — the bulk path is the batching that exists. Recorded in the register with the reasoning.
+- **The zero-filled torn tail.** Extending the kill tests to the paging store exposed a phase-01 latent bug:
+  a zero-filled torn tail parses as a zero-length record whose declared CRC (zero) equals the CRC of zero
+  bytes, crashing recovery in the codec. The log now treats a zero-length frame as torn everywhere it walks
+  records. The kill-test pattern earning its keep.
+- **The recorded numbers** (Debug build, local NVMe; the tests assert loose floors — 10x and 5x — so they
+  hold on slower machines, and print the measured values): bulk-loading the reference 24.6k×1KB blob workload
+  ran at **19.6µs/row against 860µs/row** for per-row transactions under the default durable fsync — **44x**;
+  a FASTER resident full scan of 50k rows measured **1.05x** the in-memory store (3.83ms vs 3.64ms); the
+  125MiB-dataset-under-8MiB-budget test held working-set and heap growth under half the dataset with zero
+  incorrect reads, and a key walk over 100MiB of blobs faulted zero pages.
 
 ## Done when
 

@@ -12,14 +12,41 @@ public sealed class InMemoryHotStore : IHotStore
     private readonly Dictionary<TableId, TableData> _tables = [];
 
     public InMemoryHotStore(SchemaRegistry registry)
+        : this(registry, residency: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates the store with resolved residency labels for its statistics. The labels are
+    /// reporting only: this store holds every table in memory regardless — it does not page, which
+    /// is exactly why it stays as the fast path for tests.
+    /// </summary>
+    public InMemoryHotStore(SchemaRegistry registry, IReadOnlyDictionary<TableId, Residency>? residency)
     {
         ArgumentNullException.ThrowIfNull(registry);
         _registry = registry;
         foreach (var table in registry.Tables)
-            _tables.Add(table.Id, new TableData(table));
+        {
+            var label = residency?.GetValueOrDefault(table.Id, table.Residency) ?? table.Residency;
+            _tables.Add(table.Id, new TableData(table, label));
+        }
     }
 
     public ulong AppliedLsn { get; private set; }
+
+    public void LoadSnapshot(ulong lsn, IEnumerable<SnapshotRow> rows)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        if (AppliedLsn != 0)
+            throw new InvalidOperationException("A snapshot loads only into an empty store, before any record applies.");
+        foreach (var row in rows)
+        {
+            if (_tables.TryGetValue(row.Table, out var table))
+                table.Put(row.Key, row.Row);
+        }
+
+        AppliedLsn = lsn;
+    }
 
     public void Apply(CommitRecord record)
     {
@@ -56,7 +83,43 @@ public sealed class InMemoryHotStore : IHotStore
         if (!_tables.TryGetValue(table, out var data))
             yield break;
         foreach (var pair in data.Rows)
+        {
+            data.RowsScanned++;
             yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(pair.Key, pair.Value);
+        }
+    }
+
+    public long Count(TableId table) =>
+        _tables.TryGetValue(table, out var data) ? data.Rows.Count : 0;
+
+    public IEnumerable<RowKey> ScanKeys(TableId table)
+    {
+        if (!_tables.TryGetValue(table, out var data))
+            yield break;
+        foreach (var key in data.Rows.Keys)
+            yield return key;
+    }
+
+    public HotStoreStatistics Statistics()
+    {
+        var tables = new List<HotStoreTableStatistics>(_tables.Count);
+        foreach (var table in _registry.Tables)
+        {
+            var data = _tables[table.Id];
+
+            // Everything in this store is physically resident, so measured bytes are honest for
+            // every table regardless of its declared residency label.
+            tables.Add(new HotStoreTableStatistics(
+                table.Id,
+                table.Name,
+                data.ResidencyLabel == Residency.Auto ? Residency.Resident : data.ResidencyLabel,
+                data.Rows.Count,
+                data.ResidentBytes,
+                PageFaults: 0,
+                data.RowsScanned));
+        }
+
+        return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = 0 };
     }
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
@@ -92,9 +155,10 @@ public sealed class InMemoryHotStore : IHotStore
     {
         private readonly TableSchema _schema;
 
-        public TableData(TableSchema schema)
+        public TableData(TableSchema schema, Residency residencyLabel = Residency.Paged)
         {
             _schema = schema;
+            ResidencyLabel = residencyLabel;
             foreach (var index in schema.Indexes)
                 Indexes.Add(index.Column, []);
         }
@@ -103,12 +167,27 @@ public sealed class InMemoryHotStore : IHotStore
 
         public Dictionary<string, SortedDictionary<RowKey, SortedSet<RowKey>>> Indexes { get; } = [];
 
+        public Residency ResidencyLabel { get; }
+
+        public long ResidentBytes { get; private set; }
+
+        public long RowsScanned { get; set; }
+
         public void Put(RowKey key, ReadOnlyMemory<byte> row)
         {
             if (Rows.TryGetValue(key, out var previous))
+            {
                 UnindexRow(key, previous);
+                ResidentBytes -= previous.Length;
+            }
+            else
+            {
+                ResidentBytes += key.Length;
+            }
+
             var bytes = row.ToArray();
             Rows[key] = bytes;
+            ResidentBytes += bytes.Length;
             IndexRow(key, bytes);
         }
 
@@ -116,6 +195,7 @@ public sealed class InMemoryHotStore : IHotStore
         {
             if (!Rows.Remove(key, out var previous))
                 return;
+            ResidentBytes -= key.Length + previous.Length;
             UnindexRow(key, previous);
         }
 

@@ -1,6 +1,6 @@
 namespace MelangeDB.Core.Tests;
 
-[Table(Public = true)]
+[Table(Public = true, Residency = Residency.Resident)]
 public partial struct Player
 {
     [PrimaryKey]

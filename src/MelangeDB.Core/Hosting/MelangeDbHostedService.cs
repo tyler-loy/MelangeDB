@@ -50,13 +50,22 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         // Resolving the engine is startup: its constructor runs log recovery and projection rebuild.
         var engine = (MelangeEngine)_provider.GetService(typeof(MelangeEngine))!;
         _engine = engine;
-        _reloadBridge = _monitor.OnChange(next => CopyLiveKeys(next, engine.Options));
+        _reloadBridge = _monitor.OnChange(next =>
+        {
+            CopyLiveKeys(next, engine.Options);
+            ApplyResidencyOverrides(next, engine.Options, engine);
+        });
         ReportUnpolicedReducers();
 
         // The event bus starts before the scheduler so a recovered timer's first fire can already
         // publish; its subscribers catch up from their checkpoints against the recovered log.
         _eventBus = (MelangeEventBus?)_provider.GetService(typeof(MelangeEventBus));
         _eventBus?.Start();
+
+        // Log truncation must never pass the slowest live event subscriber; the bus's minimum
+        // checkpoint is registered as a truncation floor the snapshot path consults.
+        if (_eventBus is { } bus)
+            engine.AddTruncationFloor(() => bus.MinimumLiveCheckpointLsn);
 
         // Scheduling starts only after recovery finished: the pending set is rebuilt from the
         // recovered timer rows, and overdue timers fire per Scheduler:CatchUpAfterDowntime.
@@ -142,7 +151,41 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Events.RetryBackoffMs = next.Events.RetryBackoffMs;
         live.Events.MaxPublishDepth = next.Events.MaxPublishDepth;
         live.Events.SubscriberExpirySeconds = next.Events.SubscriberExpirySeconds;
+        live.CommitLog.GroupCommit = next.CommitLog.GroupCommit;
+        live.Snapshots.Enabled = next.Snapshots.Enabled;
+        live.Snapshots.IntervalTransactions = next.Snapshots.IntervalTransactions;
+        live.Snapshots.TruncateLog = next.Snapshots.TruncateLog;
     }
+
+    /// <summary>
+    /// Applies changed <c>Residency:&lt;TableName&gt;</c> overrides to the running store — the
+    /// register's <c>careful</c> semantic: the change takes effect at runtime, but pinning a table
+    /// faults it wholly in and unpinning one migrates it to the buffer pool, so it is applied
+    /// per changed table rather than wholesale.
+    /// </summary>
+    private void ApplyResidencyOverrides(MelangeDbOptions next, MelangeDbOptions live, MelangeEngine engine)
+    {
+        if (engine.HotStore is not IResidencyControl control)
+            return;
+        foreach (var (table, residency) in next.Residency.PerTable)
+        {
+            if (live.Residency.PerTable.TryGetValue(table, out var current) && current == residency)
+                continue;
+            live.Residency.PerTable[table] = residency;
+            try
+            {
+                control.ApplyResidency(table, residency);
+            }
+            catch (Exception exception)
+            {
+                LogResidencyChangeFailed(_logger, table, residency, exception);
+            }
+        }
+    }
+
+    [LoggerMessage(EventId = 1507, EventName = "ResidencyChangeFailed", Level = LogLevel.Error,
+        Message = "Applying the Residency:{Table} override ({Residency}) to the running store failed; the table keeps its previous residency until restart.")]
+    private static partial void LogResidencyChangeFailed(ILogger logger, string table, Residency residency, Exception exception);
 
     [LoggerMessage(EventId = 1101, EventName = "MelangeStarted", Level = LogLevel.Information,
         Message = "MelangeDB started: recovered to LSN {HeadLsn} with {TableCount} table(s).")]

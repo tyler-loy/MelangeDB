@@ -13,6 +13,18 @@ internal static class Crc32
         return crc ^ 0xFFFFFFFFu;
     }
 
+    /// <summary>Incremental form for streamed payloads too large to buffer: seed with <see cref="Begin"/>, fold chunks, finish with <see cref="End"/>.</summary>
+    public static uint Begin() => 0xFFFFFFFFu;
+
+    public static uint Append(uint state, ReadOnlySpan<byte> data)
+    {
+        foreach (var b in data)
+            state = (state >> 8) ^ Table[(state ^ b) & 0xFF];
+        return state;
+    }
+
+    public static uint End(uint state) => state ^ 0xFFFFFFFFu;
+
     private static uint[] BuildTable()
     {
         var table = new uint[256];

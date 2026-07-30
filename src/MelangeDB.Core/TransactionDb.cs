@@ -172,6 +172,61 @@ internal sealed class TransactionDb : IDbView
         }
     }
 
+    public bool Any<TRow>()
+        where TRow : struct
+        => Count<TRow>() > 0;
+
+    /// <summary>
+    /// The overlay-aware count: the store's O(1) row count adjusted by the pending ops, so an
+    /// existence check materializes no row and pages nothing in. An Insert op is a row the store
+    /// lacks; a Delete op removes one it has; an Update is neutral.
+    /// </summary>
+    public long Count<TRow>()
+        where TRow : struct
+    {
+        var schema = _registry.Get(typeof(TRow));
+        var count = _store.Count(schema.Id);
+        foreach (var op in _writeSet.OpsFor(schema.Id))
+        {
+            if (op.Kind == RowOpKind.Insert)
+                count++;
+            else if (op.Kind == RowOpKind.Delete)
+                count--;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// The first row in primary-key order: the store's first key raced against the overlay's, so
+    /// at most one row materializes. A pending delete of the store's first key falls back to the
+    /// merged scan — rare, and still lazy.
+    /// </summary>
+    public TRow? First<TRow>()
+        where TRow : struct
+    {
+        var schema = _registry.Get(typeof(TRow));
+        var hasPending = false;
+        foreach (var _ in _writeSet.OpsFor(schema.Id))
+        {
+            hasPending = true;
+            break;
+        }
+
+        if (!hasPending)
+        {
+            // The common committed-state path: the store's scan is lazy, so exactly one row
+            // materializes and nothing else pages in.
+            foreach (var (_, bytes) in _store.Scan(schema.Id))
+                return Materialize<TRow>(schema, bytes);
+            return null;
+        }
+
+        foreach (var (_, bytes) in ScanMerged(schema))
+            return Materialize<TRow>(schema, bytes);
+        return null;
+    }
+
     /// <summary>
     /// Stages a delete by pre-encoded key when the row still exists in the overlay — the
     /// scheduler's one-shot consumption, which must tolerate the reducer body having already
