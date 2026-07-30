@@ -7,7 +7,8 @@ MelangeDB is instrumented with OpenTelemetry from the first commit, not retrofit
 > dashboard or an alert on `melange.applier.lag`, renaming it is a breaking change — so names get the same care
 > as method signatures.
 
-Nothing here is implemented yet; each row lands with its phase.
+Each row lands with its phase. The phase 01 spans and metrics are implemented and asserted by tests over a
+collecting `ActivityListener` / `MeterListener`.
 
 ## The dependency decision
 
@@ -67,7 +68,7 @@ Source name: `MelangeDB`.
 
 | Span | Phase | Attributes | Notes |
 | --- | --- | --- | --- |
-| `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows` | The root span for client-initiated work. |
+| `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows`; `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off; `melange.reducer.args` only when `Telemetry:IncludeReducerArguments` is opted in | The root span for client-initiated work. |
 | `melange.commit` | 01 | `melange.lsn`, `melange.writeset.bytes` | The critical section; a child `melange.fsync` span isolates durability cost from serialization cost. |
 | `melange.apply` | 01 | `melange.applier` | One per applier, per batch. |
 | `melange.subscription.initial` | 03 | `melange.table`, `melange.rows`, `melange.bytes` | The expensive half of a subscription; worth its own span. |
@@ -147,11 +148,12 @@ No parallel logging abstraction — the host's configured providers are the whol
 
 ## Health checks
 
-Standard `IHealthCheck` registrations, since they're nearly free once the metrics exist:
+Standard `IHealthCheck` registrations, since they're nearly free once the metrics exist. These require a DI
+host to register into, so the first one lands with phase 02's host integration rather than phase 01:
 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
-| `melange-log` | The commit log is unwritable or out of disk | 01 |
+| `melange-log` | The commit log is unwritable or out of disk | 02 |
 | `melange-applier` | Any applier's lag exceeds its threshold | 08 |
 | `melange-shard` | This node's shard assignment is unknown or contested | 09 |
 

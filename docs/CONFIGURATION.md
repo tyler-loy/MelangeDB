@@ -10,9 +10,17 @@ This applies to every phase, not just the one that created this file.
 
 ## Status
 
-Nothing here is implemented yet. Every row is `planned` until the phase that owns it lands, at which point its
-status becomes `shipped` and its default is verified against the code rather than the plan. Treat this as a
-design register that becomes a reference.
+Every row is `planned` until the phase that owns it lands, at which point its status becomes `shipped` and its
+default is verified against the code rather than the plan. Treat this as a design register that becomes a
+reference.
+
+**Shipped as of phase 01** (defaults verified against `MelangeDbOptions` and friends in `MelangeDB.Core`):
+`HotStore:Path`, `CommitLog:Path`, `CommitLog:FsyncPolicy`, `CommitLog:FsyncIntervalMs`, `Telemetry:Enabled`,
+`Telemetry:IncludeCallerIdentity`, `Telemetry:IncludeReducerArguments`. One nuance until phase 02's host
+integration binds these through `IOptionsMonitor<T>`: the options objects exist and `live` keys are read per
+operation (mutating the options instance takes effect on the next commit), but there is no configuration
+section binding yet — that is phase 02's `AddMelangeDb` deliverable. `HotStore:Path` is created and reserved by
+the engine; the in-memory store persists nothing in it until the paging engine lands in phase 07.
 
 ## Conventions
 

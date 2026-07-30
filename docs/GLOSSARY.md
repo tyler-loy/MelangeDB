@@ -126,8 +126,16 @@ durable. This is what buys atomicity across heterogeneous stores with no 2PC.
 **Delta** — A row insert, update, or delete sent to a subscribed client. May carry a partial row when the
 subscription projects columns or a policy masks them.
 
+**Dispatcher** — The component that runs one reducer invocation as one transaction: build the write set
+through the overlay, append at the commit point, notify the appliers. In phase 01 it is a method on the
+engine; phase 02 hides it behind host integration.
+
 **Domain event** — An application-level fact published from a reducer via `ctx.Publish`, delivered to
 DI-resolved handlers *after* the commit point.
+
+**Engine (`MelangeEngine`)** — The phase-01 composition root: opens the commit log, rebuilds projections and
+AutoInc sequences from it, and dispatches reducers. Phase 02's `AddMelangeDb` wraps it; application code
+stops meeting it directly at that point.
 
 **Event bus** — The delivery mechanism for domain events, implemented as a transactional outbox over the commit
 log. A projection, not a second source of truth.
@@ -194,6 +202,10 @@ accounts, registration, statistics. Eventually consistent with the log by design
 **Resident** — Residency: the table is pinned wholly in memory. Opt-in, because a resident-by-default store
 reproduces the RAM ceiling MelangeDB exists to remove.
 
+**RowKey** — The uniform, order-preserving encoded byte form of a primary key (or indexed column value):
+big-endian integers with the sign bit flipped when signed, UTF-8 strings, raw `Identity` bytes. Byte-wise
+comparison compares values, so the log, the stores, and range indexes share one key shape.
+
 **Log epoch** — The identifier naming one commit log incarnation, carried in `Resume` alongside the LSN so a
 cursor can never be applied against the wrong log. A client holds one cursor per attachment; a stale or unknown
 epoch is an explicit failure answered with full resync.
@@ -236,6 +248,10 @@ Anchored to one LSN across that boundary so a client observes no gap or duplicat
 
 **Table** — A `partial struct` with `[Table]`, declaring `Tier`, `Placement`, `Residency`, and visibility. Value
 types keep allocation off the reducer hot path.
+
+**TableId** — A table's stable 32-bit identifier, derived from its name (FNV-1a) so it never depends on
+registration order and survives restarts. Write-set ops and log records are keyed by table id, never by CLR
+type. Collisions are detected at schema registration.
 
 **Tier** — Which storage engine holds a table: `Hot` or `Relational`.
 

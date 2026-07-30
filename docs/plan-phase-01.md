@@ -58,14 +58,28 @@ Codegen (02), networking (03), auth (04), scheduling (05), events (06), FASTER a
 
 ## Decisions to settle
 
-- **Row representation in the log.** Reflection-based serialization is fine to start, but the format must
-  be versioned from record one, since phase 02 replaces the serializer and existing logs must still read.
-- **Primary key encoding.** A uniform comparable byte-key keeps the log and indexes simple; typed keys are
-  faster. Pick one and write it down.
-- **Index maintenance ownership** — does the store own index updates, or does the applier drive them? This
-  determines how much phase 07 has to reimplement.
-- **Nested reducer calls** — allowed (sharing one transaction) or forbidden? Forbidding is simpler and can
-  be relaxed later; allowing it later is a breaking change to nothing, so default to forbidding.
+- ~~**Row representation in the log.** Reflection-based serialization is fine to start, but the format must
+  be versioned from record one, since phase 02 replaces the serializer and existing logs must still read.~~
+  **Settled: reflection-based, versioned from record one.** Rows serialize against the schema's declared
+  column order (format v1: fixed-width little-endian primitives, null-flagged length-prefixed
+  strings/blobs, enums as their underlying integer), and every log record payload begins with a format
+  version. Phase 02's generated serializers implement the same format behind the same `TableSchema` seam,
+  so existing logs keep reading.
+- ~~**Primary key encoding.** A uniform comparable byte-key keeps the log and indexes simple; typed keys are
+  faster. Pick one and write it down.~~ **Settled: uniform order-preserving byte-key (`RowKey`).**
+  Big-endian for unsigned integers, big-endian with the sign bit flipped for signed ones, UTF-8 for
+  strings, raw bytes for `Identity` — so byte-wise comparison compares values and the log, the store,
+  and future range indexes share one key shape. Floats are not key-encodable; typed keys remain a
+  phase 07 optimization if benchmarks demand it.
+- ~~**Index maintenance ownership** — does the store own index updates, or does the applier drive them? This
+  determines how much phase 07 has to reimplement.~~ **Settled: store-owned.** `IHotStore.Apply` consumes
+  whole commit records and maintains its own secondary indexes; the applier is just a cursor. Phase 07's
+  engine swap reimplements indexing behind the same interface without touching the applier pipeline.
+- ~~**Nested reducer calls** — allowed (sharing one transaction) or forbidden? Forbidding is simpler and can
+  be relaxed later; allowing it later is a breaking change to nothing, so default to forbidding.~~
+  **Settled: forbidden — a nested invoke throws.** Relaxing later is backwards-compatible; sharing one
+  transaction today would complicate abort semantics for no workload that needs it. Shared logic belongs
+  in plain methods both reducers call.
 - ~~**AutoInc id encoding must be cluster-proof from record one.**~~ **Settled: 64-bit
   originator-prefixed ids, allocated within 63 bits.** The documented contract is **unique, not dense** —
   never promise contiguity, because phase 09 gives each shard its own log and "the" per-table sequence
