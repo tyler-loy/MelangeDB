@@ -247,7 +247,10 @@ the slowest applier or event subscriber.
 Anchored to one LSN across that boundary so a client observes no gap or duplicate.
 
 **Table** — A `partial struct` with `[Table]`, declaring `Tier`, `Placement`, `Residency`, and visibility. Value
-types keep allocation off the reducer hot path.
+types keep allocation off the reducer hot path. **The primary key is a row's identity**: `Update` locates the
+row by the primary key of the row it is handed, so mutating a primary-key field and calling `Update` is
+undefined-by-design — it either finds no row or targets a different one. Changing a row's key is a delete of
+the old row and an insert of the new one.
 
 **TableId** — A table's stable 32-bit identifier, derived from its name (FNV-1a) so it never depends on
 registration order and survives restarts. Write-set ops and log records are keyed by table id, never by CLR

@@ -157,6 +157,84 @@ public class CommitLogTests : IDisposable
         Assert.Equal(2UL, _harness.Engine.Log.HeadLsn);
     }
 
+    [Fact]
+    public void Failed_append_rolls_back_the_file_and_the_next_append_commits_with_the_correct_lsn()
+    {
+        var root = Directory.CreateTempSubdirectory("melange-log-fault-").FullName;
+        try
+        {
+            var options = new CommitLogOptions { Path = root };
+            using var log = new FileCommitLog(options);
+            log.Append(MakeRequest("First"));
+            var bytesBefore = ReadAllBytesShared(log.FilePath);
+
+            // A flush failure (disk full, in real life) must leave the file byte-identical:
+            // an orphaned record would replay a phantom commit, and an un-advanced head LSN
+            // would let the next append re-mint the same LSN and shadow a real transaction.
+            log.AppendFaultInjection = _ => throw new IOException("injected: disk full");
+            var thrown = Assert.Throws<IOException>(() => log.Append(MakeRequest("Doomed")));
+            Assert.Equal("injected: disk full", thrown.Message);
+            Assert.Equal(bytesBefore, ReadAllBytesShared(log.FilePath));
+            Assert.Equal(1UL, log.HeadLsn);
+
+            log.AppendFaultInjection = null;
+            var record = log.Append(MakeRequest("Second"));
+            Assert.Equal(2UL, record.Lsn);
+            Assert.Equal(new ulong[] { 1, 2 }, log.ReadFrom(1).Select(r => r.Lsn));
+            Assert.Equal(new[] { "First", "Second" }, log.ReadFrom(1).Select(r => r.ReducerName));
+
+            log.Dispose();
+            using var reopened = new FileCommitLog(options);
+            Assert.Equal(2UL, reopened.HeadLsn);
+            Assert.Equal(new ulong[] { 1, 2 }, reopened.ReadFrom(1).Select(r => r.Lsn));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Unrollbackable_append_failure_poisons_the_log()
+    {
+        var root = Directory.CreateTempSubdirectory("melange-log-poison-").FullName;
+        try
+        {
+            var options = new CommitLogOptions { Path = root };
+            using var log = new FileCommitLog(options);
+            log.Append(MakeRequest("First"));
+
+            // Killing the stream makes both the flush and the rollback truncation fail: the
+            // partial record cannot be removed, so the log must refuse all further appends
+            // rather than risk making an aborted transaction's record durable.
+            log.AppendFaultInjection = stream => stream.Dispose();
+            Assert.ThrowsAny<Exception>(() => log.Append(MakeRequest("Doomed")));
+
+            var poisoned = Assert.Throws<InvalidOperationException>(() => log.Append(MakeRequest("After")));
+            Assert.Contains("failed state", poisoned.Message);
+            Assert.NotNull(poisoned.InnerException);
+            Assert.Equal(1UL, log.HeadLsn);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static CommitRequest MakeRequest(string reducerName)
+    {
+        var op = new RowOp(RowOpKind.Insert, TableId.FromName("Whatever"), new RowKey([1, 2, 3]), new byte[] { 4, 5, 6 });
+        return new CommitRequest(new Timestamp(1), EngineHarness.Caller, reducerName, ReadOnlyMemory<byte>.Empty, [op]);
+    }
+
+    private static byte[] ReadAllBytesShared(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+        return buffer.ToArray();
+    }
+
     private List<string> CaptureStateAtLsn(ulong lsn)
     {
         var fresh = new InMemoryHotStore(SchemaRegistry.FromTypes(
