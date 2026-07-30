@@ -30,7 +30,14 @@ the schema) — shipped with the paged store: the hot store self-reports per-tab
 `IHotStore.Statistics()`, and the engine's telemetry exposes them as observable instruments, so both store
 engines feed the same signals. `page_faults` counts rows served from disk instead of the buffer pool (always
 zero for the in-memory store); `scan_rows` counts rows returned by full scans, the runtime shadow of analyzer
-MELANGE0017.
+MELANGE0017. Phase 08 shipped no new metric — `melange.applier.lag` has carried the postgres applier's story
+since phase 01 by design; the tier registers as a decoupled applier, so its checkpoint appears there under
+`applier="postgres"` and pins log truncation like any other. The `melange.apply` span is emitted per
+**batch** by the Postgres applier as specified below, with one honest narrowing: it starts a new trace with
+no links, because a log record persists no trace context — a catch-up batch may cover a hundred committed
+transactions whose traces are long gone. (The event bus can link because it carries the emitter's context in
+memory; a durable log cannot.) The `melange-applier` health check shipped this phase; its threshold is
+`HealthChecks:ApplierLagThreshold`.
 
 ## The dependency decision
 
@@ -183,7 +190,15 @@ buffer-pool cap, and the total they sum to — `1502 SnapshotWritten`, `1503 Log
 respected), `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
 `1505 AutoResidencyDemoted` — an `Auto` table crossing its threshold is the cliff arriving, and it announces
 itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, and `1508 ResidencyChanged`, the careful
-per-table override being applied at runtime (07).
+per-table override being applied at runtime (07); `1601 PostgresApplierStalled` — the loud stall the phase-08
+risk register demands: first failure always, then every 30 seconds under `Diagnostics:ReportApplierLag` with
+the growing lag — `1602 PostgresApplierRecovered`, `1603 PostgresSchemaMigrated` (the DDL AutoMigrate
+applied — automatic must not mean silent), `1604 PostgresMigrationRefused` (carrying the exact pending DDL,
+so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (LSNs are meaningless across log
+epochs; the applier stalls rather than guesses), `1606 PostgresTierBootstrapped` (a tier attached after log
+truncation is rebuilt from the hot store at one consistent LSN), and `1607 RelationalTablesWithoutPostgres` —
+tables declared `Tier = Relational` in a deployment that configured no Postgres run fine in the hot store,
+and are told what they are missing (08).
 
 ## Health checks
 
@@ -195,7 +210,7 @@ host to register into, so the first one landed with phase 02's host integration 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
 | `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
-| `melange-applier` | Any applier's lag exceeds its threshold | 08 |
+| `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form | 08 |
 | `melange-shard` | This node's shard assignment is unknown or contested | 09 |
 
 ## Standing requirement

@@ -250,8 +250,28 @@ reflection fallback for reducers.
 up the descriptor by name, decodes and validates arguments *before* any transaction opens, creates one DI
 scope per call, and invokes the body as one transaction. The transport phases call it; so do tests.
 
+**Owner role** — The `Sql:OwnerRole` claim (default `melange-owner`) that authorizes a caller when ad-hoc SQL
+runs in owner mode. The per-caller half of the two-mode contract, per the guest-role precedent: the IdP is the
+gate, owner capability is a claim it issues, and a caller without it is refused — never silently downgraded to
+policy-enforced.
+
+**Postgres applier** — The relational tier's applier: consumes the commit log on its own dispatch loop, off
+the commit path, projecting relational-tier rows into Postgres in batches whose checkpoint commits *inside*
+the same Postgres transaction — which is what makes resume after any failure gap-free and duplicate-free with
+no 2PC. Registered as a decoupled applier: tracked for lag and truncation floors, never driven by the commit
+path, so Postgres down is not server down.
+
 **Relational tier** — Opt-in Postgres storage for tables declaring `Tier = Relational`. The "servicey" half:
-accounts, registration, statistics. Eventually consistent with the log by design.
+accounts, registration, statistics. Eventually consistent with the log by design. Settled in phase 08: a
+relational table's rows **also** project into the hot store like any table's — tier is *additionally
+Postgres*, not *instead of the hot store* — so reducer reads, the overlay, uniqueness, and (for public
+tables) subscriptions work unchanged, and memory stays bounded by phase 07's paging. Postgres is the extra
+projection that serves SQL tooling and aggregates.
+
+**WaitForApplied** — `PostgresRelationalTier.WaitForAppliedAsync(lsn)`: completes when the tier's checkpoint
+reaches the LSN — the narrow primitive for the rare flow that genuinely needs cross-tier read-after-write.
+An honest wait: it can take as long as Postgres is down. Most code should not use it; the lag is the design,
+and the hot store already serves read-your-writes.
 
 **Replicated** — Placement: a full copy on every node, written only by the hub. Small bounded reference data.
 

@@ -68,6 +68,19 @@ changed override applies to the running store per table (pinning faults the tabl
 unpinning migrates it to the buffer pool) when the store supports runtime residency control; the
 in-memory store, which does not page, takes the label at restart.
 
+**Shipped as of phase 08** (defaults verified against `PostgresOptions`, `SqlOptions`, `DiagnosticsOptions`,
+and `HealthChecksOptions`): every `Postgres:*` key, `Sql:AdHocEnabled`, `Sql:OwnerRole` (a new key — see below),
+`Diagnostics:ReportApplierLag`, and `HealthChecks:ApplierLagThreshold`. Three notes made when it shipped:
+(1) `Sql:AdHocEnabled` gates the whole `/melange/sql` endpoint — off answers `403 sql_disabled` — and shipped
+at its planned default of `false`, which is a behavior change from phases 04–07, where the endpoint answered
+unconditionally; the register's row was always the contract, the endpoint simply predated it. (2) The
+owner-mode per-caller authorization deferred from phase 04 landed as **a role claim**, `Sql:OwnerRole`,
+following the `Auth:GuestRole` precedent — the IdP is the gate, owner capability is a claim it issues, and in
+`Owner` mode a caller without the claim is refused (`403 owner_required`), never silently downgraded to
+policy-enforced. (3) `Diagnostics:ReportApplierLag` gates only the *periodic re-logging* of a continuing
+stall; the first stall (EventId 1601) and the recovery (1602) always log, because a silent stall is the
+failure mode the phase exists to prevent.
+
 **Shipped as of phase 04** (defaults verified against `AuthOptions`, `PoliciesOptions`, `RateLimitOptions`,
 and `SqlOptions`): every `Auth:*`, `Policies:*`, and `RateLimit:*` key, plus `Sql:AdHocMode` — shipped ahead
 of its phase-08 row because `/melange/sql` already returns rows, so the policy contract could not wait. Three
@@ -142,12 +155,13 @@ to fix it without a code change and a redeploy.
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Postgres:ConnectionString` | string | — | restart | 08 | Absent means no relational tier. A deployment with no relational tables needs no Postgres at all. |
-| `Postgres:Schema` | string | `melange` | restart | 08 | |
-| `Postgres:ApplyBatchSize` | int | `100` | live | 08 | Log records per Postgres transaction. The applier checkpoint advances only with the batch, so batching stays correct. |
-| `Postgres:AutoMigrate` | bool | `false` | restart | 08 | Off by default: schema changes against a production database should be deliberate. |
-| `Sql:AdHocEnabled` | bool | `false` | live | 08 | |
-| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Per-caller owner authorization lands with 08's full contract. |
+| `Postgres:ConnectionString` | string | — | restart | 08 | Absent means no relational tier. A deployment with no relational tables needs no Postgres at all; one that declares relational tables without configuring this runs anyway (rows stay in the hot store) and is told so loudly at startup (EventId 1607). |
+| `Postgres:Schema` | string | `melange` | restart | 08 | The Postgres schema (namespace) relational tables and the applier checkpoint live in. The schema and the checkpoint table are always created — they are the tier's own plumbing; `AutoMigrate` governs user tables only. |
+| `Postgres:ApplyBatchSize` | int | `100` | live | 08 | Log records per Postgres transaction. The applier checkpoint advances only with the batch — batch and checkpoint commit atomically — so batching stays correct. |
+| `Postgres:AutoMigrate` | bool | `false` | restart | 08 | Off by default: schema changes against a production database should be deliberate. Governs only **additive** DDL (create table, add column); destructive disagreement is refused loudly (EventId 1604) in both settings. Off, the applier validates and stalls with the exact pending DDL in the log; running it manually recovers without a restart. |
+| `Sql:AdHocEnabled` | bool | `false` | live | 08 | Gates the whole `/melange/sql` endpoint; off answers `403 sql_disabled`. Ad-hoc SQL is a tooling surface, and a deployment that never opted in should not be exposing one. |
+| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Since 08, `Owner` additionally requires the caller's `Sql:OwnerRole` claim, may name private *relational-tier* tables, and is the only mode that runs aggregates. |
+| `Sql:OwnerRole` | string | `melange-owner` | live | 08 | The role claim that authorizes a caller when `AdHocMode` is `Owner` — the per-caller half of the two-mode contract, per the `Auth:GuestRole` precedent (the IdP is the gate). A caller without it is refused (`403 owner_required`), never silently downgraded to policy-enforced. Empty makes owner mode unusable by everyone. |
 
 ## Transport and subscriptions
 
@@ -231,7 +245,7 @@ Ignored entirely by single-node deployments.
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Diagnostics:ReportApplierLag` | bool | `true` | live | 08 | A silently stalled Postgres applier — writes succeeding while the tier falls hours behind — is the dangerous failure mode. Not optional in practice. |
+| `Diagnostics:ReportApplierLag` | bool | `true` | live | 08 | A silently stalled Postgres applier — writes succeeding while the tier falls hours behind — is the dangerous failure mode. Not optional in practice. Gates only the periodic (30s) re-logging of a continuing stall's growing lag; the stall itself (EventId 1601) and the recovery (1602) always log. |
 | `Diagnostics:EmitGeneratedFiles` | bool | `false` | restart | 02 | Writes source-generator output to disk. Incremental generators fail obscurely; this pays for itself. **Realized as the standard MSBuild property `<EmitCompilerGeneratedFiles>` in the consuming project file** — it acts at compile time, so it cannot be an `appsettings.json` key; the tests and sample set it, and output lands under `obj/.../generated`. |
 
 ## Telemetry
@@ -247,4 +261,4 @@ where it goes. See [OBSERVABILITY.md](OBSERVABILITY.md).
 | `Telemetry:IncludeReducerArguments` | bool | `false` | live | 01 | Off by default: arguments can contain anything, including secrets, and the commit log already records them. |
 | `Telemetry:DeltaSpanSampleRatio` | double | `0.01` | live | 03 | `melange.subscription.delta` is the highest-frequency operation in the system; tracing every one at full rate would cost more than the work. |
 | `Telemetry:SlowReducerMs` | int | `50` | live | 02 | Reducers over this threshold get a span event and a log entry. |
-| `HealthChecks:ApplierLagThreshold` | long | `10000` | live | 08 | Transactions behind before the `melange-applier` check reports unhealthy. |
+| `HealthChecks:ApplierLagThreshold` | long | `10000` | live | 08 | Transactions behind before the `melange-applier` check reports unhealthy. Applies to every applier — the hot store's included — though a decoupled applier (Postgres) is the one that realistically lags. |

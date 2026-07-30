@@ -368,7 +368,15 @@ samples/                        worker-service sample
   language; a source-generated binary format is faster. Put it behind `IMelangeSerializer` and defer.
 - **Schema migration** — how tier changes and column adds replay against an existing log. Worth
   designing for early: in SpacetimeDB every schema change means republish plus regenerating bindings
-  for every client tree, and stale-schema clients simply break.
+  for every client tree, and stale-schema clients simply break. **The relational tier's half settled
+  in phase 08:** additive changes (create table, add column) are automatic under
+  `Postgres:AutoMigrate` — an added NOT NULL column backfills existing rows with its kind's zero
+  value, so an additive migration never drops or nulls data — while anything destructive (changed
+  type, dropped column) is refused loudly with the pending DDL in the log, and stays a manual,
+  deliberate migration; with AutoMigrate off (the default) the applier validates, stalls, and prints
+  the exact DDL an operator would run. Columns present in Postgres but absent from the schema are
+  left untouched. The hot-tier half — how column adds replay against an existing *log* — remains
+  open. See [plan-phase-08.md](plan-phase-08.md).
 - ~~**Log compaction / snapshots**~~ — **Settled in phase 07: full snapshot + truncate.** Snapshot at an
   LSN beside the log, truncate behind it, never past the slowest applier, the slowest live event
   subscriber, or the Resume retention window; restart is snapshot plus tail replay. See
