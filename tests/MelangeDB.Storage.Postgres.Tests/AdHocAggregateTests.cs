@@ -43,7 +43,6 @@ public class AdHocAggregateTests
         http.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", OwnerToken());
 
         // Three stats in hour A, two in hour B; values chosen so every aggregate is checkable.
-        var reducers = app.Services.GetRequiredService<MelangeReducerHost>();
         var caller = Identity.Hash("aggregate-tests");
         var hourA = new Timestamp(1_753_800_000_000_000);
         var hourB = new Timestamp(hourA.UnixTimeMicroseconds + 3_600_000_000);
