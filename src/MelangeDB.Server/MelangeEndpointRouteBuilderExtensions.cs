@@ -37,7 +37,7 @@ public static class MelangeEndpointRouteBuilderExtensions
         var services = endpoints.ServiceProvider;
         var options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
         var engine = services.GetRequiredService<MelangeEngine>();
-        var authenticator = new MelangeAuthenticator(services, () => options.CurrentValue.Auth);
+        var authenticator = new MelangeAuthenticator(services, () => options.CurrentValue.Auth, () => options.CurrentValue.Sql);
         authenticator.EnsureSchemeConfigured();
         var transport = new MelangeTransport(
             engine,

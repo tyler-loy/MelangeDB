@@ -124,18 +124,41 @@ internal static class MelangeHttpEndpoints
     }
 
     /// <summary>
-    /// POST {path}/sql — one-shot query: <c>{"query": "...", "params": {...}}</c>, the same four
-    /// shapes subscriptions support, under the same public-table rule and cost ceilings;
-    /// aggregates land in phase 08. <c>Sql:AdHocMode</c> is the two-mode contract:
-    /// <c>PolicyEnforced</c> (default) applies the caller's row and column policies exactly as a
-    /// subscription would; <c>Owner</c> deliberately bypasses them for operator tooling.
-    /// <c>[ServerOnly]</c> columns are excluded in both modes — "never leaves the process" has no
-    /// modes. Per-caller owner authorization lands with phase 08's full contract.
+    /// POST {path}/sql — one-shot query: <c>{"query": "...", "params": {...}}</c>. Off until
+    /// <c>Sql:AdHocEnabled</c> opts in. The four row shapes run against the hot store at head,
+    /// under the same cost ceilings subscriptions have; aggregate shapes (<c>COUNT</c>/<c>SUM</c>/
+    /// <c>AVG</c>/<c>MIN</c>/<c>MAX</c>, <c>GROUP BY</c>, <c>DATE_TRUNC</c> bucketing) run against
+    /// the relational tier and reflect its applier's checkpoint. <c>Sql:AdHocMode</c> is the
+    /// two-mode contract: <c>PolicyEnforced</c> (default) applies the caller's row and column
+    /// policies exactly as a subscription would; <c>Owner</c> deliberately bypasses them, requires
+    /// the <c>Sql:OwnerRole</c> claim per caller, and additionally sees private relational-tier
+    /// tables. Aggregates are owner-mode only — row policies are in-process code that cannot be
+    /// pushed into Postgres, and a policy-enforced aggregate is refused loudly rather than
+    /// computed unenforced. <c>[ServerOnly]</c> columns are excluded in both modes — "never
+    /// leaves the process" has no modes.
     /// </summary>
     public static async Task SqlAsync(HttpContext context, MelangeTransport transport)
     {
         if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
             return;
+        var sqlOptions = transport.Options.Sql;
+        if (!sqlOptions.AdHocEnabled)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.SqlDisabled,
+                "Ad-hoc SQL is disabled; set Sql:AdHocEnabled to true to opt in.").ConfigureAwait(false);
+            return;
+        }
+
+        var owner = sqlOptions.AdHocMode == AdHocSqlMode.Owner;
+        if (owner && !session.IsSqlOwner)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.OwnerRequired,
+                "Sql:AdHocMode is Owner and this caller's token carries no Sql:OwnerRole claim; owner mode is never granted implicitly.").ConfigureAwait(false);
+            return;
+        }
+
         string query;
         Dictionary<string, object?>? parameters = null;
         try
@@ -159,9 +182,16 @@ internal static class MelangeHttpEndpoints
 
         try
         {
-            var parsed = SqlSubsetParser.Parse(query, parameters);
+            var adHoc = SqlSubsetParser.ParseAdHoc(query, parameters);
+            if (adHoc.Aggregate is { } aggregate)
+            {
+                await AggregateAsync(context, transport, aggregate, owner).ConfigureAwait(false);
+                return;
+            }
+
+            var parsed = adHoc.Rows!;
             var limits = transport.Options.Subscriptions;
-            var enforced = transport.Options.Sql.AdHocMode == AdHocSqlMode.PolicyEnforced;
+            var enforced = !owner;
             var callerContext = enforced
                 ? new PolicyContext(session.Identity, session.IsGuest, transport.Engine.CommittedView)
                 : null;
@@ -169,7 +199,8 @@ internal static class MelangeHttpEndpoints
             {
                 var compiled = ServerSubscription.Compile(
                     NullSink.Instance, 0, parsed, transport.Engine.Schema, limits,
-                    enforced ? transport.Policies : null, callerContext);
+                    enforced ? transport.Policies : null, callerContext,
+                    allowPrivateRelational: owner);
                 var collected = new List<(ReadOnlyMemory<byte> Row, IReadOnlySet<string>? Columns)>();
                 long bytes = 0;
                 foreach (var pair in compiled.MatchingRows(transport.Engine.HotStore))
@@ -225,6 +256,69 @@ internal static class MelangeHttpEndpoints
         {
             await WriteErrorAsync(context, StatusCodes.Status400BadRequest, exception.Code, exception.Message).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The aggregate half of <c>{path}/sql</c>: owner mode only, relational tier only, executed by
+    /// the registered <see cref="IRelationalQueryExecutor"/> — absent means no relational tier is
+    /// configured, which is an explicit error rather than an empty result. Results reflect the
+    /// tier at its applier's checkpoint; that lag is the design, not a bug, and the applier's
+    /// health check is where it becomes visible.
+    /// </summary>
+    private static async Task AggregateAsync(HttpContext context, MelangeTransport transport, AggregateQuery aggregate, bool owner)
+    {
+        if (!owner)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.OwnerRequired,
+                "Aggregates run in owner mode only: row policies are in-process code that cannot be pushed into Postgres, " +
+                "and a policy-enforced aggregate would silently drop enforcement. Set Sql:AdHocMode to Owner.").ConfigureAwait(false);
+            return;
+        }
+
+        var built = AdHocAggregateBuilder.Build(aggregate, transport.Engine.Schema);
+        var executor = (Core.IRelationalQueryExecutor?)context.RequestServices.GetService(typeof(Core.IRelationalQueryExecutor));
+        if (executor is null)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status400BadRequest, MelangeErrorCodes.NoRelationalTier,
+                "No relational tier is configured; aggregates need AddPostgres(...).").ConfigureAwait(false);
+            return;
+        }
+        Core.RelationalQueryResult result;
+        try
+        {
+            result = await executor.ExecuteAsync(built, context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status503ServiceUnavailable, MelangeErrorCodes.RelationalUnavailable,
+                "The relational tier did not answer; see the server logs. Writes and subscriptions are unaffected.").ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
+        {
+            writer.WriteStartArray("columns");
+            foreach (var column in result.Columns)
+                writer.WriteStringValue(column);
+            writer.WriteEndArray();
+            writer.WriteStartArray("rows");
+            foreach (var row in result.Rows)
+            {
+                writer.WriteStartArray();
+                foreach (var value in row)
+                    WriteJsonValue(writer, value);
+                writer.WriteEndArray();
+            }
+
+            writer.WriteEndArray();
+        }).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -311,6 +405,9 @@ internal static class MelangeHttpEndpoints
                 break;
             case double d:
                 writer.WriteNumberValue(d);
+                break;
+            case decimal m:
+                writer.WriteNumberValue(m);
                 break;
             case string s:
                 writer.WriteStringValue(s);

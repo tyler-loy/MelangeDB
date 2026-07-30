@@ -13,8 +13,10 @@ namespace MelangeDB.Server;
 /// One authenticated credential: the identity it resolves to and the token facts sessions need.
 /// <see cref="TokenExpiresAt"/> drives the re-auth grace window; <see cref="IsGuest"/> is the
 /// <c>Auth:GuestRole</c> claim — a guest is an ordinary identity policies may treat differently.
+/// <see cref="IsSqlOwner"/> is the <c>Sql:OwnerRole</c> claim — what authorizes a caller when
+/// ad-hoc SQL runs in owner mode.
 /// </summary>
-internal sealed record AuthResult(Identity Identity, bool IsGuest, DateTimeOffset TokenExpiresAt)
+internal sealed record AuthResult(Identity Identity, bool IsGuest, DateTimeOffset TokenExpiresAt, bool IsSqlOwner = false)
 {
     /// <summary>A validation failure, carrying a reason safe to send to the client.</summary>
     public static AuthFailure Failure(string reason) => new(reason);
@@ -35,11 +37,13 @@ internal sealed class MelangeAuthenticator
 
     private readonly IServiceProvider _services;
     private readonly Func<AuthOptions> _options;
+    private readonly Func<SqlOptions> _sqlOptions;
 
-    public MelangeAuthenticator(IServiceProvider services, Func<AuthOptions> options)
+    public MelangeAuthenticator(IServiceProvider services, Func<AuthOptions> options, Func<SqlOptions>? sqlOptions = null)
     {
         _services = services;
         _options = options;
+        _sqlOptions = sqlOptions ?? (static () => new SqlOptions());
     }
 
     /// <summary>
@@ -98,17 +102,20 @@ internal sealed class MelangeAuthenticator
         var expires = jwt.ValidTo == default
             ? DateTimeOffset.MaxValue
             : new DateTimeOffset(DateTime.SpecifyKind(jwt.ValidTo, DateTimeKind.Utc));
-        return new AuthResult(Identity.FromIssuerSubject(issuer, subject), IsGuest(result.ClaimsIdentity), expires);
+        return new AuthResult(
+            Identity.FromIssuerSubject(issuer, subject),
+            HasRole(result.ClaimsIdentity, _options().GuestRole),
+            expires,
+            HasRole(result.ClaimsIdentity, _sqlOptions().OwnerRole));
     }
 
-    private bool IsGuest(ClaimsIdentity? claims)
+    private static bool HasRole(ClaimsIdentity? claims, string role)
     {
-        var guestRole = _options().GuestRole;
-        if (string.IsNullOrEmpty(guestRole) || claims is null)
+        if (string.IsNullOrEmpty(role) || claims is null)
             return false;
         foreach (var claim in claims.Claims)
         {
-            if (claim.Value != guestRole)
+            if (claim.Value != role)
                 continue;
             if (claim.Type == claims.RoleClaimType || RoleClaimTypes.Contains(claim.Type, StringComparer.Ordinal))
                 return true;
