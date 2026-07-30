@@ -29,6 +29,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     private readonly IOptionsMonitor<MelangeDbOptions> _monitor;
     private readonly ILogger<MelangeDbHostedService> _logger;
     private MelangeEngine? _engine;
+    private MelangeScheduler? _scheduler;
     private IDisposable? _reloadBridge;
 
     public MelangeDbHostedService(
@@ -50,6 +51,11 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         _engine = engine;
         _reloadBridge = _monitor.OnChange(next => CopyLiveKeys(next, engine.Options));
         ReportUnpolicedReducers();
+
+        // Scheduling starts only after recovery finished: the pending set is rebuilt from the
+        // recovered timer rows, and overdue timers fire per Scheduler:CatchUpAfterDowntime.
+        _scheduler = (MelangeScheduler?)_provider.GetService(typeof(MelangeScheduler));
+        _scheduler?.Start();
         _state.Started = true;
         LogStarted(_logger, engine.Log.HeadLsn, engine.Schema.Tables.Count);
         return Task.CompletedTask;
@@ -83,6 +89,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     public Task StopAsync(CancellationToken cancellationToken)
     {
         _reloadBridge?.Dispose();
+        _scheduler?.Stop();
         if (_engine is { } engine)
         {
             ((MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)))?.SignalStopping();

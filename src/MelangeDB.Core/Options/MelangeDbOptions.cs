@@ -27,6 +27,64 @@ public sealed class MelangeDbOptions
     public RateLimitOptions RateLimit { get; set; } = new();
 
     public SqlOptions Sql { get; set; } = new();
+
+    public SchedulerOptions Scheduler { get; set; } = new();
+}
+
+/// <summary>What happens when a tick takes longer than its timer's interval.</summary>
+public enum SchedulerOverrunPolicy
+{
+    /// <summary>
+    /// Fires missed by the overrun are skipped and logged; the next fire is one full interval
+    /// after the slow tick completed. The default, because silent pile-up is how a simulation
+    /// death-spirals under load.
+    /// </summary>
+    Skip,
+
+    /// <summary>Every missed fire runs, back to back, until the timer catches up.</summary>
+    RunImmediately,
+
+    /// <summary>All missed fires collapse into one immediate fire, then the cadence resumes.</summary>
+    Coalesce,
+}
+
+/// <summary>How overdue repeating timers behave after process downtime.</summary>
+public enum SchedulerCatchUp
+{
+    /// <summary>
+    /// An overdue repeating timer fires once at recovery, then resumes its cadence — downtime
+    /// collapses any number of missed ticks into one. Right for a simulation, whose world was
+    /// simply paused. The default.
+    /// </summary>
+    FireOnce,
+
+    /// <summary>
+    /// An overdue repeating timer fires once per interval the process was down, back to back.
+    /// Right for billing-shaped work. Downtime is measured from the recovered log's tail record,
+    /// since repeating timers deliberately persist no per-fire bookkeeping; exact catch-up
+    /// accounting wants a self-rescheduling one-shot timer instead.
+    /// </summary>
+    CatchUpAll,
+}
+
+/// <summary>Options for the timer scheduler (<c>MelangeDb:Scheduler:*</c>).</summary>
+public sealed class SchedulerOptions
+{
+    /// <summary>Off is useful for tooling processes that must not tick the world.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>See <see cref="SchedulerOverrunPolicy"/>. Read per fire, so a change is live.</summary>
+    public SchedulerOverrunPolicy OverrunPolicy { get; set; } = SchedulerOverrunPolicy.Skip;
+
+    /// <summary>See <see cref="SchedulerCatchUp"/>. Read at scheduler start after recovery.</summary>
+    public SchedulerCatchUp CatchUpAfterDowntime { get; set; } = SchedulerCatchUp.FireOnce;
+
+    /// <summary>
+    /// The scheduler ships as a single-threaded dispatch loop, so this is effectively a bound of
+    /// one: reducer transactions serialize on the engine's single-writer lock, and a tick worker
+    /// pool would parallelize nothing that matters. Values above 1 are accepted and reserved.
+    /// </summary>
+    public int MaxConcurrentTicks { get; set; } = 1;
 }
 
 /// <summary>

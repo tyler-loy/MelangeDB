@@ -33,6 +33,121 @@ public partial struct Audit
     public string Entry;
 }
 
+/// <summary>Repeating timer rows: the world tick. Implicitly private, implicitly Local.</summary>
+[Table(Scheduled = nameof(TickReducers.WorldTick))]
+public partial struct WorldTickTimer
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public ScheduleAt ScheduledAt;
+
+    public int Payload;
+}
+
+/// <summary>One-shot timer rows; each fire deletes its row transactionally with its work.</summary>
+[Table(Scheduled = nameof(TickReducers.RunOnce))]
+public partial struct OneShotTimer
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public ScheduleAt ScheduledAt;
+
+    public string Tag;
+}
+
+/// <summary>What scheduled fires commit, so tick work is observable as ordinary rows.</summary>
+[Table]
+public partial struct TickLog
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public string Entry;
+}
+
+/// <summary>Singleton hooks the scheduler tests observe and steer fires through.</summary>
+public sealed class SchedulerProbe
+{
+    private int _worldTicks;
+    private int _oneShots;
+
+    public int WorldTicks => Volatile.Read(ref _worldTicks);
+
+    public int OneShots => Volatile.Read(ref _oneShots);
+
+    /// <summary>Whether tick reducers write a TickLog row — off makes a fire write nothing.</summary>
+    public bool WriteRows { get; set; } = true;
+
+    public bool ThrowOnOneShot { get; set; }
+
+    /// <summary>Runs inside the WorldTick body — how the overrun tests make a tick slow.</summary>
+    public Action<ReducerContext>? OnWorldTick { get; set; }
+
+    public void CountWorldTick() => Interlocked.Increment(ref _worldTicks);
+
+    public void CountOneShot() => Interlocked.Increment(ref _oneShots);
+}
+
+public sealed class TickReducers(SchedulerProbe probe)
+{
+    [Reducer]
+    public void WorldTick(ReducerContext ctx, WorldTickTimer timer)
+    {
+        probe.CountWorldTick();
+        probe.OnWorldTick?.Invoke(ctx);
+        if (probe.WriteRows)
+            ctx.Db.TickLog.Insert(new TickLog { Entry = $"tick:{timer.Id}:{timer.Payload}" });
+    }
+
+    [Reducer]
+    public void RunOnce(ReducerContext ctx, OneShotTimer timer)
+    {
+        if (probe.ThrowOnOneShot)
+            throw new RejectedException("one-shot rejected");
+        probe.CountOneShot();
+        if (probe.WriteRows)
+            ctx.Db.TickLog.Insert(new TickLog { Entry = $"once:{timer.Tag}" });
+    }
+
+    [Reducer]
+    public void ScheduleTick(ReducerContext ctx, long intervalMs, int payload) =>
+        ctx.Db.WorldTickTimer.Insert(new WorldTickTimer
+        {
+            ScheduledAt = ScheduleAt.Interval(TimeSpan.FromMilliseconds(intervalMs)),
+            Payload = payload,
+        });
+
+    [Reducer]
+    public void ScheduleOnce(ReducerContext ctx, Timestamp at, string tag) =>
+        ctx.Db.OneShotTimer.Insert(new OneShotTimer { ScheduledAt = ScheduleAt.Instant(at), Tag = tag });
+
+    [Reducer]
+    public void ScheduleOnceAndThrow(ReducerContext ctx, Timestamp at)
+    {
+        ctx.Db.OneShotTimer.Insert(new OneShotTimer { ScheduledAt = ScheduleAt.Instant(at), Tag = "doomed" });
+        throw new RejectedException("rolled back: the timer above must not survive");
+    }
+
+    [Reducer]
+    public void RescheduleTick(ReducerContext ctx, ulong id, long intervalMs)
+    {
+        var timer = ctx.Db.WorldTickTimer.Id.Find(id) ?? throw new RejectedException("no such timer");
+        ctx.Db.WorldTickTimer.Update(timer with { ScheduledAt = ScheduleAt.Interval(TimeSpan.FromMilliseconds(intervalMs)) });
+    }
+
+    [Reducer]
+    public void CancelWorldTicks(ReducerContext ctx)
+    {
+        foreach (var timer in ctx.Db.WorldTickTimer.Iter().ToList())
+            ctx.Db.WorldTickTimer.Id.Delete(timer.Id);
+    }
+}
+
 /// <summary>The test's feature flag, bound from <c>Feature:</c>.</summary>
 public sealed class FeatureOptions
 {
@@ -107,6 +222,7 @@ internal static class TestApp
         builder.Services.Configure<FeatureOptions>(builder.Configuration.GetSection("Feature"));
         builder.Services.AddScoped<ScopedProbe>();
         builder.Services.AddSingleton<SingletonProbe>();
+        builder.Services.AddSingleton<SchedulerProbe>();
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Note).Assembly)
             .AddReducersFrom(typeof(NoteReducers).Assembly));

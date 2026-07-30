@@ -24,6 +24,8 @@ internal sealed class EngineTelemetry : IDisposable
     private readonly Histogram<double> _fsyncDuration;
     private readonly Histogram<long> _writeSetRows;
     private readonly Counter<long> _rateLimited;
+    private readonly Counter<long> _schedulerOverruns;
+    private readonly Histogram<double> _schedulerTickDuration;
 
     public EngineTelemetry(TelemetryOptions options, Func<ulong> headLsn, Func<IEnumerable<(string Applier, long Lag)>> applierLags)
     {
@@ -35,6 +37,8 @@ internal sealed class EngineTelemetry : IDisposable
         _fsyncDuration = _meter.CreateHistogram<double>("melange.fsync.duration", "ms", "Durability flush duration.");
         _writeSetRows = _meter.CreateHistogram<long>("melange.writeset.rows", "{row}", "Collapsed row ops per transaction.");
         _rateLimited = _meter.CreateCounter<long>("melange.ratelimit.rejected", "{call}", "Client reducer calls rejected by the rate limiter before any transaction opened.");
+        _schedulerOverruns = _meter.CreateCounter<long>("melange.scheduler.overruns", "{tick}", "Ticks that ran past their timer's interval — the death-spiral early warning.");
+        _schedulerTickDuration = _meter.CreateHistogram<double>("melange.scheduler.tick.duration", "ms", "Scheduled fire duration, dispatch and transaction included.");
         _meter.CreateObservableGauge("melange.log.head_lsn", () => (long)headLsn(), "{lsn}", "LSN of the newest log record.");
         _meter.CreateObservableGauge(
             "melange.applier.lag",
@@ -102,6 +106,25 @@ internal sealed class EngineTelemetry : IDisposable
 
     public void RecordRateLimited(string reducerName) =>
         _rateLimited.Add(1, new KeyValuePair<string, object?>("reducer", reducerName));
+
+    /// <summary>
+    /// Starts a <c>melange.scheduler.tick</c> span. A tick has no client parent, so it starts a
+    /// new trace; any ambient activity is detached first so the root is unconditional.
+    /// </summary>
+    public Activity? StartSchedulerTick(string reducerName)
+    {
+        if (Activity.Current is not null)
+            Activity.Current = null;
+        var activity = Source.StartActivity("melange.scheduler.tick");
+        activity?.SetTag("melange.reducer.name", reducerName);
+        return activity;
+    }
+
+    public void RecordSchedulerOverrun(string reducerName) =>
+        _schedulerOverruns.Add(1, new KeyValuePair<string, object?>("reducer", reducerName));
+
+    public void RecordSchedulerTick(string reducerName, double durationMs) =>
+        _schedulerTickDuration.Record(durationMs, new KeyValuePair<string, object?>("reducer", reducerName));
 
     public void RecordCommitDuration(double durationMs) => _commitDuration.Record(durationMs);
 
