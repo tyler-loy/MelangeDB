@@ -30,6 +30,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     private readonly ILogger<MelangeDbHostedService> _logger;
     private MelangeEngine? _engine;
     private MelangeScheduler? _scheduler;
+    private MelangeEventBus? _eventBus;
     private IDisposable? _reloadBridge;
 
     public MelangeDbHostedService(
@@ -51,6 +52,11 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         _engine = engine;
         _reloadBridge = _monitor.OnChange(next => CopyLiveKeys(next, engine.Options));
         ReportUnpolicedReducers();
+
+        // The event bus starts before the scheduler so a recovered timer's first fire can already
+        // publish; its subscribers catch up from their checkpoints against the recovered log.
+        _eventBus = (MelangeEventBus?)_provider.GetService(typeof(MelangeEventBus));
+        _eventBus?.Start();
 
         // Scheduling starts only after recovery finished: the pending set is rebuilt from the
         // recovered timer rows, and overdue timers fire per Scheduler:CatchUpAfterDowntime.
@@ -90,6 +96,10 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     {
         _reloadBridge?.Dispose();
         _scheduler?.Stop();
+
+        // The bus stops before reducer dispatch closes, so an in-flight handler that calls a
+        // reducer still can; an event mid-delivery redelivers from its checkpoint next start.
+        _eventBus?.Stop();
         if (_engine is { } engine)
         {
             ((MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)))?.SignalStopping();
@@ -127,6 +137,11 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Subscriptions.MaxBytesPerSubscription = next.Subscriptions.MaxBytesPerSubscription;
         live.Subscriptions.MaxRangeSpan = next.Subscriptions.MaxRangeSpan;
         live.Subscriptions.RequirePredicateOn = next.Subscriptions.RequirePredicateOn;
+        live.Events.MaxQueueDepth = next.Events.MaxQueueDepth;
+        live.Events.HandlerRetries = next.Events.HandlerRetries;
+        live.Events.RetryBackoffMs = next.Events.RetryBackoffMs;
+        live.Events.MaxPublishDepth = next.Events.MaxPublishDepth;
+        live.Events.SubscriberExpirySeconds = next.Events.SubscriberExpirySeconds;
     }
 
     [LoggerMessage(EventId = 1101, EventName = "MelangeStarted", Level = LogLevel.Information,

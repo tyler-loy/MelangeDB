@@ -12,8 +12,10 @@ public sealed class MelangeDbBuilder
 {
     private readonly HashSet<Assembly> _tableAssemblies = [];
     private readonly HashSet<Assembly> _reducerAssemblies = [];
+    private readonly HashSet<Assembly> _handlerAssemblies = [];
     private readonly List<TableSchema> _tables = [];
     private readonly List<ReducerDescriptor> _reducers = [];
+    private readonly List<Type> _eventHandlers = [];
 
     internal MelangeDbBuilder(IServiceCollection services) => Services = services;
 
@@ -23,6 +25,8 @@ public sealed class MelangeDbBuilder
     internal IReadOnlyList<TableSchema> Tables => _tables;
 
     internal IReadOnlyList<ReducerDescriptor> Reducers => _reducers;
+
+    internal IReadOnlyList<Type> EventHandlers => _eventHandlers;
 
     /// <summary>Configures the hot store. Runs after configuration binding, so code wins.</summary>
     public MelangeDbBuilder UseHotStore(Action<HotStoreOptions> configure)
@@ -61,6 +65,40 @@ public sealed class MelangeDbBuilder
         ArgumentNullException.ThrowIfNull(assembly);
         if (_reducerAssemblies.Add(assembly))
             _reducers.AddRange(ModelOf(assembly).Reducers());
+        return this;
+    }
+
+    /// <summary>
+    /// Registers one event handler type. The type becomes a logical subscriber under its full
+    /// name, with a durable checkpoint; it is resolved from a fresh DI scope per delivery.
+    /// </summary>
+    public MelangeDbBuilder AddEventHandler<THandler>()
+        where THandler : class
+    {
+        if (!_eventHandlers.Contains(typeof(THandler)))
+            _eventHandlers.Add(typeof(THandler));
+        return this;
+    }
+
+    /// <summary>
+    /// Registers every concrete <see cref="IEventHandler{TEvent}"/> implementation in
+    /// <paramref name="assembly"/> as an event handler.
+    /// </summary>
+    public MelangeDbBuilder AddEventHandlersFrom(Assembly assembly)
+    {
+        ArgumentNullException.ThrowIfNull(assembly);
+        if (!_handlerAssemblies.Add(assembly))
+            return this;
+        foreach (var type in assembly.GetTypes())
+        {
+            if (type is { IsAbstract: false, IsClass: true }
+                && type.GetInterfaces().Any(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IEventHandler<>))
+                && !_eventHandlers.Contains(type))
+            {
+                _eventHandlers.Add(type);
+            }
+        }
+
         return this;
     }
 
