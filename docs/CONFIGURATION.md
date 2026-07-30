@@ -89,6 +89,7 @@ to fix it without a code change and a redeploy.
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `Transport:Path` | string | `/melange` | restart | 03 | |
+| — | — | — | — | 03 | **There is deliberately no MelangeDB setting for HTTP version or TLS.** Those come from the host's Kestrel listener (`HttpProtocols.Http1AndHttp2AndHttp3`, default-on since .NET 8). MelangeDB maps an endpoint; it doesn't own a listener. Adding a knob here would duplicate the host's configuration and eventually disagree with it. |
 | `Transport:MaxMessageBytes` | int | `4194304` | live | 03 | |
 | `Transport:Serializer` | enum | `MessagePack` | restart | 03 | Behind `IMelangeSerializer`. |
 | `Validation:RejectNonFiniteFloats` | bool | `true` | live | 02 | Rejects `NaN` / `±Infinity` reducer arguments during decode. A `NaN` position propagates through terrain and chunk math and poisons rows that then replicate to every client. Turning this off should feel alarming. |

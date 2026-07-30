@@ -107,6 +107,10 @@ generation and similar mass loads.
 **Commit log** — The ordered, append-only, LSN-addressed record of committed transactions. **The system of
 record.** Every store is a projection of it. One log per shard.
 
+**Channel** — A logical stream within a connection. Frames carry a channel tag and ordering is guaranteed only
+*within* a channel, so bulk transfer can't head-of-line block interactive traffic. Deliberately independent of how
+channels are carried — interleaved on one socket, several sockets over HTTP/2, or QUIC streams later.
+
 **Connect ticket** — A single-use, short-lived credential exchanged for a JWT over HTTP and presented when
 opening a socket. Exists because the browser WebSocket API cannot set headers, so header-based auth would lock
 out web clients entirely.

@@ -23,8 +23,16 @@ demonstrable, so it should be reached before anything in 04–08 is started.
   be retrofitted without a protocol version bump. A game session outlives a one-hour JWT; dropping the
   connection at expiry is unacceptable and ignoring expiry means revocation never takes effect, so in-band
   re-auth has to be designed in from the start.
-- **TLS is the host's concern** — `wss://` comes from the developer's ASP.NET Core configuration, not from
-  MelangeDB. Worth stating so nobody looks for a MelangeDB certificate setting.
+- **TLS and HTTP version are the host's concern** — `wss://`, HTTP/2, and HTTP/3 all come from the developer's
+  Kestrel listener configuration (`HttpProtocols.Http1AndHttp2AndHttp3`, on by default since .NET 8), not from
+  MelangeDB. Because `MapMelangeSocket` is an endpoint in the host's app rather than a listener we own, protocol
+  negotiation is something the library structurally doesn't have to solve. There is deliberately **no**
+  MelangeDB setting for protocol version or certificates.
+- **The endpoint must accept `CONNECT`, not only `GET`.** WebSockets over HTTP/2 (RFC 8441, supported in Kestrel
+  since .NET 7 with automatic negotiation) use a `CONNECT` request, and the ASP.NET Core docs warn this "may
+  require updates to existing routes and controllers." A `GET`-only mapping means HTTP/2 WebSockets **silently
+  fail to negotiate** and fall back to HTTP/1.1 — losing header compression and multiplexing with no error to
+  explain why. This is the one HTTP-version concern that is genuinely ours.
 - **Compression** via `permessage-deflate`, configurable. Terrain blobs are already RLE-compressed, but delta
   frames carrying many small rows compress well.
 - **Heartbeat.** `Ping`/`Pong` with a timeout, because phase 05's `ClientDisconnected` must fire on ungraceful
@@ -102,13 +110,33 @@ not an unreliable channel.
 - **Fan-out cost.** Naively testing every predicate against every row op is O(subscriptions × ops). Indexing
   subscriptions by table and key range is the fix; know whether phase 03 needs it or can defer it.
 - **Head-of-line blocking — the one that shows up as bad game feel.** A single socket carrying a 30MB terrain
-  initial set *and* movement reducer responses lets terrain block movement. Options: chunk large initial sets
-  and interleave by priority, or give the protocol logical channels. Chunk-and-interleave is simpler and
-  probably sufficient; either way this is a protocol decision, not an optimization, so it can't be deferred past
-  this phase.
+  initial set *and* movement reducer responses lets terrain block movement. Chunk-and-interleave by priority is
+  the simplest fix and is probably sufficient. But see the channel-tag constraint below: whichever fix ships,
+  the *protocol* must not foreclose the better substrates.
 - **How much log to retain for `Resume`.** Too little and every reconnect degrades to a full resync; too much
   and retention fights phase 07's compaction. Probably a time window rather than a transaction count, since what
   matters is surviving a plausible network outage.
+
+### Don't assume one totally-ordered byte stream
+
+The cheap-now, expensive-later decision in this phase. **Frames should carry a channel tag, with ordering
+guaranteed only *within* a channel** rather than globally across the connection.
+
+Cost now: a tag field and a slightly more careful client. What it buys is that every better substrate becomes an
+implementation detail instead of a protocol break:
+
+- **One socket, chunked and interleaved** — what ships in this phase.
+- **Several sockets over HTTP/2** — available today. Multiple WebSocket connections multiplex onto a single TCP
+  connection, so a second socket is cheap rather than wasteful. "Bulk terrain on one channel, interactive on
+  another" becomes practical, which is a real answer to head-of-line blocking and not a future one.
+- **WebTransport streams** — the eventual principled answer, mapping channels onto genuine QUIC streams. Status
+  unconfirmed: it does not appear in mainline ASP.NET Core documentation and seems still experimental, so
+  **nothing here plans around it** — the point is only that the protocol shouldn't rule it out.
+
+Design the protocol assuming global frame ordering and adding multiplexing later is a breaking change for every
+client. Add the tag now and it never is. Note also that QUIC requires UDP, which plenty of corporate networks
+block, so HTTP/3 must always be able to degrade to HTTP/2 — automatic with Kestrel negotiation, but a client
+must never assume it got the transport it asked for.
 
 ## Done when
 
@@ -127,6 +155,10 @@ not an unreliable channel.
 - A client disconnected past the retention window is told to full-resync rather than silently diverging.
 - A large initial set does not delay a concurrent reducer response beyond a stated bound.
 - One-shot HTTP reducer invocation and bulk ingestion work without opening a websocket.
+- A client connects over **HTTP/2** (via `CONNECT`) as well as HTTP/1.1, with the negotiated version asserted —
+  not merely "it still worked," since silent fallback is precisely the failure mode.
+- Every frame carries a channel tag, and a test asserts ordering is preserved within a channel while frames on
+  different channels may interleave.
 - A dropped connection (killed process, no close frame) is detected by heartbeat within the configured timeout.
 
 ## Risks
