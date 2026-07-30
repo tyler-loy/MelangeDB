@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/MelangeDB.Abstractions/MelangeDB.Abstractions.csproj" />
+    <Project Path="src/MelangeDB.Client/MelangeDB.Client.csproj" />
+    <Project Path="src/MelangeDB.CodeGen/MelangeDB.CodeGen.csproj" />
+    <Project Path="src/MelangeDB.Core/MelangeDB.Core.csproj" />
+    <Project Path="src/MelangeDB.OpenTelemetry/MelangeDB.OpenTelemetry.csproj" />
+    <Project Path="src/MelangeDB.Server/MelangeDB.Server.csproj" />
+    <Project Path="src/MelangeDB.Storage.Faster/MelangeDB.Storage.Faster.csproj" />
+    <Project Path="src/MelangeDB.Storage.Postgres/MelangeDB.Storage.Postgres.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/MelangeDB.Core.Tests/MelangeDB.Core.Tests.csproj" />
+  </Folder>
+</Solution>

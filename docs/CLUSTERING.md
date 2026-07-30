@@ -1,0 +1,229 @@
+# Clustering: placement, node roles, and user-defined shards
+
+[DESIGN.md](DESIGN.md) §10 deferred the clustering model. This is the resolution.
+
+The technical mechanism is the easy half. **The hard half is conveying multi-node in a way a developer
+can reason about**, and that is a real risk to the project: a clustering model nobody can hold in their
+head gets used wrong, produces mystifying bugs, and gets blamed on the database. So this document leads
+with vocabulary and only then describes machinery.
+
+Two commitments shape everything below:
+
+1. **The developer declares placement per table**, from a small fixed vocabulary — four options, not a
+   configuration language.
+2. **The developer defines the sharding function itself.** MelangeDB does not decide what a shard *means*.
+   A contiguous open world and an instanced MMO city are different answers, and both are correct.
+
+## The four placements
+
+Every table declares exactly one. This is the whole mental model.
+
+| Placement | Lives where | Written by | Use for |
+| --- | --- | --- | --- |
+| **`Partitioned`** | Split across shard nodes by shard key | The one node owning that shard | World entities: terrain, creatures, buildings, drops |
+| **`Replicated`** | Full copy on every node | Hub only; shards get read-only copies | Small bounded reference data: item defs, recipes, species |
+| **`Global`** | Hub node only | Hub only | Accounts, registration, social, world statistics |
+| **`Local`** | One node, never leaves it | That node | Per-node caches, scratch state, telemetry buffers |
+
+```csharp
+[Table(Public = true, Placement = Placement.Partitioned, ShardBy = nameof(ChunkId))]
+public partial struct Creature { public ushort ChunkId; /* ... */ }
+
+[Table(Public = true, Placement = Placement.Replicated)]      // pinned resident everywhere
+public partial struct ItemDefinition { /* ... */ }
+
+[Table(Placement = Placement.Global, Tier = StorageTier.Relational)]
+public partial struct Registration { /* ... */ }
+```
+
+`Replicated` converges with two earlier decisions: it is exactly the set that wants
+`Residency.Resident` (DESIGN.md §8) and exactly what the audited game's 52 `.Iter()` scans run over.
+One declaration, three problems solved — replicate it everywhere, pin it in RAM, scan it freely.
+
+`Global` converges with the Postgres tier: **the hub's `Global` tables are the relational tier.** The
+"servicey" split you'd already built by hand is the same split the cluster needs.
+
+### Partitioned tables are readable beyond their owner
+
+"Some tables will be alive *in part* on all nodes" — yes, and this is a distinct thing from `Replicated`.
+A `Partitioned` table has exactly one **writer** per shard, but other nodes may hold **read-only** slices
+of it. That's what lets a node render players and creatures just across a boundary without being allowed
+to mutate them. Interest — which foreign slices a node subscribes to — is derived from the shard strategy,
+not hand-configured.
+
+The invariant to teach: **one writer per shard, many readers.**
+
+## Node roles: hub and shard
+
+The **hub** / **shard node** split (originally framed as master/daughter — see
+[GLOSSARY.md](GLOSSARY.md)) is the right topology. A player holds **two** attachments at once: a permanent one
+to the hub, and a moving one to whichever shard node owns where they are.
+
+```
+                    ┌─────────────┐
+   client ──────────│     HUB     │   Global + Replicated tables, identity,
+        │           │             │   Postgres tier, shard assignment
+        │           └──────┬──────┘
+        │                  │ replicates reference data, owns Global writes
+        │        ┌─────────┴─────────┐
+        └────────│    SHARD NODE     │   Partitioned tables for its shards,
+                 │   (shard 12,13)   │   scheduled reducers for its shards
+                 └───────────────────┘
+```
+
+The hub is *not* a bottleneck by construction, because its tables are the ones not touched by
+moment-to-moment gameplay. That is also the test for what belongs there:
+
+> **A table belongs on the hub only if it is not written in the same transaction as shard-local world state.**
+
+### The trap this rule exists to catch
+
+`InventoryItem` looks like player-owned hub data. It is not — put it on the hub and you have broken the
+system.
+
+Gathering is the single most common action in a survival game: decrement a `ResourceNode` (partitioned,
+shard node) and add an `InventoryItem` (hub). That is a cross-node transaction on the hottest path in
+the game, thousands of times a minute, and it forces distributed commit into the common case — the exact
+thing this design avoids everywhere else.
+
+So `InventoryItem`, `PlayerSkill`, `PlayerAttribute`, `EquipmentSlot`, `PlayerCombatState`, and
+`PlayerState` are **`Partitioned` and follow the player**, sharing the player's current shard key. They
+transfer on handoff. Handoff is comparatively rare; gathering is not.
+
+What genuinely belongs on the hub: `Registration`, accounts and auth, `AdminIdentity`, `WorldStat`,
+social/guild/friends state, and trade *history*. None of those are written by a gather, a swing, or a
+step.
+
+The general form of the rule: **place tables so that transaction boundaries fall inside a node.** If two
+tables are mutated together, they belong in the same place. That single sentence is most of what a
+developer needs to get placement right.
+
+## Sharding is user-defined
+
+MelangeDB supplies the mechanism — one writer per shard, per-shard logs, handoff, interest — and the
+developer supplies the meaning:
+
+```csharp
+public interface IShardStrategy
+{
+    // Which shard owns this row?
+    ShardKey ShardForRow(TableId table, in RowRef row);
+
+    // Which shard is this session currently attached to?
+    ShardKey ShardForSession(SessionContext session);
+
+    // Which foreign shards must this shard hold read-only slices of?
+    IReadOnlyList<ShardKey> InterestOf(ShardKey shard);
+}
+```
+
+### Strategy A — spatial partitioning (Vibe Shaft)
+
+A contiguous 10km world of 157×157 chunks. Shard = a rectangular block of chunks; shard key derives from
+`ChunkId`. Interest = the eight neighbouring blocks, one chunk deep. Handoff is **continuous and
+implicit** — triggered by walking.
+
+Splitting a single crowded location makes no sense here: everyone in the town square interacts with
+everyone else, so they must share a writer. **This is the hard case.**
+
+### Strategy B — instancing (WoW-style)
+
+Shard = an explicit instance id, already a column on the row. No geometry, no interest overlap between
+instances (they are causally disjoint by definition), and handoff is **explicit and discrete** — you
+enter a portal, and the loading screen *is* the handoff window.
+
+```csharp
+[Table(Public = true, Placement = Placement.Partitioned, ShardBy = nameof(InstanceId))]
+public partial struct Creature { public uint InstanceId; /* ... */ }
+```
+
+Here "200 players in one city" is solved by putting 100 in city instance 1 and 100 in instance 2 —
+precisely the option unavailable to a single-world game. **This is the easy case**, and it should ship
+first: it needs no border overlap, no interest computation, and no seamless transfer.
+
+### They compose
+
+Real MMOs are both at once: a continuous open world *plus* instanced dungeons and city shards. So a
+deployment registers more than one strategy, and each table group names the one it uses. Strategy is a
+property of a table group, not of the cluster.
+
+### The one contract the developer must uphold
+
+MelangeDB cannot verify this, so it has to be stated loudly:
+
+> **Rows that are mutated in the same transaction must resolve to the same shard.**
+
+Get this right and virtually every transaction is single-shard and commits locally. Get it wrong and you
+get either correctness bugs or a system that silently degrades into distributed commits. A debug-mode
+check should fail loudly when a transaction's write set spans shard keys, so violations surface in
+development rather than under load.
+
+## Handoff
+
+Two shapes, following from the strategy:
+
+- **Explicit** (instancing, portals, zone transitions): the transition is a discrete player action with a
+  natural pause. Freeze, transfer, resume. Simple, and no overlap machinery required.
+- **Continuous** (open world): the destination node begins streaming border chunks before the player
+  arrives, the player's partitioned rows transfer, then the origin drops the band. Seamless, and the
+  reason interest overlap exists.
+
+Either way, transfer is the one unavoidable distributed transaction: the player must not be writable on
+two nodes at once, and must not vanish if a node dies mid-transfer. It runs as a small saga — *freeze on
+origin → append on destination → confirm → release on origin* — recoverable because both logs record
+their half, so an interrupted handoff replays. A fencing token prevents a wrongly-suspected-dead node
+from continuing to write a player it no longer owns.
+
+## What holds regardless of strategy
+
+- **Each shard is internally single-writer** — one serialized transaction loop, one commit log, exactly
+  the semantics that make reducers pleasant. Multi-writer is a property of the *cluster*. The reducer
+  programming model does not change.
+- **One commit log per shard.** No global total order across the cluster — only per-shard order plus
+  causal ordering via handoffs and the event bus. You cannot ask "what was the whole world's state at
+  instant T." Games don't need that; ledgers do. Accepting it is what makes writes scale.
+- **`[Unique]` is a single-writer guarantee.** A unique index is enforceable only inside one shard's
+  writer, so unique columns are restricted to non-partitioned tables (`Global`, `Replicated`, `Local`) —
+  a compile-time diagnostic, not a runtime surprise. A globally-unique *claim* over partitioned data
+  (player names) lives in a small `Global` claims table on the hub. `[AutoInc]` stays coordination-free
+  for the same structural reason: its contract is unique-not-dense, so each shard allocates from an
+  originator-prefixed range and no cross-shard sequence exists.
+- **Scheduled reducers partition with their rows.** Timers are rows (DESIGN.md §3), so a timer fires on
+  whichever node owns its shard — no global timer wheel, no leader election. Vibe Shaft's single global
+  `CreatureAiTick` row becomes one row per shard, and the hand-written "only chunks near a player"
+  filtering becomes implicit in the partition.
+- **A shard may itself be replicated** (Raft across nodes) for HA later, independently of this design.
+
+## Two axes of scale, not one
+
+Sharding alone does not solve the N² memory problem — it re-bills it as more machines. The world's cost
+has two terms that grow differently:
+
+| Term | Grows with | What it is | Fixed by |
+| --- | --- | --- | --- |
+| **Cold world** | **Area (N²)** | Terrain, flora, water, LOD blobs — ~24.6k chunk rows, nearly all far from any player | **Paging** (DESIGN.md §8) |
+| **Live simulation** | **Player density** | Creatures, combat, buildings being ticked | **Sharding** (this doc) |
+
+Vibe Shaft's own `CreatureAiTick.cs` already says it: *"everything else in the world is inert, which is
+what makes a persistent world-wide population affordable."* Most of a 10km world is cold at any instant.
+
+Doubling that world to ~20km means 314×314 = 98,596 chunks, 4× the memory — the wall you hit. (It also
+overflows `ushort ChunkId`, since `cx * 157 + cy` tops out at 65,535; the key encoding widens regardless.)
+Paging is what lets one node own a shard far larger than its RAM. **Paging ships first** — it attacks the
+bigger term and needs no coordination layer at all.
+
+## Open questions
+
+- **Shard assignment and rebalancing.** Static assignment first. Player density is wildly uneven, so
+  fixed shards will hotspot; dynamic splitting (a quadtree subdividing under load) is where the spatial
+  strategy ends up, and it's a substantial subsystem. Instancing sidesteps it — another reason to ship
+  that first.
+- **The hotspot ceiling is strategy-dependent, and worth telling users plainly.** Spatial partitioning
+  cannot split a single crowded location; instancing can. A developer choosing a strategy is choosing
+  which failure mode they get, and that should be documented at the point of choice.
+- **Cluster membership.** Ownership registry, failure detection, reassigning a dead node's shards and
+  recovering its log.
+- **Client protocol during dual attachment.** A client holds a hub session plus a shard session, and
+  briefly two shard sessions mid-handoff. The gateway must present that as one endpoint.
+- **Does the hub shard?** For a very large deployment the hub's `Global` tables become the ceiling. Since
+  they're the Postgres tier, the answer is probably "Postgres's problem, not ours" — but it needs saying.
