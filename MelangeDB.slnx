@@ -14,6 +14,7 @@
     <Project Path="tests/MelangeDB.CodeGen.Tests/MelangeDB.CodeGen.Tests.csproj" />
     <Project Path="tests/MelangeDB.Core.Tests/MelangeDB.Core.Tests.csproj" />
     <Project Path="tests/MelangeDB.Host.Tests/MelangeDB.Host.Tests.csproj" />
+    <Project Path="tests/MelangeDB.Transport.Tests/MelangeDB.Transport.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/MelangeDB.Sample.Client/MelangeDB.Sample.Client.csproj" />

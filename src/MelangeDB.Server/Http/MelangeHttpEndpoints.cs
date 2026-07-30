@@ -220,7 +220,7 @@ internal static class MelangeHttpEndpoints
         JsonValueKind.String => element.GetString(),
         JsonValueKind.Number => element.TryGetInt64(out var signed)
             ? signed
-            : element.TryGetUInt64(out var unsigned) ? unsigned : element.GetDouble(),
+            : element.TryGetUInt64(out var unsigned) ? unsigned : (object)element.GetDouble(),
         JsonValueKind.Array => element.EnumerateArray().Select(ToArgument).ToArray(),
         JsonValueKind.Object when element.TryGetProperty("$identity", out var hex) =>
             new Identity(Convert.FromHexString(hex.GetString() ?? string.Empty)),
