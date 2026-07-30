@@ -359,7 +359,8 @@ public sealed class MelangeEngine : IDisposable
         var writeSet = new WriteSet();
         var stage = _sequencer.BeginStage();
         var random = new Random(unchecked((int)timestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
-        var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage));
+        var events = new EventStage(_options.Events);
+        var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage), events);
 
         try
         {
@@ -379,12 +380,12 @@ public sealed class MelangeEngine : IDisposable
 
         ulong committedLsn = 0;
         var ops = writeSet.ToOps();
-        if (ops.Count > 0)
+        if (ops.Count > 0 || events.Events is { Count: > 0 })
         {
             using (var commit = _telemetry?.StartCommit())
             {
                 var commitStarted = Stopwatch.GetTimestamp();
-                var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, encodedArguments, ops));
+                var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, encodedArguments, ops, events.Events));
                 _telemetry?.RecordCommitDuration(Elapsed(commitStarted));
                 commit?.SetTag("melange.lsn", (long)record.Lsn);
                 commit?.SetTag("melange.writeset.bytes", record.SerializedLength);

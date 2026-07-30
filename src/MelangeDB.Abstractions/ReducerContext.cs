@@ -6,13 +6,22 @@ namespace MelangeDB;
 /// </summary>
 public sealed class ReducerContext
 {
-    public ReducerContext(Identity caller, ConnectionId connectionId, Timestamp timestamp, Random random, IDbView db)
+    private readonly IEventCollector? _events;
+
+    public ReducerContext(
+        Identity caller,
+        ConnectionId connectionId,
+        Timestamp timestamp,
+        Random random,
+        IDbView db,
+        IEventCollector? events = null)
     {
         Caller = caller;
         ConnectionId = connectionId;
         Timestamp = timestamp;
         Random = random;
         Db = db;
+        _events = events;
     }
 
     /// <summary>Who is acting. Stable across reconnects and restarts.</summary>
@@ -29,4 +38,24 @@ public sealed class ReducerContext
 
     /// <summary>The transactional view: write set overlaid on the store, read-your-writes included.</summary>
     public IDbView Db { get; }
+
+    /// <summary>
+    /// Publishes a domain event. <b>No I/O happens here</b> — the event is staged into the write
+    /// set and lands in the commit record, so it is published exactly when this transaction
+    /// commits and never when it aborts: the transactional outbox, with the commit log as the
+    /// outbox. Handlers (<see cref="IEventHandler{TEvent}"/>) run outside the transaction, after
+    /// the commit point, with at-least-once delivery.
+    /// </summary>
+    public void Publish<TEvent>(TEvent @event)
+        where TEvent : notnull
+    {
+        ArgumentNullException.ThrowIfNull(@event);
+        if (_events is null)
+        {
+            throw new InvalidOperationException(
+                "This context has no event collector; events can only be published from a reducer dispatched by the engine.");
+        }
+
+        _events.Publish(@event);
+    }
 }

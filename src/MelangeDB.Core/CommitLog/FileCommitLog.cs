@@ -147,12 +147,13 @@ public sealed class FileCommitLog : ICommitLog
             return new CommitRecord
             {
                 Lsn = lsn,
-                FormatVersion = RowSerializer.FormatVersion,
+                FormatVersion = LogRecordCodec.RecordFormatVersion,
                 Timestamp = request.Timestamp,
                 Caller = request.Caller,
                 ReducerName = request.ReducerName,
                 Arguments = request.Arguments,
                 WriteSet = request.WriteSet,
+                Events = request.Events ?? [],
                 SerializedLength = FrameSize + payload.Length,
             };
         }

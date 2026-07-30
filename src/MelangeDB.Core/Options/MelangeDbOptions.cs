@@ -29,6 +29,49 @@ public sealed class MelangeDbOptions
     public SqlOptions Sql { get; set; } = new();
 
     public SchedulerOptions Scheduler { get; set; } = new();
+
+    public EventsOptions Events { get; set; } = new();
+}
+
+/// <summary>Options for the event bus (<c>MelangeDb:Events:*</c>).</summary>
+public sealed class EventsOptions
+{
+    /// <summary>
+    /// Ceiling on events held in the in-memory delivery window. Bounded on purpose: a slow handler
+    /// must not grow memory without limit. Overflow evicts the oldest window entries — nothing is
+    /// lost, because the commit log is the real buffer and a lagging subscriber replays from it,
+    /// its checkpoint lag saying honestly how far behind it is.
+    /// </summary>
+    public int MaxQueueDepth { get; set; } = 10_000;
+
+    /// <summary>Retries after a handler's first failed attempt, before the event dead-letters.</summary>
+    public int HandlerRetries { get; set; } = 3;
+
+    /// <summary>
+    /// The first retry's backoff in milliseconds; each further retry doubles it, capped at 30
+    /// seconds.
+    /// </summary>
+    public int RetryBackoffMs { get; set; } = 500;
+
+    /// <summary>Directory for the dead-letter records (<c>melange.deadletter.ndjson</c>).</summary>
+    public string DeadLetterPath { get; set; } = "./data/deadletter";
+
+    /// <summary>
+    /// Cycle guard for handlers that call reducers that publish. Each event carries the depth it
+    /// was published at — one more than the event whose handler published it — and a publish at
+    /// this depth throws, aborting the reducer. Bounds the event → reducer → event loop durably,
+    /// across restarts included.
+    /// </summary>
+    public int MaxPublishDepth { get; set; } = 4;
+
+    /// <summary>
+    /// A checkpoint whose subscriber no longer exists — handler deleted from the code, service
+    /// retired — would pin log truncation at a frozen LSN forever: a full disk on a timer. Idle
+    /// past this window it is evicted with a loud log (EventId 1403); a subscriber returning after
+    /// eviction has lost its place and starts from current state, told so (EventId 1404).
+    /// Deliberate, bounded data loss, chosen over unbounded disk growth. Seven days default.
+    /// </summary>
+    public int SubscriberExpirySeconds { get; set; } = 604_800;
 }
 
 /// <summary>What happens when a tick takes longer than its timer's interval.</summary>
