@@ -153,6 +153,26 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table)
     {
+        TableState? resident = null;
+        lock (_lock)
+        {
+            if (_tables.TryGetValue(table, out var state) && state.IsResident)
+                resident = state;
+        }
+
+        if (resident is not null)
+        {
+            // Residency's whole promise: a resident scan iterates managed memory directly, the
+            // same shape as the in-memory store — no key snapshot, no per-row lookup.
+            foreach (var pair in resident.ResidentRows)
+            {
+                resident.RowsScanned++;
+                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(pair.Key, pair.Value);
+            }
+
+            yield break;
+        }
+
         foreach (var key in ScanKeys(table))
         {
             byte[]? bytes;

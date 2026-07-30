@@ -202,7 +202,7 @@ public sealed class FileCommitLog : ICommitLog
             reader.ReadExactly(frame);
             var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
             var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(4));
-            if (length > MaxRecordBytes || reader.Position + length > reader.Length)
+            if (length == 0 || length > MaxRecordBytes || reader.Position + length > reader.Length)
                 yield break; // Torn tail; Recover() already truncated the durable file.
             var payload = new byte[length];
             reader.ReadExactly(payload);
@@ -299,6 +299,15 @@ public sealed class FileCommitLog : ICommitLog
             _stream.ReadExactly(frame);
             var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(frame);
             var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame[4..]);
+            if (payloadLength == 0)
+            {
+                // A record payload is never empty, and a zero-filled torn tail would otherwise
+                // pass the CRC check: CRC32 of zero bytes is zero, exactly what the zeroed frame
+                // declares.
+                TruncateTorn(position, "zero-length record in torn tail");
+                break;
+            }
+
             if (payloadLength > MaxRecordBytes || position + FrameSize + payloadLength > length)
             {
                 TruncateTorn(position, "record extends past end of file");
@@ -363,7 +372,7 @@ public sealed class FileCommitLog : ICommitLog
                 {
                     _stream.ReadExactly(frame);
                     var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
-                    if (length > MaxRecordBytes || _stream.Position + length > _stream.Length)
+                    if (length == 0 || length > MaxRecordBytes || _stream.Position + length > _stream.Length)
                         break;
                     var payload = new byte[length];
                     _stream.ReadExactly(payload);

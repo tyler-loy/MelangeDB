@@ -14,6 +14,7 @@
          instance; no test asserts on other internals. -->
     <InternalsVisibleTo Include="MelangeDB.Core.Tests" />
     <InternalsVisibleTo Include="MelangeDB.Host.Tests" />
+    <InternalsVisibleTo Include="MelangeDB.Storage.Faster.Tests" />
   </ItemGroup>
 
   <ItemGroup>
