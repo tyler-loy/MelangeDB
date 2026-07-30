@@ -25,6 +25,7 @@ namespace MelangeDB.Generated
                         IsAutoInc = true,
                         IsUnique = false,
                         IsIndexed = false,
+                        IsServerOnly = false,
                         GetValue = static row => ((global::Snapshot.Creature)row).Id,
                         SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).Id = (ulong)value,
                     },
@@ -38,6 +39,7 @@ namespace MelangeDB.Generated
                         IsAutoInc = false,
                         IsUnique = false,
                         IsIndexed = true,
+                        IsServerOnly = false,
                         GetValue = static row => ((global::Snapshot.Creature)row).ChunkId,
                         SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).ChunkId = (ushort)value,
                     },
@@ -51,6 +53,7 @@ namespace MelangeDB.Generated
                         IsAutoInc = false,
                         IsUnique = false,
                         IsIndexed = false,
+                        IsServerOnly = false,
                         GetValue = static row => ((global::Snapshot.Creature)row).Kind,
                         SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).Kind = (global::Snapshot.Species)value,
                     },
@@ -64,6 +67,7 @@ namespace MelangeDB.Generated
                         IsAutoInc = false,
                         IsUnique = false,
                         IsIndexed = false,
+                        IsServerOnly = false,
                         GetValue = static row => ((global::Snapshot.Creature)row).X,
                         SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).X = (float)value,
                     },
@@ -77,6 +81,7 @@ namespace MelangeDB.Generated
                         IsAutoInc = false,
                         IsUnique = false,
                         IsIndexed = false,
+                        IsServerOnly = false,
                         GetValue = static row => ((global::Snapshot.Creature)row).Name,
                         SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).Name = (string)value,
                     },
@@ -90,8 +95,23 @@ namespace MelangeDB.Generated
                         IsAutoInc = false,
                         IsUnique = false,
                         IsIndexed = false,
+                        IsServerOnly = false,
                         GetValue = static row => ((global::Snapshot.Creature)row).Genome,
                         SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).Genome = (byte[])value,
+                    },
+                    new global::MelangeDB.Core.ColumnSchema
+                    {
+                        Name = "NextThinkAt",
+                        ClrType = typeof(ulong),
+                        Kind = global::MelangeDB.Core.ColumnKind.UInt64,
+                        IsEnum = false,
+                        IsPrimaryKey = false,
+                        IsAutoInc = false,
+                        IsUnique = false,
+                        IsIndexed = false,
+                        IsServerOnly = true,
+                        GetValue = static row => ((global::Snapshot.Creature)row).NextThinkAt,
+                        SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<global::Snapshot.Creature>(row).NextThinkAt = (ulong)value,
                     },
                 },
                 isPublic: true,
@@ -111,6 +131,7 @@ namespace MelangeDB.Generated
             writer.WriteFloat32(row.X);
             writer.WriteString(row.Name);
             writer.WriteBytes(row.Genome);
+            writer.WriteUInt64(row.NextThinkAt);
             return writer.ToArray();
         }
 
@@ -124,6 +145,7 @@ namespace MelangeDB.Generated
             row.X = reader.ReadFloat32();
             row.Name = reader.ReadString();
             row.Genome = reader.ReadBytes();
+            row.NextThinkAt = reader.ReadUInt64();
             return row;
         }
 

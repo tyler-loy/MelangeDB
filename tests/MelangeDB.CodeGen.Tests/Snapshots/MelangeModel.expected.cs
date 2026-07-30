@@ -19,6 +19,22 @@ namespace MelangeDB.Generated
             new global::MelangeDB.Core.ReducerDescriptor[]
             {
                 new global::MelangeDB.Core.ReducerDescriptor(
+                    "Cull",
+                    global::MelangeDB.ReducerKind.Standard,
+                    typeof(global::Snapshot.CreatureReducers),
+                    static (ref global::MelangeDB.Core.ReducerArgsReader reader) =>
+                    {
+                        reader.ExpectCount(0);
+                        reader.End();
+                    },
+                    static (object instance, global::MelangeDB.ReducerContext context, ref global::MelangeDB.Core.ReducerArgsReader reader) =>
+                    {
+                        reader.ExpectCount(0);
+                        ((global::Snapshot.CreatureReducers)instance).Cull(context);
+                        reader.End();
+                    },
+                    policy: typeof(global::Snapshot.AdminOnly)),
+                new global::MelangeDB.Core.ReducerDescriptor(
                     "Spawn",
                     global::MelangeDB.ReducerKind.Standard,
                     typeof(global::Snapshot.CreatureReducers),

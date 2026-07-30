@@ -29,12 +29,23 @@ public class GeneratedOutputTests
             public float X;
             public string Name;
             public byte[] Genome;
+            [ServerOnly] public ulong NextThinkAt;
+        }
+
+        public sealed class AdminOnly : IReducerPolicy
+        {
+            public bool MayCall(string reducer, PolicyContext ctx) => false;
         }
 
         public sealed class CreatureReducers
         {
             [Reducer]
             public void Spawn(ReducerContext ctx, ushort chunkId, string name, int[] stats)
+            {
+            }
+
+            [Reducer(Policy = typeof(AdminOnly))]
+            public void Cull(ReducerContext ctx)
             {
             }
         }
