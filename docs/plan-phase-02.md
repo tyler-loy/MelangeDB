@@ -31,6 +31,11 @@ It also removes the reflection path from phase 01, which matters for startup tim
   injection of scoped and singleton services both work.
 - `IHostedService` owning startup (log recovery, projection rebuild) and graceful shutdown (drain, flush,
   checkpoint).
+- **Argument validation on the generated decode path.** Reducer arguments come from clients and are otherwise
+  trusted. The framework can't check semantics, but it must reject the inputs that corrupt state regardless of
+  game rules — above all **`NaN` and `±Infinity` floats**, which propagate through position and chunk math and
+  poison rows that then replicate to every client. Plus string length caps, collection length caps, and
+  declared integer ranges. Rejection happens during decode, before a transaction opens.
 - Options bound through `IOptions`/`IOptionsMonitor` so `appsettings.json`, environment variables, and
   Azure App Configuration all work with no MelangeDB-specific code.
 
@@ -67,6 +72,8 @@ format from 03).
 - Every diagnostic above has a test proving it fires, and a test proving valid code compiles clean.
 - Phase 01's tests still pass against generated registration instead of reflection.
 - A table added to the sample requires no manual registration anywhere.
+- A reducer call carrying `NaN`, `Infinity`, an over-long string, or an over-long array is rejected during
+  decode, with no transaction opened and no log record appended.
 
 ## Risks
 

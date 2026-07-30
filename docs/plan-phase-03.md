@@ -31,6 +31,15 @@ demonstrable, so it should be reached before anything in 04–08 is started.
   - `SELECT a, b, c FROM t WHERE ...` — **column projection**, so deltas carry partial rows
 - Subscriptions may only name `Public` tables; naming a private table is a clean error, never a silent empty
   result.
+
+**Subscription cost limits.** Nothing otherwise stops an authenticated client — including a guest — from
+subscribing to `SELECT * FROM terrain_chunk_data` with no predicate and pulling ~24.6k compressed terrain blobs,
+the entire world, in one request. `MaxPerConnection` caps how *many* subscriptions exist, not what one costs.
+This is a denial-of-service surface, so it belongs in the phase that ships subscriptions:
+- **Mandatory-predicate tables** — a table may require that a subscription constrain a given column.
+- **Bounded range width** — a maximum span on `BETWEEN`, so a client streams a ring around itself, not the map.
+- **Row and byte ceilings per subscription**, with a clear error instead of an OOM.
+- **Cost estimated and rejected before execution** — by the time you're streaming, the damage is done.
 - A `SubscriptionApplied` set and the delta stream must be consistent at a single LSN — the client must not
   be able to observe a gap or a duplicate across that boundary.
 
@@ -66,6 +75,8 @@ for clients follows once the wire format has settled.
 - A range subscription re-scoped as a simulated player "moves" (changing `:lo`/`:hi`) correctly emits inserts
   for newly-visible rows and deletes for newly-invisible ones — the terrain-streaming pattern.
 - Subscribing to a private table returns an explicit error.
+- An unbounded subscription to a mandatory-predicate table is rejected before any rows are read.
+- A range subscription exceeding the maximum span is rejected with an actionable error naming the limit.
 - Killing and reconnecting a client restores its subscriptions and converges to correct state.
 - A test asserts no gap and no duplicate across the initial-set/delta boundary under concurrent writes.
 

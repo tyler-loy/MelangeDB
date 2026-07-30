@@ -44,6 +44,8 @@ app.Run();
 - **[docs/DESIGN.md](docs/DESIGN.md)** — the architecture, the trade-offs it accepts, and the open questions.
 - **[docs/CLUSTERING.md](docs/CLUSTERING.md)** — the four table placements, hub/shard node roles, and
   why *you* define the sharding function rather than MelangeDB.
+- **[docs/SECURITY.md](docs/SECURITY.md)** — what a server can enforce against an untrusted client, and what
+  it deliberately doesn't.
 - **[docs/VIBE-SHAFT-COVERAGE.md](docs/VIBE-SHAFT-COVERAGE.md)** — the design audited against a live
   82-table SpacetimeDB game, as a reality check on scope.
 

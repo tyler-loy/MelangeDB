@@ -42,10 +42,59 @@ evaluate for ordinary clients and kills their *entire* subscription — a docume
 reference workload's `Rls.cs` (gray screen, no spawn). A policy object runs in-process with no restricted
 namespace, so admin bypass is a plain lookup. Ship a test that encodes exactly this scenario.
 
+**Column-level visibility.** Row policies filter rows; nothing filters columns, and that gap is live in the
+reference workload today. `Creature` is `Public = true` and ships `NextThinkAt`, `SpookedUntil`,
+`LastDamagedAt`, and `HomeX/HomeZ` to every client — a complete AI oracle telling a cheater exactly when a
+creature next thinks and whether its alert radius is doubled. See [SECURITY.md](SECURITY.md) for the full
+argument.
+
+```csharp
+[ServerOnly] public ulong NextThinkAt;      // static: never leaves the process
+```
+```csharp
+public sealed class PlayerStateColumns : IColumnPolicy<PlayerState>   // dynamic: depends on the asker
+{
+    public ColumnMask VisibleTo(in PlayerState row, PolicyContext ctx) =>
+        row.Identity == ctx.Caller ? ColumnMask.All
+                                   : ColumnMask.All.Except(nameof(PlayerState.LastSeen));
+}
+```
+
+This reuses phase 03's partial-row wire format — client projection and server column policy are the same
+mechanism applied from opposite ends. The composition rule is easy to invert, so state it in the XML docs:
+**rows UNION, columns INTERSECT.** A client requesting a `[ServerOnly]` column gets an error, never a silently
+empty field.
+
+Splitting tables is *not* an acceptable substitute here: `Creature` deliberately stores a path rather than a
+point so the server writes only when a creature decides something, and splitting AI fields out would double
+writes on the hottest table in the game.
+
+**Reducer authorization.** The reference module calls `RequireAdmin(ctx)` by hand **24 times**. Every one is a
+site where omitting the line is a privilege escalation, and nothing detects the omission.
+
+```csharp
+[Reducer(Policy = typeof(AdminOnly))]
+public void ClearCreatures(ReducerContext ctx) { /* no guard clause */ }
+```
+
+Policies resolve from DI (so they can read private tables). The deliverable that matters as much as the
+attribute is a **report listing every client-callable reducer with no policy attached** — that turns "did we
+forget one?" from a code-review question into a build artifact.
+
+**Rate limiting.** Connection-level token bucket per identity, configurable per reducer, rejected before a
+transaction opens. The reference workload implements this *as table rows* (`PlayerRateLimit` + a micro-token
+bucket), paying a row write on every gathered rock purely for defense. Game-semantic checks like movement
+plausibility stay in the module — that's gameplay — but "no more than N calls/second" shouldn't need schema.
+
+**Identity and connection caps.** `AllowGuests` currently grants an identity to anyone who asks, so every
+per-identity defense in this phase is bypassed by acquiring a new identity. Needs a connection cap per identity
+and a guest-issuance limit.
+
 ## Out of scope
 
-Authorization of *reducer calls* beyond identity — per-reducer permission attributes can come later; a
-reducer can check `ctx.Caller` itself for now. Role hierarchies, groups, delegation.
+Role hierarchies, groups, delegation. Sandboxing server code — there is deliberately no sandbox (DESIGN.md §1).
+Client-side cheat detection: column visibility narrows what a cheat can *know*, but cannot police what a client
+does with data it legitimately receives.
 
 ## Decisions to settle
 
@@ -58,6 +107,12 @@ reducer can check `ctx.Caller` itself for now. Role hierarchies, groups, delegat
   admin path needs to bypass them deliberately. Two explicit modes, no ambiguity.
 - **Guest identity durability.** Cookie, local token file, or client-persisted key? Affects whether a guest
   keeps their character after a client restart.
+- **Reducer authorization default posture.** Deny-by-default is safer but makes every ordinary gameplay reducer
+  carry an annotation. Allow-by-default plus the unpoliced-reducer report is probably the right trade — the
+  omission becomes visible without being fatal — but decide it explicitly rather than by accident.
+- **Cost of column masking on the delta path.** A per-row mask evaluation on terrain-scale fan-out may be too
+  slow. `[ServerOnly]` is free (it's compile-time), so the question is only about `IColumnPolicy<T>`; consider
+  restricting dynamic masks to tables that aren't high-fan-out.
 
 ## Done when
 
@@ -70,6 +125,16 @@ reducer can check `ctx.Caller` itself for now. Role hierarchies, groups, delegat
   non-admin's subscription is **unaffected** — the SpacetimeDB failure mode, shown fixed.
 - Making a row invisible to a subscribed client emits a delete to that client and nothing to others.
 - Subscribing to a private table errors; no policy can make a private table visible.
+- A `[ServerOnly]` column never appears on the wire for any client, admin included — asserted by inspecting
+  frames, not the client API.
+- A client explicitly requesting a `[ServerOnly]` column gets an error rather than a null or default value.
+- A column masked by policy for one caller and visible to another is correct in both directions, and changing
+  the mask mid-subscription updates the client.
+- Every client-callable reducer either has a policy or appears in the unpoliced-reducer report; the report is
+  asserted in a test so it can't silently regress.
+- A reducer over its rate limit is rejected **before** a transaction opens — verified by asserting no log
+  record was appended, not just that an error came back.
+- One identity cannot exceed the connection cap; guest issuance is limited.
 
 ## Risks
 

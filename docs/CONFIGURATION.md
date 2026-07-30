@@ -91,9 +91,16 @@ to fix it without a code change and a redeploy.
 | `Transport:Path` | string | `/melange` | restart | 03 | |
 | `Transport:MaxMessageBytes` | int | `4194304` | live | 03 | |
 | `Transport:Serializer` | enum | `MessagePack` | restart | 03 | Behind `IMelangeSerializer`. |
+| `Validation:RejectNonFiniteFloats` | bool | `true` | live | 02 | Rejects `NaN` / `±Infinity` reducer arguments during decode. A `NaN` position propagates through terrain and chunk math and poisons rows that then replicate to every client. Turning this off should feel alarming. |
+| `Validation:MaxStringLength` | int | `4096` | live | 02 | |
+| `Validation:MaxCollectionLength` | int | `4096` | live | 02 | |
 | `Subscriptions:MaxPerConnection` | int | `64` | live | 03 | |
 | `Subscriptions:BackpressurePolicy` | enum | `Buffer` | live | 03 | `Buffer` \| `DropAndResync` \| `Disconnect`. Matters most during bulk terrain streaming to a slow client. |
 | `Subscriptions:MaxBufferedBytes` | long | `16777216` | live | 03 | Per connection; the trigger for the policy above. |
+| `Subscriptions:MaxRowsPerSubscription` | long | `100000` | live | 03 | Ceiling on an initial result set. Rejected before execution, not mid-stream. |
+| `Subscriptions:MaxBytesPerSubscription` | long | `67108864` | live | 03 | The one that actually matters for blob tables. |
+| `Subscriptions:MaxRangeSpan` | long | `1024` | live | 03 | Maximum width of a `BETWEEN` predicate. Lets a client stream a ring around itself but not the whole map. |
+| `Subscriptions:RequirePredicateOn` | string[] | — | live | 03 | Tables where an unbounded subscription is rejected. Terrain and blob tables belong here. |
 
 ## Identity and policies
 
@@ -103,6 +110,14 @@ to fix it without a code change and a redeploy.
 | `Auth:Audience` | string | — | restart | 04 | |
 | `Auth:AllowGuests` | bool | `true` | live | 04 | |
 | `Auth:GuestSigningKey` | string | — | restart | 04 | **Secret.** Belongs in a secret store, never `appsettings.json`. Guest identities are forgeable without it being secret. |
+| `Auth:MaxConnectionsPerIdentity` | int | `4` | live | 04 | Without this, every per-identity defense is bypassed by opening more connections. |
+| `Auth:GuestIssuancePerMinute` | int | `60` | live | 04 | Unlimited guest identities bypass every per-identity limit by rotating identity. |
+| `Policies:UnpolicedReducerReport` | enum | `Warn` | restart | 04 | `Off` \| `Warn` \| `Fail`. Lists client-callable reducers with no authorization policy. Turns "did we forget one?" into a build artifact. |
+| `Policies:DefaultReducerPosture` | enum | `Allow` | restart | 04 | `Allow` \| `Deny`. `Deny` is safer but annotates every ordinary gameplay reducer; pair `Allow` with the report above. |
+| `RateLimit:Enabled` | bool | `true` | live | 04 | |
+| `RateLimit:ReducerCallsPerSecond` | int | `20` | live | 04 | Default token bucket per identity. Rejected before a transaction opens, so it costs no log volume. |
+| `RateLimit:BurstCapacity` | int | `60` | live | 04 | Bursts pass at human click speed; sustained rates are what actually stop macros. |
+| `RateLimit:PerReducer:<ReducerName>` | int | — | live | 04 | Per-reducer override of the global rate. |
 
 ## Scheduling
 
