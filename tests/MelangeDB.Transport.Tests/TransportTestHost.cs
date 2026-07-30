@@ -55,6 +55,8 @@ internal sealed class TransportTestHost : IAsyncDisposable
 
     public MelangeSessions Sessions => _app!.Services.GetRequiredService<MelangeSessions>();
 
+    public IServiceProvider Services => _app!.Services;
+
     public static async Task<TransportTestHost> StartAsync(
         Dictionary<string, string?>? settings = null,
         bool manualTime = false,

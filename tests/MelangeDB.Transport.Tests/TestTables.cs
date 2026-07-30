@@ -245,4 +245,10 @@ public sealed class TransportReducers
     public void Noop(ReducerContext ctx)
     {
     }
+
+    /// <summary>Not client-callable; a client naming it is told "unknown", never "forbidden".</summary>
+    [Reducer(ReducerKind.ClientConnected)]
+    public void OnConnect(ReducerContext ctx)
+    {
+    }
 }
