@@ -134,6 +134,29 @@ public class RowPolicyTests
     }
 
     [Fact]
+    public async Task A_policy_can_treat_guests_differently_via_the_context()
+    {
+        // A guest is an ordinary identity whose token carries Auth:GuestRole — and that fact
+        // reaches policies, so "members only" is one predicate rather than a second auth system.
+        await using var host = await TransportTestHost.StartAsync(services: services =>
+            services.AddSingleton<IRowPolicy<Chunk>, MembersOnlyChunks>());
+        host.Call("SetChunk", 1L, 1L, new byte[] { 1 });
+
+        await using var guest = new RawSocketClient();
+        await guest.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("visitor", role: "guest"));
+        Assert.Empty(await InitialSetAsync(guest, 1, "SELECT * FROM Chunk"));
+
+        await using var member = new RawSocketClient();
+        await member.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("visitor-upgraded"));
+        Assert.Single(await InitialSetAsync(member, 1, "SELECT * FROM Chunk"));
+    }
+
+    private sealed class MembersOnlyChunks : IRowPolicy<Chunk>
+    {
+        public bool IsVisibleTo(in Chunk row, PolicyContext ctx) => !ctx.IsGuest;
+    }
+
+    [Fact]
     public async Task No_policy_can_make_a_private_table_visible()
     {
         await using var host = await TransportTestHost.StartAsync(services: services =>
