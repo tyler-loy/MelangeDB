@@ -8,7 +8,12 @@ MelangeDB is instrumented with OpenTelemetry from the first commit, not retrofit
 > as method signatures.
 
 Each row lands with its phase. The phase 01 spans and metrics are implemented and asserted by tests over a
-collecting `ActivityListener` / `MeterListener`.
+collecting `ActivityListener` / `MeterListener`. The phase 03 rows — `melange.subscription.initial`, the
+sampled `melange.subscription.delta` (ratio: `Telemetry:DeltaSpanSampleRatio`), `melange.subscriptions.active`,
+`melange.subscription.delta_rows`, `melange.subscription.rejected` (dimension: the wire error code), and
+`melange.connections.active` — shipped with the transport, emitted on the same `MelangeDB` source and meter.
+`CallReducer`'s `traceparent` shipped as specified below: the server parses it into an `ActivityContext` that
+parents the `melange.reducer` span directly.
 
 ## The dependency decision
 
@@ -151,7 +156,8 @@ Structured through `ILogger` with stable `EventId`s so log-based alerts don't br
 No parallel logging abstraction — the host's configured providers are the whole story.
 
 Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
-`1101 MelangeStarted`, `1102 MelangeStopped` (02).
+`1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
+`1204 ReducerCallFailed` (03).
 
 ## Health checks
 
