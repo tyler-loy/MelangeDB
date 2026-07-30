@@ -13,6 +13,16 @@ public sealed class IndexAttribute : Attribute;
 public sealed class UniqueAttribute : Attribute;
 
 /// <summary>
+/// Marks a column on a <c>Public</c> table that never leaves the process — not sent to any client,
+/// admin included. Compile-time and free: the column simply has no wire representation. Declaring
+/// it makes the table subscription-visible by intent, so a table carrying it must be
+/// <c>Public = true</c>; the analyzer reports the mismatch. Wire enforcement lands with the
+/// subscription engine.
+/// </summary>
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property)]
+public sealed class ServerOnlyAttribute : Attribute;
+
+/// <summary>
 /// Marks a <see cref="long"/> or <see cref="ulong"/> column whose value is assigned from a durable
 /// per-table sequence when a row is inserted with the value left at zero. The contract is
 /// <b>unique, not dense</b>: gaps are normal. Ids are 64-bit but allocated within 63 bits

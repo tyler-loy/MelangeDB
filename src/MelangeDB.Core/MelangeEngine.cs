@@ -15,6 +15,7 @@ public sealed class MelangeEngine : IDisposable
 {
     private readonly MelangeDbOptions _options;
     private readonly TimeProvider _time;
+    private readonly ILogger _logger;
     private readonly FileCommitLog _log;
     private readonly AutoIncSequencer _sequencer;
     private readonly EngineTelemetry? _telemetry;
@@ -34,6 +35,7 @@ public sealed class MelangeEngine : IDisposable
         Schema = schema;
         _time = timeProvider ?? TimeProvider.System;
         var loggers = loggerFactory ?? NullLoggerFactory.Instance;
+        _logger = loggers.CreateLogger<MelangeEngine>();
 
         Directory.CreateDirectory(options.HotStore.Path);
         _telemetry = options.Telemetry.Enabled
@@ -72,6 +74,12 @@ public sealed class MelangeEngine : IDisposable
 
     public ICommitLog Log => _log;
 
+    /// <summary>The options instance the engine reads live keys from; the host's reload bridge mutates it.</summary>
+    internal MelangeDbOptions Options => _options;
+
+    /// <summary>The commit log's poisoned-state failure, if any — the melange-log health signal.</summary>
+    internal Exception? LogFailure => _log.Failure;
+
     public IHotStore HotStore { get; }
 
     public ApplierPipeline Appliers { get; }
@@ -102,13 +110,65 @@ public sealed class MelangeEngine : IDisposable
             _inReducer.Value = true;
             try
             {
-                InvokeCore(reducerName, caller, body, arguments, connectionId);
+                InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
             }
             finally
             {
                 _inReducer.Value = false;
             }
         }
+    }
+
+    /// <summary>
+    /// Invokes a reducer body with pre-encoded arguments — the generated dispatch path, which
+    /// decoded (and validated) the same bytes before this call.
+    /// </summary>
+    public void Invoke(
+        string reducerName,
+        Identity caller,
+        ReadOnlyMemory<byte> encodedArguments,
+        Action<ReducerContext> body,
+        ConnectionId connectionId = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(reducerName);
+        ArgumentNullException.ThrowIfNull(body);
+        if (_inReducer.Value)
+        {
+            throw new InvalidOperationException(
+                "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
+                "Extract shared logic into a plain method both reducers call.");
+        }
+
+        lock (_writeLock)
+        {
+            _inReducer.Value = true;
+            try
+            {
+                InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId);
+            }
+            finally
+            {
+                _inReducer.Value = false;
+            }
+        }
+    }
+
+    /// <summary>Blocks until any in-flight invocation has completed. Used by graceful shutdown.</summary>
+    public void Drain()
+    {
+        lock (_writeLock)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Advances every unpaused applier to the log head and forces the log to stable storage —
+    /// graceful shutdown's flush-and-checkpoint step.
+    /// </summary>
+    public void Checkpoint()
+    {
+        Appliers.CatchUpAll();
+        _log.FlushToDisk();
     }
 
     public void Dispose()
@@ -126,6 +186,7 @@ public sealed class MelangeEngine : IDisposable
         Identity caller,
         Action<ReducerContext> body,
         IReadOnlyList<object?>? arguments,
+        ReadOnlyMemory<byte> encodedArguments,
         ConnectionId connectionId)
     {
         using var activity = _telemetry?.StartReducer(reducerName, caller, arguments);
@@ -158,7 +219,7 @@ public sealed class MelangeEngine : IDisposable
             using (var commit = _telemetry?.StartCommit())
             {
                 var commitStarted = Stopwatch.GetTimestamp();
-                var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, ArgsCodec.Encode(arguments), ops));
+                var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, encodedArguments, ops));
                 _telemetry?.RecordCommitDuration(Elapsed(commitStarted));
                 commit?.SetTag("melange.lsn", (long)record.Lsn);
                 commit?.SetTag("melange.writeset.bytes", record.SerializedLength);
@@ -169,9 +230,29 @@ public sealed class MelangeEngine : IDisposable
 
         activity?.SetTag("melange.outcome", "commit");
         activity?.SetTag("melange.writeset.rows", ops.Count);
-        _telemetry?.RecordTransaction(reducerName, "commit", Elapsed(started), ops.Count);
+        var elapsed = Elapsed(started);
+        _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
+        if (elapsed > _options.Telemetry.SlowReducerMs)
+        {
+            activity?.AddEvent(new ActivityEvent(
+                "melange.slow_reducer",
+                tags: new ActivityTagsCollection { ["melange.duration_ms"] = elapsed }));
+            LogMessages.SlowReducer(_logger, reducerName, elapsed, _options.Telemetry.SlowReducerMs);
+        }
     }
 
     private static double Elapsed(long startedTimestamp) =>
         Stopwatch.GetElapsedTime(startedTimestamp).TotalMilliseconds;
+
+    private static class LogMessages
+    {
+        private static readonly Action<ILogger, string, double, int, Exception?> SlowReducerMessage =
+            LoggerMessage.Define<string, double, int>(
+                LogLevel.Warning,
+                new EventId(1003, "SlowReducer"),
+                "Reducer '{Reducer}' took {DurationMs:F1}ms, over the Telemetry:SlowReducerMs threshold of {ThresholdMs}ms.");
+
+        public static void SlowReducer(ILogger logger, string reducer, double durationMs, int thresholdMs) =>
+            SlowReducerMessage(logger, reducer, durationMs, thresholdMs, null);
+    }
 }

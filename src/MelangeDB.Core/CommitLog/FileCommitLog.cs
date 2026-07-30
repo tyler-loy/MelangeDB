@@ -56,6 +56,32 @@ public sealed class FileCommitLog : ICommitLog
     /// </summary>
     internal Action<FileStream>? AppendFaultInjection { get; set; }
 
+    /// <summary>
+    /// The failure that poisoned the log, or null while it is writable. A poisoned log rejects
+    /// every append until restart — the unhealthy signal for the <c>melange-log</c> health check.
+    /// </summary>
+    internal Exception? Failure
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _failure;
+            }
+        }
+    }
+
+    /// <summary>Forces buffered appends to stable storage regardless of the fsync policy.</summary>
+    public void FlushToDisk()
+    {
+        lock (_lock)
+        {
+            if (_disposed || _failure is not null)
+                return;
+            _stream.Flush(flushToDisk: true);
+        }
+    }
+
     public ulong HeadLsn
     {
         get

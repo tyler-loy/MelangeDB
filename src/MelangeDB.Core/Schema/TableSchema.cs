@@ -15,7 +15,8 @@ public sealed class TableSchema
         Residency residency = Residency.Paged,
         Placement placement = Placement.Partitioned,
         string? shardBy = null,
-        string? scheduled = null)
+        string? scheduled = null,
+        RowCodec? codec = null)
     {
         ArgumentNullException.ThrowIfNull(rowType);
         ArgumentException.ThrowIfNullOrEmpty(name);
@@ -39,6 +40,9 @@ public sealed class TableSchema
                 throw new NotSupportedException($"Table '{name}': column '{column.Name}' of kind {column.Kind} cannot be indexed.");
         }
 
+        if (codec is not null && codec.RowType != rowType)
+            throw new ArgumentException($"Table '{name}': codec serializes {codec.RowType}, not {rowType}.", nameof(codec));
+
         RowType = rowType;
         Name = name;
         Id = TableId.FromName(name);
@@ -54,6 +58,7 @@ public sealed class TableSchema
         Placement = placement;
         ShardBy = shardBy;
         Scheduled = scheduled;
+        Codec = codec;
     }
 
     public Type RowType { get; }
@@ -83,6 +88,13 @@ public sealed class TableSchema
     public string? ShardBy { get; }
 
     public string? Scheduled { get; }
+
+    /// <summary>
+    /// The generated per-table serializer, or null on the reflection path. When present, the
+    /// engine's typed paths and the hot store's index maintenance use it instead of
+    /// <see cref="RowSerializer"/> and the boxed column accessors.
+    /// </summary>
+    public RowCodec? Codec { get; }
 
     /// <summary>Finds a column by name, or throws.</summary>
     public ColumnSchema Column(string name) =>

@@ -36,4 +36,12 @@ public interface IDbView
     /// </summary>
     IEnumerable<TRow> Filter<TRow>(string column, object value)
         where TRow : struct;
+
+    /// <summary>
+    /// Enumerates rows whose indexed column falls within [<paramref name="low"/>,
+    /// <paramref name="high"/>], both inclusive. The column must carry <c>[Index]</c> or
+    /// <c>[Unique]</c>; range comparison follows the column's order-preserving key encoding.
+    /// </summary>
+    IEnumerable<TRow> FilterRange<TRow>(string column, object low, object high)
+        where TRow : struct;
 }

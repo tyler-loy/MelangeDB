@@ -28,4 +28,10 @@ public interface IHotStore
     /// in primary-key order.
     /// </summary>
     IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value);
+
+    /// <summary>
+    /// Enumerates rows whose indexed column's encoded value falls within
+    /// [<paramref name="low"/>, <paramref name="high"/>], both inclusive, in index-value order.
+    /// </summary>
+    IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high);
 }
