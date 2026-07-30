@@ -147,24 +147,52 @@ does with data it legitimately receives.
 
 ## Decisions to settle
 
-- **Cost of per-row policy evaluation.** A delegate per row on the delta path may be too slow for terrain-
-  scale fan-out. Options: allow a policy to declare an index-backed *pre-filter* so most rows never reach the
-  predicate, or cache per-(identity, table) visibility. Measure before choosing.
-- **Policy-relevant state changes.** If `AdminIdentity` changes, cached visibility is stale. Either policies
-  declare their dependencies, or admin changes force a resubscribe. The second is cruder and probably right.
-- **Do policies apply to ad-hoc SQL (phase 08)?** They must, or RLS is trivially bypassable — but an owner/
-  admin path needs to bypass them deliberately. Two explicit modes, no ambiguity.
-- **Guest token persistence in the client SDK.** With the IdP minting guest tokens, durability means the
-  client persists that token (or its refresh token) across restarts. The client SDK should ship a pluggable
-  token store — a guest token the client loses is a lost character, regardless of how well conversion works.
+- ~~**Cost of per-row policy evaluation.**~~ **Settled: ship the simple delegate path, with the measurement
+  recorded.** Measured on the dev machine (Debug build, `PolicyCostMeasurementTests`): a union of two row
+  policies — one of them doing a `Find` into the private `AdminIdentity` table per row, the worst realistic
+  shape — evaluates at **~520 ns/row (~1.9M rows/s)**, including the per-evaluation row deserialization. At
+  that rate a 100k-row initial set pays ~50ms and a typical delta fan-out pays microseconds, which is nowhere
+  near the top of the profile. No pre-filter declaration, no per-(identity, table) visibility cache — both
+  add invalidation machinery whose bugs are silent leaks, the worst class this phase exists to prevent.
+  Revisit under phase 10's load rig if it shows up hot.
+- ~~**Policy-relevant state changes.**~~ **Settled: no caching, so *new* decisions apply immediately; already-
+  delivered rows are corrected by resubscribe or termination — the crude option, deliberately.** Policies are
+  evaluated per event against committed state, never cached, so an `AdminIdentity` change affects the very
+  next delta and every later initial set on its own. What it does not do is retroactively re-filter rows a
+  client already holds. The honest remedies ship today: the client resubscribes (a re-scope or reconnect), or
+  the server calls `MelangeSessions.Terminate(identity)` after a privilege change — demotion and revocation
+  usually coincide anyway. Dependency-tracking policies would turn every policy into an invalidation problem;
+  cruder is right until a real workload proves otherwise.
+- ~~**Do policies apply to ad-hoc SQL (phase 08)?**~~ **Settled: the two-mode contract ships now, not in 08.**
+  `Sql:AdHocMode` — `PolicyEnforced` (default) applies row and column policies exactly as a subscription
+  would; `Owner` deliberately bypasses them for operator tooling. There is no third mode. `[ServerOnly]`
+  columns are excluded in **both** modes: "never leaves the process" has no modes, and owner mode bypasses
+  policies, not physics. Every HTTP endpoint requires a valid JWT either way. What 08 still owns: per-caller
+  authorization of who may use owner mode (today it is a deployment-level setting) and the aggregate/join
+  surface.
+- ~~**Guest token persistence in the client SDK.**~~ **Settled: shipped as `ITokenStore`.** Pluggable on
+  `MelangeClientOptions`, with `InMemoryTokenStore` as the honest-for-tests default and `FileTokenStore`
+  (atomic temp-file-and-rename writes — a torn guest token is a lost character) as the durable reference
+  implementation. The client loads from the store when no token is configured and persists the accepted token
+  on connect and after every successful `Reauthenticate`, so a guest conversion updates the stored credential
+  automatically.
 - ~~**Guest → authenticated upgrade.**~~ **Settled: not MelangeDB's concern.** Guest conversion is IdP-side
   account linking; if the subject is preserved the identity never changes. See the deliverable above.
-- **Reducer authorization default posture.** Deny-by-default is safer but makes every ordinary gameplay reducer
-  carry an annotation. Allow-by-default plus the unpoliced-reducer report is probably the right trade — the
-  omission becomes visible without being fatal — but decide it explicitly rather than by accident.
-- **Cost of column masking on the delta path.** A per-row mask evaluation on terrain-scale fan-out may be too
-  slow. `[ServerOnly]` is free (it's compile-time), so the question is only about `IColumnPolicy<T>`; consider
-  restricting dynamic masks to tables that aren't high-fan-out.
+- ~~**Reducer authorization default posture.**~~ **Settled: allow-by-default, paired with the report — and the
+  report is asserted.** `Policies:DefaultReducerPosture` defaults to `Allow` because deny-by-default taxes
+  every ordinary gameplay reducer with an annotation and pushes teams toward a blanket `AllowAll` policy that
+  defeats the audit. The omission stays visible instead of fatal: `Policies:UnpolicedReducerReport` lists
+  every client-callable reducer with no policy at startup (`Warn` default, `Fail` refuses to start), and a
+  test asserts the report's exact contents so it cannot silently regress. `Deny` remains one config key away
+  for teams that want it. Policies gate client-originated calls only; in-process dispatch is the host's own
+  code.
+- ~~**Cost of column masking on the delta path.**~~ **Settled: `IColumnPolicy<T>` ships unrestricted, with the
+  measurement recorded.** Same rig as the row measurement: one mask evaluated and intersected costs
+  **~470 ns/row (~2.1M rows/s)**. Tables with no column policy pay literally nothing on the delta path — the
+  wire column set is precomputed at subscription compile time — and `[ServerOnly]` stays compile-time-free,
+  so the per-row cost exists only where a dynamic mask was explicitly requested. A high-fan-out restriction
+  would be policy for a problem the numbers say does not exist yet; phase 10's load rig re-opens this if
+  terrain-scale fan-out disagrees.
 
 ## Done when
 

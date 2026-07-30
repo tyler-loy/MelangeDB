@@ -13,7 +13,10 @@ sampled `melange.subscription.delta` (ratio: `Telemetry:DeltaSpanSampleRatio`), 
 `melange.subscription.delta_rows`, `melange.subscription.rejected` (dimension: the wire error code), and
 `melange.connections.active` — shipped with the transport, emitted on the same `MelangeDB` source and meter.
 `CallReducer`'s `traceparent` shipped as specified below: the server parses it into an `ActivityContext` that
-parents the `melange.reducer` span directly.
+parents the `melange.reducer` span directly. The phase 04 rows — `melange.ratelimit.rejected` (dimension:
+reducer) and `melange.policy.rows_filtered` (dimension: table) — shipped with identity and policies, on the
+same meter. Neither carries an identity dimension, per the cardinality rule below: *whose* call was limited
+belongs on the span and in the log, never on a time series.
 
 ## The dependency decision
 
@@ -157,7 +160,7 @@ No parallel logging abstraction — the host's configured providers are the whol
 
 Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
-`1204 ReducerCallFailed` (03).
+`1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04).
 
 ## Health checks
 

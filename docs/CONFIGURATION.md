@@ -35,6 +35,17 @@ is a build-time switch and lives in the project file, not in `appsettings.json` 
 `MaxBufferedBytes` exists to bound per-connection memory, and a default that buffers without bound past its own
 trigger would make the trigger meaningless. `Buffer` remains as an explicit opt-in for trusted links.
 
+**Shipped as of phase 04** (defaults verified against `AuthOptions`, `PoliciesOptions`, `RateLimitOptions`,
+and `SqlOptions`): every `Auth:*`, `Policies:*`, and `RateLimit:*` key, plus `Sql:AdHocMode` — shipped ahead
+of its phase-08 row because `/melange/sql` already returns rows, so the policy contract could not wait. Three
+doc corrections made when it shipped: (1) the planned `Auth:Authority` and `Auth:Audience` keys were
+**removed** rather than implemented — token validation reads the host's own JWT bearer scheme registration
+(`Auth:Scheme`, a new key), and duplicating the host's authority/audience settings here would eventually
+disagree with them, the same reasoning as the deliberate absence of TLS knobs; (2)
+`Policies:DefaultReducerPosture` is `live`, not the `restart` this register planned — it is read per call
+through the options monitor, and a cheaper-than-planned semantic is recorded, not rounded down; (3)
+`Policies:UnpolicedReducerReport` stays `restart` as planned (it acts at startup only).
+
 ## Conventions
 
 - **Everything lives under the `MelangeDb:` configuration section**, so a host can bind it from
@@ -103,7 +114,7 @@ to fix it without a code change and a redeploy.
 | `Postgres:ApplyBatchSize` | int | `100` | live | 08 | Log records per Postgres transaction. The applier checkpoint advances only with the batch, so batching stays correct. |
 | `Postgres:AutoMigrate` | bool | `false` | restart | 08 | Off by default: schema changes against a production database should be deliberate. |
 | `Sql:AdHocEnabled` | bool | `false` | live | 08 | |
-| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 08 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. |
+| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Per-caller owner authorization lands with 08's full contract. |
 
 ## Transport and subscriptions
 
@@ -134,16 +145,16 @@ to fix it without a code change and a redeploy.
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Auth:Authority` | string | — | restart | 04 | Uses the host's existing ASP.NET Core authentication. |
-| `Auth:Audience` | string | — | restart | 04 | |
+| `Auth:Scheme` | string | `Bearer` | live | 04 | The host authentication scheme whose `JwtBearerOptions` connection tokens are validated against — `MapMelangeSocket` fails fast if it is not registered. |
+| — | — | — | — | 04 | **There are deliberately no MelangeDB settings for authority, audience, or signing keys.** Those live on the host's own `AddAuthentication().AddJwtBearer(...)` registration — the IdP is the gate, and duplicating its settings here would eventually disagree with them (the same reasoning as the absent TLS knob above). The originally planned `Auth:Authority`/`Auth:Audience` rows were removed when phase 04 shipped; this row is the record. |
 | `Auth:GuestRole` | string | `guest` | live | 04 | Role claim value marking IdP-issued guest tokens. **The IdP is the gate**: every connection presents a valid token, MelangeDB mints no identities, and guest-issuance throttling is the IdP's job. This setting only lets policies and caps treat guests differently; empty disables guest-specific treatment. |
 | `Auth:TicketTtlSeconds` | int | `30` | live | 04 | Connect tickets are single-use and short-lived, so a leaked one is near-worthless. Exists because browsers cannot set WebSocket headers. |
 | `Auth:ReauthGraceSeconds` | int | `120` | live | 04 | How long past token expiry a connection survives while awaiting `Reauthenticate`. Zero means expiry drops the socket — correct for a bank, wrong for a game. |
 | `Auth:MaxConnectionsPerIdentity` | int | `4` | live | 04 | Without this, a valid token holds unlimited sockets, subscriptions, and rate-limit buckets. |
-| `Policies:UnpolicedReducerReport` | enum | `Warn` | restart | 04 | `Off` \| `Warn` \| `Fail`. Lists client-callable reducers with no authorization policy. Turns "did we forget one?" into a build artifact. |
-| `Policies:DefaultReducerPosture` | enum | `Allow` | restart | 04 | `Allow` \| `Deny`. `Deny` is safer but annotates every ordinary gameplay reducer; pair `Allow` with the report above. |
+| `Policies:UnpolicedReducerReport` | enum | `Warn` | restart | 04 | `Off` \| `Warn` \| `Fail`. Lists client-callable reducers with no authorization policy at startup (EventId 1104). Turns "did we forget one?" into a build artifact; `Fail` refuses to start. |
+| `Policies:DefaultReducerPosture` | enum | `Allow` | live | 04 | `Allow` \| `Deny`. `Deny` is safer but annotates every ordinary gameplay reducer; pair `Allow` with the report above. Governs client-originated calls only — in-process dispatch is the host's own code. |
 | `RateLimit:Enabled` | bool | `true` | live | 04 | |
-| `RateLimit:ReducerCallsPerSecond` | int | `20` | live | 04 | Default token bucket per identity. Rejected before a transaction opens, so it costs no log volume. |
+| `RateLimit:ReducerCallsPerSecond` | int | `20` | live | 04 | Default sustained rate; the bucket is per identity **per reducer**, so one spammed reducer cannot starve the rest of a player's actions. Rejected before a transaction opens, so it costs no log volume. Client-originated calls only. |
 | `RateLimit:BurstCapacity` | int | `60` | live | 04 | Bursts pass at human click speed; sustained rates are what actually stop macros. |
 | `RateLimit:PerReducer:<ReducerName>` | int | — | live | 04 | Per-reducer override of the global rate. |
 
