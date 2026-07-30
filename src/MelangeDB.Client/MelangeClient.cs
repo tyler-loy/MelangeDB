@@ -26,6 +26,7 @@ public sealed class MelangeClient : IAsyncDisposable
     private Task? _receiveLoop;
     private TaskCompletionSource<WelcomeFrame>? _pendingWelcome;
     private TaskCompletionSource<ResumeResultFrame>? _pendingResume;
+    private TaskCompletionSource<ReauthenticateResultFrame>? _pendingReauthenticate;
     private uint _nextRequestId;
     private uint _nextSubscriptionId;
     private long _bytesReceived;
@@ -224,12 +225,24 @@ public sealed class MelangeClient : IAsyncDisposable
 
     private async Task DialAsync(CancellationToken cancellationToken)
     {
+        var token = _options.Token ?? await _options.TokenStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var uri = _options.Uri;
+        string? helloToken = token;
+        if (_options.UseTicket)
+        {
+            // The header-less path: exchange the JWT for a single-use ticket over HTTP, then put
+            // only the near-worthless ticket on the socket URL — never the token itself.
+            var ticket = await MintTicketAsync(token, cancellationToken).ConfigureAwait(false);
+            uri = new UriBuilder(uri) { Query = $"ticket={Uri.EscapeDataString(ticket)}" }.Uri;
+            helloToken = null;
+        }
+
         var socket = new ClientWebSocket();
         socket.Options.HttpVersion = _options.HttpVersion;
         socket.Options.HttpVersionPolicy = HttpVersionPolicy.RequestVersionExact;
         if (_options.CompressionEnabled)
             socket.Options.DangerousDeflateOptions = new WebSocketDeflateOptions();
-        await socket.ConnectAsync(_options.Uri, SharedInvoker, cancellationToken).ConfigureAwait(false);
+        await socket.ConnectAsync(uri, SharedInvoker, cancellationToken).ConfigureAwait(false);
 
         _socket = socket;
         var welcomePending = new TaskCompletionSource<WelcomeFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -238,12 +251,59 @@ public sealed class MelangeClient : IAsyncDisposable
         await SendAsync(new HelloFrame(
             MessagePackFrameSerializer.ProtocolVersion,
             MessagePackFrameSerializer.ProtocolVersion,
-            _options.Token), cancellationToken).ConfigureAwait(false);
+            helloToken), cancellationToken).ConfigureAwait(false);
         var welcome = await welcomePending.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         ProtocolVersion = welcome.Version;
         ConnectionId = welcome.ConnectionId;
         LogEpochId = welcome.EpochId;
         NegotiatedHttpProtocol = welcome.HttpProtocol;
+        if (token is not null)
+            await _options.TokenStore.SaveAsync(token, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<string> MintTicketAsync(string? token, CancellationToken cancellationToken)
+    {
+        var endpoint = _options.TicketUri ?? new UriBuilder(_options.Uri)
+        {
+            Scheme = _options.Uri.Scheme switch
+            {
+                "wss" => "https",
+                "ws" => "http",
+                var scheme => scheme,
+            },
+            Path = _options.Uri.AbsolutePath.TrimEnd('/') + "/ticket",
+        }.Uri;
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+        if (token is not null)
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        using var response = await SharedInvoker.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new MelangeCallException(MelangeErrorCodes.Unauthorized, $"The ticket endpoint answered {(int)response.StatusCode}: {body}");
+        using var json = System.Text.Json.JsonDocument.Parse(body);
+        return json.RootElement.GetProperty("ticket").GetString()
+            ?? throw new MelangeCallException(MelangeErrorCodes.Internal, "The ticket endpoint returned no ticket.");
+    }
+
+    /// <summary>
+    /// Presents a fresh token before the current one's expiry (plus the server's grace window).
+    /// The server accepts only a token resolving to the <em>same</em> identity — an identity
+    /// switch closes the connection instead, by design. On success the token is persisted to the
+    /// <see cref="MelangeClientOptions.TokenStore"/>; a guest conversion is exactly this call with
+    /// the account-linked token.
+    /// </summary>
+    public async Task ReauthenticateAsync(string token, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(token);
+        var pending = new TaskCompletionSource<ReauthenticateResultFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingReauthenticate = pending;
+        await SendAsync(new ReauthenticateFrame(token), cancellationToken).ConfigureAwait(false);
+        var result = await pending.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (!result.Accepted)
+            throw new MelangeCallException(MelangeErrorCodes.Unauthorized, result.Message ?? "Re-authentication was rejected.");
+        _options.Token = token;
+        await _options.TokenStore.SaveAsync(token, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task ReestablishAsync(IEnumerable<MelangeSubscription> subscriptions, CancellationToken cancellationToken)
@@ -352,7 +412,8 @@ public sealed class MelangeClient : IAsyncDisposable
                 break;
             case PongFrame:
                 break;
-            case ReauthenticateResultFrame:
+            case ReauthenticateResultFrame reauthenticated:
+                _pendingReauthenticate?.TrySetResult(reauthenticated);
                 break;
             case ErrorFrame error:
                 HandleError(error);
@@ -399,6 +460,9 @@ public sealed class MelangeClient : IAsyncDisposable
 
         _pendingWelcome?.TrySetException(new MelangeCallException(MelangeErrorCodes.Internal, "The connection dropped during the handshake."));
         _pendingResume?.TrySetException(new MelangeCallException(MelangeErrorCodes.Internal, "The connection dropped during resume."));
+        _pendingReauthenticate?.TrySetException(new MelangeCallException(
+            MelangeErrorCodes.Internal,
+            "The connection dropped before the re-authentication result arrived — a token for a different identity closes the connection by design."));
     }
 
     private static void InterlockedMax(ref ulong location, ulong value)

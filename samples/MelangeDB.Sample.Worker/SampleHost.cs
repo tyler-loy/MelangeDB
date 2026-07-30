@@ -20,6 +20,7 @@ public static class SampleHost
         configure?.Invoke(builder);
 
         builder.Services.Configure<GreetingOptions>(builder.Configuration.GetSection("Sample:Greeting"));
+        builder.Services.AddDevJwtAuthentication();
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Visitor).Assembly)
             .AddReducersFrom(typeof(GreetingReducers).Assembly));
