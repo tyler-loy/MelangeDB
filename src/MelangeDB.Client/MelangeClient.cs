@@ -319,7 +319,16 @@ public sealed class MelangeClient : IAsyncDisposable
                 break;
             case SubscriptionAppliedFrame chunk:
                 if (_subscriptions.TryGetValue(chunk.SubscriptionId, out var applied))
+                {
                     applied.AcceptInitialChunk(chunk);
+
+                    // The initial set is consistent at its anchor, and every delta frame at or
+                    // below the anchor was already received in order on this connection — so the
+                    // attachment cursor may advance, and a resume never replays the anchor's past.
+                    if (chunk.IsLast)
+                        InterlockedMax(ref _lastAckedLsn, chunk.AnchorLsn);
+                }
+
                 break;
             case TransactionUpdateFrame update:
                 foreach (var group in update.Updates)

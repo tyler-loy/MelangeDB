@@ -22,8 +22,10 @@ internal sealed class MelangeTransport : ICommitObserver
         MelangeReducerHost reducers,
         IOptionsMonitor<MelangeDbOptions> options,
         TimeProvider? time,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        CancellationToken stopping = default)
     {
+        Stopping = stopping;
         Engine = engine;
         Reducers = reducers;
         _options = options;
@@ -44,6 +46,9 @@ internal sealed class MelangeTransport : ICommitObserver
         Tickets = new TicketStore(Time);
         engine.AddCommitObserver(this);
     }
+
+    /// <summary>Fires on host shutdown, so live sockets close instead of pinning graceful stop.</summary>
+    public CancellationToken Stopping { get; }
 
     public MelangeEngine Engine { get; }
 

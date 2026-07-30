@@ -34,7 +34,8 @@ public static class MelangeEndpointRouteBuilderExtensions
             services.GetRequiredService<MelangeReducerHost>(),
             options,
             services.GetService<TimeProvider>(),
-            services.GetRequiredService<ILoggerFactory>());
+            services.GetRequiredService<ILoggerFactory>(),
+            services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>()?.ApplicationStopping ?? default);
         var basePath = (path ?? options.CurrentValue.Transport.Path).TrimEnd('/');
 
         // endpoints.Map (not MapGet) carries no method constraint, so both the HTTP/1.1 GET

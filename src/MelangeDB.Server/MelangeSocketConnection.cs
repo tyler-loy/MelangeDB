@@ -58,7 +58,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
     public async Task RunAsync(CancellationToken requestAborted)
     {
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(requestAborted, _closed.Token);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(requestAborted, _closed.Token, _transport.Stopping);
         var sender = Task.Run(() => SendLoopAsync(linked.Token), CancellationToken.None);
         StartHeartbeat();
         try
@@ -287,12 +287,14 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             if (_subscriptions.TryGetValue(subscribe.SubscriptionId, out var existing))
             {
                 // Re-scope: the moving-range pattern. The diff rides the data channel under the
-                // engine lock, so it cannot interleave incorrectly with commit deltas.
-                _transport.Engine.ReadConsistent(head =>
+                // engine lock, so it cannot interleave incorrectly with commit deltas. It is
+                // synthetic rather than commit-tied, so it carries LSN 0, which a client applies
+                // unconditionally instead of judging against its anchor.
+                _transport.Engine.ReadConsistent(_ =>
                 {
                     var ops = _transport.Subscriptions.Rescope(existing, query, limits);
                     if (ops.Count > 0)
-                        EnqueueDelta(new TransactionUpdateFrame(head, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
+                        EnqueueDelta(new TransactionUpdateFrame(0, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
                 });
                 return;
             }
