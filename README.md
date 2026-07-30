@@ -38,6 +38,8 @@ app.Run();
 
 ## Docs
 
+- **[docs/GLOSSARY.md](docs/GLOSSARY.md)** — every noun and what it means here. Start here if the vocabulary
+  isn't landing; it leads with the terms that sound alike and aren't.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the phase plans and why they're ordered the way they are.
 - **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — every setting MelangeDB exposes. New config items are
   added here in the same change that introduces them.

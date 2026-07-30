@@ -35,7 +35,7 @@ attachment plus a moving shard attachment.
 
 Placement rule to document prominently, because it prevents the expensive mistake:
 
-> A table belongs on the hub only if it is **not** written in the same transaction as regional world state.
+> A table belongs on the hub only if it is **not** written in the same transaction as shard-local world state.
 > More generally: place tables so transaction boundaries fall inside a node.
 
 The trap this catches: `InventoryItem` looks like hub data, but gathering decrements a `ResourceNode` (shard)

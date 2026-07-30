@@ -9,6 +9,9 @@ definition of done.
 - **Every configuration item goes in [CONFIGURATION.md](CONFIGURATION.md)**, in the same change that introduces
   it — not at the end of a phase. That document is the source of truth for key names, defaults, and reload
   semantics. Undocumented knobs are how a library becomes folklore.
+- **Every noun goes in [GLOSSARY.md](GLOSSARY.md)** when the phase introducing it lands. Vocabulary drift is how
+  a design becomes unexplainable — "region" survived in three documents after the concept became "shard," which
+  is exactly the failure the glossary prevents.
 - **Every phase instruments what it adds**, recorded in [OBSERVABILITY.md](OBSERVABILITY.md) in the same change.
   Span and metric names are public API — once a dashboard or alert depends on `melange.applier.lag`, renaming it
   is a breaking change. A phase is not done if its failure modes are invisible, which is why several phases name

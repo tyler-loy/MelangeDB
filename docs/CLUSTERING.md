@@ -55,8 +55,9 @@ The invariant to teach: **one writer per shard, many readers.**
 
 ## Node roles: hub and shard
 
-Your master/daughter split is the right topology. A player holds **two** attachments at once: a
-permanent one to the hub, and a moving one to whichever shard node owns where they are.
+The **hub** / **shard node** split (originally framed as master/daughter — see
+[GLOSSARY.md](GLOSSARY.md)) is the right topology. A player holds **two** attachments at once: a permanent one
+to the hub, and a moving one to whichever shard node owns where they are.
 
 ```
                     ┌─────────────┐
@@ -73,7 +74,7 @@ permanent one to the hub, and a moving one to whichever shard node owns where th
 The hub is *not* a bottleneck by construction, because its tables are the ones not touched by
 moment-to-moment gameplay. That is also the test for what belongs there:
 
-> **A table belongs on the hub only if it is not written in the same transaction as regional world state.**
+> **A table belongs on the hub only if it is not written in the same transaction as shard-local world state.**
 
 ### The trap this rule exists to catch
 

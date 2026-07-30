@@ -52,7 +52,7 @@ transaction rate and lag. Debugging a distributed world without these is guesswo
 
 ## Out of scope
 
-Dynamic rebalancing / quadtree splitting — still static assignment. Region-level Raft for HA. Cross-shard
+Dynamic rebalancing / quadtree splitting — still static assignment. Shard-level Raft for HA. Cross-shard
 distributed transactions beyond the handoff saga.
 
 ## Decisions to settle

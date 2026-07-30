@@ -189,7 +189,7 @@ without breaking anything: on restart, each applier resumes from its own checkpo
 
 - Atomicity across two unrelated storage engines with no 2PC and no XA — one append succeeds or it doesn't.
 - The RAM ceiling goes away: the log is on disk, and each projection manages its own residency.
-- Clustering is "one log per region" — see [CLUSTERING.md](CLUSTERING.md). The log is the primitive
+- Clustering is "one log per shard" — see [CLUSTERING.md](CLUSTERING.md). The log is the primitive
   that made it possible to settle the storage design before the clustering model.
 - Reducers become replayable, which makes deterministic tests cheap.
 
@@ -235,7 +235,7 @@ public sealed class DeathHandler(ILogger<DeathHandler> log) : IEventHandler<Play
 
 The bus is deliberately **not** a second source of truth. It is a projection of the log, exactly like
 the hot store and Postgres. `IEventTransport` is in-process by default; a distributed transport is what
-carries cross-region sagas and world events once clustering exists (see
+carries cross-shard sagas and world events once clustering exists (see
 [CLUSTERING.md](CLUSTERING.md)). Because the log already provides ordering and replay, the bus does not
 need to.
 
