@@ -85,6 +85,19 @@ public sealed class MelangeEngine : IDisposable
 
     public ApplierPipeline Appliers { get; }
 
+    /// <summary>The engine's telemetry, if enabled — shared with the dispatch path's rate limiter.</summary>
+    internal EngineTelemetry? Telemetry => _telemetry;
+
+    /// <summary>
+    /// A read-only <see cref="IDbView"/> over committed state — what policies evaluate against.
+    /// Reads see the hot store with no overlay: during commit fan-out (which runs before the store
+    /// applies) that is the pre-transaction committed state, never a partially applied write set.
+    /// </summary>
+    public IDbView CommittedView =>
+        _committedView ??= new CommittedReadView(Schema, HotStore);
+
+    private IDbView? _committedView;
+
     /// <summary>
     /// Invokes a reducer body as one transaction. <paramref name="reducerName"/> and
     /// <paramref name="arguments"/> are recorded as log metadata for audit; the write set is the

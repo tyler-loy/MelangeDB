@@ -237,6 +237,11 @@ comparison compares values, so the log, the stores, and range indexes share one 
 cursor can never be applied against the wrong log. A client holds one cursor per attachment; a stale or unknown
 epoch is an explicit failure answered with full resync.
 
+**Revocation** — Session-level exclusion of an identity, effective immediately and without restart: live
+sessions are terminated, new connections and `Reauthenticate` are refused until reinstated. Held in memory by
+`MelangeSessions` on purpose — it answers "the ban must take effect *now*, not when the token expires." The
+durable ban belongs at the IdP, which simply stops issuing the subject tokens.
+
 **Resume** — Reconnecting by naming the log epoch and last LSN a client acknowledged, per attachment, and
 receiving only the deltas it missed rather than recomputing a full initial set. Falls back to full resync when
 the gap can no longer be served — a decision the *server* makes, since a client assuming it can resume would
@@ -250,9 +255,11 @@ rare cross-shard case. Explicitly not ACID.
 
 **Scheduled reducer** — A reducer fired by a timer row rather than by a client. Not client-callable.
 
-**`[ServerOnly]`** — A column attribute: never sent to any client, admin included. Compile-time and free.
-The attribute exists from phase 02 — declaring it marks the table subscription-visible by intent, so the
-analyzer reports it on a non-`Public` table — and the wire enforcement lands with policies (04).
+**`[ServerOnly]`** — A column attribute: never sent to any client, admin included, in any mode — ad-hoc SQL's
+owner mode included, because "never leaves the process" has no modes. Enforced on the wire since phase 04:
+the column is absent from every frame, an explicit request for it (projection or predicate) is an error
+rather than a null, and a change touching only `[ServerOnly]` columns emits no frame at all — an update frame
+with unchanged visible columns would still be a timing oracle.
 
 **Shard** — An independently writable slice of the world, owned by exactly one node, with its own commit log.
 Internally single-writer, so the reducer model is unchanged; "multi-writer" is a property of the *cluster*.
@@ -291,11 +298,20 @@ type. Collisions are detected at schema registration.
 which is what makes scheduling transactional, recoverable, and partitionable — an inline `[Cron(...)]` attribute
 could be none of those.
 
+**Token store** — The client SDK's pluggable persistence for its bearer token (`ITokenStore`; in-memory
+default, file-backed reference implementation). Matters most for guests: the IdP mints guest identities, so
+the token *is* the character, and a client that loses it has lost the character.
+
 **Transaction** — One reducer invocation. Reads through the overlay, accumulates a write set, and commits by a
 single log append. Returns to commit, throws to abort with nothing appended.
 
 **Transactional outbox** — The pattern making the event bus safe: events go into the write set and publish only
 after the commit point, so an event can never escape for a rolled-back transaction.
+
+**Unpoliced-reducer report** — The startup artifact listing every client-callable reducer with no
+authorization policy attached (`Policies:UnpolicedReducerReport`: warn or refuse to start). It turns "did we
+forget one?" from a code-review question into a build artifact, and it is asserted in a test so it cannot
+silently regress.
 
 **Typed accessor** — The generated, strongly typed view onto a table through `ctx.Db` —
 `ctx.Db.Player.Id.Find(id)`, `ctx.Db.Creature.ChunkId.Filter(lo, hi)` — emitted as readonly structs over

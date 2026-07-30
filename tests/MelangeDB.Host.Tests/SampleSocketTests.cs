@@ -43,7 +43,13 @@ public class SampleSocketTests : IDisposable
         var address = host.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
         var uri = new Uri(new Uri(address.Replace("http://", "ws://")), "/melange");
 
-        await using var client = new MelangeClient(new MelangeClientOptions { Uri = uri });
+        // The token comes from the sample's dev issuer — the IdP stand-in; connections without one
+        // are rejected at the handshake now that the IdP is the gate.
+        await using var client = new MelangeClient(new MelangeClientOptions
+        {
+            Uri = uri,
+            Token = DevIdentity.MintToken("socket-test"),
+        });
         await client.ConnectAsync(TestContext.Current.CancellationToken);
 
         var visitors = await client.SubscribeAsync("SELECT * FROM Visitor", cancellationToken: TestContext.Current.CancellationToken);

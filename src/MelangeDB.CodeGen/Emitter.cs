@@ -175,6 +175,7 @@ internal static class Emitter
             builder.AppendLine($"                        IsAutoInc = {(column.IsAutoInc ? "true" : "false")},");
             builder.AppendLine($"                        IsUnique = {(column.IsUnique ? "true" : "false")},");
             builder.AppendLine($"                        IsIndexed = {(column.IsIndexed ? "true" : "false")},");
+            builder.AppendLine($"                        IsServerOnly = {(column.IsServerOnly ? "true" : "false")},");
             builder.AppendLine($"                        GetValue = static row => (({row})row).{column.Name},");
             builder.AppendLine($"                        SetValue = static (row, value) => global::System.Runtime.CompilerServices.Unsafe.Unbox<{row}>(row).{column.Name} = ({column.ClrFqn})value,");
             builder.AppendLine("                    },");
@@ -282,7 +283,15 @@ internal static class Emitter
         var arguments = string.Concat(Enumerable.Range(0, reducer.Parameters.Length).Select(static i => $", arg{i}"));
         builder.AppendLine($"                        (({reducer.ContainingTypeFqn})instance).{reducer.MethodName}(context{arguments});");
         builder.AppendLine("                        reader.End();");
-        builder.AppendLine("                    }),");
+        if (reducer.PolicyFqn is null)
+        {
+            builder.AppendLine("                    }),");
+        }
+        else
+        {
+            builder.AppendLine("                    },");
+            builder.AppendLine($"                    policy: typeof({reducer.PolicyFqn})),");
+        }
     }
 
     private static void EmitArgumentRead(StringBuilder builder, ParameterModel parameter, int index, string indent, bool bind)

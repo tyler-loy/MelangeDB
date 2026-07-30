@@ -8,14 +8,17 @@ namespace MelangeDB.Server;
 
 /// <summary>
 /// The transport's composition root, built once by <c>MapMelangeSocket</c>: the serializer, the
-/// subscription engine wired into the engine as a commit observer, the live connection set, and
-/// the ticket store. Everything here reads options through the monitor, so live keys apply with
-/// no restart.
+/// subscription engine wired into the engine as a commit observer, the authenticator over the
+/// host's JWT bearer scheme, the ticket store, the DI-resolved policy set, the per-identity
+/// connection caps, and the live connection set. Everything here reads options through the
+/// monitor, so live keys apply with no restart.
 /// </summary>
-internal sealed class MelangeTransport : ICommitObserver
+internal sealed class MelangeTransport : ICommitObserver, IDisposable
 {
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
     private readonly ConcurrentDictionary<ConnectionId, MelangeSocketConnection> _connections = new();
+    private readonly ConcurrentDictionary<Identity, int> _connectionsPerIdentity = new();
+    private readonly IDisposable _sessionsAttachment;
 
     public MelangeTransport(
         MelangeEngine engine,
@@ -23,6 +26,9 @@ internal sealed class MelangeTransport : ICommitObserver
         IOptionsMonitor<MelangeDbOptions> options,
         TimeProvider? time,
         ILoggerFactory loggerFactory,
+        MelangeAuthenticator authenticator,
+        MelangeSessions sessions,
+        PolicySet policies,
         CancellationToken stopping = default)
     {
         Stopping = stopping;
@@ -31,6 +37,9 @@ internal sealed class MelangeTransport : ICommitObserver
         _options = options;
         Time = time ?? TimeProvider.System;
         Logger = loggerFactory.CreateLogger("MelangeDB.Server");
+        Authenticator = authenticator;
+        Sessions = sessions;
+        Policies = policies;
         Serializer = options.CurrentValue.Transport.Serializer switch
         {
             WireSerializer.MessagePack => new MessagePackFrameSerializer(),
@@ -43,7 +52,8 @@ internal sealed class MelangeTransport : ICommitObserver
                 () => Subscriptions!.ActiveByTable)
             : null;
         Subscriptions = new SubscriptionEngine(engine, Telemetry);
-        Tickets = new TicketStore(Time);
+        Tickets = new TicketStore(Time, () => _options.CurrentValue.Auth.TicketTtlSeconds);
+        _sessionsAttachment = sessions.Attach(TerminateSessions);
         engine.AddCommitObserver(this);
     }
 
@@ -66,6 +76,12 @@ internal sealed class MelangeTransport : ICommitObserver
 
     public TicketStore Tickets { get; }
 
+    public MelangeAuthenticator Authenticator { get; }
+
+    public MelangeSessions Sessions { get; }
+
+    public PolicySet Policies { get; }
+
     public MelangeDbOptions Options => _options.CurrentValue;
 
     public int ActiveConnections => _connections.Count;
@@ -77,39 +93,53 @@ internal sealed class MelangeTransport : ICommitObserver
 
     public void OnConnectionClosed(MelangeSocketConnection connection) =>
         _connections.TryRemove(connection.ConnectionId, out _);
-}
 
-/// <summary>
-/// Mints and redeems connect tickets. Phase 03 ships the endpoint and the store; phase 04 wires
-/// redemption into the socket handshake and backs the ticket with a validated JWT. Tickets are
-/// single-use and short-lived so a leaked one is near-worthless.
-/// </summary>
-internal sealed class TicketStore(TimeProvider time)
-{
-    private const int TicketTtlSeconds = 30;
-
-    private readonly ConcurrentDictionary<string, DateTimeOffset> _tickets = new(StringComparer.Ordinal);
-
-    /// <summary>Mints a single-use ticket. Returns the ticket and its lifetime in seconds.</summary>
-    public (string Ticket, int ExpiresInSeconds) Mint()
+    /// <summary>
+    /// Counts a new connection against <c>Auth:MaxConnectionsPerIdentity</c>; false refuses it.
+    /// The caller must pair a true with <see cref="ReleaseConnectionSlot"/> on close.
+    /// </summary>
+    public bool TryReserveConnectionSlot(Identity identity)
     {
-        Prune();
-        var ticket = Guid.NewGuid().ToString("N");
-        _tickets[ticket] = time.GetUtcNow().AddSeconds(TicketTtlSeconds);
-        return (ticket, TicketTtlSeconds);
-    }
-
-    /// <summary>Redeems a ticket; each ticket redeems at most once, and never after expiry.</summary>
-    public bool TryRedeem(string ticket) =>
-        _tickets.TryRemove(ticket, out var expires) && expires >= time.GetUtcNow();
-
-    private void Prune()
-    {
-        var now = time.GetUtcNow();
-        foreach (var (ticket, expires) in _tickets)
+        var cap = _options.CurrentValue.Auth.MaxConnectionsPerIdentity;
+        while (true)
         {
-            if (expires < now)
-                _tickets.TryRemove(ticket, out _);
+            var current = _connectionsPerIdentity.GetValueOrDefault(identity);
+            if (current >= cap)
+                return false;
+            if (current == 0
+                ? _connectionsPerIdentity.TryAdd(identity, 1)
+                : _connectionsPerIdentity.TryUpdate(identity, current + 1, current))
+            {
+                return true;
+            }
         }
     }
+
+    public void ReleaseConnectionSlot(Identity identity)
+    {
+        while (_connectionsPerIdentity.TryGetValue(identity, out var current))
+        {
+            if (current <= 1
+                ? _connectionsPerIdentity.TryRemove(new KeyValuePair<Identity, int>(identity, current))
+                : _connectionsPerIdentity.TryUpdate(identity, current - 1, current))
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>Closes every live connection held by an identity — the moderation path.</summary>
+    public int TerminateSessions(Identity identity)
+    {
+        var closed = 0;
+        foreach (var connection in _connections.Values)
+        {
+            if (connection.Caller == identity && connection.Terminate())
+                closed++;
+        }
+
+        return closed;
+    }
+
+    public void Dispose() => _sessionsAttachment.Dispose();
 }

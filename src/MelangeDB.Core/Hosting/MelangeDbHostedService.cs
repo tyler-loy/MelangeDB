@@ -49,9 +49,35 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         var engine = (MelangeEngine)_provider.GetService(typeof(MelangeEngine))!;
         _engine = engine;
         _reloadBridge = _monitor.OnChange(next => CopyLiveKeys(next, engine.Options));
+        ReportUnpolicedReducers();
         _state.Started = true;
         LogStarted(_logger, engine.Log.HeadLsn, engine.Schema.Tables.Count);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The unpoliced-reducer report: every client-callable reducer with no authorization policy,
+    /// as a startup artifact rather than a code-review question. <c>Warn</c> logs the list;
+    /// <c>Fail</c> refuses to start.
+    /// </summary>
+    private void ReportUnpolicedReducers()
+    {
+        var mode = _monitor.CurrentValue.Policies.UnpolicedReducerReport;
+        if (mode == UnpolicedReducerReport.Off)
+            return;
+        var host = (MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost));
+        if (host is null || host.UnpolicedReducers is not { Count: > 0 } unpoliced)
+            return;
+
+        var list = string.Join(", ", unpoliced);
+        if (mode == UnpolicedReducerReport.Fail)
+        {
+            throw new InvalidOperationException(
+                $"Policies:UnpolicedReducerReport is Fail and {unpoliced.Count} client-callable reducer(s) declare no " +
+                $"authorization policy: {list}. Attach [Reducer(Policy = typeof(...))] to each, or lower the report to Warn.");
+        }
+
+        LogUnpolicedReducers(_logger, unpoliced.Count, list);
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -103,4 +129,9 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     [LoggerMessage(EventId = 1102, EventName = "MelangeStopped", Level = LogLevel.Information,
         Message = "MelangeDB stopped: drained, checkpointed, and flushed at LSN {HeadLsn}.")]
     private static partial void LogStopped(ILogger logger, ulong headLsn);
+
+    [LoggerMessage(EventId = 1104, EventName = "UnpolicedReducers", Level = LogLevel.Warning,
+        Message = "{Count} client-callable reducer(s) declare no authorization policy: {Reducers}. " +
+            "Each is callable by any authenticated client (Policies:DefaultReducerPosture).")]
+    private static partial void LogUnpolicedReducers(ILogger logger, int count, string reducers);
 }

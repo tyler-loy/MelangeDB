@@ -101,10 +101,13 @@ internal static class ModelExtractor
             ? k switch { 1 => "ClientConnected", 2 => "ClientDisconnected", _ => "Standard" }
             : "Standard";
         var reducerName = method.Name;
+        string? policyFqn = null;
         foreach (var named in attribute.NamedArguments)
         {
             if (named.Key == "Name" && named.Value.Value is string explicitName)
                 reducerName = explicitName;
+            if (named.Key == "Policy" && named.Value.Value is INamedTypeSymbol policyType)
+                policyFqn = Fqn(policyType);
         }
 
         var location = LocationInfo.From(
@@ -160,6 +163,7 @@ internal static class ModelExtractor
             MethodName: method.Name,
             ReducerName: reducerName,
             Kind: kind,
+            PolicyFqn: policyFqn,
             Parameters: new EquatableArray<ParameterModel>([.. parameters]),
             Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]));
     }

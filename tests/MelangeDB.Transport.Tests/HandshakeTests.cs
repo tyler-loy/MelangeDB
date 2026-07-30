@@ -71,14 +71,19 @@ public class HandshakeTests
     }
 
     [Fact]
-    public async Task Reauthenticate_is_acknowledged_as_a_frame_with_semantics_deferred_to_phase_04()
+    public async Task Reauthenticate_with_an_invalid_token_is_refused_without_dropping_the_session()
     {
         await using var host = await TransportTestHost.StartAsync();
         await using var raw = new RawSocketClient();
         await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
-        await raw.SendAsync(new ReauthenticateFrame("a-fresh-token"), TestContext.Current.CancellationToken);
+        await raw.SendAsync(new ReauthenticateFrame("not-a-jwt"), TestContext.Current.CancellationToken);
         var result = await raw.ReceiveUntilAsync<ReauthenticateResultFrame>(TestContext.Current.CancellationToken);
-        Assert.True(result.Accepted);
+        Assert.False(result.Accepted);
+
+        // The session lives on under its current token; the client may retry before the grace runs out.
+        await raw.SendAsync(new PingFrame(9), TestContext.Current.CancellationToken);
+        var pong = await raw.ReceiveUntilAsync<PongFrame>(TestContext.Current.CancellationToken);
+        Assert.Equal(9u, pong.Id);
     }
 
     [Fact]

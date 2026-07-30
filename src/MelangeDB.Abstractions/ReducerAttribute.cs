@@ -30,4 +30,13 @@ public sealed class ReducerAttribute : Attribute
 
     /// <summary>The reducer's public name; defaults to the method name.</summary>
     public string? Name { get; set; }
+
+    /// <summary>
+    /// An <see cref="IReducerPolicy"/> type deciding whether a client may call this reducer,
+    /// resolved from the call's DI scope — so it may read private tables. Applies to
+    /// client-originated calls only; in-process dispatch is the host's own code. A client-callable
+    /// reducer with no policy is listed by the unpoliced-reducer report
+    /// (<c>Policies:UnpolicedReducerReport</c>).
+    /// </summary>
+    public Type? Policy { get; set; }
 }

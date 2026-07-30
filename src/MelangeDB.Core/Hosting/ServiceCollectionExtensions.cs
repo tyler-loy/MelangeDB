@@ -32,7 +32,14 @@ public static class ServiceCollectionExtensions
 
         services.TryAddSingleton(new ReducerRegistry(builder.Reducers));
         foreach (var descriptor in builder.Reducers)
+        {
             services.TryAddScoped(descriptor.ReducerClass);
+
+            // Reducer policies resolve from the call's DI scope; registering them here means an
+            // attribute is all a policy needs, while an explicit registration still wins.
+            if (descriptor.Policy is { } policy)
+                services.TryAddScoped(policy);
+        }
 
         var tables = builder.Tables;
         services.TryAddSingleton(_ => new SchemaRegistry(tables));

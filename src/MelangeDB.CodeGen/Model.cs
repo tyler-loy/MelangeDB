@@ -152,6 +152,7 @@ internal sealed record ReducerModel(
     string MethodName,
     string ReducerName,
     string Kind,
+    string? PolicyFqn,
     EquatableArray<ParameterModel> Parameters,
     EquatableArray<DiagnosticInfo> Diagnostics)
 {

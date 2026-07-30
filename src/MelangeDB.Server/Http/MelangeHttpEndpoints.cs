@@ -8,14 +8,16 @@ namespace MelangeDB.Server;
 /// <summary>
 /// The plain-HTTP endpoints. WebSocket is the wrong shape for two of the three reference client
 /// types: admin consoles run one-shot SQL, and terrain generation bulk-loads tens of thousands of
-/// rows — neither wants a subscription protocol. Identity here is stubbed from the bearer token
-/// until phase 04 validates it.
+/// rows — neither wants a subscription protocol. Every endpoint requires a valid bearer JWT,
+/// validated against the host's own scheme: the IdP is the gate here exactly as on the socket.
 /// </summary>
 internal static class MelangeHttpEndpoints
 {
     /// <summary>POST {path}/call/{reducer} — one-shot reducer invocation: a JSON array of arguments.</summary>
     public static async Task CallAsync(HttpContext context, MelangeTransport transport)
     {
+        if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
+            return;
         var reducer = (string)context.Request.RouteValues["reducer"]!;
         object?[] arguments;
         try
@@ -36,7 +38,12 @@ internal static class MelangeHttpEndpoints
 
         try
         {
-            var lsn = transport.Reducers.Call(reducer, CallerOf(context), ConnectionId.None, ReducerArguments.Encode(arguments));
+            var lsn = transport.Reducers.Call(
+                reducer,
+                session.Identity,
+                ConnectionId.None,
+                ReducerArguments.Encode(arguments),
+                source: CallSource.Client(session.IsGuest));
             await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
             {
                 writer.WriteBoolean("ok", true);
@@ -50,6 +57,14 @@ internal static class MelangeHttpEndpoints
         catch (RejectedException exception)
         {
             await WriteErrorAsync(context, StatusCodes.Status400BadRequest, MelangeErrorCodes.Rejected, exception.Message).ConfigureAwait(false);
+        }
+        catch (RateLimitedException exception)
+        {
+            await WriteErrorAsync(context, StatusCodes.Status429TooManyRequests, MelangeErrorCodes.RateLimited, exception.Message).ConfigureAwait(false);
+        }
+        catch (ReducerDeniedException exception)
+        {
+            await WriteErrorAsync(context, StatusCodes.Status403Forbidden, MelangeErrorCodes.Denied, exception.Message).ConfigureAwait(false);
         }
         catch (ArgumentException)
         {
@@ -67,6 +82,8 @@ internal static class MelangeHttpEndpoints
     /// </summary>
     public static async Task BulkAsync(HttpContext context, MelangeTransport transport)
     {
+        if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
+            return;
         List<BulkRow> rows = [];
         try
         {
@@ -92,7 +109,7 @@ internal static class MelangeHttpEndpoints
 
         try
         {
-            var record = transport.Engine.BulkInsert(CallerOf(context), rows);
+            var record = transport.Engine.BulkInsert(session.Identity, rows);
             await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
             {
                 writer.WriteBoolean("ok", true);
@@ -107,12 +124,18 @@ internal static class MelangeHttpEndpoints
     }
 
     /// <summary>
-    /// POST {path}/sql — one-shot query: <c>{"query": "...", "params": {...}}</c>. Phase 03
-    /// executes the same four shapes subscriptions support, under the same public-table rule and
-    /// cost ceilings; aggregates land in phase 08.
+    /// POST {path}/sql — one-shot query: <c>{"query": "...", "params": {...}}</c>, the same four
+    /// shapes subscriptions support, under the same public-table rule and cost ceilings;
+    /// aggregates land in phase 08. <c>Sql:AdHocMode</c> is the two-mode contract:
+    /// <c>PolicyEnforced</c> (default) applies the caller's row and column policies exactly as a
+    /// subscription would; <c>Owner</c> deliberately bypasses them for operator tooling.
+    /// <c>[ServerOnly]</c> columns are excluded in both modes — "never leaves the process" has no
+    /// modes. Per-caller owner authorization lands with phase 08's full contract.
     /// </summary>
     public static async Task SqlAsync(HttpContext context, MelangeTransport transport)
     {
+        if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
+            return;
         string query;
         Dictionary<string, object?>? parameters = null;
         try
@@ -138,14 +161,25 @@ internal static class MelangeHttpEndpoints
         {
             var parsed = SqlSubsetParser.Parse(query, parameters);
             var limits = transport.Options.Subscriptions;
-            var (schema, projection, rows) = transport.Engine.ReadConsistent(head =>
+            var enforced = transport.Options.Sql.AdHocMode == AdHocSqlMode.PolicyEnforced;
+            var callerContext = enforced
+                ? new PolicyContext(session.Identity, session.IsGuest, transport.Engine.CommittedView)
+                : null;
+            var (subscription, rows) = transport.Engine.ReadConsistent(head =>
             {
-                var subscription = ServerSubscription.Compile(NullSink.Instance, 0, parsed, transport.Engine.Schema, limits);
-                var collected = new List<KeyValuePair<RowKey, ReadOnlyMemory<byte>>>();
+                var compiled = ServerSubscription.Compile(
+                    NullSink.Instance, 0, parsed, transport.Engine.Schema, limits,
+                    enforced ? transport.Policies : null, callerContext);
+                var collected = new List<(ReadOnlyMemory<byte> Row, IReadOnlySet<string>? Columns)>();
                 long bytes = 0;
-                foreach (var pair in subscription.MatchingRows(transport.Engine.HotStore))
+                foreach (var pair in compiled.MatchingRows(transport.Engine.HotStore))
                 {
-                    collected.Add(pair);
+                    if (!compiled.PolicyAdmits(pair.Value.Span))
+                        continue;
+
+                    // Column masks are evaluated here, under the lock, so they read the same
+                    // committed state the rows were collected at.
+                    collected.Add((pair.Value, compiled.VisibleColumns(pair.Value.Span)));
                     bytes += pair.Value.Length;
                     if (collected.Count > limits.MaxRowsPerSubscription || bytes > limits.MaxBytesPerSubscription)
                     {
@@ -155,10 +189,13 @@ internal static class MelangeHttpEndpoints
                     }
                 }
 
-                return (subscription.Schema, subscription.Projection, collected);
+                return (compiled, collected);
             });
 
-            var columns = parsed.Projection ?? [.. schema.Columns.Select(c => c.Name)];
+            var schema = subscription.Schema;
+            var columns = subscription.StaticWireColumns is { } wire
+                ? schema.Columns.Select(c => c.Name).Where(wire.Contains).ToArray()
+                : [.. schema.Columns.Select(c => c.Name)];
             await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
             {
                 writer.WriteStartArray("columns");
@@ -166,9 +203,11 @@ internal static class MelangeHttpEndpoints
                     writer.WriteStringValue(column);
                 writer.WriteEndArray();
                 writer.WriteStartArray("rows");
-                foreach (var (_, rowBytes) in rows)
+                foreach (var (rowBytes, visibleColumns) in rows)
                 {
-                    var values = RowWire.ToColumns(schema, rowBytes.Span, projection);
+                    // A column-policy mask writes null for a hidden value; [ServerOnly] columns
+                    // are absent from the column list entirely.
+                    var values = RowWire.ToColumns(schema, rowBytes.Span, visibleColumns);
                     writer.WriteStartArray();
                     foreach (var column in columns)
                         WriteJsonValue(writer, values.GetValueOrDefault(column));
@@ -188,24 +227,40 @@ internal static class MelangeHttpEndpoints
         }
     }
 
-    /// <summary>POST {path}/ticket — mints a single-use connect ticket. Redemption semantics land in phase 04.</summary>
-    public static Task TicketAsync(HttpContext context, MelangeTransport transport)
+    /// <summary>
+    /// POST {path}/ticket — exchanges a valid JWT (over TLS) for a single-use, short-lived connect
+    /// ticket presented on the socket URL. The path that works from browsers, whose WebSocket API
+    /// cannot set headers; a token in the query string would end up in access and proxy logs.
+    /// </summary>
+    public static async Task TicketAsync(HttpContext context, MelangeTransport transport)
     {
-        var (ticket, expiresInSeconds) = transport.Tickets.Mint();
-        return WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
+        if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
+            return;
+        var (ticket, expiresInSeconds) = transport.Tickets.Mint(session);
+        await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
         {
             writer.WriteString("ticket", ticket);
             writer.WriteNumber("expiresInSeconds", expiresInSeconds);
-        });
+        }).ConfigureAwait(false);
     }
 
-    private static Identity CallerOf(HttpContext context)
+    /// <summary>Validates the request's bearer token, or writes 401 and returns null.</summary>
+    private static async Task<AuthResult?> AuthenticateAsync(HttpContext context, MelangeTransport transport)
     {
-        string? token = null;
-        var authorization = context.Request.Headers.Authorization.ToString();
-        if (authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            token = authorization["Bearer ".Length..];
-        return StubIdentity.FromToken(token);
+        var token = MelangeEndpointRouteBuilderExtensions.BearerToken(context);
+        switch (await transport.Authenticator.ValidateAsync(token).ConfigureAwait(false))
+        {
+            case AuthResult session when !transport.Sessions.IsRevoked(session.Identity):
+                return session;
+            case AuthResult:
+                await WriteErrorAsync(context, StatusCodes.Status401Unauthorized, MelangeErrorCodes.Unauthorized, "This identity is revoked.").ConfigureAwait(false);
+                return null;
+            case AuthFailure failure:
+                await WriteErrorAsync(context, StatusCodes.Status401Unauthorized, MelangeErrorCodes.Unauthorized, failure.Reason).ConfigureAwait(false);
+                return null;
+            default:
+                return null;
+        }
     }
 
     /// <summary>
@@ -297,13 +352,4 @@ internal static class MelangeHttpEndpoints
         {
         }
     }
-}
-
-/// <summary>Phase 03's identity stub: a stable hash of the presented token. Phase 04 replaces this with validated issuer+subject.</summary>
-internal static class StubIdentity
-{
-    public static Identity FromToken(string? token) =>
-        string.IsNullOrEmpty(token)
-            ? Identity.Hash("melange-anonymous")
-            : Identity.Hash("melange-stub-token:" + token);
 }

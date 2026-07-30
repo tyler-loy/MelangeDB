@@ -64,6 +64,13 @@ public static class MelangeErrorCodes
     public const string TooManyBytes = "too_many_bytes";
     public const string TooManySubscriptions = "too_many_subscriptions";
     public const string OverflowResync = "overflow_resync";
+    public const string Unauthorized = "unauthorized";
+    public const string ConnectionCap = "connection_cap";
+    public const string RateLimited = "rate_limited";
+    public const string Denied = "denied";
+    public const string ServerOnlyColumn = "server_only_column";
+    public const string TokenExpired = "token_expired";
+    public const string IdentityChanged = "identity_changed";
 }
 
 /// <summary>One frame on the wire. Every frame carries its channel tag.</summary>
@@ -75,7 +82,12 @@ public abstract record Frame
     public abstract FrameType Type { get; }
 }
 
-/// <summary>The client's first frame: the protocol versions it speaks and a bearer token (semantics in phase 04).</summary>
+/// <summary>
+/// The client's first frame: the protocol versions it speaks and a bearer JWT. The token is
+/// validated at the handshake unless the connection already authenticated by header or connect
+/// ticket, in which case it is ignored; an unauthenticated Hello with no valid token is rejected —
+/// the IdP is the gate.
+/// </summary>
 public sealed record HelloFrame(int MinVersion, int MaxVersion, string? Token) : Frame
 {
     public override FrameType Type => FrameType.Hello;
@@ -191,9 +203,11 @@ public sealed record ResumeResultFrame(bool Accepted, string? Reason) : Frame
 }
 
 /// <summary>
-/// Presents a fresh token mid-session. The frame ships in phase 03 because a frame type cannot be
-/// retrofitted without a protocol bump; validation semantics land in phase 04 — until then the
-/// server accepts and stores nothing.
+/// Presents a fresh token mid-session, before the current one's expiry plus the server's grace
+/// window (<c>Auth:ReauthGraceSeconds</c>) runs out. A re-auth may refresh a token but never
+/// change the connection's identity: a token resolving to a different identity closes the
+/// connection, because every delta already sent was filtered under the current identity's
+/// policies.
 /// </summary>
 public sealed record ReauthenticateFrame(string Token) : Frame
 {

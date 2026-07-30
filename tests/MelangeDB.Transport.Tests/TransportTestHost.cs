@@ -25,15 +25,17 @@ internal sealed class TransportTestHost : IAsyncDisposable
 {
     private readonly Dictionary<string, string?> _settings;
     private readonly string _root;
+    private readonly Action<IServiceCollection>? _services;
     private WebApplication? _app;
     private int _http1Port;
     private int _http2Port;
 
-    private TransportTestHost(string root, Dictionary<string, string?> settings, ManualTimeProvider? time)
+    private TransportTestHost(string root, Dictionary<string, string?> settings, ManualTimeProvider? time, Action<IServiceCollection>? services)
     {
         _root = root;
         _settings = settings;
         Time = time;
+        _services = services;
     }
 
     public ManualTimeProvider? Time { get; }
@@ -48,14 +50,20 @@ internal sealed class TransportTestHost : IAsyncDisposable
 
     public MelangeReducerHost Reducers => _app!.Services.GetRequiredService<MelangeReducerHost>();
 
-    public static Identity Caller { get; } = Identity.Hash("transport-tests");
+    /// <summary>The identity of <see cref="TestTokens.Default"/> — server-side writes and the default client share it.</summary>
+    public static Identity Caller { get; } = TestTokens.IdentityOf(TestTokens.DefaultSubject);
+
+    public MelangeSessions Sessions => _app!.Services.GetRequiredService<MelangeSessions>();
+
+    public IServiceProvider Services => _app!.Services;
 
     public static async Task<TransportTestHost> StartAsync(
         Dictionary<string, string?>? settings = null,
-        bool manualTime = false)
+        bool manualTime = false,
+        Action<IServiceCollection>? services = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-transport-").FullName;
-        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null);
+        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null, services);
         await host.StartAppAsync();
         return host;
     }
@@ -65,9 +73,22 @@ internal sealed class TransportTestHost : IAsyncDisposable
 
     public MelangeClient CreateClient(Action<MelangeClientOptions>? configure = null)
     {
-        var options = new MelangeClientOptions { Uri = WsUri };
+        var options = new MelangeClientOptions { Uri = WsUri, Token = TestTokens.Default };
         configure?.Invoke(options);
         return new MelangeClient(options);
+    }
+
+    /// <summary>An HTTP client for the plain endpoints, authenticated as <paramref name="token"/> (default: the shared test identity).</summary>
+    public HttpClient CreateHttp(string? token = "default")
+    {
+        var http = new HttpClient { BaseAddress = HttpBase };
+        if (token is not null)
+        {
+            http.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token == "default" ? TestTokens.Default : token);
+        }
+
+        return http;
     }
 
     /// <summary>
@@ -132,9 +153,30 @@ internal sealed class TransportTestHost : IAsyncDisposable
         builder.Configuration.AddInMemoryCollection(_settings);
         if (Time is not null)
             builder.Services.AddSingleton<TimeProvider>(Time);
+
+        // The tests' own IdP: MelangeDB validates against the host's JWT bearer scheme, so the
+        // harness registers one over the test signing key. Under manual time, token lifetime is
+        // judged by the hand-cranked clock too — otherwise expiry tests would race the wall clock.
+        builder.Services.AddAuthentication().AddJwtBearer(jwt =>
+        {
+            jwt.TokenValidationParameters = new Microsoft.IdentityModel.Tokens.TokenValidationParameters
+            {
+                ValidIssuers = [TestTokens.Issuer, TestTokens.SecondIssuer],
+                ValidateAudience = false,
+                IssuerSigningKey = TestTokens.Key,
+                RoleClaimType = "role",
+            };
+            if (Time is { } time)
+            {
+                jwt.TokenValidationParameters.LifetimeValidator =
+                    (_, expires, _, _) => expires is null || expires > time.GetUtcNow().UtcDateTime;
+            }
+        });
+        builder.Services.AddSingleton<MelangeSessions>();
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Chunk).Assembly)
             .AddReducersFrom(typeof(TransportReducers).Assembly));
+        _services?.Invoke(builder.Services);
 
         var app = builder.Build();
         app.UseWebSockets();

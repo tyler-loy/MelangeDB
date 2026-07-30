@@ -16,8 +16,29 @@ public sealed class MelangeClientOptions
     /// </summary>
     public Version HttpVersion { get; set; } = System.Net.HttpVersion.Version11;
 
-    /// <summary>The bearer token presented in the handshake. Validation semantics land in phase 04.</summary>
+    /// <summary>
+    /// The bearer JWT presented at the handshake. When null, the client loads one from
+    /// <see cref="TokenStore"/> instead; connecting with neither fails — every connection presents
+    /// a valid token, and the server's IdP is the gate.
+    /// </summary>
     public string? Token { get; set; }
+
+    /// <summary>
+    /// Where the client persists its token across runs. Defaults to <see cref="InMemoryTokenStore"/>;
+    /// use <see cref="FileTokenStore"/> (or platform secure storage) in anything real — for a
+    /// guest, the token is the character.
+    /// </summary>
+    public ITokenStore TokenStore { get; set; } = new InMemoryTokenStore();
+
+    /// <summary>
+    /// Authenticate via the connect-ticket flow instead of the Hello token: POST the JWT to
+    /// <see cref="TicketUri"/> (derived from <see cref="Uri"/> by default), then open the socket
+    /// with the single-use ticket on the URL. The path that works where headers cannot be set.
+    /// </summary>
+    public bool UseTicket { get; set; }
+
+    /// <summary>Overrides the ticket endpoint; defaults to <c>{Uri as http(s)}/ticket</c>.</summary>
+    public Uri? TicketUri { get; set; }
 
     /// <summary>Requests <c>permessage-deflate</c> on the socket.</summary>
     public bool CompressionEnabled { get; set; }

@@ -86,6 +86,16 @@ The composition rule, which is easy to get backwards:
 > A client sees a row if *any* row policy admits it, and sees a column only if *every* applicable rule admits
 > it. A client requesting a `[ServerOnly]` column is an error, not a silently empty field.
 
+**Shipped in phase 04**, with three guarantees sharper than originally stated:
+
+- A predicate on a `[ServerOnly]` column is also an error — membership through hit-versus-miss is
+  information too.
+- A write touching **only** invisible columns emits **no frame at all**. An update frame with unchanged
+  visible columns would still tell a client *when* `NextThinkAt` changed — the timing oracle without the
+  value.
+- `[ServerOnly]` exclusion has **no modes**: it holds for admins, and it holds in ad-hoc SQL's owner mode.
+  Owner mode bypasses row and column *policies*; it does not reopen columns that never leave the process.
+
 ## Gap 2 — Reducer authorization
 
 Vibe Shaft calls `RequireAdmin(ctx)` **24 times**, by hand, at the top of privileged reducers. Every one of
@@ -105,8 +115,11 @@ can list every client-callable reducer with no policy attached, which turns "did
 review question into a build artifact.
 
 Default posture is worth deciding deliberately: deny-by-default is safer but makes every ordinary gameplay
-reducer carry an annotation. Probably allow-by-default with an explicit opt-in *and* a report listing
-unpoliced reducers, so the omission is visible without being fatal.
+reducer carry an annotation. **Decided and shipped in phase 04**: allow-by-default
+(`Policies:DefaultReducerPosture`, with `Deny` as the opt-in) *plus* the unpoliced-reducer report
+(`Policies:UnpolicedReducerReport` — warn at startup, or refuse to start), and the report is asserted in a
+test so it cannot silently regress. Policies apply to client-originated calls only; in-process dispatch is
+the host's own code. Denial happens before any transaction opens — no log record exists for a refused call.
 
 ## Gap 3 — Subscription cost limits
 
@@ -131,10 +144,11 @@ on read, plus a movement plausibility check. It works, and it costs a row write 
 for defense — write amplification on the hottest path, and log volume, to enforce something the transport layer
 could enforce for free.
 
-MelangeDB should provide connection-level reducer rate limiting (token bucket per identity, configurable per
-reducer, rejected before a transaction opens). Game-semantic checks like movement plausibility stay in the
-module — that's gameplay logic, not infrastructure — but "no more than N calls/second" should not require
-schema.
+MelangeDB provides exactly this since phase 04: a token bucket per identity **per reducer**
+(`RateLimit:*`, per-reducer overrides), applied to client-originated calls and rejected **before** a
+transaction opens — asserted in tests by the log head not moving, not just by the error coming back.
+Game-semantic checks like movement plausibility stay in the module — that's gameplay logic, not
+infrastructure — but "no more than N calls/second" no longer requires schema.
 
 ## Gap 5 — Argument validation
 
@@ -165,6 +179,13 @@ lifetime.** `Reauthenticate` refreshes a token; it must not switch identity. Eve
 connection was computed under the current identity's row and column policies, so an in-place switch delivers
 A's filtered rows to B — a leak that bypasses the entire policy layer without triggering any of it. A token
 resolving to a different identity closes the connection instead.
+
+All of this shipped with phase 04, plus the moderation surface it implies: `MelangeSessions` terminates every
+live session for an identity and holds an in-memory revocation set checked on connect and on re-auth —
+effective immediately, no restart. Session-level on purpose: it answers "the ban takes effect *now*, not in
+55 minutes when the token expires"; the durable ban belongs at the IdP, which stops issuing the subject
+tokens. Expiry is enforced mid-session too — a token past its lifetime plus `Auth:ReauthGraceSeconds`
+without a successful `Reauthenticate` closes the connection.
 
 ## Explicitly not defended against
 
