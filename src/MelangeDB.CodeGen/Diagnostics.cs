@@ -103,6 +103,15 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor DuplicateTableName = new(
+        "MELANGE0013",
+        "Table names must be unique within a compilation",
+        "Table '{0}' (struct {1}) collides with another table in this compilation. " +
+        "The TableId derives from the table name and generated type names derive from the struct name, so both must be unique; rename one of them.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor KeyColumnNotEncodable = new(
         "MELANGE0012",
         "Column type cannot serve as a key",

@@ -68,7 +68,7 @@ Source name: `MelangeDB`.
 
 | Span | Phase | Attributes | Notes |
 | --- | --- | --- | --- |
-| `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows`; `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off; `melange.reducer.args` only when `Telemetry:IncludeReducerArguments` is opted in | The root span for client-initiated work. |
+| `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows`; `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off; `melange.reducer.args` only when `Telemetry:IncludeReducerArguments` is opted in (formatted values for in-process calls; the hex-encoded argument payload, capped at 256 bytes, for encoded dispatch) | The root span for client-initiated work. |
 | `melange.commit` | 01 | `melange.lsn`, `melange.writeset.bytes` | The critical section; a child `melange.fsync` span isolates durability cost from serialization cost. |
 | `melange.apply` | 01 | `melange.applier` | One per applier, per batch. |
 | `melange.subscription.initial` | 03 | `melange.table`, `melange.rows`, `melange.bytes` | The expensive half of a subscription; worth its own span. |

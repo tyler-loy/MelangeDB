@@ -17,3 +17,4 @@ MELANGE0009 | MelangeDB | Error | Reducer signature is invalid
 MELANGE0010 | MelangeDB | Warning | Reducer bodies must perform no I/O
 MELANGE0011 | MelangeDB | Error | Column type is not supported
 MELANGE0012 | MelangeDB | Error | Column type cannot serve as a key
+MELANGE0013 | MelangeDB | Error | Table names must be unique within a compilation

@@ -80,6 +80,7 @@ internal static class ModelExtractor
             TypeName: type.Name,
             SafeName: SafeName(type),
             TableName: tableName,
+            Location: typeLocation,
             IsPublic: isPublic,
             Tier: tier,
             Residency: residency,

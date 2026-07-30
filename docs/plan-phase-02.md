@@ -27,7 +27,7 @@ It also removes the reflection path from phase 01, which matters for startup tim
   `ctx.Random`); a subscription-visible table that is not `Public` — shipped as MELANGE0007, with
   `[ServerOnly]` as the compile-time marker of subscription visibility: a column mask only means anything
   on a table clients can see, so declaring one on a private table is the detectable mismatch. Each with a
-  stable `MELANGE####` id (the full register is MELANGE0001–0012; see `MelangeDB.CodeGen/Diagnostics.cs`).
+  stable `MELANGE####` id (the full register is MELANGE0001–0013; see `MelangeDB.CodeGen/Diagnostics.cs`).
 
 **`MelangeDB.Core` — host integration**
 - `AddMelangeDb(Action<MelangeDbBuilder>)` with `UseHotStore`, `AddTablesFrom`, `AddReducersFrom`.

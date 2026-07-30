@@ -59,6 +59,7 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
             .Where(static t => t.IsValid)
             .OrderBy(static t => t.TableName, StringComparer.Ordinal)
             .ToArray();
+        validTables = ReportNameCollisions(production, validTables);
         var validReducers = reducers
             .Where(static r => r.IsValid)
             .OrderBy(static r => r.ReducerName, StringComparer.Ordinal)
@@ -67,5 +68,37 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         if (validTables.Length == 0 && validReducers.Length == 0)
             return;
         production.AddSource("MelangeModel.g.cs", Emitter.EmitModel(validTables, validReducers));
+    }
+
+    /// <summary>
+    /// Reports MELANGE0013 for tables colliding on table name (the TableId axis) or struct name
+    /// (the generated-type-name axis), and drops the colliding tables from the emitted model —
+    /// turning a confusing runtime registration failure into a compile-time error.
+    /// </summary>
+    private static TableModel[] ReportNameCollisions(SourceProductionContext production, TableModel[] tables)
+    {
+        var colliding = new HashSet<TableModel>();
+        foreach (var group in tables.GroupBy(static t => t.TableName, StringComparer.Ordinal))
+        {
+            if (group.Count() > 1)
+                colliding.UnionWith(group);
+        }
+
+        foreach (var group in tables.GroupBy(static t => t.TypeName, StringComparer.Ordinal))
+        {
+            if (group.Count() > 1)
+                colliding.UnionWith(group);
+        }
+
+        foreach (var table in colliding)
+        {
+            production.ReportDiagnostic(Diagnostic.Create(
+                Diagnostics.DuplicateTableName,
+                table.Location.ToLocation(),
+                table.TableName,
+                table.TypeFqn));
+        }
+
+        return colliding.Count == 0 ? tables : tables.Where(t => !colliding.Contains(t)).ToArray();
     }
 }

@@ -122,6 +122,7 @@ internal sealed record TableModel(
     string TypeName,
     string SafeName,
     string TableName,
+    LocationInfo Location,
     bool IsPublic,
     string Tier,
     string Residency,

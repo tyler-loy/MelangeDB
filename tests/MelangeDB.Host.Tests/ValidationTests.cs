@@ -47,6 +47,20 @@ public class ValidationTests : IAsyncLifetime
         AssertRejected("Clamp", 1, poison);
 
     [Fact]
+    public void Finite_double_overflowing_a_declared_float_is_rejected_during_decode()
+    {
+        // 1e39 is a perfectly finite double, but narrowing it to the declared float parameter
+        // mints PositiveInfinity — the exact poison RejectNonFiniteFloats exists to stop.
+        AssertRejected("Clamp", 1, 1e39);
+    }
+
+    [Fact]
+    public void The_same_large_value_is_accepted_for_a_declared_double()
+    {
+        _host.Reducers().Call("AddNote", TestApp.Caller, "big-but-finite", 1e39);
+    }
+
+    [Fact]
     public void Over_long_string_is_rejected_during_decode()
     {
         AssertRejected("AddNote", new string('x', 5000), 1.0);

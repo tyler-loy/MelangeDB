@@ -93,7 +93,18 @@ public ref struct ReducerArgsReader
     public float ReadFloat32()
     {
         var value = ReadFloat64();
-        return (float)value;
+        var narrowed = (float)value;
+
+        // ReadFloat64 checked the double, but a finite double beyond float range (1e39) narrows
+        // to infinity — the cast itself can mint the non-finite value the option exists to stop.
+        if (_limits.RejectNonFiniteFloats && !float.IsFinite(narrowed))
+        {
+            throw new ReducerArgumentException(
+                $"Value {value} overflows the declared float parameter to {narrowed}; " +
+                "non-finite floats are rejected (Validation:RejectNonFiniteFloats).");
+        }
+
+        return narrowed;
     }
 
     public double ReadFloat64()

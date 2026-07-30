@@ -297,6 +297,82 @@ public class DiagnosticTests
     }
 
     [Fact]
+    public void Melange0013_fires_on_two_tables_with_the_same_struct_name()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            namespace World
+            {
+                [Table]
+                public partial struct Player
+                {
+                    [PrimaryKey] public long Id;
+                }
+            }
+
+            namespace Lobby
+            {
+                [Table]
+                public partial struct Player
+                {
+                    [PrimaryKey] public long Id;
+                }
+            }
+            """);
+        Assert.Equal(2, result.MelangeDiagnostics.Count(d => d.Id == "MELANGE0013"));
+    }
+
+    [Fact]
+    public void Melange0013_fires_on_two_structs_declaring_the_same_table_name()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Name = "player")]
+            public partial struct PlayerRow
+            {
+                [PrimaryKey] public long Id;
+            }
+
+            [Table(Name = "player")]
+            public partial struct PlayerRecord
+            {
+                [PrimaryKey] public long Id;
+            }
+            """);
+        Assert.Equal(2, result.MelangeDiagnostics.Count(d => d.Id == "MELANGE0013"));
+    }
+
+    [Fact]
+    public void Melange0013_is_silent_when_names_are_distinct()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            namespace World
+            {
+                [Table]
+                public partial struct Player
+                {
+                    [PrimaryKey] public long Id;
+                }
+            }
+
+            namespace Lobby
+            {
+                [Table]
+                public partial struct LobbyPlayer
+                {
+                    [PrimaryKey] public long Id;
+                }
+            }
+            """);
+        Assert.Empty(result.MelangeDiagnostics);
+        Assert.Empty(result.Errors);
+    }
+
+    [Fact]
     public async Task Valid_tables_and_reducers_compile_clean_with_zero_melange_diagnostics()
     {
         var source = """

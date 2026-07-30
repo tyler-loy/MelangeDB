@@ -189,7 +189,7 @@ public sealed class MelangeEngine : IDisposable
         ReadOnlyMemory<byte> encodedArguments,
         ConnectionId connectionId)
     {
-        using var activity = _telemetry?.StartReducer(reducerName, caller, arguments);
+        using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments);
         var started = Stopwatch.GetTimestamp();
         var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
         var writeSet = new WriteSet();

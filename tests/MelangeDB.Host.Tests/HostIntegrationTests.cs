@@ -160,6 +160,46 @@ public class HostIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Encoded_arguments_reach_the_reducer_span_when_opted_in()
+    {
+        using var host = TestApp.Build(_root, new Dictionary<string, string?>
+        {
+            ["MelangeDb:Telemetry:IncludeReducerArguments"] = "true",
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+
+        var captured = new List<string>();
+        using var listener = new System.Diagnostics.ActivityListener
+        {
+            ShouldListenTo = source => source.Name == "MelangeDB",
+            Sample = (ref System.Diagnostics.ActivityCreationOptions<System.Diagnostics.ActivityContext> _) =>
+                System.Diagnostics.ActivitySamplingResult.AllData,
+            ActivityStopped = activity =>
+            {
+                if (activity.OperationName == "melange.reducer" && activity.GetTagItem("melange.reducer.args") is string args)
+                {
+                    lock (captured)
+                    {
+                        captured.Add(args);
+                    }
+                }
+            },
+        };
+        System.Diagnostics.ActivitySource.AddActivityListener(listener);
+
+        var text = $"traced-{Guid.NewGuid():N}";
+        var expected = Convert.ToHexStringLower(ReducerArguments.Encode(text, 1.0));
+        host.Reducers().Call("AddNote", TestApp.Caller, text, 1.0);
+
+        lock (captured)
+        {
+            Assert.Contains(expected, captured);
+        }
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
     public async Task Unknown_reducer_is_rejected_by_name()
     {
         using var host = TestApp.Build(_root);
