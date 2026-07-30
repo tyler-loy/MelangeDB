@@ -140,12 +140,34 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         EnqueuePriority(new ErrorFrame(
             MelangeErrorCodes.Unauthorized,
             "This identity's sessions were terminated by the server."));
-        _ = Task.Run(async () =>
-        {
-            await DrainPriorityLaneAsync().ConfigureAwait(false);
-            _socket.Abort();
-        });
+        _ = CloseAfterPriorityDrainAsync();
         return true;
+    }
+
+    /// <summary>
+    /// Ends the connection <em>after</em> the queued explanation reaches the peer: an immediate
+    /// abort would RST the socket and discard the client's unread buffer, making the close mute.
+    /// The close frame flushes behind the error frame, the read loop then observes the peer's
+    /// answer (or its drop), and a real-time backstop ends things for a peer that never reacts.
+    /// </summary>
+    private async Task CloseAfterPriorityDrainAsync()
+    {
+        await DrainPriorityLaneAsync().ConfigureAwait(false);
+        try
+        {
+            if (_socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                await _socket.CloseOutputAsync(WebSocketCloseStatus.PolicyViolation, "session closed", timeout.Token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or WebSocketException or ObjectDisposedException or InvalidOperationException)
+        {
+        }
+
+        await Task.Delay(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        if (!_closed.IsCancellationRequested)
+            await _closed.CancelAsync().ConfigureAwait(false);
     }
 
     /// <summary>Waits briefly for the priority lane — error frames included — to hit the socket.</summary>
@@ -621,11 +643,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 EnqueuePriority(new ErrorFrame(
                     MelangeErrorCodes.TokenExpired,
                     $"The session token expired and Auth:ReauthGraceSeconds ({options.Auth.ReauthGraceSeconds}s) passed without Reauthenticate."));
-                _ = Task.Run(async () =>
-                {
-                    await DrainPriorityLaneAsync().ConfigureAwait(false);
-                    _socket.Abort();
-                });
+                _ = CloseAfterPriorityDrainAsync();
                 return;
             }
 
