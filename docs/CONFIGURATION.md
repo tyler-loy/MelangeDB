@@ -35,6 +35,15 @@ is a build-time switch and lives in the project file, not in `appsettings.json` 
 `MaxBufferedBytes` exists to bound per-connection memory, and a default that buffers without bound past its own
 trigger would make the trigger meaningless. `Buffer` remains as an explicit opt-in for trusted links.
 
+**Shipped as of phase 05** (defaults verified against `SchedulerOptions`): every `Scheduler:*` key. Two doc
+corrections made when it shipped: (1) `Scheduler:CatchUpAfterDowntime` is **`restart`**, not the `live` this
+register planned — it is read exactly once, at scheduler start after recovery, which is the only moment
+downtime catch-up can mean anything, and a "live" label on a startup-only key would be an empty promise;
+(2) `Scheduler:MaxConcurrentTicks` shipped **accepted-and-reserved at its default of 1**: the scheduler is
+a single-threaded dispatch loop on purpose, because reducer transactions serialize on the engine's
+single-writer lock and a tick worker pool would parallelize nothing that matters (see
+docs/plan-phase-05.md, scheduler fairness). Values above 1 bind and validate but do not change dispatch.
+
 **Shipped as of phase 04** (defaults verified against `AuthOptions`, `PoliciesOptions`, `RateLimitOptions`,
 and `SqlOptions`): every `Auth:*`, `Policies:*`, and `RateLimit:*` key, plus `Sql:AdHocMode` — shipped ahead
 of its phase-08 row because `/melange/sql` already returns rows, so the policy contract could not wait. Three
@@ -162,10 +171,10 @@ to fix it without a code change and a redeploy.
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Scheduler:Enabled` | bool | `true` | live | 05 | Off is useful for tooling processes that must not tick the world. |
-| `Scheduler:OverrunPolicy` | enum | `Skip` | live | 05 | `Skip` \| `RunImmediately` \| `Coalesce`. `Skip` and log is the default because silent pile-up is how a simulation death-spirals under load. |
-| `Scheduler:CatchUpAfterDowntime` | enum | `FireOnce` | live | 05 | `FireOnce` \| `CatchUpAll`. `FireOnce` is right for a simulation; `CatchUpAll` is right for billing. |
-| `Scheduler:MaxConcurrentTicks` | int | `1` | live | 05 | Default 1 keeps transactions serialized. Raising it needs care. |
+| `Scheduler:Enabled` | bool | `true` | live | 05 | Off is useful for tooling processes that must not tick the world. Timer rows are untouched while off; re-enabling fires whatever is due. |
+| `Scheduler:OverrunPolicy` | enum | `Skip` | live | 05 | `Skip` \| `RunImmediately` \| `Coalesce`. Applied when a tick ran past its own interval: skip the missed fires and resume one interval after the slow tick (default — silent pile-up is how a simulation death-spirals under load), replay every missed fire back to back, or collapse them into one immediate fire. All three log (EventId 1301) and count `melange.scheduler.overruns`. |
+| `Scheduler:CatchUpAfterDowntime` | enum | `FireOnce` | restart | 05 | `FireOnce` \| `CatchUpAll`, applied to repeating timers overdue at recovery. `FireOnce` is right for a simulation (the world was paused); `CatchUpAll` fires once per missed interval and is right for billing. Downtime is measured from the recovered log's tail record, since repeating timers persist no per-fire bookkeeping. Was planned `live`; corrected — it acts at scheduler start only. |
+| `Scheduler:MaxConcurrentTicks` | int | `1` | live | 05 | Default 1 keeps transactions serialized. Shipped accepted-and-reserved: dispatch is a single-threaded loop because the engine's single-writer lock serializes tick transactions anyway; see the phase 05 note above. |
 
 ## Event bus
 
