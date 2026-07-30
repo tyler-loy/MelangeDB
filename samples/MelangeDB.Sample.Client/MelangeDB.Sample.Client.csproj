@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>MelangeDB.Sample.Client</RootNamespace>
+    <Description>A console client for the sample worker: connects, subscribes, calls a reducer, and watches the delta arrive.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
+  </ItemGroup>
+
+</Project>
