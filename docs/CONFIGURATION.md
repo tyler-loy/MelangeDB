@@ -16,11 +16,17 @@ reference.
 
 **Shipped as of phase 01** (defaults verified against `MelangeDbOptions` and friends in `MelangeDB.Core`):
 `HotStore:Path`, `CommitLog:Path`, `CommitLog:FsyncPolicy`, `CommitLog:FsyncIntervalMs`, `Telemetry:Enabled`,
-`Telemetry:IncludeCallerIdentity`, `Telemetry:IncludeReducerArguments`. One nuance until phase 02's host
-integration binds these through `IOptionsMonitor<T>`: the options objects exist and `live` keys are read per
-operation (mutating the options instance takes effect on the next commit), but there is no configuration
-section binding yet — that is phase 02's `AddMelangeDb` deliverable. `HotStore:Path` is created and reserved by
-the engine; the in-memory store persists nothing in it until the paging engine lands in phase 07.
+`Telemetry:IncludeCallerIdentity`, `Telemetry:IncludeReducerArguments`. `HotStore:Path` is created and
+reserved by the engine; the in-memory store persists nothing in it until the paging engine lands in phase 07.
+
+**Shipped as of phase 02**: `Validation:RejectNonFiniteFloats`, `Validation:MaxStringLength`,
+`Validation:MaxCollectionLength`, and `Telemetry:SlowReducerMs` (defaults verified against
+`ValidationOptions`/`TelemetryOptions`). Phase 02's `AddMelangeDb` also delivered the binding itself: the
+whole `MelangeDb:` section binds through `IOptions<T>`/`IOptionsMonitor<T>`, so `appsettings.json`,
+environment variables, and Azure App Configuration all work with no MelangeDB-specific code, and `live` keys
+reach the running engine through the hosted service's reload bridge — a configuration change takes effect on
+the next operation with no restart. One doc correction made when it shipped: `Diagnostics:EmitGeneratedFiles`
+is a build-time switch and lives in the project file, not in `appsettings.json` — see its row.
 
 ## Conventions
 
@@ -175,7 +181,7 @@ Ignored entirely by single-node deployments.
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `Diagnostics:ReportApplierLag` | bool | `true` | live | 08 | A silently stalled Postgres applier — writes succeeding while the tier falls hours behind — is the dangerous failure mode. Not optional in practice. |
-| `Diagnostics:EmitGeneratedFiles` | bool | `false` | restart | 02 | Writes source-generator output to disk. Incremental generators fail obscurely; this pays for itself. |
+| `Diagnostics:EmitGeneratedFiles` | bool | `false` | restart | 02 | Writes source-generator output to disk. Incremental generators fail obscurely; this pays for itself. **Realized as the standard MSBuild property `<EmitCompilerGeneratedFiles>` in the consuming project file** — it acts at compile time, so it cannot be an `appsettings.json` key; the tests and sample set it, and output lands under `obj/.../generated`. |
 
 ## Telemetry
 

@@ -77,6 +77,10 @@ Source name: `MelangeDB`.
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
+A `melange.reducer` span whose duration exceeds `Telemetry:SlowReducerMs` additionally carries a
+`melange.slow_reducer` span event (with `melange.duration_ms`) and produces a warning log entry — shipped
+with phase 02, threshold live-reloadable.
+
 ### Context propagation
 
 Two places, both of which need explicit protocol support:
@@ -146,14 +150,19 @@ corresponds to a documented silent failure mode:
 Structured through `ILogger` with stable `EventId`s so log-based alerts don't break on message rewording.
 No parallel logging abstraction — the host's configured providers are the whole story.
 
+Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
+`1101 MelangeStarted`, `1102 MelangeStopped` (02).
+
 ## Health checks
 
 Standard `IHealthCheck` registrations, since they're nearly free once the metrics exist. These require a DI
-host to register into, so the first one lands with phase 02's host integration rather than phase 01:
+host to register into, so the first one landed with phase 02's host integration rather than phase 01.
+`AddMelangeDb` registers each check automatically; the host only opts into health checks at all
+(`AddHealthChecks()`).
 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
-| `melange-log` | The commit log is unwritable or out of disk | 02 |
+| `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
 | `melange-applier` | Any applier's lag exceeds its threshold | 08 |
 | `melange-shard` | This node's shard assignment is unknown or contested | 09 |
 
