@@ -107,6 +107,10 @@ generation and similar mass loads.
 **Commit log** — The ordered, append-only, LSN-addressed record of committed transactions. **The system of
 record.** Every store is a projection of it. One log per shard.
 
+**Connect ticket** — A single-use, short-lived credential exchanged for a JWT over HTTP and presented when
+opening a socket. Exists because the browser WebSocket API cannot set headers, so header-based auth would lock
+out web clients entirely.
+
 **Commit point** — The single atomic log append. Before it nothing happened; after it the transaction is
 durable. This is what buys atomicity across heterogeneous stores with no 2PC.
 
@@ -179,6 +183,10 @@ accounts, registration, statistics. Eventually consistent with the log by design
 
 **Resident** — Residency: the table is pinned wholly in memory. Opt-in, because a resident-by-default store
 reproduces the RAM ceiling MelangeDB exists to remove.
+
+**Resume** — Reconnecting by naming the last LSN a client acknowledged and receiving only the deltas it missed,
+rather than recomputing a full initial set. Falls back to full resync when the gap can no longer be served —
+a decision the *server* makes, since a client assuming it can resume would silently diverge.
 
 **Residency** — Whether a table must stay in memory. Declared, so the memory budget is computable from source
 rather than discovered under load.

@@ -94,6 +94,12 @@ to fix it without a code change and a redeploy.
 | `Validation:RejectNonFiniteFloats` | bool | `true` | live | 02 | Rejects `NaN` / `±Infinity` reducer arguments during decode. A `NaN` position propagates through terrain and chunk math and poisons rows that then replicate to every client. Turning this off should feel alarming. |
 | `Validation:MaxStringLength` | int | `4096` | live | 02 | |
 | `Validation:MaxCollectionLength` | int | `4096` | live | 02 | |
+| `Transport:CompressionEnabled` | bool | `true` | restart | 03 | `permessage-deflate`. Terrain blobs are already RLE-compressed; delta frames of many small rows are what benefit. |
+| `Transport:HeartbeatIntervalMs` | int | `15000` | live | 03 | |
+| `Transport:HeartbeatTimeoutMs` | int | `45000` | live | 03 | A closed socket is not the only way a client goes away; this is what makes `ClientDisconnected` fire on ungraceful drops. |
+| `Transport:HttpEndpointsEnabled` | bool | `true` | restart | 03 | One-shot reducer calls, bulk ingestion, tickets. WebSocket is the wrong shape for CLI tools and admin consoles. |
+| `Transport:MaxInitialSetChunkBytes` | int | `262144` | live | 03 | Large initial sets are chunked and interleaved so a 30MB terrain subscription can't block a movement reducer response. |
+| `Resume:RetentionWindowSeconds` | int | `300` | live | 03 | How far back a reconnecting client can resume. Too small and every blip becomes a full resync; too large and it fights log compaction. |
 | `Subscriptions:MaxPerConnection` | int | `64` | live | 03 | |
 | `Subscriptions:BackpressurePolicy` | enum | `Buffer` | live | 03 | `Buffer` \| `DropAndResync` \| `Disconnect`. Matters most during bulk terrain streaming to a slow client. |
 | `Subscriptions:MaxBufferedBytes` | long | `16777216` | live | 03 | Per connection; the trigger for the policy above. |
@@ -110,6 +116,8 @@ to fix it without a code change and a redeploy.
 | `Auth:Audience` | string | — | restart | 04 | |
 | `Auth:AllowGuests` | bool | `true` | live | 04 | |
 | `Auth:GuestSigningKey` | string | — | restart | 04 | **Secret.** Belongs in a secret store, never `appsettings.json`. Guest identities are forgeable without it being secret. |
+| `Auth:TicketTtlSeconds` | int | `30` | live | 04 | Connect tickets are single-use and short-lived, so a leaked one is near-worthless. Exists because browsers cannot set WebSocket headers. |
+| `Auth:ReauthGraceSeconds` | int | `120` | live | 04 | How long past token expiry a connection survives while awaiting `Reauthenticate`. Zero means expiry drops the socket — correct for a bank, wrong for a game. |
 | `Auth:MaxConnectionsPerIdentity` | int | `4` | live | 04 | Without this, every per-identity defense is bypassed by opening more connections. |
 | `Auth:GuestIssuancePerMinute` | int | `60` | live | 04 | Unlimited guest identities bypass every per-identity limit by rotating identity. |
 | `Policies:UnpolicedReducerReport` | enum | `Warn` | restart | 04 | `Off` \| `Warn` \| `Fail`. Lists client-callable reducers with no authorization policy. Turns "did we forget one?" into a build artifact. |

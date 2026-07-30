@@ -14,11 +14,32 @@ it worth doing early for its own sake.
 ## Deliverables
 
 **Identity**
-- JWT bearer validation on the websocket handshake using the host's existing ASP.NET Core authentication —
-  no bespoke token system. `Identity` is a stable hash of the token subject.
+- JWT bearer validation using the host's existing ASP.NET Core authentication — no bespoke token system.
+  `Identity` is a stable hash of the token subject.
 - Signed **guest identities** for anonymous play, issued by the server and durable across reconnects.
 - `ctx.Caller` (identity) and `ctx.ConnectionId` (this session) are distinct, and the distinction is
   documented — one identity may hold several connections.
+
+**Connect tickets — because browsers cannot set WebSocket headers.** The obvious design, an
+`Authorization: Bearer` header on the handshake, works from Godot and .NET and is *impossible* from the browser
+WebSocket API, which permits no custom headers. That would leave the reference project's admin web console
+unable to authenticate at all. The alternatives are all worse than a ticket: a token in the query string ends up
+in access logs and proxy logs, and the `Sec-WebSocket-Protocol` smuggle is a hack that confuses every
+intermediary.
+
+So: `POST /melange/ticket` with the JWT over TLS returns a **single-use, ~30-second ticket** presented on the
+socket URL. Header auth stays supported for clients that can do it, but the ticket is the path that works
+everywhere. Tickets are single-use and short-lived so a leaked one is near-worthless.
+
+**Mid-session re-authentication.** A game session runs for hours; a JWT lasts about one. Neither obvious option
+is acceptable — dropping the connection at expiry is terrible game feel, and ignoring expiry after the handshake
+means a revoked or expired credential keeps working indefinitely. Instead the client sends `Reauthenticate`
+(frame defined in phase 03) with a fresh token before expiry, and the server enforces a configurable grace
+window past expiry before closing the connection.
+
+**Revocation.** Banning a cheater must take effect now, not in 55 minutes when their token expires. Needs an
+explicit "terminate all sessions for this identity" operation, and a revocation check on re-auth. Without this,
+moderation in a live game doesn't work.
 
 **Row-level policies**
 ```csharp
@@ -107,6 +128,11 @@ does with data it legitimately receives.
   admin path needs to bypass them deliberately. Two explicit modes, no ambiguity.
 - **Guest identity durability.** Cookie, local token file, or client-persisted key? Affects whether a guest
   keeps their character after a client restart.
+- **Guest → authenticated upgrade.** A guest plays for two hours, then signs in. Do they keep their character?
+  In a full-loot game identity *is* inventory, so this is a product decision with real weight, not a technical
+  detail. Either support an identity-merge operation (and accept that merging is a fraud vector worth
+  rate-limiting) or refuse it explicitly and tell players up front. Silence here means players lose characters
+  and blame the game.
 - **Reducer authorization default posture.** Deny-by-default is safer but makes every ordinary gameplay reducer
   carry an annotation. Allow-by-default plus the unpoliced-reducer report is probably the right trade — the
   omission becomes visible without being fatal — but decide it explicitly rather than by accident.
@@ -118,6 +144,12 @@ does with data it legitimately receives.
 
 - A client with no token connects as a guest, gets an identity, and keeps it across a reconnect.
 - A client with a JWT resolves to a stable identity across reconnects and across server restarts.
+- A browser-style client with **no ability to set headers** authenticates successfully via the ticket flow.
+- A ticket is rejected on second use, and after its TTL expires.
+- A session whose token expires mid-connection survives if the client re-authenticates within the grace window,
+  and is closed if it doesn't — both asserted, since only testing the happy path here is how the insecure
+  variant ships.
+- Revoking an identity terminates its live sessions and prevents re-auth, without restarting the server.
 - Player A cannot see Player B's inventory rows, skills, or attributes — asserted at the protocol level, not
   just the API level.
 - Both players see the contents of a shared world container: the union case, proven.

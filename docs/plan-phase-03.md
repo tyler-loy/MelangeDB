@@ -17,7 +17,33 @@ demonstrable, so it should be reached before anything in 04–08 is started.
   every client language we'll eventually target; a source-generated binary format can replace it behind the
   interface once there's something to measure.
 - Framed binary protocol: `CallReducer`, `Subscribe`, `Unsubscribe`, `SubscriptionApplied` (initial set),
-  `TransactionUpdate` (deltas), `ReducerResult`, `Error`. Versioned handshake.
+  `TransactionUpdate` (deltas), `ReducerResult`, `Error`, `Ping`/`Pong`, `Resume`, `Reauthenticate`.
+  Versioned handshake. `CallReducer` carries a `traceparent` (see [OBSERVABILITY.md](OBSERVABILITY.md)).
+- `Reauthenticate` exists in this phase even though phase 04 owns its *semantics*, because a frame type cannot
+  be retrofitted without a protocol version bump. A game session outlives a one-hour JWT; dropping the
+  connection at expiry is unacceptable and ignoring expiry means revocation never takes effect, so in-band
+  re-auth has to be designed in from the start.
+- **TLS is the host's concern** — `wss://` comes from the developer's ASP.NET Core configuration, not from
+  MelangeDB. Worth stating so nobody looks for a MelangeDB certificate setting.
+- **Compression** via `permessage-deflate`, configurable. Terrain blobs are already RLE-compressed, but delta
+  frames carrying many small rows compress well.
+- **Heartbeat.** `Ping`/`Pong` with a timeout, because phase 05's `ClientDisconnected` must fire on ungraceful
+  drops and a closed socket is not the only way a client goes away.
+
+**HTTP endpoints.** WebSocket is the wrong shape for two of the three client types in the reference project: the
+admin console runs **one-shot SQL over HTTP**, and terrain-gen **bulk-loads ~24.6k chunk rows**. Neither wants a
+subscription protocol.
+- `POST /melange/call/{reducer}` — one-shot reducer invocation for tooling and CLIs.
+- `POST /melange/bulk` — the bulk ingestion path (one large write set, not one transaction per row).
+- `POST /melange/sql` — ad-hoc query endpoint; the aggregate-capable implementation lands in phase 08.
+- `POST /melange/ticket` — mints a short-lived connect ticket (phase 04).
+
+**Resume, not refetch.** A reconnecting client sends `Resume` with its last-acked LSN and receives the deltas it
+missed. Recomputing a full initial set on every network blip means tens of megabytes of terrain for a two-second
+outage. Requirements: the client tracks its acked LSN, the server retains enough log to serve the gap, and there
+is an explicit fallback to full resync when a client is too far behind (or the log has been truncated past its
+position). Getting this wrong is silent state divergence, so the fallback must be detected by the server rather
+than assumed by the client.
 
 **`MelangeDB.Server`**
 - `MapMelangeSocket(path)` on `IEndpointRouteBuilder` — an endpoint in the developer's own ASP.NET Core app,
@@ -46,13 +72,22 @@ This is a denial-of-service surface, so it belongs in the phase that ships subsc
 **`MelangeDB.Client`**
 - Connect, authenticate (stubbed until 04), call reducers, await results.
 - Locally maintained row cache per subscription with `OnInsert` / `OnUpdate` / `OnDelete` events.
-- Reconnect with subscription re-establishment.
+- Reconnect with `Resume` from the last acked LSN, falling back to full re-establishment when the server says
+  the gap can't be served.
 
 ## Out of scope
 
 Joins — explicitly deferred, and the audit of a live 82-table SpacetimeDB game found **zero** subscriptions
-using one. Auth (04). Generated typed client bindings — hand-written or dynamic access is fine here; codegen
-for clients follows once the wire format has settled.
+using one. Auth semantics (04) — this phase ships the frames, not the validation. Generated typed client
+bindings — hand-written or dynamic access is fine here; codegen for clients follows once the wire format has
+settled.
+
+**Unreliable/UDP transport, permanently.** Games often want fire-and-forget position updates, but a reducer is a
+transaction: it either commits or it doesn't, and a client needs to know which. An unreliable path is
+incompatible with that contract. Where per-tick position writes are too expensive, the answer is rate limiting
+plus client-side interpolation — which the reference workload already does, storing a *path* rather than a point
+on `Creature` and `PlayerState` so the server writes only on decisions. That pattern is the supported solution,
+not an unreliable channel.
 
 ## Decisions to settle
 
@@ -66,6 +101,14 @@ for clients follows once the wire format has settled.
   resync, or disconnect? Needs an answer here, because it shapes the protocol.
 - **Fan-out cost.** Naively testing every predicate against every row op is O(subscriptions × ops). Indexing
   subscriptions by table and key range is the fix; know whether phase 03 needs it or can defer it.
+- **Head-of-line blocking — the one that shows up as bad game feel.** A single socket carrying a 30MB terrain
+  initial set *and* movement reducer responses lets terrain block movement. Options: chunk large initial sets
+  and interleave by priority, or give the protocol logical channels. Chunk-and-interleave is simpler and
+  probably sufficient; either way this is a protocol decision, not an optimization, so it can't be deferred past
+  this phase.
+- **How much log to retain for `Resume`.** Too little and every reconnect degrades to a full resync; too much
+  and retention fights phase 07's compaction. Probably a time window rather than a transaction count, since what
+  matters is surviving a plausible network outage.
 
 ## Done when
 
@@ -79,6 +122,12 @@ for clients follows once the wire format has settled.
 - A range subscription exceeding the maximum span is rejected with an actionable error naming the limit.
 - Killing and reconnecting a client restores its subscriptions and converges to correct state.
 - A test asserts no gap and no duplicate across the initial-set/delta boundary under concurrent writes.
+- A client disconnected for a few seconds during active writes reconnects via `Resume` and converges **without**
+  refetching its initial set — asserted by measuring bytes transferred, since the whole point is the saving.
+- A client disconnected past the retention window is told to full-resync rather than silently diverging.
+- A large initial set does not delay a concurrent reducer response beyond a stated bound.
+- One-shot HTTP reducer invocation and bulk ingestion work without opening a websocket.
+- A dropped connection (killed process, no close frame) is detected by heartbeat within the configured timeout.
 
 ## Risks
 

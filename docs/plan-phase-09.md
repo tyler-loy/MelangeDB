@@ -83,6 +83,13 @@ the hub.
 - **Cluster membership.** Ownership registry, failure detection, and reassigning a dead node's shards. Could
   be Postgres-backed (the hub already needs it) rather than a new consensus dependency — worth taking, since
   it avoids introducing Raft one phase early.
+- **How do shard nodes trust an identity?** A client authenticates once at the gateway; re-validating its JWT on
+  every shard node is wasteful and doesn't work at all for hub-issued guest identities, which no external
+  issuer can vouch for. The likely answer is a signed internal identity assertion minted by the hub and
+  verified by shard nodes, plus mutual auth between nodes so a client cannot talk to a shard node directly and
+  claim to be anyone. Note the trust boundary this creates: a compromised shard node can impersonate any player
+  in its shards. That may be acceptable — nodes are your infrastructure — but it should be a stated assumption
+  rather than an accident.
 - **Client protocol during dual attachment.** A client holds a hub session and a shard session; the gateway
   must present that as one endpoint, including which node answers which subscription.
 - **Does `Replicated` need write support from shards?** Say no as long as possible.
