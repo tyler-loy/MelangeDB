@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>WebSocket transport, subscription engine, and identity/auth integration. Hosted inside the developer's own ASP.NET Core app.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>C# client: connects, calls reducers, and maintains subscribed row sets locally.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>
