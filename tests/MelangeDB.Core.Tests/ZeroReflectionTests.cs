@@ -75,6 +75,37 @@ public class ZeroReflectionTests
     }
 
     [Fact]
+    public void Core_hot_path_sources_contain_no_reflection_apis()
+    {
+        // The reflection serializer and the startup-only model discovery are the two sanctioned
+        // uses of reflection in Core; the invocation path itself must never grow one. This fails
+        // the moment Type.GetType, MethodInfo.Invoke, or Activator appear in a hot-path file.
+        string[] hotPathFiles =
+        [
+            "MelangeEngine.cs",
+            "TransactionDb.cs",
+            "WriteSet.cs",
+            Path.Combine("Store", "InMemoryHotStore.cs"),
+            Path.Combine("Serialization", "RowCodec.cs"),
+            Path.Combine("Serialization", "RowWriter.cs"),
+            Path.Combine("Serialization", "KeyCodec.cs"),
+            Path.Combine("Serialization", "ReducerArgsReader.cs"),
+            Path.Combine("Dispatch", "ReducerDescriptor.cs"),
+            Path.Combine("Hosting", "MelangeReducerHost.cs"),
+        ];
+        string[] forbidden = ["System.Reflection", "MethodInfo", "GetMethod", "Type.GetType", "Activator.CreateInstance"];
+
+        foreach (var file in hotPathFiles)
+        {
+            var path = Path.Combine(RepoRoot(), "src", "MelangeDB.Core", file);
+            Assert.True(File.Exists(path), $"Hot-path file {file} moved; update this test's list.");
+            var source = File.ReadAllText(path);
+            foreach (var api in forbidden)
+                Assert.False(source.Contains(api, StringComparison.Ordinal), $"{file} contains forbidden '{api}'.");
+        }
+    }
+
+    [Fact]
     public void Generated_accessors_are_readonly_structs_that_wrap_the_view_without_copying()
     {
         // Settle-check for the struct-mutation decision: the handle and column accessors are
