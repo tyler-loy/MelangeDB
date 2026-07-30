@@ -31,7 +31,7 @@ public partial struct InventoryItem
     public int Quantity;
 }
 
-[Table(Tier = StorageTier.Relational)]
+[Table(Tier = StorageTier.Relational, Placement = Placement.Global)]
 public partial struct Registration
 {
     [PrimaryKey]
