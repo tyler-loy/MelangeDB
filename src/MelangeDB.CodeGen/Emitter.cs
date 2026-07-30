@@ -48,26 +48,28 @@ internal static class Emitter
             EmitDescriptor(builder, reducer);
         builder.AppendLine("            };");
         builder.AppendLine("    }");
+        builder.AppendLine("}");
 
         if (tables.Length > 0)
         {
+            // Global namespace, so ctx.Db.<Table> resolves everywhere in the assembly with no
+            // using directive. The class is internal; nothing leaks across assemblies.
             builder.AppendLine();
-            builder.AppendLine("    /// <summary>Typed table accessors on <c>ctx.Db</c>.</summary>");
-            builder.AppendLine("    internal static class MelangeDbAccessors");
+            builder.AppendLine("/// <summary>Typed table accessors on <c>ctx.Db</c>.</summary>");
+            builder.AppendLine("internal static class MelangeDbGeneratedAccessors");
+            builder.AppendLine("{");
+            builder.AppendLine("    extension(global::MelangeDB.IDbView db)");
             builder.AppendLine("    {");
-            builder.AppendLine("        extension(global::MelangeDB.IDbView db)");
-            builder.AppendLine("        {");
             foreach (var table in tables)
             {
-                builder.AppendLine($"            public global::MelangeDB.Generated.{table.TypeName}Handle {table.TypeName} =>");
-                builder.AppendLine($"                new global::MelangeDB.Generated.{table.TypeName}Handle(db);");
+                builder.AppendLine($"        public global::MelangeDB.Generated.{table.TypeName}Handle {table.TypeName} =>");
+                builder.AppendLine($"            new global::MelangeDB.Generated.{table.TypeName}Handle(db);");
             }
 
-            builder.AppendLine("        }");
             builder.AppendLine("    }");
+            builder.AppendLine("}");
         }
 
-        builder.AppendLine("}");
         return builder.ToString();
     }
 
