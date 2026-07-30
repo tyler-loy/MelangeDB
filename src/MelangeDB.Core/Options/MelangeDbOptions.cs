@@ -31,6 +31,82 @@ public sealed class MelangeDbOptions
     public SchedulerOptions Scheduler { get; set; } = new();
 
     public EventsOptions Events { get; set; } = new();
+
+    public ResidencyOptions Residency { get; set; } = new();
+
+    public SnapshotsOptions Snapshots { get; set; } = new();
+}
+
+/// <summary>
+/// Per-table residency configuration (<c>MelangeDb:Residency:*</c>), overriding the
+/// <c>[Table(Residency = ...)]</c> attribute. Configurable and not code-only on purpose: the right
+/// residency set depends on deployment size, and an operator hitting a slow scan should be able to
+/// fix it without a code change and a redeploy.
+/// </summary>
+public sealed class ResidencyOptions
+{
+    /// <summary>
+    /// The residency for tables whose attribute leaves it unspecified. <b>Leaving this at
+    /// <see cref="MelangeDB.Residency.Paged"/> is deliberate</b>: a resident-by-default store
+    /// reproduces the RAM ceiling MelangeDB exists to remove, as a cliff arriving under production
+    /// load. Because <see cref="MelangeDB.Residency.Paged"/> is also the attribute's default value,
+    /// an attribute that explicitly says Paged is indistinguishable from one that says nothing —
+    /// under a non-Paged default, pin a table back down with its per-table override.
+    /// </summary>
+    public Residency Default { get; set; } = Residency.Paged;
+
+    /// <summary>
+    /// The size at which an <see cref="MelangeDB.Residency.Auto"/> table stops being resident and
+    /// starts paging. Only read for tables resolved to Auto.
+    /// </summary>
+    public long AutoThresholdBytes { get; set; } = 8_388_608;
+
+    /// <summary>
+    /// Logs each resident table's row count and measured bytes plus the buffer-pool cap at startup
+    /// (EventId 1501). The memory budget has to be observable, not theoretical.
+    /// </summary>
+    public bool ReportOnStartup { get; set; } = true;
+
+    /// <summary>
+    /// Per-table overrides, keyed by table name — bound from the <c>MelangeDb:Residency</c>
+    /// section's remaining keys (<c>Residency:&lt;TableName&gt;</c>), where config wins over the
+    /// attribute.
+    /// </summary>
+    public Dictionary<string, Residency> PerTable { get; } = new(StringComparer.Ordinal);
+}
+
+/// <summary>Snapshot and log-compaction options (<c>MelangeDb:Snapshots:*</c>).</summary>
+public sealed class SnapshotsOptions
+{
+    /// <summary>Whether snapshots are taken at all. Off leaves the log growing without bound.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>How many committed transactions between automatic snapshots.</summary>
+    public long IntervalTransactions { get; set; } = 100_000;
+
+    /// <summary>
+    /// Whether a successful snapshot truncates the log behind it. Truncation never passes the
+    /// slowest applier checkpoint, the slowest live event-subscriber checkpoint, or the Resume
+    /// retention window, regardless of this setting.
+    /// </summary>
+    public bool TruncateLog { get; set; } = true;
+}
+
+/// <summary>The hot-store engines <c>HotStore:Engine</c> may name.</summary>
+public enum HotStoreEngine
+{
+    /// <summary>
+    /// Picks <see cref="Faster"/> when a FASTER store provider is registered
+    /// (<c>UseFasterHotStore()</c>), else <see cref="InMemory"/> — selection by registration, not
+    /// by path, since <c>HotStore:Path</c> always has a default.
+    /// </summary>
+    Auto,
+
+    /// <summary>The dictionary-backed store. A legitimate choice, not just a test double.</summary>
+    InMemory,
+
+    /// <summary>The FASTER-backed paging store. Requires the MelangeDB.Storage.Faster package.</summary>
+    Faster,
 }
 
 /// <summary>Options for the event bus (<c>MelangeDb:Events:*</c>).</summary>
@@ -383,10 +459,19 @@ public sealed class HotStoreOptions
 {
     /// <summary>
     /// Directory for the hot store's files. The in-memory engine persists nothing here — it is a
-    /// projection rebuilt from the log — but the directory is created so the setting is honest
-    /// before the paging engine lands.
+    /// projection rebuilt from the log — while the FASTER engine keeps its hybrid log here.
     /// </summary>
     public string Path { get; set; } = "./data/hot";
+
+    /// <summary>Which storage engine backs the hot tier; see <see cref="HotStoreEngine"/>.</summary>
+    public HotStoreEngine Engine { get; set; } = HotStoreEngine.Auto;
+
+    /// <summary>
+    /// Cap on the paging buffer pool in bytes. <b>Excludes</b> resident tables, which are
+    /// accounted separately — the total declared footprint is this plus the residency report.
+    /// Ignored by the in-memory engine, which does not page.
+    /// </summary>
+    public long MemoryBudgetBytes { get; set; } = 128 * 1024 * 1024;
 }
 
 /// <summary>When the commit log forces appended records to stable storage.</summary>
@@ -422,6 +507,14 @@ public sealed class CommitLogOptions
 
     /// <summary>Only read when <see cref="FsyncPolicy"/> is <see cref="FsyncPolicy.Interval"/>.</summary>
     public int FsyncIntervalMs { get; set; } = 100;
+
+    /// <summary>
+    /// Batch concurrent commits into one fsync. Shipped accepted-and-reserved at its default: the
+    /// engine's single-writer lock serializes commits, so no two appends are ever in flight for
+    /// one fsync to cover — the bulk path is the batching that actually exists. The knob binds and
+    /// validates so a future concurrent commit path can honor it without a config break.
+    /// </summary>
+    public bool GroupCommit { get; set; } = true;
 }
 
 /// <summary>Options for what MelangeDB emits (<c>MelangeDb:Telemetry:*</c>). Exporters are the host's business.</summary>

@@ -27,6 +27,11 @@ public static class ServiceCollectionExtensions
         // over the same options object, and code wins over file only because it runs last.
         services.AddOptions<MelangeDbOptions>().BindConfiguration(ConfigurationSection);
 
+        // Residency:<TableName> keys share their section with the reserved settings, so the
+        // per-table map binds by enumeration rather than by property name.
+        services.AddOptions<MelangeDbOptions>().Configure<Microsoft.Extensions.Configuration.IConfiguration>(
+            static (options, configuration) => BindPerTableResidency(options, configuration));
+
         var builder = new MelangeDbBuilder(services);
         configure(builder);
 
@@ -61,7 +66,8 @@ public static class ServiceCollectionExtensions
             provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>().CurrentValue,
             provider.GetRequiredService<SchemaRegistry>(),
             provider.GetService<ILoggerFactory>(),
-            provider.GetService<TimeProvider>()));
+            provider.GetService<TimeProvider>(),
+            provider.GetService<IHotStoreProvider>()));
         services.TryAddSingleton<MelangeReducerHost>();
         services.TryAddSingleton(provider => new MelangeScheduler(
             provider.GetRequiredService<MelangeEngine>(),
@@ -85,5 +91,25 @@ public static class ServiceCollectionExtensions
         });
 
         return services;
+    }
+
+    private static readonly string[] ReservedResidencyKeys = ["Default", "AutoThresholdBytes", "ReportOnStartup", "PerTable"];
+
+    private static void BindPerTableResidency(MelangeDbOptions options, Microsoft.Extensions.Configuration.IConfiguration configuration)
+    {
+        var section = configuration.GetSection($"{ConfigurationSection}:Residency");
+        foreach (var child in section.GetChildren())
+        {
+            if (ReservedResidencyKeys.Contains(child.Key, StringComparer.OrdinalIgnoreCase) || child.Value is null)
+                continue;
+            if (!Enum.TryParse<Residency>(child.Value, ignoreCase: true, out var residency))
+            {
+                throw new InvalidOperationException(
+                    $"Configuration key 'MelangeDb:Residency:{child.Key}' has value '{child.Value}'; " +
+                    "expected Resident, Paged, or Auto.");
+            }
+
+            options.Residency.PerTable[child.Key] = residency;
+        }
     }
 }

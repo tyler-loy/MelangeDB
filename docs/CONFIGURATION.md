@@ -51,6 +51,23 @@ in-memory delivery *window*, not delivery itself: overflow evicts the oldest win
 subscriber replays from the commit log, which is the buffer that actually holds the events. Nothing is dropped;
 the subscriber's checkpoint lag is the honest measure of how far behind it is.
 
+**Shipped as of phase 07** (defaults verified against `HotStoreOptions`, `ResidencyOptions`, and
+`SnapshotsOptions`): `HotStore:Engine`, `HotStore:MemoryBudgetBytes`, every `Residency:*` key, every
+`Snapshots:*` key, and `CommitLog:GroupCommit`. Three notes made when it shipped: (1)
+`HotStore:MemoryBudgetBytes` planned no default and shipped with a real one — `134217728` (128 MiB) —
+because a paging store with an unset cap is unbounded, which is the failure mode this phase exists to
+remove. (2) `CommitLog:GroupCommit` shipped **accepted-and-reserved** at its default of `true` (the
+`Scheduler:MaxConcurrentTicks` precedent): the engine's single-writer lock serializes commits, so no
+two appends are ever in flight for one fsync to cover — the bulk-ingestion path is the batching that
+actually exists; the knob binds and validates so a future concurrent commit path can honor it without
+a config break. (3) `Residency:Default` is consulted only for tables whose attribute leaves residency
+unspecified — and because `Paged` is the attribute's default value, an attribute explicitly declaring
+`Paged` is indistinguishable from silence; under a non-`Paged` configured default, the per-table
+override is how a table is pinned back down. `Residency:<TableName>` is `careful` as planned: a
+changed override applies to the running store per table (pinning faults the table wholly in,
+unpinning migrates it to the buffer pool) when the store supports runtime residency control; the
+in-memory store, which does not page, takes the label at restart.
+
 **Shipped as of phase 04** (defaults verified against `AuthOptions`, `PoliciesOptions`, `RateLimitOptions`,
 and `SqlOptions`): every `Auth:*`, `Policies:*`, and `RateLimit:*` key, plus `Sql:AdHocMode` — shipped ahead
 of its phase-08 row because `/melange/sql` already returns rows, so the policy contract could not wait. Three
@@ -85,7 +102,7 @@ through the options monitor, and a cheaper-than-planned semantic is recorded, no
 | --- | --- | --- | --- | --- | --- |
 | `HotStore:Path` | string | `./data/hot` | restart | 01 | Directory for the hot store's files. |
 | `HotStore:Engine` | enum | `Auto` | restart | 07 | `InMemory` \| `Faster` \| `Auto`. `Auto` picks `Faster` when the FASTER storage package is registered, else `InMemory` — selection by registration, not by path, since `HotStore:Path` always has a default. `InMemory` is a legitimate choice, not just a test double. |
-| `HotStore:MemoryBudgetBytes` | long | — | restart | 07 | Cap on the paging buffer pool. **Excludes** resident tables, which are accounted separately — total footprint is this plus the residency report. |
+| `HotStore:MemoryBudgetBytes` | long | `134217728` | restart | 07 | Cap on the paging buffer pool. **Excludes** resident tables, which are accounted separately — total footprint is this plus the residency report. Planned with no default; shipped with 128 MiB, because an unset cap is unbounded. Ignored by the in-memory engine, which does not page. |
 | `CommitLog:Path` | string | `./data/log` | restart | 01 | |
 | `CommitLog:FsyncPolicy` | enum | `OnCommit` | live | 01 | `OnCommit` \| `Interval` \| `OsBuffered`. `OnCommit` is the only durable choice; the others trade a bounded window of committed-but-lost transactions for throughput and must say so in their XML docs. |
 | `CommitLog:FsyncIntervalMs` | int | `100` | live | 01 | Only read when `FsyncPolicy = Interval`. This is the size of the data-loss window. |

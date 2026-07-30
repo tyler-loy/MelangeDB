@@ -23,10 +23,11 @@ public sealed class FileCommitLog : ICommitLog
     private readonly CommitLogOptions _options;
     private readonly ILogger _logger;
     private readonly EngineTelemetry? _telemetry;
-    private readonly FileStream _stream;
+    private FileStream _stream;
     private readonly Lock _lock = new();
     private Timer? _flushTimer;
     private ulong _headLsn;
+    private ulong _baseLsn;
     private Exception? _failure;
     private bool _disposed;
 
@@ -44,7 +45,10 @@ public sealed class FileCommitLog : ICommitLog
         Directory.CreateDirectory(options.Path);
         FilePath = System.IO.Path.Combine(options.Path, "melange.log");
         EpochFilePath = System.IO.Path.Combine(options.Path, "melange.epoch");
-        _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        BaseFilePath = System.IO.Path.Combine(options.Path, "melange.base");
+        // FileShare.Delete throughout: log compaction atomically replaces the file, and every open
+        // handle must permit that or a concurrent lazy reader would make truncation fail.
+        _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
         Recover();
     }
 
@@ -60,6 +64,28 @@ public sealed class FileCommitLog : ICommitLog
     public string EpochFilePath { get; }
 
     public Guid EpochId { get; private set; }
+
+    /// <summary>
+    /// The full path of the truncation-base sidecar: the highest LSN compaction has removed, so a
+    /// truncated log recovers its head even when every surviving record was truncated away. Zero
+    /// (or an absent file) means the log has never been truncated.
+    /// </summary>
+    public string BaseFilePath { get; }
+
+    /// <summary>
+    /// The highest LSN removed by truncation; records exist only above it. Recovery of anything at
+    /// or below this LSN must come from a snapshot.
+    /// </summary>
+    public ulong BaseLsn
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _baseLsn;
+            }
+        }
+    }
 
     /// <summary>
     /// Test-only fault injection, invoked after a record's bytes are written but before the flush —
@@ -166,7 +192,7 @@ public sealed class FileCommitLog : ICommitLog
             _stream.Flush(); // Make buffered appends visible to the read handle.
         }
 
-        using var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         if (reader.Length < HeaderSize)
             yield break;
         reader.Seek(HeaderSize, SeekOrigin.Begin);
@@ -232,13 +258,19 @@ public sealed class FileCommitLog : ICommitLog
             _stream.Write(header);
             _stream.Flush(flushToDisk: true);
 
-            // A fresh log file is a fresh incarnation: any epoch left behind by a deleted log must
-            // not survive it, or an old resume cursor would count against the wrong history.
+            // A fresh log file is a fresh incarnation: any epoch or truncation base left behind by
+            // a deleted log must not survive it, or an old resume cursor would count against the
+            // wrong history.
             EpochId = MintEpoch();
+            if (File.Exists(BaseFilePath))
+                File.Delete(BaseFilePath);
+            _baseLsn = 0;
             return;
         }
 
         EpochId = ReadOrMintEpoch();
+        _baseLsn = ReadBaseLsn();
+        _headLsn = _baseLsn;
 
         Span<byte> fileHeader = stackalloc byte[HeaderSize];
         _stream.Seek(0, SeekOrigin.Begin);
@@ -289,9 +321,87 @@ public sealed class FileCommitLog : ICommitLog
             }
 
             var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + payloadLength));
-            _headLsn = record.Lsn;
+
+            // Max, not assignment: a crash between writing the base sidecar and swapping the
+            // compacted file can leave already-truncated records on disk below the base.
+            _headLsn = Math.Max(_headLsn, record.Lsn);
             intactEnd = position + FrameSize + payloadLength;
         }
+    }
+
+    /// <summary>
+    /// Removes every record at or below <paramref name="upToLsn"/> — log compaction's physical
+    /// half. The caller (the engine's snapshot path) is responsible for the floors: a snapshot
+    /// must cover the removed range, and no applier, live event subscriber, or resume-retention
+    /// window may still need it. Atomic against a crash: the compacted file is fully written and
+    /// flushed before it replaces the live one, and the base sidecar is written first, so a crash
+    /// at any point leaves either the old log or a consistent truncated one.
+    /// </summary>
+    internal void TruncateBefore(ulong upToLsn)
+    {
+        lock (_lock)
+        {
+            if (_disposed || _failure is not null)
+                return;
+            upToLsn = Math.Min(upToLsn, _headLsn);
+            if (upToLsn <= _baseLsn)
+                return;
+
+            _stream.Flush();
+            var tempPath = FilePath + ".compact";
+            using (var compact = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                Span<byte> header = stackalloc byte[HeaderSize];
+                BinaryPrimitives.WriteUInt32LittleEndian(header, Magic);
+                BinaryPrimitives.WriteUInt16LittleEndian(header[4..], FileFormatVersion);
+                BinaryPrimitives.WriteUInt16LittleEndian(header[6..], 0);
+                compact.Write(header);
+
+                var frame = new byte[FrameSize];
+                _stream.Seek(HeaderSize, SeekOrigin.Begin);
+                while (_stream.Position + FrameSize <= _stream.Length)
+                {
+                    _stream.ReadExactly(frame);
+                    var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+                    if (length > MaxRecordBytes || _stream.Position + length > _stream.Length)
+                        break;
+                    var payload = new byte[length];
+                    _stream.ReadExactly(payload);
+                    var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + length));
+                    if (record.Lsn > upToLsn)
+                    {
+                        compact.Write(frame);
+                        compact.Write(payload);
+                    }
+                }
+
+                compact.Flush(flushToDisk: true);
+            }
+
+            WriteBaseLsn(upToLsn);
+            _stream.Dispose();
+            File.Move(tempPath, FilePath, overwrite: true);
+            _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+            _stream.Seek(0, SeekOrigin.End);
+            _baseLsn = upToLsn;
+        }
+    }
+
+    private ulong ReadBaseLsn()
+    {
+        if (!File.Exists(BaseFilePath))
+            return 0;
+        var bytes = File.ReadAllBytes(BaseFilePath);
+        return bytes.Length == 8 ? BinaryPrimitives.ReadUInt64LittleEndian(bytes) : 0;
+    }
+
+    private void WriteBaseLsn(ulong baseLsn)
+    {
+        var bytes = new byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, baseLsn);
+        var tempPath = BaseFilePath + ".tmp";
+        File.WriteAllBytes(tempPath, bytes);
+        File.Move(tempPath, BaseFilePath, overwrite: true);
     }
 
     private Guid MintEpoch()
