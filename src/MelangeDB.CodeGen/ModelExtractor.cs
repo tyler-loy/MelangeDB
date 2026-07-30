@@ -47,6 +47,14 @@ internal static class ModelExtractor
             }
         }
 
+        // A table declaring Scheduled holds timer rows: implicitly private, implicitly Local
+        // until clustering gives timer tables a placement.
+        if (scheduled is not null)
+        {
+            isPublic = false;
+            placement = "Local";
+        }
+
         var typeLocation = LocationInfo.From(
             (context.TargetNode as StructDeclarationSyntax)?.Identifier.GetLocation() ?? context.TargetNode.GetLocation());
         var diagnostics = new List<DiagnosticInfo>();
@@ -73,6 +81,22 @@ internal static class ModelExtractor
                 "MELANGE0001",
                 typeLocation,
                 new EquatableArray<string>([tableName, primaryKeys.ToString()])));
+        }
+
+        var scheduleAtColumns = columns.Count(static c => c.Kind == WireKind.ScheduleAt);
+        if (scheduled is not null && scheduleAtColumns != 1)
+        {
+            diagnostics.Add(new DiagnosticInfo(
+                "MELANGE0016",
+                typeLocation,
+                new EquatableArray<string>([tableName, $"declares Scheduled and must declare exactly one ScheduleAt column; found {scheduleAtColumns}"])));
+        }
+        else if (scheduled is null && scheduleAtColumns > 0)
+        {
+            diagnostics.Add(new DiagnosticInfo(
+                "MELANGE0016",
+                typeLocation,
+                new EquatableArray<string>([tableName, "declares a ScheduleAt column, which is only valid on a table declaring Scheduled"])));
         }
 
         return new TableModel(
@@ -144,6 +168,26 @@ internal static class ModelExtractor
                     continue;
                 }
 
+                if (IsTableStruct(parameter.Type))
+                {
+                    // The scheduled-reducer shape: the timer row rides as the argument. Whether a
+                    // table actually schedules this reducer is checked once tables and reducers
+                    // meet in the combine step.
+                    parameters.Add(new ParameterModel(
+                        parameter.Name,
+                        WireKind.None,
+                        Fqn(parameter.Type),
+                        IsEnum: false,
+                        EnumUnderlyingFqn: string.Empty,
+                        IsArray: false,
+                        ElementKind: WireKind.None,
+                        ElementClrFqn: string.Empty,
+                        ElementIsEnum: false,
+                        ElementEnumUnderlyingFqn: string.Empty,
+                        IsTimerRow: true));
+                    continue;
+                }
+
                 var model = ClassifyParameter(parameter);
                 if (model is null)
                 {
@@ -158,12 +202,16 @@ internal static class ModelExtractor
             }
         }
 
+        if (kind is "ClientConnected" or "ClientDisconnected" && parameters.Count > 0)
+            AddSignature(diagnostics, location, reducerName, "is a lifecycle reducer, which takes only ReducerContext — the transport has no arguments to supply");
+
         return new ReducerModel(
             ContainingTypeFqn: method.ContainingType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
             MethodName: method.Name,
             ReducerName: reducerName,
             Kind: kind,
             PolicyFqn: policyFqn,
+            Location: location,
             Parameters: new EquatableArray<ParameterModel>([.. parameters]),
             Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]));
     }
@@ -178,6 +226,7 @@ internal static class ModelExtractor
         {
             "MelangeDB.Identity" => WireKind.Identity,
             "MelangeDB.Timestamp" => WireKind.Timestamp,
+            "MelangeDB.ScheduleAt" => WireKind.ScheduleAt,
             _ => WireKind.None,
         };
         return byName != WireKind.None
@@ -260,7 +309,7 @@ internal static class ModelExtractor
         if (parameter.Type is IArrayTypeSymbol { Rank: 1 } array && array.ElementType.SpecialType != SpecialType.System_Byte)
         {
             var (elementKind, elementIsEnum, elementUnderlying) = Classify(array.ElementType);
-            if (elementKind == WireKind.None || array.ElementType is IArrayTypeSymbol)
+            if (elementKind is WireKind.None or WireKind.ScheduleAt || array.ElementType is IArrayTypeSymbol)
                 return null;
             return new ParameterModel(
                 parameter.Name,
@@ -276,7 +325,7 @@ internal static class ModelExtractor
         }
 
         var (kind, isEnum, underlying) = Classify(parameter.Type);
-        if (kind == WireKind.None)
+        if (kind is WireKind.None or WireKind.ScheduleAt)
             return null;
         return new ParameterModel(
             parameter.Name,
@@ -301,6 +350,9 @@ internal static class ModelExtractor
     private static bool HasAttribute(ISymbol member, string attributeName) =>
         member.GetAttributes().Any(a =>
             a.AttributeClass is { Name: var name, ContainingNamespace.Name: "MelangeDB" } && name == attributeName);
+
+    private static bool IsTableStruct(ITypeSymbol type) =>
+        type.TypeKind == TypeKind.Struct && HasAttribute(type, "TableAttribute");
 
     private static string Fqn(ITypeSymbol type) => type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
 

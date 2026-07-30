@@ -373,6 +373,158 @@ public class DiagnosticTests
     }
 
     [Fact]
+    public void Melange0009_fires_on_lifecycle_reducer_with_parameters()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            public sealed class Reducers
+            {
+                [Reducer(ReducerKind.ClientConnected)]
+                public void OnConnected(ReducerContext ctx, int extra)
+                {
+                }
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0009");
+    }
+
+    [Fact]
+    public void Melange0014_fires_when_a_scheduled_table_names_a_missing_reducer()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "TickCreatures")]
+            public partial struct CreatureAiTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+            }
+            """);
+        var diagnostic = Assert.Single(result.MelangeDiagnostics, d => d.Id == "MELANGE0014");
+        Assert.Contains("TickCreatures", diagnostic.GetMessage());
+    }
+
+    [Fact]
+    public void Melange0015_fires_when_the_scheduled_reducer_lacks_the_timer_row_parameter()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "TickCreatures")]
+            public partial struct CreatureAiTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void TickCreatures(ReducerContext ctx)
+                {
+                }
+            }
+            """);
+        var diagnostic = Assert.Single(result.MelangeDiagnostics, d => d.Id == "MELANGE0015");
+        Assert.Contains("CreatureAiTick timer", diagnostic.GetMessage());
+    }
+
+    [Fact]
+    public void Melange0015_fires_on_a_timer_row_parameter_no_table_schedules()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table]
+            public partial struct Player
+            {
+                [PrimaryKey] public long Id;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Touch(ReducerContext ctx, Player row)
+                {
+                }
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0015");
+    }
+
+    [Fact]
+    public void Melange0016_fires_when_a_scheduled_table_has_no_ScheduleAt_column()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "Tick")]
+            public partial struct BareTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Tick(ReducerContext ctx, BareTick timer)
+                {
+                }
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0016");
+    }
+
+    [Fact]
+    public void Melange0016_fires_on_a_ScheduleAt_column_outside_a_scheduled_table()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table]
+            public partial struct Confused
+            {
+                [PrimaryKey] public long Id;
+                public ScheduleAt When;
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0016");
+    }
+
+    [Fact]
+    public void A_well_formed_scheduled_table_and_reducer_compile_clean()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = nameof(SimulationReducers.TickCreatures))]
+            public partial struct CreatureAiTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+                public int Region;
+            }
+
+            public sealed class SimulationReducers
+            {
+                [Reducer]
+                public void TickCreatures(ReducerContext ctx, CreatureAiTick timer)
+                {
+                    ctx.Db.CreatureAiTick.Insert(new CreatureAiTick
+                    {
+                        ScheduledAt = ScheduleAt.Instant(ctx.Timestamp),
+                        Region = timer.Region,
+                    });
+                }
+            }
+            """);
+        Assert.Empty(result.MelangeDiagnostics);
+        Assert.Empty(result.Errors);
+    }
+
+    [Fact]
     public async Task Valid_tables_and_reducers_compile_clean_with_zero_melange_diagnostics()
     {
         var source = """

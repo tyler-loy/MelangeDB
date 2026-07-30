@@ -66,7 +66,10 @@ public sealed class TableAttribute : Attribute
 
     /// <summary>
     /// Names the reducer this table's timer rows fire. Declaring it makes rows of this table
-    /// scheduling data, not client data.
+    /// scheduling data, not client data: the table must carry exactly one <see cref="ScheduleAt"/>
+    /// column, is implicitly private, and is implicitly <see cref="Placement.Local"/> until
+    /// clustering gives timer tables a placement. The named reducer's signature is
+    /// <c>void Name(ReducerContext ctx, ThisTable timer)</c>, and it is not client-callable.
     /// </summary>
     public string? Scheduled { get; set; }
 }

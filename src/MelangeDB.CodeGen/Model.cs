@@ -65,6 +65,7 @@ internal sealed record DiagnosticInfo(string DescriptorId, LocationInfo Location
         "MELANGE0009" => Diagnostics.InvalidReducerSignature,
         "MELANGE0011" => Diagnostics.UnsupportedColumnType,
         "MELANGE0012" => Diagnostics.KeyColumnNotEncodable,
+        "MELANGE0016" => Diagnostics.ScheduleAtColumnMisplaced,
         _ => throw new InvalidOperationException($"Unknown diagnostic id {id}."),
     };
 }
@@ -98,6 +99,7 @@ internal enum WireKind
     Bytes,
     Identity,
     Timestamp,
+    ScheduleAt,
 }
 
 internal sealed record ColumnModel(
@@ -112,7 +114,7 @@ internal sealed record ColumnModel(
     bool IsServerOnly,
     bool IsProperty)
 {
-    public bool IsKeyEncodable => Kind is not (WireKind.Float32 or WireKind.Float64);
+    public bool IsKeyEncodable => Kind is not (WireKind.Float32 or WireKind.Float64 or WireKind.ScheduleAt);
 
     public bool HasIndexAccessor => IsUnique || IsIndexed;
 }
@@ -145,7 +147,8 @@ internal sealed record ParameterModel(
     WireKind ElementKind,
     string ElementClrFqn,
     bool ElementIsEnum,
-    string ElementEnumUnderlyingFqn);
+    string ElementEnumUnderlyingFqn,
+    bool IsTimerRow = false);
 
 internal sealed record ReducerModel(
     string ContainingTypeFqn,
@@ -153,8 +156,12 @@ internal sealed record ReducerModel(
     string ReducerName,
     string Kind,
     string? PolicyFqn,
+    LocationInfo Location,
     EquatableArray<ParameterModel> Parameters,
     EquatableArray<DiagnosticInfo> Diagnostics)
 {
     public bool IsValid => Diagnostics.Length == 0;
+
+    /// <summary>Whether any parameter is a <c>[Table]</c> struct — the scheduled-reducer shape.</summary>
+    public bool HasTimerRowParameter => Parameters.Items.Any(static p => p.IsTimerRow);
 }

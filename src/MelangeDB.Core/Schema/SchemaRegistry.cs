@@ -148,8 +148,9 @@ public sealed class SchemaRegistry
         if (type == typeof(byte[])) return ColumnKind.Bytes;
         if (type == typeof(Identity)) return ColumnKind.Identity;
         if (type == typeof(Timestamp)) return ColumnKind.Timestamp;
+        if (type == typeof(ScheduleAt)) return ColumnKind.ScheduleAt;
         throw new NotSupportedException(
             $"Table '{table.Name}': column '{column}' has unsupported type {type}. " +
-            "Supported: integers, floats, bool, string, byte[], Identity, Timestamp, enums.");
+            "Supported: integers, floats, bool, string, byte[], Identity, Timestamp, ScheduleAt, enums.");
     }
 }
