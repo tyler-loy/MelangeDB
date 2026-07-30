@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Description>IHotStore backed by Microsoft.FASTER.Core, providing a hybrid log with spill-to-disk. See DESIGN.md section 7 for why this is FASTER rather than Tsavorite.</Description>
   </PropertyGroup>
 
