@@ -42,9 +42,10 @@ internal sealed class PostgresSchemaManager
     /// <summary>
     /// Ensures the schema namespace and the checkpoint table exist (always — they are the tier's
     /// own plumbing, not a user schema change), then creates or validates every relational table
-    /// per the migration contract.
+    /// per the migration contract. Returns the DDL that was applied, empty when the schema already
+    /// matched — the caller logs it, because an automatic schema change should never be silent.
     /// </summary>
-    public async Task EnsureAsync(NpgsqlConnection connection, IReadOnlyList<TableSchema> tables, bool autoMigrate, CancellationToken ct)
+    public async Task<string> EnsureAsync(NpgsqlConnection connection, IReadOnlyList<TableSchema> tables, bool autoMigrate, CancellationToken ct)
     {
         await ExecuteAsync(connection, $"CREATE SCHEMA IF NOT EXISTS {PostgresIdentifier.Quote(_schema)}", ct).ConfigureAwait(false);
         await ExecuteAsync(
@@ -60,17 +61,28 @@ internal sealed class PostgresSchemaManager
             ct).ConfigureAwait(false);
 
         var pendingDdl = new StringBuilder();
+        var appliedDdl = new StringBuilder();
         var refusals = new List<string>();
+
+        async Task ApplyOrCollectAsync(string ddl)
+        {
+            if (autoMigrate)
+            {
+                await ExecuteScriptAsync(connection, ddl, ct).ConfigureAwait(false);
+                appliedDdl.AppendLine(ddl);
+            }
+            else
+            {
+                pendingDdl.AppendLine(ddl);
+            }
+        }
+
         foreach (var table in tables)
         {
             var existing = await ExistingColumnsAsync(connection, table.Name, ct).ConfigureAwait(false);
             if (existing.Count == 0)
             {
-                var ddl = CreateTableDdl(table);
-                if (autoMigrate)
-                    await ExecuteScriptAsync(connection, ddl, ct).ConfigureAwait(false);
-                else
-                    pendingDdl.AppendLine(ddl);
+                await ApplyOrCollectAsync(CreateTableDdl(table)).ConfigureAwait(false);
                 continue;
             }
 
@@ -89,11 +101,7 @@ internal sealed class PostgresSchemaManager
                     continue;
                 }
 
-                var addDdl = AddColumnDdl(table, column);
-                if (autoMigrate)
-                    await ExecuteScriptAsync(connection, addDdl, ct).ConfigureAwait(false);
-                else
-                    pendingDdl.AppendLine(addDdl);
+                await ApplyOrCollectAsync(AddColumnDdl(table, column)).ConfigureAwait(false);
             }
 
             if (autoMigrate)
@@ -115,6 +123,8 @@ internal sealed class PostgresSchemaManager
                 + "Run the DDL below (or enable AutoMigrate) — schema changes against production should be deliberate.",
                 pendingDdl.ToString());
         }
+
+        return appliedDdl.ToString();
     }
 
     /// <summary>The full CREATE TABLE (plus indexes) for one relational table.</summary>

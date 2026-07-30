@@ -230,7 +230,9 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
     {
         var options = _options.CurrentValue.Postgres;
         await using var connection = await _connections.DataSource.OpenConnectionAsync(ct).ConfigureAwait(false);
-        await _schemaManager!.EnsureAsync(connection, _relationalTables, options.AutoMigrate, ct).ConfigureAwait(false);
+        var appliedDdl = await _schemaManager!.EnsureAsync(connection, _relationalTables, options.AutoMigrate, ct).ConfigureAwait(false);
+        if (appliedDdl.Length > 0)
+            LogMessages.SchemaMigrated(_logger, appliedDdl);
 
         var epoch = _engine.Log.EpochId;
         var (checkpointLsn, checkpointEpoch) = await ReadCheckpointAsync(connection, ct).ConfigureAwait(false);
@@ -524,6 +526,15 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         public static void Recovered(ILogger logger, ulong appliedLsn, int failures) =>
             RecoveredMessage(logger, appliedLsn, failures, null);
+
+        private static readonly Action<ILogger, string, Exception?> SchemaMigratedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Information,
+                new EventId(1603, "PostgresSchemaMigrated"),
+                "Postgres:AutoMigrate applied additive schema changes — automatic must not mean silent:\n{Ddl}");
+
+        public static void SchemaMigrated(ILogger logger, string ddl) =>
+            SchemaMigratedMessage(logger, ddl, null);
 
         private static readonly Action<ILogger, string, string, long, Exception?> MigrationRefusedMessage =
             LoggerMessage.Define<string, string, long>(
