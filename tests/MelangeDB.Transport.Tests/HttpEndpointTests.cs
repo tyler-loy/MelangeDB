@@ -15,7 +15,7 @@ public class HttpEndpointTests
     public async Task One_shot_reducer_invocation_works_without_a_websocket()
     {
         await using var host = await TransportTestHost.StartAsync();
-        using var http = new HttpClient { BaseAddress = host.HttpBase };
+        using var http = host.CreateHttp();
 
         var response = await http.PostAsync(
             "/melange/call/SetChunk",
@@ -38,7 +38,7 @@ public class HttpEndpointTests
     public async Task Reducer_call_errors_map_to_http_codes()
     {
         await using var host = await TransportTestHost.StartAsync();
-        using var http = new HttpClient { BaseAddress = host.HttpBase };
+        using var http = host.CreateHttp();
 
         var unknown = await http.PostAsync("/melange/call/NoSuchReducer", Json("[]"), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
@@ -57,7 +57,7 @@ public class HttpEndpointTests
     public async Task Bulk_ingestion_appends_one_write_set_not_one_transaction_per_row()
     {
         await using var host = await TransportTestHost.StartAsync();
-        using var http = new HttpClient { BaseAddress = host.HttpBase };
+        using var http = host.CreateHttp();
         var headBefore = host.Engine.Log.HeadLsn;
 
         var rows = string.Join(',', Enumerable.Range(0, 1000).Select(i =>
@@ -81,7 +81,7 @@ public class HttpEndpointTests
         host.Call("AddSkill", 7L, "logging", 20L, 2);
         host.Call("AddSkill", 8L, "smithing", 30L, 3);
         host.Call("AddSecret", 1UL, "hidden");
-        using var http = new HttpClient { BaseAddress = host.HttpBase };
+        using var http = host.CreateHttp();
 
         var projected = await http.PostAsync(
             "/melange/sql",
@@ -112,7 +112,7 @@ public class HttpEndpointTests
     public async Task Ticket_endpoint_mints_single_use_short_lived_tickets()
     {
         await using var host = await TransportTestHost.StartAsync();
-        using var http = new HttpClient { BaseAddress = host.HttpBase };
+        using var http = host.CreateHttp();
 
         var first = await ReadJsonAsync(await http.PostAsync("/melange/ticket", Json("{}"), TestContext.Current.CancellationToken));
         var second = await ReadJsonAsync(await http.PostAsync("/melange/ticket", Json("{}"), TestContext.Current.CancellationToken));
@@ -128,7 +128,7 @@ public class HttpEndpointTests
         {
             ["MelangeDb:Transport:HttpEndpointsEnabled"] = "false",
         });
-        using var http = new HttpClient { BaseAddress = host.HttpBase };
+        using var http = host.CreateHttp();
         var response = await http.PostAsync("/melange/ticket", Json("{}"), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.NotFound, response.StatusCode);
 
