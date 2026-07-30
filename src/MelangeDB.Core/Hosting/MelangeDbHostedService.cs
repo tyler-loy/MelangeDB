@@ -81,6 +81,19 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Telemetry.IncludeCallerIdentity = next.Telemetry.IncludeCallerIdentity;
         live.Telemetry.IncludeReducerArguments = next.Telemetry.IncludeReducerArguments;
         live.Telemetry.SlowReducerMs = next.Telemetry.SlowReducerMs;
+        live.Telemetry.DeltaSpanSampleRatio = next.Telemetry.DeltaSpanSampleRatio;
+        live.Transport.MaxMessageBytes = next.Transport.MaxMessageBytes;
+        live.Transport.HeartbeatIntervalMs = next.Transport.HeartbeatIntervalMs;
+        live.Transport.HeartbeatTimeoutMs = next.Transport.HeartbeatTimeoutMs;
+        live.Transport.MaxInitialSetChunkBytes = next.Transport.MaxInitialSetChunkBytes;
+        live.Resume.RetentionWindowSeconds = next.Resume.RetentionWindowSeconds;
+        live.Subscriptions.MaxPerConnection = next.Subscriptions.MaxPerConnection;
+        live.Subscriptions.BackpressurePolicy = next.Subscriptions.BackpressurePolicy;
+        live.Subscriptions.MaxBufferedBytes = next.Subscriptions.MaxBufferedBytes;
+        live.Subscriptions.MaxRowsPerSubscription = next.Subscriptions.MaxRowsPerSubscription;
+        live.Subscriptions.MaxBytesPerSubscription = next.Subscriptions.MaxBytesPerSubscription;
+        live.Subscriptions.MaxRangeSpan = next.Subscriptions.MaxRangeSpan;
+        live.Subscriptions.RequirePredicateOn = next.Subscriptions.RequirePredicateOn;
     }
 
     [LoggerMessage(EventId = 1101, EventName = "MelangeStarted", Level = LogLevel.Information,

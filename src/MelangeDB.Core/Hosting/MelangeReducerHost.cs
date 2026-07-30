@@ -37,15 +37,22 @@ public sealed class MelangeReducerHost
     public IReadOnlyList<ReducerDescriptor> Reducers => _registry.Reducers;
 
     /// <summary>Encodes <paramref name="arguments"/> and dispatches — the in-process convenience path.</summary>
-    public void Call(string reducerName, Identity caller, params object?[] arguments) =>
+    public ulong Call(string reducerName, Identity caller, params object?[] arguments) =>
         Call(reducerName, caller, ConnectionId.None, ArgsCodec.Encode(arguments));
 
     /// <summary>
     /// Dispatches a reducer call from already-encoded arguments — the path a transport uses.
     /// Arguments are decoded and validated against the declared parameter types before any
     /// transaction opens; a <see cref="ReducerArgumentException"/> means nothing happened.
+    /// <paramref name="parentContext"/> carries a caller-propagated trace context
+    /// (<c>traceparent</c> on the wire) so the reducer span parents to the client's trace.
     /// </summary>
-    public void Call(string reducerName, Identity caller, ConnectionId connectionId, ReadOnlyMemory<byte> encodedArguments)
+    public ulong Call(
+        string reducerName,
+        Identity caller,
+        ConnectionId connectionId,
+        ReadOnlyMemory<byte> encodedArguments,
+        System.Diagnostics.ActivityContext parentContext = default)
     {
         if (_stopping)
             throw new InvalidOperationException("MelangeDB is shutting down; no further reducer calls are accepted.");
@@ -60,7 +67,7 @@ public sealed class MelangeReducerHost
 
         using var scope = _scopes.CreateScope();
         var instance = scope.ServiceProvider.GetRequiredService(descriptor.ReducerClass);
-        _engine.Invoke(
+        return _engine.Invoke(
             descriptor.Name,
             caller,
             encodedArguments,
@@ -69,7 +76,8 @@ public sealed class MelangeReducerHost
                 var reader = new ReducerArgsReader(encodedArguments.Span, validation);
                 descriptor.Invoke(instance, context, ref reader);
             },
-            connectionId);
+            connectionId,
+            parentContext);
     }
 
     internal void SignalStopping() => _stopping = true;

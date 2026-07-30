@@ -53,6 +53,23 @@ public sealed class SchemaRegistry
 
     public bool TryGet(TableId id, out TableSchema schema) => _byId.TryGetValue(id, out schema!);
 
+    /// <summary>Finds a table by its declared name, ordinal comparison.</summary>
+    public bool TryGetByName(string name, out TableSchema schema)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(name);
+        foreach (var table in Tables)
+        {
+            if (string.Equals(table.Name, name, StringComparison.Ordinal))
+            {
+                schema = table;
+                return true;
+            }
+        }
+
+        schema = null!;
+        return false;
+    }
+
     private static TableSchema BuildSchema(Type type)
     {
         if (!type.IsValueType)

@@ -25,6 +25,99 @@ public static class RowSerializer
         return stream.ToArray();
     }
 
+    /// <summary>
+    /// Serializes a row from boxed column values keyed by column name — the schema-driven path
+    /// bulk ingestion uses, no row type instance and no reflection accessors involved. Missing
+    /// columns serialize as their default; a value that cannot coerce to its column's kind throws.
+    /// </summary>
+    public static byte[] SerializeValues(TableSchema table, IReadOnlyDictionary<string, object?> values)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(values);
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream);
+        foreach (var column in table.Columns)
+        {
+            values.TryGetValue(column.Name, out var value);
+            WriteValue(writer, column, CoerceValue(table, column, value));
+        }
+
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    /// <summary>
+    /// Coerces a loosely typed value (as JSON or a wire map delivers it) to the boxed form
+    /// <see cref="Serialize"/> expects for the column's kind, range-checked.
+    /// </summary>
+    public static object? CoerceValue(TableSchema table, ColumnSchema column, object? value)
+    {
+        ArgumentNullException.ThrowIfNull(table);
+        ArgumentNullException.ThrowIfNull(column);
+        try
+        {
+            return column.Kind switch
+            {
+                ColumnKind.Bool => value is null ? false : (bool)value,
+                ColumnKind.Int8 => checked((sbyte)ToInt64(value)),
+                ColumnKind.UInt8 => checked((byte)ToUInt64(value)),
+                ColumnKind.Int16 => checked((short)ToInt64(value)),
+                ColumnKind.UInt16 => checked((ushort)ToUInt64(value)),
+                ColumnKind.Int32 => checked((int)ToInt64(value)),
+                ColumnKind.UInt32 => checked((uint)ToUInt64(value)),
+                ColumnKind.Int64 => ToInt64(value),
+                ColumnKind.UInt64 => ToUInt64(value),
+                ColumnKind.Float32 => value is null ? 0f : Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture),
+                ColumnKind.Float64 => value is null ? 0d : Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture),
+                ColumnKind.String => value is null ? null : (string)value,
+                ColumnKind.Bytes => value switch
+                {
+                    null => null,
+                    byte[] bytes => bytes,
+                    string base64 => Convert.FromBase64String(base64),
+                    _ => throw new InvalidCastException(),
+                },
+                ColumnKind.Identity => ToIdentity(value),
+                ColumnKind.Timestamp => value switch
+                {
+                    null => new Timestamp(0),
+                    Timestamp timestamp => timestamp,
+                    _ => new Timestamp(ToInt64(value)),
+                },
+                _ => throw new NotSupportedException($"Unknown column kind {column.Kind}."),
+            };
+        }
+        catch (Exception exception) when (exception is InvalidCastException or FormatException or OverflowException)
+        {
+            throw new ArgumentException(
+                $"Table '{table.Name}': value '{value}' cannot coerce to column '{column.Name}' of kind {column.Kind}.",
+                nameof(value));
+        }
+    }
+
+    private static long ToInt64(object? value) => value switch
+    {
+        null => 0L,
+        ulong u => checked((long)u),
+        _ => Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture),
+    };
+
+    private static ulong ToUInt64(object? value) => value switch
+    {
+        null => 0UL,
+        ulong u => u,
+        _ => checked((ulong)Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture)),
+    };
+
+    private static Identity ToIdentity(object? value) => value switch
+    {
+        null => Identity.None,
+        Identity identity => identity,
+        byte[] bytes => new Identity(bytes),
+        string hex => new Identity(Convert.FromHexString(hex)),
+        _ => throw new InvalidCastException(),
+    };
+
     public static object Deserialize(TableSchema table, ReadOnlyMemory<byte> data)
     {
         ArgumentNullException.ThrowIfNull(table);

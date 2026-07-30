@@ -21,6 +21,7 @@ public sealed class MelangeEngine : IDisposable
     private readonly EngineTelemetry? _telemetry;
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
+    private readonly List<ICommitObserver> _commitObservers = [];
     private bool _disposed;
 
     public MelangeEngine(
@@ -89,7 +90,7 @@ public sealed class MelangeEngine : IDisposable
     /// <paramref name="arguments"/> are recorded as log metadata for audit; the write set is the
     /// authoritative payload. Nested invocations are forbidden and throw.
     /// </summary>
-    public void Invoke(
+    public ulong Invoke(
         string reducerName,
         Identity caller,
         Action<ReducerContext> body,
@@ -110,7 +111,7 @@ public sealed class MelangeEngine : IDisposable
             _inReducer.Value = true;
             try
             {
-                InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
+                return InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
             }
             finally
             {
@@ -121,14 +122,16 @@ public sealed class MelangeEngine : IDisposable
 
     /// <summary>
     /// Invokes a reducer body with pre-encoded arguments — the generated dispatch path, which
-    /// decoded (and validated) the same bytes before this call.
+    /// decoded (and validated) the same bytes before this call. <paramref name="parentContext"/>
+    /// parents the reducer span when a transport propagated a caller's trace context.
     /// </summary>
-    public void Invoke(
+    public ulong Invoke(
         string reducerName,
         Identity caller,
         ReadOnlyMemory<byte> encodedArguments,
         Action<ReducerContext> body,
-        ConnectionId connectionId = default)
+        ConnectionId connectionId = default,
+        ActivityContext parentContext = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(reducerName);
         ArgumentNullException.ThrowIfNull(body);
@@ -144,12 +147,100 @@ public sealed class MelangeEngine : IDisposable
             _inReducer.Value = true;
             try
             {
-                InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId);
+                return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext);
             }
             finally
             {
                 _inReducer.Value = false;
             }
+        }
+    }
+
+    /// <summary>
+    /// Registers a commit observer. It sees every record committed after registration, in LSN
+    /// order, under the write lock and before any applier advances — see
+    /// <see cref="ICommitObserver"/> for the pre-image guarantee.
+    /// </summary>
+    public void AddCommitObserver(ICommitObserver observer)
+    {
+        ArgumentNullException.ThrowIfNull(observer);
+        lock (_writeLock)
+        {
+            _commitObservers.Add(observer);
+        }
+    }
+
+    /// <summary>
+    /// Runs a read under the write lock, handing it the head LSN the read is consistent at. No
+    /// commit — and no commit observer — runs concurrently, so state observed here plus every
+    /// observed record after that LSN is a gap-free, duplicate-free view. This is the anchor a
+    /// subscription's initial set shares with its delta stream; keep the body cheap, because every
+    /// reducer call waits behind it.
+    /// </summary>
+    public T ReadConsistent<T>(Func<ulong, T> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        lock (_writeLock)
+        {
+            return read(_log.HeadLsn);
+        }
+    }
+
+    /// <summary>Runs an action under the write lock; see <see cref="ReadConsistent{T}"/>.</summary>
+    public void ReadConsistent(Action<ulong> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        lock (_writeLock)
+        {
+            read(_log.HeadLsn);
+        }
+    }
+
+    /// <summary>
+    /// Appends one large write set as one transaction — the bulk ingestion path, one log record
+    /// for the whole batch rather than one per row. Rows are upserts built from boxed column
+    /// values keyed by name; zero or missing <c>[AutoInc]</c> columns are allocated, explicit
+    /// values observed. Returns null when <paramref name="rows"/> is empty. Unique indexes are
+    /// checked against committed state, not within the batch — the batch is the loader's to keep
+    /// consistent.
+    /// </summary>
+    public CommitRecord? BulkInsert(Identity caller, IReadOnlyList<BulkRow> rows, ConnectionId connectionId = default)
+    {
+        ArgumentNullException.ThrowIfNull(rows);
+        if (rows.Count == 0)
+            return null;
+        if (_inReducer.Value)
+            throw new InvalidOperationException("Bulk ingestion cannot run inside a reducer.");
+
+        lock (_writeLock)
+        {
+            using var activity = _telemetry?.StartReducer(BulkReducerName, caller, arguments: null, encodedArguments: default);
+            var started = Stopwatch.GetTimestamp();
+            var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
+            var writeSet = new WriteSet();
+            var stage = _sequencer.BeginStage();
+            try
+            {
+                foreach (var row in rows)
+                    StageBulkRow(row, writeSet, stage);
+            }
+            catch (Exception exception)
+            {
+                activity?.SetTag("melange.outcome", "rejected");
+                activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
+                _telemetry?.RecordTransaction(BulkReducerName, "rejected", Elapsed(started), 0);
+                throw;
+            }
+
+            var ops = writeSet.ToOps();
+            var record = _log.Append(new CommitRequest(timestamp, caller, BulkReducerName, ReadOnlyMemory<byte>.Empty, ops));
+            stage.Commit();
+            NotifyCommitObservers(record);
+            Appliers.NotifyAppended(record);
+            activity?.SetTag("melange.outcome", "commit");
+            activity?.SetTag("melange.writeset.rows", ops.Count);
+            _telemetry?.RecordTransaction(BulkReducerName, "commit", Elapsed(started), ops.Count);
+            return record;
         }
     }
 
@@ -181,15 +272,67 @@ public sealed class MelangeEngine : IDisposable
         _inReducer.Dispose();
     }
 
-    private void InvokeCore(
+    private const string BulkReducerName = "melange/bulk";
+
+    private void StageBulkRow(in BulkRow row, WriteSet writeSet, AutoIncStage stage)
+    {
+        if (!Schema.TryGetByName(row.Table, out var schema))
+            throw new ArgumentException($"No table named '{row.Table}' is registered.");
+
+        var values = new Dictionary<string, object?>(row.Columns.Count, StringComparer.Ordinal);
+        foreach (var (name, value) in row.Columns)
+        {
+            var column = schema.Column(name);
+            values[name] = RowSerializer.CoerceValue(schema, column, value);
+        }
+
+        foreach (var autoInc in schema.AutoIncColumns)
+        {
+            var current = values.TryGetValue(autoInc.Name, out var supplied) ? AutoIncSequencer.ToUInt64(supplied) : 0UL;
+            if (current is 0 or null)
+                values[autoInc.Name] = autoInc.Kind == ColumnKind.Int64 ? (long)stage.Allocate(schema.Id) : stage.Allocate(schema.Id);
+            else if (current is { } explicitId)
+                stage.ObserveExplicit(schema.Id, explicitId);
+        }
+
+        values.TryGetValue(schema.PrimaryKey.Name, out var pkValue);
+        if (pkValue is null)
+            throw new ArgumentException($"Table '{schema.Name}': bulk row is missing primary key column '{schema.PrimaryKey.Name}'.");
+
+        var key = KeyCodec.Encode(schema.PrimaryKey, pkValue);
+        var exists = writeSet.TryGetPending(schema.Id, key, out var pending)
+            ? pending.Kind != RowOpKind.Delete
+            : HotStore.TryGetRow(schema.Id, key, out _);
+        var bytes = RowSerializer.SerializeValues(schema, values);
+        writeSet.Stage(new RowOp(exists ? RowOpKind.Update : RowOpKind.Insert, schema.Id, key, bytes));
+    }
+
+    private void NotifyCommitObservers(CommitRecord record)
+    {
+        foreach (var observer in _commitObservers)
+        {
+            try
+            {
+                observer.OnCommit(record);
+            }
+            catch (Exception exception)
+            {
+                // The transaction is durable; an observer failure must not undo or poison it.
+                LogMessages.CommitObserverFailed(_logger, record.Lsn, exception);
+            }
+        }
+    }
+
+    private ulong InvokeCore(
         string reducerName,
         Identity caller,
         Action<ReducerContext> body,
         IReadOnlyList<object?>? arguments,
         ReadOnlyMemory<byte> encodedArguments,
-        ConnectionId connectionId)
+        ConnectionId connectionId,
+        ActivityContext parentContext = default)
     {
-        using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments);
+        using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments, parentContext);
         var started = Stopwatch.GetTimestamp();
         var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
         var writeSet = new WriteSet();
@@ -213,6 +356,7 @@ public sealed class MelangeEngine : IDisposable
             throw;
         }
 
+        ulong committedLsn = 0;
         var ops = writeSet.ToOps();
         if (ops.Count > 0)
         {
@@ -224,7 +368,9 @@ public sealed class MelangeEngine : IDisposable
                 commit?.SetTag("melange.lsn", (long)record.Lsn);
                 commit?.SetTag("melange.writeset.bytes", record.SerializedLength);
                 stage.Commit();
+                NotifyCommitObservers(record);
                 Appliers.NotifyAppended(record);
+                committedLsn = record.Lsn;
             }
         }
 
@@ -239,6 +385,8 @@ public sealed class MelangeEngine : IDisposable
                 tags: new ActivityTagsCollection { ["melange.duration_ms"] = elapsed }));
             LogMessages.SlowReducer(_logger, reducerName, elapsed, _options.Telemetry.SlowReducerMs);
         }
+
+        return committedLsn;
     }
 
     private static double Elapsed(long startedTimestamp) =>
@@ -254,5 +402,17 @@ public sealed class MelangeEngine : IDisposable
 
         public static void SlowReducer(ILogger logger, string reducer, double durationMs, int thresholdMs) =>
             SlowReducerMessage(logger, reducer, durationMs, thresholdMs, null);
+
+        private static readonly Action<ILogger, ulong, Exception?> CommitObserverFailedMessage =
+            LoggerMessage.Define<ulong>(
+                LogLevel.Error,
+                new EventId(1005, "CommitObserverFailed"),
+                "A commit observer threw for LSN {Lsn}; the transaction is committed and unaffected.");
+
+        public static void CommitObserverFailed(ILogger logger, ulong lsn, Exception failure) =>
+            CommitObserverFailedMessage(logger, lsn, failure);
     }
 }
+
+/// <summary>One bulk-ingested row: a table name and boxed column values keyed by column name.</summary>
+public readonly record struct BulkRow(string Table, IReadOnlyDictionary<string, object?> Columns);

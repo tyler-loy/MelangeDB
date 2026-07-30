@@ -10,6 +10,13 @@ public interface ICommitLog : IDisposable
     ulong HeadLsn { get; }
 
     /// <summary>
+    /// The identifier of this log incarnation. An LSN is meaningful only within one log, so a
+    /// resume cursor names the epoch it counts against; a recreated log mints a fresh epoch, which
+    /// is what turns a stale cursor into an explicit failure instead of silent divergence.
+    /// </summary>
+    Guid EpochId { get; }
+
+    /// <summary>
     /// Appends one committed transaction, assigns the next LSN, and makes it durable per the
     /// configured fsync policy. Returns the record as written.
     /// </summary>
