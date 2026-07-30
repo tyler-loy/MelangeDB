@@ -427,3 +427,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+samples/**/data/
+samples/**/log/
+samples/**/hot/

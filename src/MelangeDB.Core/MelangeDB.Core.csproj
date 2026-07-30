@@ -10,8 +10,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Solely for the commit log's append fault-injection seam; no test asserts on other internals. -->
+    <!-- Solely for the commit log's append fault-injection seam and the engine's live-options
+         instance; no test asserts on other internals. -->
     <InternalsVisibleTo Include="MelangeDB.Core.Tests" />
+    <InternalsVisibleTo Include="MelangeDB.Host.Tests" />
   </ItemGroup>
 
   <ItemGroup>
