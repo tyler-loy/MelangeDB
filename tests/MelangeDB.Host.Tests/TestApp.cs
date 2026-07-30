@@ -33,6 +33,20 @@ public partial struct Audit
     public string Entry;
 }
 
+/// <summary>
+/// Relational-tier with no Postgres configured anywhere in this suite: the zero-Postgres
+/// deployment must run — rows live in the hot store — and be warned once (EventId 1607).
+/// </summary>
+[Table(Tier = StorageTier.Relational)]
+public partial struct AuditArchive
+{
+    [PrimaryKey]
+    [AutoInc]
+    public long Id;
+
+    public string Entry;
+}
+
 /// <summary>Repeating timer rows: the world tick. Implicitly private, implicitly Local.</summary>
 [Table(Scheduled = nameof(TickReducers.WorldTick), Residency = Residency.Resident)]
 public partial struct WorldTickTimer
@@ -186,6 +200,10 @@ public sealed class NoteReducers(
         ctx.Db.Audit.Insert(new Audit { Entry = $"note:{text}" });
         logger.LogInformation("Added note {Text}", text);
     }
+
+    [Reducer]
+    public void Archive(ReducerContext ctx, string entry) =>
+        ctx.Db.AuditArchive.Insert(new AuditArchive { Entry = entry });
 
     [Reducer]
     public void AddMany(ReducerContext ctx, string[] texts, byte[] blob)
