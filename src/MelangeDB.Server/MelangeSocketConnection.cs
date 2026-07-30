@@ -10,8 +10,12 @@ namespace MelangeDB.Server;
 /// <summary>
 /// One client socket: the versioned handshake, the frame read loop, the lane-based sender that
 /// interleaves bulk initial sets with interactive traffic, the heartbeat, and the per-connection
-/// subscription set. Frames from the client are processed strictly in order; outbound ordering is
-/// guaranteed only within a channel, which is exactly what the protocol promises.
+/// subscription set. Every connection authenticates — by upgrade-request header, by connect
+/// ticket, or by a token in Hello — and is bound to that one identity for its lifetime:
+/// <c>Reauthenticate</c> refreshes the token but a different identity closes the connection,
+/// because every delta already sent was filtered under the current identity's policies. Frames
+/// from the client are processed strictly in order; outbound ordering is guaranteed only within a
+/// channel, which is exactly what the protocol promises.
 /// </summary>
 internal sealed class MelangeSocketConnection : IDeltaSink
 {
@@ -30,6 +34,9 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private readonly Dictionary<uint, ServerSubscription> _subscriptions = [];
     private readonly List<TransactionUpdateFrame> _resumeBuffer = [];
 
+    private AuthResult? _session;
+    private PolicyContext? _policyContext;
+    private bool _slotReserved;
     private long _bufferedDeltaBytes;
     private bool _resumeBuffering;
     private bool _resyncPending;
@@ -38,8 +45,14 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private ITimer? _heartbeat;
     private bool _handshaken;
     private volatile bool _senderBusy;
+    private int _terminated;
 
-    public MelangeSocketConnection(WebSocket socket, MelangeTransport transport, string httpProtocol)
+    public MelangeSocketConnection(
+        WebSocket socket,
+        MelangeTransport transport,
+        string httpProtocol,
+        AuthResult? preAuthenticated = null,
+        bool slotReserved = false)
     {
         _socket = socket;
         _transport = transport;
@@ -48,14 +61,17 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         _logger = transport.Logger;
         _serializer = transport.Serializer;
         ConnectionId = ConnectionId.New();
-        Caller = Identity.Hash("melange-anonymous");
+        _session = preAuthenticated;
+        _slotReserved = slotReserved;
+        if (preAuthenticated is not null)
+            _policyContext = new PolicyContext(preAuthenticated.Identity, preAuthenticated.IsGuest, transport.Engine.CommittedView);
         _lastReceivedTicks = _time.GetUtcNow().UtcTicks;
     }
 
     public ConnectionId ConnectionId { get; }
 
-    /// <summary>The connection's identity. Stubbed from the Hello token until phase 04's validation.</summary>
-    public Identity Caller { get; private set; }
+    /// <summary>The connection's identity — <see cref="Identity.None"/> until authenticated.</summary>
+    public Identity Caller => _session?.Identity ?? Identity.None;
 
     public async Task RunAsync(CancellationToken requestAborted)
     {
@@ -84,6 +100,12 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _heartbeat?.Dispose();
             await _closed.CancelAsync().ConfigureAwait(false);
             UnregisterAllSubscriptions();
+            if (_slotReserved)
+            {
+                _transport.ReleaseConnectionSlot(Caller);
+                _slotReserved = false;
+            }
+
             _transport.OnConnectionClosed(this);
             try
             {
@@ -105,6 +127,25 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Closes this connection from outside the read loop — the terminate-sessions path. The error
+    /// frame is queued first so the close is not mute; returns false if already closing.
+    /// </summary>
+    public bool Terminate()
+    {
+        if (Interlocked.Exchange(ref _terminated, 1) != 0 || _closed.IsCancellationRequested)
+            return false;
+        EnqueuePriority(new ErrorFrame(
+            MelangeErrorCodes.Unauthorized,
+            "This identity's sessions were terminated by the server."));
+        _ = Task.Run(async () =>
+        {
+            await DrainPriorityLaneAsync().ConfigureAwait(false);
+            _socket.Abort();
+        });
+        return true;
     }
 
     /// <summary>Waits briefly for the priority lane — error frames included — to hit the socket.</summary>
@@ -212,17 +253,17 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
             _lastReceivedTicks = _time.GetUtcNow().UtcTicks;
             var frame = _serializer.Deserialize(message.GetBuffer().AsSpan(0, (int)message.Length));
-            HandleFrame(frame);
+            await HandleFrameAsync(frame).ConfigureAwait(false);
         }
     }
 
-    private void HandleFrame(Frame frame)
+    private async Task HandleFrameAsync(Frame frame)
     {
         if (!_handshaken)
         {
             if (frame is not HelloFrame hello)
                 throw new MelangeProtocolException("The first frame must be Hello.");
-            HandleHello(hello);
+            await HandleHelloAsync(hello).ConfigureAwait(false);
             return;
         }
 
@@ -242,10 +283,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             case ResumeFrame resume:
                 HandleResume(resume);
                 break;
-            case ReauthenticateFrame:
-                // Phase 04 owns validation. The invariant it will enforce: a re-auth may refresh
-                // a token but never change the connection's identity.
-                EnqueuePriority(new ReauthenticateResultFrame(true, null));
+            case ReauthenticateFrame reauthenticate:
+                await HandleReauthenticateAsync(reauthenticate).ConfigureAwait(false);
                 break;
             case PingFrame ping:
                 EnqueuePriority(new PongFrame(ping.Id));
@@ -257,7 +296,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         }
     }
 
-    private void HandleHello(HelloFrame hello)
+    private async Task HandleHelloAsync(HelloFrame hello)
     {
         if (hello.MinVersion > MessagePackFrameSerializer.ProtocolVersion || hello.MaxVersion < MessagePackFrameSerializer.ProtocolVersion)
         {
@@ -267,8 +306,37 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             throw new MelangeProtocolException("No common protocol version.");
         }
 
-        if (!string.IsNullOrEmpty(hello.Token))
-            Caller = StubIdentity.FromToken(hello.Token);
+        if (_session is null)
+        {
+            // Header and ticket connections arrive pre-authenticated; everyone else presents a
+            // token here. No token, no connection — the IdP is the gate.
+            switch (await _transport.Authenticator.ValidateAsync(hello.Token).ConfigureAwait(false))
+            {
+                case AuthFailure failure:
+                    EnqueuePriority(new ErrorFrame(MelangeErrorCodes.Unauthorized, failure.Reason));
+                    throw new MelangeProtocolException("Handshake authentication failed.");
+                case AuthResult session:
+                    if (_transport.Sessions.IsRevoked(session.Identity))
+                    {
+                        EnqueuePriority(new ErrorFrame(MelangeErrorCodes.Unauthorized, "This identity is revoked."));
+                        throw new MelangeProtocolException("Revoked identity.");
+                    }
+
+                    if (!_transport.TryReserveConnectionSlot(session.Identity))
+                    {
+                        EnqueuePriority(new ErrorFrame(
+                            MelangeErrorCodes.ConnectionCap,
+                            $"This identity already holds Auth:MaxConnectionsPerIdentity ({_transport.Options.Auth.MaxConnectionsPerIdentity}) connections."));
+                        throw new MelangeProtocolException("Connection cap exceeded.");
+                    }
+
+                    _slotReserved = true;
+                    _session = session;
+                    _policyContext = new PolicyContext(session.Identity, session.IsGuest, _transport.Engine.CommittedView);
+                    break;
+            }
+        }
+
         _handshaken = true;
         EnqueuePriority(new WelcomeFrame(
             MessagePackFrameSerializer.ProtocolVersion,
@@ -276,6 +344,52 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _transport.Engine.Log.EpochId,
             _transport.Engine.Log.HeadLsn,
             _httpProtocol));
+    }
+
+    /// <summary>
+    /// The invariant that makes re-auth safe: a fresh token may extend the session but must never
+    /// change its identity. Every initial set and delta on this connection was filtered under the
+    /// current identity's policies, so an in-place switch would deliver A's rows to B — the
+    /// connection closes instead, and the client reconnects as whoever it now is.
+    /// </summary>
+    private async Task HandleReauthenticateAsync(ReauthenticateFrame reauthenticate)
+    {
+        switch (await _transport.Authenticator.ValidateAsync(reauthenticate.Token).ConfigureAwait(false))
+        {
+            case AuthFailure failure:
+                // An invalid refresh is not fatal by itself: the session lives until the current
+                // token's expiry plus the grace window, and the client may try again.
+                EnqueuePriority(new ReauthenticateResultFrame(false, failure.Reason));
+                return;
+            case AuthResult next:
+                if (next.Identity != Caller)
+                {
+                    EnqueuePriority(new ErrorFrame(
+                        MelangeErrorCodes.IdentityChanged,
+                        "Reauthenticate presented a token for a different identity; a connection is bound to one identity for its lifetime. Reconnect."));
+                    throw new MelangeProtocolException("Reauthentication with a different identity.");
+                }
+
+                if (_transport.Sessions.IsRevoked(next.Identity))
+                {
+                    EnqueuePriority(new ReauthenticateResultFrame(false, "This identity is revoked."));
+                    throw new MelangeProtocolException("Reauthentication for a revoked identity.");
+                }
+
+                _session = next;
+
+                // Same identity, possibly new claims (guest conversion). The context is replaced
+                // under the write lock so no fan-out observes a half-swapped caller.
+                var context = new PolicyContext(next.Identity, next.IsGuest, _transport.Engine.CommittedView);
+                _transport.Engine.ReadConsistent(_ =>
+                {
+                    _policyContext = context;
+                    foreach (var subscription in _subscriptions.Values)
+                        subscription.Context = context;
+                });
+                EnqueuePriority(new ReauthenticateResultFrame(true, null));
+                break;
+        }
     }
 
     private void HandleCallReducer(CallReducerFrame call)
@@ -287,7 +401,13 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         ulong lsn;
         try
         {
-            lsn = _transport.Reducers.Call(call.Reducer, Caller, ConnectionId, call.Arguments, parentContext);
+            lsn = _transport.Reducers.Call(
+                call.Reducer,
+                Caller,
+                ConnectionId,
+                call.Arguments,
+                parentContext,
+                CallSource.Client(_session?.IsGuest ?? false));
         }
         catch (Exception exception)
         {
@@ -295,6 +415,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             {
                 ReducerArgumentException => (MelangeErrorCodes.InvalidArguments, exception.Message),
                 RejectedException => (MelangeErrorCodes.Rejected, exception.Message),
+                RateLimitedException => (MelangeErrorCodes.RateLimited, exception.Message),
+                ReducerDeniedException => (MelangeErrorCodes.Denied, exception.Message),
                 ArgumentException => (MelangeErrorCodes.UnknownReducer, $"No reducer named '{call.Reducer}' is registered."),
                 _ => (MelangeErrorCodes.Internal, "The reducer failed; see the server logs."),
             };
@@ -338,7 +460,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             using var activity = _transport.Telemetry?.StartInitialSet(query.Table);
             var (subscription, initialSet) = _transport.Engine.ReadConsistent(head =>
             {
-                var registered = _transport.Subscriptions.Register(this, subscribe.SubscriptionId, query, limits, head, computeInitialSet: true);
+                var registered = _transport.Subscriptions.Register(
+                    this, subscribe.SubscriptionId, query, limits, head, computeInitialSet: true, _transport.Policies, _policyContext);
                 _subscriptions[subscribe.SubscriptionId] = registered.Subscription;
                 return registered;
             });
@@ -429,7 +552,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 {
                     var query = SqlSubsetParser.Parse(request.Query, request.Parameters);
                     var (subscription, _) = _transport.Subscriptions.Register(
-                        this, request.SubscriptionId, query, _transport.Options.Subscriptions, head, computeInitialSet: false);
+                        this, request.SubscriptionId, query, _transport.Options.Subscriptions, head,
+                        computeInitialSet: false, _transport.Policies, _policyContext);
                     _subscriptions[request.SubscriptionId] = subscription;
                     registered.Add(subscription);
                 }
@@ -489,24 +613,44 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     {
         try
         {
-            var options = _transport.Options.Transport;
+            var options = _transport.Options;
+            if (TokenExpiryExceeded(options.Auth))
+            {
+                // The token expired and the grace window passed with no successful re-auth: a
+                // revoked or expired credential must not keep working indefinitely.
+                EnqueuePriority(new ErrorFrame(
+                    MelangeErrorCodes.TokenExpired,
+                    $"The session token expired and Auth:ReauthGraceSeconds ({options.Auth.ReauthGraceSeconds}s) passed without Reauthenticate."));
+                _ = Task.Run(async () =>
+                {
+                    await DrainPriorityLaneAsync().ConfigureAwait(false);
+                    _socket.Abort();
+                });
+                return;
+            }
+
             var silence = _time.GetUtcNow() - new DateTimeOffset(Interlocked.Read(ref _lastReceivedTicks), TimeSpan.Zero);
-            if (silence > TimeSpan.FromMilliseconds(options.HeartbeatTimeoutMs))
+            if (silence > TimeSpan.FromMilliseconds(options.Transport.HeartbeatTimeoutMs))
             {
                 // No close frame arrived and nothing else did either: an ungraceful drop. Abort so
                 // the read loop observes the death instead of waiting forever.
-                LogMessages.HeartbeatTimeout(_logger, ConnectionId.ToString(), options.HeartbeatTimeoutMs);
+                LogMessages.HeartbeatTimeout(_logger, ConnectionId.ToString(), options.Transport.HeartbeatTimeoutMs);
                 _socket.Abort();
                 return;
             }
 
             EnqueuePriority(new PingFrame(_nextPingId++));
-            _heartbeat?.Change(TimeSpan.FromMilliseconds(options.HeartbeatIntervalMs), Timeout.InfiniteTimeSpan);
+            _heartbeat?.Change(TimeSpan.FromMilliseconds(options.Transport.HeartbeatIntervalMs), Timeout.InfiniteTimeSpan);
         }
         catch (ObjectDisposedException)
         {
         }
     }
+
+    private bool TokenExpiryExceeded(AuthOptions options) =>
+        _session is { TokenExpiresAt: var expires }
+        && expires != DateTimeOffset.MaxValue
+        && _time.GetUtcNow() > expires.AddSeconds(options.ReauthGraceSeconds);
 
     private async Task SendLoopAsync(CancellationToken ct)
     {
@@ -605,8 +749,13 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             long budget = 0;
             while (_index < initialSet.Rows.Count && (budget == 0 || budget < chunkBudget))
             {
-                var (key, row) = initialSet.Rows[_index++];
-                rows.Add(new WireRow(key.ToArray(), RowWire.ToColumns(Subscription.Schema, row.Span, Subscription.Projection)));
+                var (key, row) = initialSet.Rows[_index];
+
+                // Per-row column sets were mask-evaluated under the write lock at the anchor;
+                // static wire columns already exclude [ServerOnly].
+                var columns = initialSet.RowColumns is { } perRow ? perRow[_index] : Subscription.StaticWireColumns;
+                _index++;
+                rows.Add(new WireRow(key.ToArray(), RowWire.ToColumns(Subscription.Schema, row.Span, columns)));
                 budget += key.Length + row.Length;
             }
 

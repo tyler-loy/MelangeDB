@@ -4,8 +4,17 @@ using MelangeDB.Protocol;
 
 namespace MelangeDB.Server;
 
-/// <summary>A registered subscription's initial set: the anchor LSN and the matching row references.</summary>
-internal sealed record InitialSet(ulong AnchorLsn, IReadOnlyList<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Rows, long Bytes);
+/// <summary>
+/// A registered subscription's initial set: the anchor LSN and the matching, policy-visible row
+/// references. <see cref="RowColumns"/> carries each row's mask-evaluated column set when the
+/// table has column policies — computed under the write lock at the anchor, so the columns match
+/// the state the rows were collected at; null means the subscription's static wire columns apply.
+/// </summary>
+internal sealed record InitialSet(
+    ulong AnchorLsn,
+    IReadOnlyList<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Rows,
+    long Bytes,
+    IReadOnlyList<IReadOnlySet<string>?>? RowColumns = null);
 
 /// <summary>
 /// The server-wide subscription registry and delta computer. Subscriptions are indexed by table,
@@ -41,9 +50,11 @@ internal sealed class SubscriptionEngine
         SubscriptionQuery query,
         SubscriptionsOptions limits,
         ulong anchorLsn,
-        bool computeInitialSet)
+        bool computeInitialSet,
+        PolicySet? policies = null,
+        PolicyContext? context = null)
     {
-        var subscription = ServerSubscription.Compile(sink, id, query, _engine.Schema, limits);
+        var subscription = ServerSubscription.Compile(sink, id, query, _engine.Schema, limits, policies, context);
         var initialSet = computeInitialSet
             ? CollectWithCeilings(subscription, limits, anchorLsn)
             : new InitialSet(anchorLsn, [], 0);
@@ -82,8 +93,11 @@ internal sealed class SubscriptionEngine
         CheckCeilings(probe, limits);
 
         var previousKeys = new HashSet<RowKey>();
-        foreach (var (key, _) in subscription.MatchingRows(_engine.HotStore))
-            previousKeys.Add(key);
+        foreach (var (key, row) in subscription.MatchingRows(_engine.HotStore))
+        {
+            if (subscription.PolicyAdmits(row.Span))
+                previousKeys.Add(key);
+        }
 
         subscription.Rescope(query, limits);
 
@@ -91,9 +105,15 @@ internal sealed class SubscriptionEngine
         var nowKeys = new HashSet<RowKey>();
         foreach (var (key, row) in subscription.MatchingRows(_engine.HotStore))
         {
+            if (!subscription.PolicyAdmits(row.Span))
+            {
+                _telemetry?.RecordRowsFiltered(subscription.Schema.Name, 1);
+                continue;
+            }
+
             nowKeys.Add(key);
             if (!previousKeys.Contains(key))
-                ops.Add(new WireRowOp(RowOpKind.Insert, key.ToArray(), RowWire.ToColumns(subscription.Schema, row.Span, subscription.Projection)));
+                ops.Add(new WireRowOp(RowOpKind.Insert, key.ToArray(), RowWire.ToColumns(subscription.Schema, row.Span, subscription.VisibleColumns(row.Span))));
         }
 
         foreach (var key in previousKeys)
@@ -152,8 +172,9 @@ internal sealed class SubscriptionEngine
 
     /// <summary>
     /// Computes one record's deltas for resumed subscriptions from the log alone. The log has no
-    /// pre-images, so updates that do not match emit conservative deletes — a client applies a
-    /// delete for a row it never had as a no-op, which keeps replay correct without them.
+    /// pre-images, so updates that are not visible — by predicate or by row policy — emit
+    /// conservative deletes: a client applies a delete for a row it never had as a no-op, which
+    /// keeps replay correct (and leak-free) without them.
     /// </summary>
     public static IReadOnlyList<SubscriptionUpdate> ComputeReplayUpdates(
         IReadOnlyList<ServerSubscription> subscriptions,
@@ -171,12 +192,12 @@ internal sealed class SubscriptionEngine
                 {
                     (ops ??= []).Add(new WireRowOp(RowOpKind.Delete, op.Key.ToArray(), null));
                 }
-                else if (subscription.Matches(op.Key, op.Row.Span))
+                else if (subscription.RowVisible(op.Key, op.Row.Span))
                 {
                     (ops ??= []).Add(new WireRowOp(
                         op.Kind,
                         op.Key.ToArray(),
-                        RowWire.ToColumns(subscription.Schema, op.Row.Span, subscription.Projection)));
+                        RowWire.ToColumns(subscription.Schema, op.Row.Span, subscription.VisibleColumns(op.Row.Span))));
                 }
                 else if (op.Kind == RowOpKind.Update)
                 {
@@ -193,40 +214,75 @@ internal sealed class SubscriptionEngine
 
     private WireRowOp? ComputeDelta(ServerSubscription subscription, in RowOp op, bool hasOld, ReadOnlyMemory<byte> oldRow)
     {
+        // Predicate AND row policy decide visibility on both sides of the change. The store still
+        // holds the pre-image here (the fan-out runs before the hot store applies), and policy
+        // reads of other tables see the same pre-transaction committed state — never a partially
+        // applied write set.
         var oldMatch = hasOld && subscription.Matches(op.Key, oldRow.Span);
         var newMatch = op.Kind != RowOpKind.Delete && subscription.Matches(op.Key, op.Row.Span);
-        if (newMatch && !oldMatch)
-            return new WireRowOp(RowOpKind.Insert, op.Key.ToArray(), RowWire.ToColumns(subscription.Schema, op.Row.Span, subscription.Projection));
-        if (newMatch && oldMatch)
+        var oldVisible = oldMatch && subscription.PolicyAdmits(oldRow.Span);
+        var newVisible = newMatch && subscription.PolicyAdmits(op.Row.Span);
+        if (newMatch && !newVisible)
+            _telemetry?.RecordRowsFiltered(subscription.Schema.Name, 1);
+
+        if (newVisible && !oldVisible)
+            return new WireRowOp(RowOpKind.Insert, op.Key.ToArray(), RowWire.ToColumns(subscription.Schema, op.Row.Span, subscription.VisibleColumns(op.Row.Span)));
+        if (newVisible && oldVisible)
         {
-            // A projected subscription must not emit when only non-projected columns changed —
-            // that would be wasted bandwidth on the hottest path.
-            if (subscription.Projection is { } projection
-                && RowWire.ProjectedEqual(subscription.Schema, oldRow.Span, op.Row.Span, projection))
+            var newColumns = subscription.VisibleColumns(op.Row.Span);
+            if (newColumns is not null)
             {
-                return null;
+                // A restricted subscription must not emit when only invisible columns changed:
+                // beyond wasted bandwidth, an update frame for a [ServerOnly]-column change is a
+                // timing oracle. A mask that itself changed still emits, with the new columns.
+                var oldColumns = subscription.VisibleColumns(oldRow.Span);
+                if (ColumnsEqual(oldColumns, newColumns)
+                    && RowWire.ProjectedEqual(subscription.Schema, oldRow.Span, op.Row.Span, newColumns))
+                {
+                    return null;
+                }
             }
 
-            return new WireRowOp(RowOpKind.Update, op.Key.ToArray(), RowWire.ToColumns(subscription.Schema, op.Row.Span, subscription.Projection));
+            return new WireRowOp(RowOpKind.Update, op.Key.ToArray(), RowWire.ToColumns(subscription.Schema, op.Row.Span, newColumns));
         }
 
-        if (!newMatch && oldMatch)
+        if (!newVisible && oldVisible)
             return new WireRowOp(RowOpKind.Delete, op.Key.ToArray(), null);
         return null;
+    }
+
+    private static bool ColumnsEqual(IReadOnlySet<string>? left, IReadOnlySet<string>? right)
+    {
+        if (left is null || right is null)
+            return left is null && right is null;
+        return left.Count == right.Count && left.SetEquals(right);
     }
 
     private InitialSet CollectWithCeilings(ServerSubscription subscription, SubscriptionsOptions limits, ulong anchorLsn)
     {
         var rows = new List<KeyValuePair<RowKey, ReadOnlyMemory<byte>>>();
+        var perRowColumns = subscription.Evaluator is { HasColumnPolicies: true } && subscription.Context is not null
+            ? new List<IReadOnlySet<string>?>()
+            : null;
         long bytes = 0;
+        var filtered = 0;
         foreach (var pair in subscription.MatchingRows(_engine.HotStore))
         {
+            if (!subscription.PolicyAdmits(pair.Value.Span))
+            {
+                filtered++;
+                continue;
+            }
+
             rows.Add(pair);
+            perRowColumns?.Add(subscription.VisibleColumns(pair.Value.Span));
             bytes += pair.Value.Length;
             EnforceCeilings(subscription, limits, rows.Count, bytes);
         }
 
-        return new InitialSet(anchorLsn, rows, bytes);
+        if (filtered > 0)
+            _telemetry?.RecordRowsFiltered(subscription.Schema.Name, filtered);
+        return new InitialSet(anchorLsn, rows, bytes, perRowColumns);
     }
 
     private void CheckCeilings(ServerSubscription subscription, SubscriptionsOptions limits)

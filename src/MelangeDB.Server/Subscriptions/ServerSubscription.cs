@@ -23,16 +23,20 @@ internal sealed class SubscriptionRejectedException : Exception
 
 /// <summary>
 /// One registered subscription: the compiled predicate tested against row ops on the fan-out path,
-/// and the column projection its deltas are masked to. Registration state is mutated only under
-/// the engine's write lock.
+/// the column projection its deltas are masked to, and the caller's policy context. Registration
+/// state is mutated only under the engine's write lock. Row visibility is predicate AND policy
+/// (policies union among themselves); wire columns are projection ∩ non-<c>[ServerOnly]</c> ∩
+/// every column mask — rows union, columns intersect.
 /// </summary>
 internal sealed class ServerSubscription
 {
-    private ServerSubscription(IDeltaSink sink, uint id, TableSchema schema)
+    private ServerSubscription(IDeltaSink sink, uint id, TableSchema schema, TablePolicyEvaluator? evaluator, PolicyContext? context)
     {
         Sink = sink;
         Id = id;
         Schema = schema;
+        Evaluator = evaluator;
+        Context = context;
     }
 
     public IDeltaSink Sink { get; }
@@ -40,6 +44,22 @@ internal sealed class ServerSubscription
     public uint Id { get; }
 
     public TableSchema Schema { get; }
+
+    /// <summary>The table's row and column policies, or null when it has none.</summary>
+    public TablePolicyEvaluator? Evaluator { get; }
+
+    /// <summary>
+    /// The caller this subscription filters for; null runs no policies (the owner-mode SQL path).
+    /// Replaced on re-authentication so a guest conversion updates <c>IsGuest</c> in place.
+    /// </summary>
+    public PolicyContext? Context { get; set; }
+
+    /// <summary>
+    /// The columns this subscription puts on the wire before per-row masks: the client's
+    /// projection, else all columns minus <c>[ServerOnly]</c>; null means every column. Computed
+    /// at compile time so subscriptions without column policies pay nothing per row.
+    /// </summary>
+    public HashSet<string>? StaticWireColumns { get; private set; }
 
     public HashSet<string>? Projection { get; private set; }
 
@@ -55,13 +75,20 @@ internal sealed class ServerSubscription
 
     public RowKey RangeHigh { get; private set; }
 
-    /// <summary>Compiles and validates a query against the schema and the configured cost limits.</summary>
+    /// <summary>
+    /// Compiles and validates a query against the schema and the configured cost limits.
+    /// <paramref name="context"/> is the caller policies filter for; null (with a null
+    /// <paramref name="policies"/>) is the deliberate owner-mode bypass — no policy can make a
+    /// private table visible either way, since a private table never compiles.
+    /// </summary>
     public static ServerSubscription Compile(
         IDeltaSink sink,
         uint id,
         SubscriptionQuery query,
         SchemaRegistry registry,
-        SubscriptionsOptions limits)
+        SubscriptionsOptions limits,
+        PolicySet? policies = null,
+        PolicyContext? context = null)
     {
         if (!registry.TryGetByName(query.Table, out var schema) || !schema.IsPublic)
         {
@@ -72,9 +99,10 @@ internal sealed class ServerSubscription
                 $"No public table named '{query.Table}' is subscribable.");
         }
 
-        var subscription = new ServerSubscription(sink, id, schema);
+        var subscription = new ServerSubscription(sink, id, schema, policies?.For(schema.Id), context);
         subscription.ApplyProjection(query);
         subscription.ApplyPredicate(query, limits);
+        subscription.ComputeStaticWireColumns();
         return subscription;
     }
 
@@ -101,6 +129,34 @@ internal sealed class ServerSubscription
         }
 
         ApplyPredicate(query, limits);
+    }
+
+    /// <summary>
+    /// Whether the caller's row policies admit <paramref name="row"/> — union: any policy is
+    /// enough, and a table with no row policies is fully visible (it compiled, so it is public).
+    /// True with no <see cref="Context"/>: that is the owner-mode bypass.
+    /// </summary>
+    public bool PolicyAdmits(ReadOnlySpan<byte> row) =>
+        Evaluator is null || Context is null || !Evaluator.HasRowPolicies || Evaluator.IsRowVisible(row, Context);
+
+    /// <summary>Predicate AND policy — whether the caller receives this row at all.</summary>
+    public bool RowVisible(in RowKey key, ReadOnlySpan<byte> row) =>
+        Matches(key, row) && PolicyAdmits(row);
+
+    /// <summary>
+    /// The columns of <paramref name="row"/> the caller receives: the static wire set intersected
+    /// with every column mask. Null means all columns. Callers on the fan-out path evaluate this
+    /// under the engine's write lock, so masks read committed state.
+    /// </summary>
+    public IReadOnlySet<string>? VisibleColumns(ReadOnlySpan<byte> row)
+    {
+        if (Evaluator is not { HasColumnPolicies: true } evaluator || Context is null)
+            return StaticWireColumns;
+        var visible = StaticWireColumns is not null
+            ? new HashSet<string>(StaticWireColumns, StringComparer.Ordinal)
+            : new HashSet<string>(Schema.Columns.Select(c => c.Name), StringComparer.Ordinal);
+        evaluator.IntersectColumns(row, Context, visible);
+        return visible;
     }
 
     /// <summary>Whether a row belongs to this subscription. <paramref name="key"/> is the primary key.</summary>
@@ -176,17 +232,45 @@ internal sealed class ServerSubscription
         var projection = new HashSet<string>(StringComparer.Ordinal);
         foreach (var name in query.Projection)
         {
-            if (Schema.Columns.All(c => !string.Equals(c.Name, name, StringComparison.Ordinal)))
+            var column = Schema.Columns.FirstOrDefault(c => string.Equals(c.Name, name, StringComparison.Ordinal));
+            if (column is null)
             {
                 throw new SubscriptionRejectedException(
                     MelangeErrorCodes.UnknownColumn,
                     $"Table '{Schema.Name}' has no column '{name}'.");
             }
 
+            // An explicit request for a [ServerOnly] column is an error, never a silently empty
+            // field — a null a client can misread as "no value" would hide the policy.
+            if (column.IsServerOnly)
+            {
+                throw new SubscriptionRejectedException(
+                    MelangeErrorCodes.ServerOnlyColumn,
+                    $"Table '{Schema.Name}': column '{name}' is [ServerOnly] and never leaves the server.");
+            }
+
             projection.Add(name);
         }
 
         Projection = projection;
+    }
+
+    /// <summary>
+    /// Precomputes the wire column set: the projection (already validated ServerOnly-free), else
+    /// all columns minus <c>[ServerOnly]</c>, else null meaning "all" — so subscriptions on tables
+    /// with nothing to hide pay nothing per row.
+    /// </summary>
+    private void ComputeStaticWireColumns()
+    {
+        if (Projection is not null)
+        {
+            StaticWireColumns = Projection;
+            return;
+        }
+
+        StaticWireColumns = Schema.Columns.Any(c => c.IsServerOnly)
+            ? new HashSet<string>(Schema.Columns.Where(c => !c.IsServerOnly).Select(c => c.Name), StringComparer.Ordinal)
+            : null;
     }
 
     private void ApplyPredicate(SubscriptionQuery query, SubscriptionsOptions limits)
@@ -200,6 +284,16 @@ internal sealed class ServerSubscription
         }
 
         var column = Schema.Column(query.Column!);
+
+        // A predicate on a [ServerOnly] column would leak its values through hit-versus-miss —
+        // membership is information too.
+        if (column.IsServerOnly)
+        {
+            throw new SubscriptionRejectedException(
+                MelangeErrorCodes.ServerOnlyColumn,
+                $"Table '{Schema.Name}': column '{column.Name}' is [ServerOnly] and cannot appear in a predicate.");
+        }
+
         if (column is { IsPrimaryKey: false, IsIndexed: false, IsUnique: false })
         {
             throw new SubscriptionRejectedException(
