@@ -236,32 +236,19 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         var epoch = _engine.Log.EpochId;
         var (checkpointLsn, checkpointEpoch) = await ReadCheckpointAsync(connection, ct).ConfigureAwait(false);
-        if (checkpointEpoch is null)
+        if (checkpointEpoch is null || (checkpointEpoch != epoch && checkpointLsn == 0))
         {
-            if (_engine.Log.BaseLsn > 0)
-            {
-                await BootstrapFromStoreAsync(connection, epoch, ct).ConfigureAwait(false);
-            }
-            else
-            {
-                await WriteCheckpointAsync(connection, transaction: null, 0, epoch, ct).ConfigureAwait(false);
-                Volatile.Write(ref _appliedLsn, 0);
-            }
-
+            // No checkpoint, or a foreign-epoch one that never applied anything — either way the
+            // projection has no valid place in this log, and the anchoring must be the same:
+            // replay from the start when the log still has its start, bootstrap from the hot
+            // store when truncation removed it. Anchoring a truncated log at 0 would silently
+            // skip records 1..BaseLsn, because ReadFrom serves permissively from the base.
+            await AnchorFreshAsync(connection, epoch, ct).ConfigureAwait(false);
             return;
         }
 
         if (checkpointEpoch != epoch)
-        {
-            if (checkpointLsn == 0)
-            {
-                await WriteCheckpointAsync(connection, transaction: null, 0, epoch, ct).ConfigureAwait(false);
-                Volatile.Write(ref _appliedLsn, 0);
-                return;
-            }
-
             throw new PostgresEpochMismatchException(checkpointEpoch.Value, epoch, checkpointLsn);
-        }
 
         if (checkpointLsn < _engine.Log.BaseLsn)
         {
@@ -273,6 +260,23 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         Volatile.Write(ref _appliedLsn, checkpointLsn);
         SignalWaiters(checkpointLsn);
+    }
+
+    /// <summary>
+    /// Anchors a projection that has no valid checkpoint in this log: replay from the start when
+    /// the log is untruncated, bootstrap from the hot store when it is not.
+    /// </summary>
+    private async Task AnchorFreshAsync(NpgsqlConnection connection, Guid epoch, CancellationToken ct)
+    {
+        if (_engine.Log.BaseLsn > 0)
+        {
+            await BootstrapFromStoreAsync(connection, epoch, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            await WriteCheckpointAsync(connection, transaction: null, 0, epoch, ct).ConfigureAwait(false);
+            Volatile.Write(ref _appliedLsn, 0);
+        }
     }
 
     /// <summary>
@@ -288,6 +292,19 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             var applied = AppliedLsn;
             if (applied >= head)
                 return;
+
+            // ReadFrom is permissive below the truncation base — it would silently serve from
+            // BaseLsn + 1 and this loop would checkpoint right past the gap. Registration as an
+            // applier floors truncation at our checkpoint, so this cannot happen in-process; the
+            // guard turns any future violation of that invariant into a loud stall instead of a
+            // silent hole in the projection.
+            if (applied < _engine.Log.BaseLsn)
+            {
+                throw new InvalidOperationException(
+                    $"The commit log was truncated up to LSN {_engine.Log.BaseLsn}, past the postgres applier's " +
+                    $"checkpoint at LSN {applied}; applying from here would skip records. Clear the Postgres schema " +
+                    "to re-bootstrap, or restore the matching log.");
+            }
 
             var batchSize = Math.Max(1, _options.CurrentValue.Postgres.ApplyBatchSize);
             var batch = new List<CommitRecord>(batchSize);

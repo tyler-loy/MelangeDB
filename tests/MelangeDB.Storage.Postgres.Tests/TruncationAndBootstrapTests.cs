@@ -88,4 +88,54 @@ public class TruncationAndBootstrapTests
             $"expected the bootstrap log (EventId 1606); events: {string.Join(" | ", harness.Logs.Events.Select(e => $"{e.EventId}:{e.Message}"))}; " +
             $"baseLsn={harness.Engine.Log.BaseLsn}, applied={harness.Tier.AppliedLsn}");
     }
+
+    [Fact]
+    public async Task A_foreign_epoch_checkpoint_at_lsn_zero_bootstraps_against_a_truncated_log()
+    {
+        _postgres.SkipUnlessAvailable();
+        await using var harness = new TierHarness(_postgres.ConnectionString, PostgresContainerFixture.NewSchema());
+        await harness.StartTierAsync();
+
+        var applied = 0UL;
+        for (var i = 0; i < 4; i++)
+        {
+            applied = harness.Invoke("RecordStat", ctx =>
+                ctx.Db.Stat.Insert(new Stat { Metric = "epoch", Value = i, At = ctx.Timestamp }));
+        }
+
+        await harness.WaitAppliedAsync(applied);
+        await harness.StopTierAsync();
+
+        // The database now carries a checkpoint from another log that never applied anything —
+        // the shape left behind when Postgres was first attached to a previous log and abandoned
+        // before its first batch. Anchoring this at 0 against a truncated log would silently skip
+        // records 1..BaseLsn; it must bootstrap instead, exactly like the no-checkpoint path.
+        await harness.ExecuteAsync(
+            $"UPDATE \"{harness.Schema}\".\"__melange_applier\" SET \"applied_lsn\" = 0, " +
+            $"\"log_epoch\" = '{Guid.NewGuid()}' WHERE \"applier\" = 'postgres'");
+
+        for (var i = 4; i < 6; i++)
+        {
+            harness.Invoke("RecordStat", ctx =>
+                ctx.Db.Stat.Insert(new Stat { Metric = "epoch", Value = i, At = ctx.Timestamp }));
+        }
+
+        // A fresh engine (same log, same epoch) with no tier registered, so truncation can pass.
+        await harness.RestartAsync(startTier: false);
+        harness.Options.Resume.RetentionWindowSeconds = 0;
+        harness.Engine.TakeSnapshot();
+        Assert.True(harness.Engine.Log.BaseLsn > 0);
+
+        await harness.StartTierAsync();
+        var head = harness.Engine.Log.HeadLsn;
+        await harness.WaitAppliedAsync(head);
+
+        Assert.True(
+            harness.Logs.Has(1606),
+            $"expected the bootstrap log (EventId 1606); events: {string.Join(" | ", harness.Logs.Events.Select(e => $"{e.EventId}:{e.Message}"))}");
+        Assert.False(harness.Logs.Has(1605));
+        Assert.Equal(6L, await harness.ScalarAsync($"SELECT count(*) FROM \"{harness.Schema}\".\"Stat\""));
+        Assert.Equal(15L, await harness.ScalarAsync($"SELECT sum(\"Value\")::bigint FROM \"{harness.Schema}\".\"Stat\""));
+        Assert.Equal((long)head, await harness.StoredCheckpointAsync());
+    }
 }
