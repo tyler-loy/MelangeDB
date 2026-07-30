@@ -18,7 +18,8 @@ public sealed class ReducerDescriptor
         ReducerKind kind,
         Type reducerClass,
         ReducerArgsValidator validate,
-        ReducerBodyInvoker invoke)
+        ReducerBodyInvoker invoke,
+        Type? policy = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(reducerClass);
@@ -29,6 +30,7 @@ public sealed class ReducerDescriptor
         ReducerClass = reducerClass;
         Validate = validate;
         Invoke = invoke;
+        Policy = policy;
     }
 
     /// <summary>The reducer's public name; the dispatcher's key.</summary>
@@ -42,6 +44,13 @@ public sealed class ReducerDescriptor
     public ReducerArgsValidator Validate { get; }
 
     public ReducerBodyInvoker Invoke { get; }
+
+    /// <summary>
+    /// The <c>IReducerPolicy</c> type from <c>[Reducer(Policy = ...)]</c>, resolved from the
+    /// call's DI scope for client-originated calls; null means unpoliced (see
+    /// <c>Policies:DefaultReducerPosture</c>).
+    /// </summary>
+    public Type? Policy { get; }
 }
 
 /// <summary>Encodes reducer arguments into the wire form the generated dispatcher decodes.</summary>

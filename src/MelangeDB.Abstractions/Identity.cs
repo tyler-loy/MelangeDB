@@ -37,8 +37,22 @@ public readonly struct Identity : IEquatable<Identity>, IComparable<Identity>
     public bool IsNone => (_a | _b | _c | _d) == 0;
 
     /// <summary>
-    /// Derives an identity by hashing an arbitrary string with SHA-256. The authoritative
-    /// issuer/subject derivation lands with the auth phase; this is the stable primitive beneath it.
+    /// The authoritative identity derivation: SHA-256 over a token's issuer <em>and</em> subject.
+    /// Issuer included deliberately — hashing the subject alone would let a subject from one token
+    /// source collide into another source's identity, bypassing the entire policy layer without
+    /// triggering any of it. The canonical form (<c>issuer '\n' subject</c>) is contract: it is
+    /// what makes an identity stable across reconnects, restarts, and token refreshes.
+    /// </summary>
+    public static Identity FromIssuerSubject(string issuer, string subject)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(issuer);
+        ArgumentException.ThrowIfNullOrEmpty(subject);
+        return Hash(issuer + "\n" + subject);
+    }
+
+    /// <summary>
+    /// Derives an identity by hashing an arbitrary string with SHA-256. The stable primitive
+    /// beneath <see cref="FromIssuerSubject"/>; also used for fixed in-process identities.
     /// </summary>
     public static Identity Hash(string value)
     {

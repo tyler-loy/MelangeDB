@@ -44,6 +44,12 @@ public sealed class ColumnSchema
 
     public bool IsIndexed { get; init; }
 
+    /// <summary>
+    /// <c>[ServerOnly]</c>: the column never leaves the process — excluded from every frame for
+    /// every client, admin included, and an explicit request for it is an error.
+    /// </summary>
+    public bool IsServerOnly { get; init; }
+
     /// <summary>Reads this column from a boxed row.</summary>
     public required Func<object, object?> GetValue { get; init; }
 

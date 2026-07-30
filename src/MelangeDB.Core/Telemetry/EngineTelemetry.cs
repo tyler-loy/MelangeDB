@@ -23,6 +23,7 @@ internal sealed class EngineTelemetry : IDisposable
     private readonly Histogram<double> _commitDuration;
     private readonly Histogram<double> _fsyncDuration;
     private readonly Histogram<long> _writeSetRows;
+    private readonly Counter<long> _rateLimited;
 
     public EngineTelemetry(TelemetryOptions options, Func<ulong> headLsn, Func<IEnumerable<(string Applier, long Lag)>> applierLags)
     {
@@ -33,6 +34,7 @@ internal sealed class EngineTelemetry : IDisposable
         _commitDuration = _meter.CreateHistogram<double>("melange.commit.duration", "ms", "Log append duration, fsync included.");
         _fsyncDuration = _meter.CreateHistogram<double>("melange.fsync.duration", "ms", "Durability flush duration.");
         _writeSetRows = _meter.CreateHistogram<long>("melange.writeset.rows", "{row}", "Collapsed row ops per transaction.");
+        _rateLimited = _meter.CreateCounter<long>("melange.ratelimit.rejected", "{call}", "Client reducer calls rejected by the rate limiter before any transaction opened.");
         _meter.CreateObservableGauge("melange.log.head_lsn", () => (long)headLsn(), "{lsn}", "LSN of the newest log record.");
         _meter.CreateObservableGauge(
             "melange.applier.lag",
@@ -97,6 +99,9 @@ internal sealed class EngineTelemetry : IDisposable
         _reducerDuration.Record(durationMs, reducerTag);
         _writeSetRows.Record(writeSetRows, reducerTag);
     }
+
+    public void RecordRateLimited(string reducerName) =>
+        _rateLimited.Add(1, new KeyValuePair<string, object?>("reducer", reducerName));
 
     public void RecordCommitDuration(double durationMs) => _commitDuration.Record(durationMs);
 

@@ -19,6 +19,135 @@ public sealed class MelangeDbOptions
     public SubscriptionsOptions Subscriptions { get; set; } = new();
 
     public ResumeOptions Resume { get; set; } = new();
+
+    public AuthOptions Auth { get; set; } = new();
+
+    public PoliciesOptions Policies { get; set; } = new();
+
+    public RateLimitOptions RateLimit { get; set; } = new();
+
+    public SqlOptions Sql { get; set; } = new();
+}
+
+/// <summary>
+/// Identity and session options (<c>MelangeDb:Auth:*</c>). <b>The IdP is the gate</b>: every
+/// connection presents a valid JWT, validated against the host's own ASP.NET Core JWT bearer
+/// configuration — MelangeDB mints no identities and owns no issuer, audience, or key settings.
+/// </summary>
+public sealed class AuthOptions
+{
+    /// <summary>
+    /// The authentication scheme whose <c>JwtBearerOptions</c> tokens are validated against —
+    /// the host's <c>AddAuthentication().AddJwtBearer(...)</c> registration. There are
+    /// deliberately no MelangeDB settings for authority, audience, or keys: those live on the
+    /// host's scheme, and duplicating them here would eventually disagree with it.
+    /// </summary>
+    public string Scheme { get; set; } = "Bearer";
+
+    /// <summary>
+    /// The role claim value marking IdP-issued guest tokens. A guest is an ordinary identity that
+    /// policies and caps may treat differently, nothing more; empty disables guest treatment.
+    /// </summary>
+    public string GuestRole { get; set; } = "guest";
+
+    /// <summary>
+    /// Lifetime of a connect ticket. Tickets are single-use and short-lived so a leaked one is
+    /// near-worthless; they exist because browsers cannot set WebSocket headers.
+    /// </summary>
+    public int TicketTtlSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// How long past token expiry a connection survives while awaiting <c>Reauthenticate</c>.
+    /// Zero means expiry drops the socket — correct for a bank, wrong for a game.
+    /// </summary>
+    public int ReauthGraceSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// How many live sockets one identity may hold. Without this, a valid token holds unlimited
+    /// sockets, subscriptions, and rate-limit buckets.
+    /// </summary>
+    public int MaxConnectionsPerIdentity { get; set; } = 4;
+}
+
+/// <summary>What the unpoliced-reducer report does at startup.</summary>
+public enum UnpolicedReducerReport
+{
+    /// <summary>No report.</summary>
+    Off,
+
+    /// <summary>Log the client-callable reducers with no authorization policy. The default.</summary>
+    Warn,
+
+    /// <summary>Refuse to start while any client-callable reducer has no policy.</summary>
+    Fail,
+}
+
+/// <summary>What happens when a client calls a reducer that declares no policy.</summary>
+public enum ReducerPolicyPosture
+{
+    /// <summary>
+    /// The call is allowed. Pair with the unpoliced-reducer report so the omission is visible
+    /// without being fatal. The default.
+    /// </summary>
+    Allow,
+
+    /// <summary>The call is denied. Safer, but annotates every ordinary gameplay reducer.</summary>
+    Deny,
+}
+
+/// <summary>Reducer authorization options (<c>MelangeDb:Policies:*</c>).</summary>
+public sealed class PoliciesOptions
+{
+    /// <summary>
+    /// The startup report listing every client-callable reducer with no authorization policy —
+    /// turns "did we forget one?" into a build artifact.
+    /// </summary>
+    public UnpolicedReducerReport UnpolicedReducerReport { get; set; } = UnpolicedReducerReport.Warn;
+
+    /// <summary>Whether an unpoliced reducer is callable by clients.</summary>
+    public ReducerPolicyPosture DefaultReducerPosture { get; set; } = ReducerPolicyPosture.Allow;
+}
+
+/// <summary>
+/// Reducer rate limiting (<c>MelangeDb:RateLimit:*</c>): a token bucket per identity per reducer,
+/// rejected <b>before</b> a transaction opens — so an over-limit call costs no log volume and no
+/// schema, unlike rate limits implemented as table rows.
+/// </summary>
+public sealed class RateLimitOptions
+{
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>The default sustained rate per identity. Sustained rates are what stop macros.</summary>
+    public int ReducerCallsPerSecond { get; set; } = 20;
+
+    /// <summary>The bucket capacity: bursts up to this pass at human click speed.</summary>
+    public int BurstCapacity { get; set; } = 60;
+
+    /// <summary>Per-reducer overrides of <see cref="ReducerCallsPerSecond"/>, keyed by reducer name.</summary>
+    public Dictionary<string, int> PerReducer { get; set; } = new(StringComparer.Ordinal);
+}
+
+/// <summary>Whether ad-hoc SQL results pass through row and column policies.</summary>
+public enum AdHocSqlMode
+{
+    /// <summary>
+    /// Row and column policies apply exactly as they do to subscriptions. The default — there is
+    /// no third mode and no default-to-owner, because ambiguity here is a security hole.
+    /// </summary>
+    PolicyEnforced,
+
+    /// <summary>
+    /// Row and column policies are deliberately bypassed — the operator's path. <c>[ServerOnly]</c>
+    /// columns stay excluded even here: "never leaves the process" has no modes.
+    /// </summary>
+    Owner,
+}
+
+/// <summary>Ad-hoc SQL options (<c>MelangeDb:Sql:*</c>).</summary>
+public sealed class SqlOptions
+{
+    /// <summary>See <see cref="AdHocSqlMode"/>. Applies to <c>{path}/sql</c>.</summary>
+    public AdHocSqlMode AdHocMode { get; set; } = AdHocSqlMode.PolicyEnforced;
 }
 
 /// <summary>Options for the websocket and HTTP transport (<c>MelangeDb:Transport:*</c>).</summary>

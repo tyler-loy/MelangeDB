@@ -101,6 +101,7 @@ public sealed class SchemaRegistry
                 IsAutoInc = member.GetCustomAttribute<AutoIncAttribute>() is not null,
                 IsUnique = member.GetCustomAttribute<UniqueAttribute>() is not null,
                 IsIndexed = member.GetCustomAttribute<IndexAttribute>() is not null,
+                IsServerOnly = member.GetCustomAttribute<ServerOnlyAttribute>() is not null,
                 GetValue = member switch
                 {
                     FieldInfo f => f.GetValue,
