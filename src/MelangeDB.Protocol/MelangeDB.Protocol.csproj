@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>The MelangeDB wire contract: frame types, the versioned MessagePack framing, and the argument encoding — shared by MelangeDB.Server and MelangeDB.Client.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>
