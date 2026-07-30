@@ -4,6 +4,12 @@ Phase plans live in `docs/plan-phase-NN.md`. Each is written to be executable on
 dependencies, deliverables, what's explicitly out of scope, decisions still to settle, and a verifiable
 definition of done.
 
+## Standing conventions
+
+- **Every configuration item goes in [CONFIGURATION.md](CONFIGURATION.md)**, in the same change that introduces
+  it — not at the end of a phase. That document is the source of truth for key names, defaults, and reload
+  semantics. Undocumented knobs are how a library becomes folklore.
+
 ## Ordering principles
 
 Three constraints drove the sequence, and each one reverses an intuitive ordering:

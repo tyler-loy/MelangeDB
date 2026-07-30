@@ -47,9 +47,9 @@ for clients follows once the wire format has settled.
 
 ## Decisions to settle
 
-- **Query representation.** A SQL subset is familiar and portable but needs a parser; a typed builder API is
-  simpler to implement and validate but is C#-only, which hurts the eventual TypeScript client. Leaning SQL
-  subset for portability — decide before writing the parser.
+- ~~**Query representation.**~~ **Settled: a SQL subset**, chosen for portability — a typed builder would be
+  C#-only and would block the eventual TypeScript client. Cost accepted: we own a parser and must define the
+  subset precisely enough that "valid MelangeDB SQL" is unambiguous.
 - **Delta granularity for projections.** Does a projected subscription emit an update when a *non-projected*
   column changes? It must not — that's wasted bandwidth on the hottest path — but it requires per-
   subscription column masking in the delta computation.

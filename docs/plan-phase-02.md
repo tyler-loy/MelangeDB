@@ -49,9 +49,10 @@ format from 03).
 - **How does a scoped service interact with the no-I/O rule?** A reducer can be injected a `DbContext` or
   `HttpClient` and misuse it mid-transaction. Options: document it, or ship an analyzer that flags awaits
   and known I/O types inside reducer bodies. Prefer the analyzer — the rule is invisible otherwise.
-- **Async reducers.** Almost certainly *disallowed*: the transaction is a synchronous critical section, and
-  permitting `await` invites exactly the I/O the design forbids. Decide now, because relaxing it later is
-  easy and tightening it later is not.
+- ~~**Async reducers.**~~ **Settled: reducers are synchronous.** The transaction is a synchronous critical
+  section, and permitting `await` invites exactly the I/O the design forbids. Relaxing this later is
+  backwards-compatible; tightening it later would not be. The generator should reject an `async` reducer with
+  a diagnostic rather than letting it compile and misbehave.
 - **Struct tables and generated mutation.** Tables are `partial struct` mutated with `with` expressions;
   confirm the generated accessors don't defensively copy on the hot path.
 

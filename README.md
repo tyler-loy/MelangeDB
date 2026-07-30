@@ -39,6 +39,8 @@ app.Run();
 ## Docs
 
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — the phase plans and why they're ordered the way they are.
+- **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — every setting MelangeDB exposes. New config items are
+  added here in the same change that introduces them.
 - **[docs/DESIGN.md](docs/DESIGN.md)** — the architecture, the trade-offs it accepts, and the open questions.
 - **[docs/CLUSTERING.md](docs/CLUSTERING.md)** — the four table placements, hub/shard node roles, and
   why *you* define the sharding function rather than MelangeDB.
