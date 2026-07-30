@@ -103,6 +103,11 @@ round-trips through Postgres `bigint` and signed-only client languages unchanged
 **Border band** — In the spatial strategy, the ring of chunks a shard node holds read-only copies of so it can
 serve entities just beyond its own boundary. Derived from `InterestOf`.
 
+**Buffer pool** — The capped in-memory portion of the paging store's hybrid logs, bounded by
+`HotStore:MemoryBudgetBytes`. **Excludes** resident tables, which are pinned and accounted separately — the
+store's total declared footprint is the pool cap plus the residency report. Split between main records and
+out-of-line blobs, so blob churn cannot evict hot main records.
+
 **Bulk ingestion** — A path appending one large write set instead of one transaction per row, for world
 generation and similar mass loads.
 
@@ -196,12 +201,22 @@ causally disjoint — no interest overlap between them.
 
 **Local** — Placement: the table lives on one node and never leaves it. Caches, scratch state, telemetry.
 
+**Key directory** — Per paged table, the pinned managed map from primary key to that row's bookkeeping: which
+blob columns are out of line, and the row's encoded index values. It is why `Count`/`Any` are O(1), why a key
+walk faults nothing, and why index maintenance never reads an old row back from disk. Store-owned, like the
+indexes beside it.
+
 **Lifecycle reducer** — A reducer fired on a session transition: `ReducerKind.ClientConnected` on a
 completed websocket handshake, `ReducerKind.ClientDisconnected` on graceful close or heartbeat-detected
 drop, paired one-to-one per connection. Each fire is its own transaction. Not client-callable, and never
 fired by HTTP one-shots, ad-hoc SQL, or ticket minting — a session, not a query.
 
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
+
+**Out of line** — Where a large `byte[]` payload (256 bytes and up) lives in the paging store: a separate blob
+log, keyed by row and column, while the main record keeps only the column's framing. Scanning a blob table by
+key therefore faults no blobs; a blob pages in exactly when its row is materialized. The split and the splice
+are byte-exact, because serialized bytes are a row's identity.
 
 **Overlay** — The read path inside a transaction: the uncommitted write set layered over the store, which is
 what makes read-your-writes work with no I/O in a reducer body.
@@ -268,6 +283,10 @@ silently diverge.
 **Residency** — Whether a table must stay in memory. Declared, so the memory budget is computable from source
 rather than discovered under load.
 
+**Residency report** — The startup artifact (EventId 1501) itemizing each resident table's row count and
+measured bytes plus the buffer-pool cap, summing to the store's declared footprint. What turns the computable
+budget into an observed one; `melange.store.resident_bytes` is its continuous form.
+
 **Saga** — A multi-step, eventually-consistent operation with compensating actions, used for handoff and the
 rare cross-shard case. Explicitly not ACID.
 
@@ -308,7 +327,9 @@ supplies the mechanism; spatial partitioning and instancing are both first-class
 that contract cannot be verified statically.
 
 **Snapshot** — A materialized state capture at an LSN, allowing the log behind it to be truncated — never past
-the slowest applier or event subscriber.
+the slowest applier checkpoint, the slowest *live* event-subscriber checkpoint, or the Resume retention
+window. Full-format by settled decision (phase 07): one CRC-guarded file beside the log, atomically swapped,
+carrying the epoch, the LSN, the AutoInc sequences, and every row. Restart is snapshot plus tail replay.
 
 **Subscriber checkpoint** — An event subscriber's durable applied-LSN, the same shape as an applier's: a
 subscriber that was down catches up from it instead of losing events, and log truncation (phase 07) never

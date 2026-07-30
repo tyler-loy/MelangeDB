@@ -358,14 +358,20 @@ samples/                        worker-service sample
 
 ## 10. Open questions
 
-- **Residency defaults** — §8 proposes opt-in `Residency.Resident`. Unresolved: whether the default
-  should instead be resident-until-a-size-threshold, which would make porting existing all-in-RAM code
-  painless at the cost of a less predictable memory budget.
+- ~~**Residency defaults**~~ — **Settled in phase 07: opt-in `Resident`, default `Paged`.** A size
+  threshold makes memory a function of data size — the SpacetimeDB failure mode with a delay — while
+  opt-in makes the resident footprint a declared, computable artifact. Ships with the compile-time scan
+  analyzer (MELANGE0017), the startup residency report, `.Any()`/`.Count`/`.First()`, `Residency.Auto`
+  for anyone explicitly wanting threshold behaviour, and the per-table configuration override. See
+  [plan-phase-07.md](plan-phase-07.md).
 - **Wire serialization** — MessagePack gets us moving and has implementations in every client
   language; a source-generated binary format is faster. Put it behind `IMelangeSerializer` and defer.
 - **Schema migration** — how tier changes and column adds replay against an existing log. Worth
   designing for early: in SpacetimeDB every schema change means republish plus regenerating bindings
   for every client tree, and stale-schema clients simply break.
-- **Log compaction / snapshots** — required before the log outgrows disk; snapshot + truncate.
+- ~~**Log compaction / snapshots**~~ — **Settled in phase 07: full snapshot + truncate.** Snapshot at an
+  LSN beside the log, truncate behind it, never past the slowest applier, the slowest live event
+  subscriber, or the Resume retention window; restart is snapshot plus tail replay. See
+  [plan-phase-07.md](plan-phase-07.md).
 - **Codegen targets** — a real project has several client trees (game client, admin web, CLI tools)
   generating from one schema. `MelangeDB.CodeGen` should emit to multiple output trees from the start.

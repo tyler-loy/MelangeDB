@@ -24,7 +24,13 @@ phase 06 rows — the `melange.event.handle` span (a new trace **linked** to the
 never parented under it, exactly as specified below; a subscriber catching up from the log gets no link, since
 the emitting trace is gone), `melange.events.queue_depth` (the bounded in-memory delivery window), and
 `melange.events.deadlettered` (dimension: `event_type` — bounded, being a code-declared set) — shipped with the
-event bus on the same source and meter.
+event bus on the same source and meter. The phase 07 rows — `melange.store.resident_bytes`,
+`melange.store.page_faults`, and `melange.store.scan_rows` (dimension: `table` on all three — bounded, being
+the schema) — shipped with the paged store: the hot store self-reports per-table statistics through
+`IHotStore.Statistics()`, and the engine's telemetry exposes them as observable instruments, so both store
+engines feed the same signals. `page_faults` counts rows served from disk instead of the buffer pool (always
+zero for the in-memory store); `scan_rows` counts rows returned by full scans, the runtime shadow of analyzer
+MELANGE0017.
 
 ## The dependency decision
 
@@ -171,7 +177,13 @@ Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01);
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
 `1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,
 `1403 SubscriberCheckpointEvicted` — the loud eviction the expiry design promises — and
-`1404 SubscriberLostPlace`, how a returning subscriber is told it starts from current state (06).
+`1404 SubscriberLostPlace`, how a returning subscriber is told it starts from current state (06);
+`1501 ResidencyReport` — the startup residency report: per resident table row count and measured bytes, the
+buffer-pool cap, and the total they sum to — `1502 SnapshotWritten`, `1503 LogTruncated` (naming the floor it
+respected), `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
+`1505 AutoResidencyDemoted` — an `Auto` table crossing its threshold is the cliff arriving, and it announces
+itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, and `1508 ResidencyChanged`, the careful
+per-table override being applied at runtime (07).
 
 ## Health checks
 
