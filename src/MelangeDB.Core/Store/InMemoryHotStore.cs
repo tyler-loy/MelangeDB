@@ -71,6 +71,23 @@ public sealed class InMemoryHotStore : IHotStore
             yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, data.Rows[key]);
     }
 
+    public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
+    {
+        if (!_tables.TryGetValue(table, out var data))
+            yield break;
+        if (!data.Indexes.TryGetValue(column, out var index))
+            throw new ArgumentException($"Table {table} has no index on column '{column}'.", nameof(column));
+        foreach (var (value, keys) in index)
+        {
+            if (value.CompareTo(low) < 0)
+                continue;
+            if (value.CompareTo(high) > 0)
+                yield break;
+            foreach (var key in keys)
+                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, data.Rows[key]);
+        }
+    }
+
     private sealed class TableData
     {
         private readonly TableSchema _schema;
@@ -106,8 +123,7 @@ public sealed class InMemoryHotStore : IHotStore
         {
             if (Indexes.Count == 0)
                 return;
-            var row = RowSerializer.Deserialize(_schema, bytes);
-            foreach (var (column, entries) in IndexedValues(row))
+            foreach (var (column, entries) in IndexedValues(bytes))
             {
                 if (!Indexes[column].TryGetValue(entries, out var keys))
                     Indexes[column][entries] = keys = [];
@@ -119,8 +135,7 @@ public sealed class InMemoryHotStore : IHotStore
         {
             if (Indexes.Count == 0)
                 return;
-            var row = RowSerializer.Deserialize(_schema, bytes);
-            foreach (var (column, value) in IndexedValues(row))
+            foreach (var (column, value) in IndexedValues(bytes))
             {
                 if (Indexes[column].TryGetValue(value, out var keys))
                 {
@@ -131,8 +146,22 @@ public sealed class InMemoryHotStore : IHotStore
             }
         }
 
-        private IEnumerable<(string Column, RowKey Value)> IndexedValues(object row)
+        private IEnumerable<(string Column, RowKey Value)> IndexedValues(byte[] bytes)
         {
+            // The generated codec path: no reflection, no boxing. Falls back to the boxed column
+            // accessors when the schema was built by reflection.
+            if (_schema.Codec is { } codec)
+            {
+                foreach (var index in _schema.Indexes)
+                {
+                    if (codec.EncodeColumnFromBytes(index.Column, bytes) is { } value)
+                        yield return (index.Column, value);
+                }
+
+                yield break;
+            }
+
+            var row = RowSerializer.Deserialize(_schema, bytes);
             foreach (var index in _schema.Indexes)
             {
                 var column = _schema.Column(index.Column);

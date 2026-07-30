@@ -16,10 +16,16 @@ internal sealed class EngineHarness : IDisposable
     ];
 
     private readonly Type[] _tables;
+    private readonly bool _useReflectionSchema;
 
-    public EngineHarness(FsyncPolicy fsyncPolicy = FsyncPolicy.OnCommit, bool telemetryEnabled = true, Type[]? tables = null)
+    public EngineHarness(
+        FsyncPolicy fsyncPolicy = FsyncPolicy.OnCommit,
+        bool telemetryEnabled = true,
+        Type[]? tables = null,
+        bool useReflectionSchema = false)
     {
         _tables = tables ?? DefaultTables;
+        _useReflectionSchema = useReflectionSchema;
         Root = Directory.CreateTempSubdirectory("melange-test-").FullName;
         Options = new MelangeDbOptions
         {
@@ -83,6 +89,19 @@ internal sealed class EngineHarness : IDisposable
         }
     }
 
+    /// <summary>
+    /// The default path uses the generated registration — codecs attached, no reflection — which is
+    /// how phase 01's suite doubles as proof that generated schemas behave identically. The
+    /// reflection path stays available for the format-compatibility tests.
+    /// </summary>
+    public SchemaRegistry CreateRegistry() =>
+        _useReflectionSchema
+            ? SchemaRegistry.FromTypes(_tables)
+            : GeneratedRegistry(_tables);
+
+    public static SchemaRegistry GeneratedRegistry(params Type[] tables) =>
+        new(new MelangeDB.Generated.MelangeModel().Tables().Where(t => tables.Contains(t.RowType)));
+
     private MelangeEngine CreateEngine() =>
-        new(Options, SchemaRegistry.FromTypes(_tables));
+        new(Options, CreateRegistry());
 }

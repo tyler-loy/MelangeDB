@@ -143,6 +143,10 @@ log. A projection, not a second source of truth.
 **Fencing token** — A guard ensuring a node wrongly suspected of being dead cannot keep writing rows it no
 longer owns.
 
+**Generated model** — The per-assembly registration the source generator emits: every `[Table]` schema with
+its row codec attached, and every `[Reducer]` descriptor. `AddTablesFrom`/`AddReducersFrom` discover it
+through an assembly attribute, which is why a new table or reducer needs no manual registration anywhere.
+
 **Global** — Placement: the table lives on the hub only. In practice the relational tier.
 
 **Guest identity** — An ordinary identity whose token the IdP issued with a guest role claim. MelangeDB mints
@@ -194,6 +198,14 @@ synchronous and perform no I/O.
 `Caller`, `ConnectionId`, `Timestamp`, `Random`, `Db`, and `Publish`. Reaching for `DateTime.Now` or
 `new Random()` instead is a bug the analyzer reports.
 
+**Reducer descriptor** — One generated reducer registration: the public name the dispatcher keys on, the
+DI-resolved class the body lives on, and the generated argument decode/validate delegates. There is no
+reflection fallback for reducers.
+
+**Reducer host (`MelangeReducerHost`)** — The dispatch surface phase 02 adds in front of the engine: looks
+up the descriptor by name, decodes and validates arguments *before* any transaction opens, creates one DI
+scope per call, and invokes the body as one transaction. The transport phases call it; so do tests.
+
 **Relational tier** — Opt-in Postgres storage for tables declaring `Tier = Relational`. The "servicey" half:
 accounts, registration, statistics. Eventually consistent with the log by design.
 
@@ -201,6 +213,10 @@ accounts, registration, statistics. Eventually consistent with the log by design
 
 **Resident** — Residency: the table is pinned wholly in memory. Opt-in, because a resident-by-default store
 reproduces the RAM ceiling MelangeDB exists to remove.
+
+**Row codec** — A generated per-table serializer implementing the same versioned row format as the
+reflection serializer — no reflection, no boxing — carried on the table's schema so the engine and the hot
+store dispatch through it. Logs written by either path read through the other.
 
 **RowKey** — The uniform, order-preserving encoded byte form of a primary key (or indexed column value):
 big-endian integers with the sign bit flipped when signed, UTF-8 strings, raw `Identity` bytes. Byte-wise
@@ -224,6 +240,8 @@ rare cross-shard case. Explicitly not ACID.
 **Scheduled reducer** — A reducer fired by a timer row rather than by a client. Not client-callable.
 
 **`[ServerOnly]`** — A column attribute: never sent to any client, admin included. Compile-time and free.
+The attribute exists from phase 02 — declaring it marks the table subscription-visible by intent, so the
+analyzer reports it on a non-`Public` table — and the wire enforcement lands with policies (04).
 
 **Shard** — An independently writable slice of the world, owned by exactly one node, with its own commit log.
 Internally single-writer, so the reducer model is unchanged; "multi-writer" is a property of the *cluster*.
@@ -267,6 +285,10 @@ single log append. Returns to commit, throws to abort with nothing appended.
 
 **Transactional outbox** — The pattern making the event bus safe: events go into the write set and publish only
 after the commit point, so an event can never escape for a rolled-back transaction.
+
+**Typed accessor** — The generated, strongly typed view onto a table through `ctx.Db` —
+`ctx.Db.Player.Id.Find(id)`, `ctx.Db.Creature.ChunkId.Filter(lo, hi)` — emitted as readonly structs over
+`IDbView`, so the ergonomic path and the fast path are the same path.
 
 **Write set** — The ordered row operations a transaction produced, keyed by table and primary key. **The
 authoritative payload of a log record** — logging the write set rather than the reducer invocation is what lets

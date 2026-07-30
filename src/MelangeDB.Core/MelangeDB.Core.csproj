@@ -10,14 +10,22 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Solely for the commit log's append fault-injection seam; no test asserts on other internals. -->
+    <!-- Solely for the commit log's append fault-injection seam and the engine's live-options
+         instance; no test asserts on other internals. -->
     <InternalsVisibleTo Include="MelangeDB.Core.Tests" />
+    <InternalsVisibleTo Include="MelangeDB.Host.Tests" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+    <!-- Microsoft.Extensions.Diagnostics.HealthChecks is NOT an ASP.NET Core package: it is the
+         Microsoft.Extensions health-check service usable from any generic host, and it is what
+         lets AddMelangeDb register the melange-log check without the host doing anything. -->
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.0" />
     <!-- Telemetry needs no package reference: ActivitySource and Meter are in the
          net10.0 framework. MelangeDB emits signals; the host chooses exporters.
          Deliberately NO OpenTelemetry dependency here — see docs/OBSERVABILITY.md. -->

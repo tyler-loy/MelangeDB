@@ -3,12 +3,14 @@ using System.Text;
 namespace MelangeDB.Core;
 
 /// <summary>
-/// Serializes reducer arguments for the log's metadata. Audit-only: never replayed, never decoded
-/// on any hot path. Values outside the supported kinds fall back to their string form.
+/// Serializes reducer arguments: the format <see cref="ReducerArgsReader"/> decodes for dispatch
+/// and the log stores as audit metadata. Self-describing tagged values; enums as their underlying
+/// integer; arrays as a count plus tagged elements. Values outside the supported kinds fall back
+/// to their string form (they are then audit-only — no reducer parameter can declare them).
 /// </summary>
 internal static class ArgsCodec
 {
-    private enum Tag : byte
+    internal enum Tag : byte
     {
         Null = 0,
         Bool = 1,
@@ -19,6 +21,7 @@ internal static class ArgsCodec
         Bytes = 6,
         Identity = 7,
         Timestamp = 8,
+        Array = 9,
     }
 
     public static byte[] Encode(IReadOnlyList<object?>? arguments)
@@ -57,6 +60,19 @@ internal static class ArgsCodec
                 writer.Write((byte)Tag.Float64);
                 writer.Write(Convert.ToDouble(value));
                 break;
+            case Enum e:
+                if (Enum.GetUnderlyingType(e.GetType()) == typeof(ulong))
+                {
+                    writer.Write((byte)Tag.UInt64);
+                    writer.Write(Convert.ToUInt64(e));
+                }
+                else
+                {
+                    writer.Write((byte)Tag.Int64);
+                    writer.Write(Convert.ToInt64(e));
+                }
+
+                break;
             case byte[] bytes:
                 writer.Write((byte)Tag.Bytes);
                 writer.Write(bytes.Length);
@@ -71,6 +87,12 @@ internal static class ArgsCodec
             case Timestamp timestamp:
                 writer.Write((byte)Tag.Timestamp);
                 writer.Write(timestamp.UnixTimeMicroseconds);
+                break;
+            case Array array:
+                writer.Write((byte)Tag.Array);
+                writer.Write(array.Length);
+                foreach (var element in array)
+                    WriteArgument(writer, element);
                 break;
             default:
                 writer.Write((byte)Tag.String);

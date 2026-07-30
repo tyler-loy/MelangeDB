@@ -2,7 +2,10 @@ namespace MelangeDB.Core;
 
 /// <summary>
 /// The overlay: a transaction's read/write view resolving the uncommitted write set before the
-/// store, which is what makes read-your-writes work with no I/O in a reducer body.
+/// store, which is what makes read-your-writes work with no I/O in a reducer body. When a table's
+/// schema carries a generated <see cref="RowCodec{TRow}"/>, every serialize, deserialize, and key
+/// encode dispatches through it — no reflection and no boxed rows on the invocation path; the
+/// boxed <see cref="RowSerializer"/> path remains for reflection-built schemas.
 /// </summary>
 internal sealed class TransactionDb : IDbView
 {
@@ -23,6 +26,17 @@ internal sealed class TransactionDb : IDbView
         where TRow : struct
     {
         var schema = _registry.Get(typeof(TRow));
+        if (schema.Codec is RowCodec<TRow> codec)
+        {
+            codec.AssignAutoInc(ref row, _autoInc, schema.Id);
+            var key = codec.EncodePrimaryKey(in row);
+            if (Exists(schema.Id, key))
+                throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {key} already exists.");
+            CheckUniqueConstraints(schema, codec, key, in row);
+            _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, key, codec.Serialize(in row)));
+            return row;
+        }
+
         object boxed = row;
         foreach (var column in schema.AutoIncColumns)
         {
@@ -38,12 +52,11 @@ internal sealed class TransactionDb : IDbView
             }
         }
 
-        var key = KeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
-        if (Exists(schema.Id, key))
-            throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {key} already exists.");
-        CheckUniqueConstraints(schema, key, boxed);
-        var bytes = RowSerializer.Serialize(schema, boxed);
-        _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, key, bytes));
+        var boxedKey = KeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
+        if (Exists(schema.Id, boxedKey))
+            throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {boxedKey} already exists.");
+        CheckUniqueConstraints(schema, boxedKey, boxed);
+        _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, boxedKey, RowSerializer.Serialize(schema, boxed)));
         return (TRow)boxed;
     }
 
@@ -51,13 +64,22 @@ internal sealed class TransactionDb : IDbView
         where TRow : struct
     {
         var schema = _registry.Get(typeof(TRow));
+        if (schema.Codec is RowCodec<TRow> codec)
+        {
+            var key = codec.EncodePrimaryKey(in row);
+            if (!Exists(schema.Id, key))
+                throw new InvalidOperationException($"Table '{schema.Name}': no row with primary key {key} to update.");
+            CheckUniqueConstraints(schema, codec, key, in row);
+            _writeSet.Stage(new RowOp(RowOpKind.Update, schema.Id, key, codec.Serialize(in row)));
+            return;
+        }
+
         object boxed = row;
-        var key = KeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
-        if (!Exists(schema.Id, key))
-            throw new InvalidOperationException($"Table '{schema.Name}': no row with primary key {key} to update.");
-        CheckUniqueConstraints(schema, key, boxed);
-        var bytes = RowSerializer.Serialize(schema, boxed);
-        _writeSet.Stage(new RowOp(RowOpKind.Update, schema.Id, key, bytes));
+        var boxedKey = KeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
+        if (!Exists(schema.Id, boxedKey))
+            throw new InvalidOperationException($"Table '{schema.Name}': no row with primary key {boxedKey} to update.");
+        CheckUniqueConstraints(schema, boxedKey, boxed);
+        _writeSet.Stage(new RowOp(RowOpKind.Update, schema.Id, boxedKey, RowSerializer.Serialize(schema, boxed)));
     }
 
     public bool Delete<TRow>(object primaryKey)
@@ -82,11 +104,11 @@ internal sealed class TransactionDb : IDbView
         {
             return pending.Kind == RowOpKind.Delete
                 ? null
-                : (TRow)RowSerializer.Deserialize(schema, pending.Row);
+                : Materialize<TRow>(schema, pending.Row);
         }
 
         return _store.TryGetRow(schema.Id, key, out var stored)
-            ? (TRow)RowSerializer.Deserialize(schema, stored)
+            ? Materialize<TRow>(schema, stored)
             : null;
     }
 
@@ -95,7 +117,7 @@ internal sealed class TransactionDb : IDbView
     {
         var schema = _registry.Get(typeof(TRow));
         foreach (var (_, bytes) in ScanMerged(schema))
-            yield return (TRow)RowSerializer.Deserialize(schema, bytes);
+            yield return Materialize<TRow>(schema, bytes);
     }
 
     public IEnumerable<TRow> Filter<TRow>(string column, object value)
@@ -104,41 +126,105 @@ internal sealed class TransactionDb : IDbView
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(value);
         var schema = _registry.Get(typeof(TRow));
-        var columnSchema = schema.Column(column);
-        if (columnSchema is { IsIndexed: false, IsUnique: false, IsPrimaryKey: false })
-            throw new InvalidOperationException($"Table '{schema.Name}': column '{column}' is not indexed; declare [Index] or [Unique].");
+        var columnSchema = RequireIndexed(schema, column);
         var encoded = KeyCodec.Encode(columnSchema, value);
 
         if (columnSchema.IsPrimaryKey)
         {
-            var single = FindByEncodedKey(schema, encoded);
-            if (single is not null)
-                yield return (TRow)single;
+            if (FindByEncodedKey<TRow>(schema, encoded) is { } single)
+                yield return single;
             yield break;
         }
 
-        foreach (var (key, bytes) in _store.ScanIndex(schema.Id, column, encoded))
+        foreach (var row in FilterCore<TRow>(schema, columnSchema, _store.ScanIndex(schema.Id, column, encoded), v => v == encoded))
+            yield return row;
+    }
+
+    public IEnumerable<TRow> FilterRange<TRow>(string column, object low, object high)
+        where TRow : struct
+    {
+        ArgumentException.ThrowIfNullOrEmpty(column);
+        ArgumentNullException.ThrowIfNull(low);
+        ArgumentNullException.ThrowIfNull(high);
+        var schema = _registry.Get(typeof(TRow));
+        var columnSchema = RequireIndexed(schema, column);
+        var lowKey = KeyCodec.Encode(columnSchema, low);
+        var highKey = KeyCodec.Encode(columnSchema, high);
+
+        if (columnSchema.IsPrimaryKey)
+        {
+            foreach (var (key, bytes) in ScanMerged(schema))
+            {
+                if (key.CompareTo(lowKey) >= 0 && key.CompareTo(highKey) <= 0)
+                    yield return Materialize<TRow>(schema, bytes);
+            }
+
+            yield break;
+        }
+
+        foreach (var row in FilterCore<TRow>(
+            schema,
+            columnSchema,
+            _store.ScanIndexRange(schema.Id, column, lowKey, highKey),
+            v => v.CompareTo(lowKey) >= 0 && v.CompareTo(highKey) <= 0))
+        {
+            yield return row;
+        }
+    }
+
+    private static ColumnSchema RequireIndexed(TableSchema schema, string column)
+    {
+        var columnSchema = schema.Column(column);
+        if (columnSchema is { IsIndexed: false, IsUnique: false, IsPrimaryKey: false })
+            throw new InvalidOperationException($"Table '{schema.Name}': column '{column}' is not indexed; declare [Index] or [Unique].");
+        return columnSchema;
+    }
+
+    /// <summary>Store index hits with pending rows overlaid, matched by encoded column value.</summary>
+    private IEnumerable<TRow> FilterCore<TRow>(
+        TableSchema schema,
+        ColumnSchema column,
+        IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> storeHits,
+        Func<RowKey, bool> matches)
+        where TRow : struct
+    {
+        foreach (var (key, bytes) in storeHits)
         {
             if (_writeSet.TryGetPending(schema.Id, key, out _))
                 continue; // The pending version is considered below.
-            yield return (TRow)RowSerializer.Deserialize(schema, bytes);
+            yield return Materialize<TRow>(schema, bytes);
         }
 
         foreach (var op in _writeSet.OpsFor(schema.Id))
         {
             if (op.Kind == RowOpKind.Delete)
                 continue;
-            var row = RowSerializer.Deserialize(schema, op.Row);
-            if (KeyCodec.Encode(columnSchema, columnSchema.GetValue(row)) == encoded)
-                yield return (TRow)row;
+            if (EncodePendingColumn(schema, column, op.Row) is { } pendingValue && matches(pendingValue))
+                yield return Materialize<TRow>(schema, op.Row);
         }
     }
 
-    private object? FindByEncodedKey(TableSchema schema, RowKey key)
+    private static TRow Materialize<TRow>(TableSchema schema, ReadOnlyMemory<byte> bytes)
+        where TRow : struct
+        => schema.Codec is RowCodec<TRow> codec
+            ? codec.Deserialize(bytes.Span)
+            : (TRow)RowSerializer.Deserialize(schema, bytes);
+
+    private static RowKey? EncodePendingColumn(TableSchema schema, ColumnSchema column, ReadOnlyMemory<byte> rowBytes)
+    {
+        if (schema.Codec is { } codec)
+            return codec.EncodeColumnFromBytes(column.Name, rowBytes.Span);
+        var row = RowSerializer.Deserialize(schema, rowBytes);
+        var value = column.GetValue(row);
+        return value is null ? null : KeyCodec.Encode(column, value);
+    }
+
+    private TRow? FindByEncodedKey<TRow>(TableSchema schema, RowKey key)
+        where TRow : struct
     {
         if (_writeSet.TryGetPending(schema.Id, key, out var pending))
-            return pending.Kind == RowOpKind.Delete ? null : RowSerializer.Deserialize(schema, pending.Row);
-        return _store.TryGetRow(schema.Id, key, out var stored) ? RowSerializer.Deserialize(schema, stored) : null;
+            return pending.Kind == RowOpKind.Delete ? null : Materialize<TRow>(schema, pending.Row);
+        return _store.TryGetRow(schema.Id, key, out var stored) ? Materialize<TRow>(schema, stored) : null;
     }
 
     private bool Exists(TableId table, RowKey key)
@@ -146,6 +232,19 @@ internal sealed class TransactionDb : IDbView
         if (_writeSet.TryGetPending(table, key, out var pending))
             return pending.Kind != RowOpKind.Delete;
         return _store.TryGetRow(table, key, out _);
+    }
+
+    private void CheckUniqueConstraints<TRow>(TableSchema schema, RowCodec<TRow> codec, RowKey selfKey, in TRow row)
+        where TRow : struct
+    {
+        foreach (var index in schema.Indexes)
+        {
+            if (!index.Unique)
+                continue;
+            if (codec.EncodeColumn(index.Column, in row) is not { } encoded)
+                continue;
+            CheckUniqueValue(schema, schema.Column(index.Column), selfKey, encoded);
+        }
     }
 
     private void CheckUniqueConstraints(TableSchema schema, RowKey selfKey, object row)
@@ -158,25 +257,26 @@ internal sealed class TransactionDb : IDbView
             var value = column.GetValue(row);
             if (value is null)
                 continue;
-            var encoded = KeyCodec.Encode(column, value);
+            CheckUniqueValue(schema, column, selfKey, KeyCodec.Encode(column, value));
+        }
+    }
 
-            foreach (var (key, _) in _store.ScanIndex(schema.Id, column.Name, encoded))
-            {
-                // A pending op on the conflicting row supersedes its stored version; the pending
-                // scan below re-evaluates it.
-                if (key != selfKey && !_writeSet.TryGetPending(schema.Id, key, out _))
-                    throw new InvalidOperationException($"Table '{schema.Name}': unique constraint on '{column.Name}' violated.");
-            }
+    private void CheckUniqueValue(TableSchema schema, ColumnSchema column, RowKey selfKey, RowKey encoded)
+    {
+        foreach (var (key, _) in _store.ScanIndex(schema.Id, column.Name, encoded))
+        {
+            // A pending op on the conflicting row supersedes its stored version; the pending
+            // scan below re-evaluates it.
+            if (key != selfKey && !_writeSet.TryGetPending(schema.Id, key, out _))
+                throw new InvalidOperationException($"Table '{schema.Name}': unique constraint on '{column.Name}' violated.");
+        }
 
-            foreach (var op in _writeSet.OpsFor(schema.Id))
-            {
-                if (op.Kind == RowOpKind.Delete || op.Key == selfKey)
-                    continue;
-                var pendingRow = RowSerializer.Deserialize(schema, op.Row);
-                var pendingValue = column.GetValue(pendingRow);
-                if (pendingValue is not null && KeyCodec.Encode(column, pendingValue) == encoded)
-                    throw new InvalidOperationException($"Table '{schema.Name}': unique constraint on '{column.Name}' violated.");
-            }
+        foreach (var op in _writeSet.OpsFor(schema.Id))
+        {
+            if (op.Kind == RowOpKind.Delete || op.Key == selfKey)
+                continue;
+            if (EncodePendingColumn(schema, column, op.Row) == encoded)
+                throw new InvalidOperationException($"Table '{schema.Name}': unique constraint on '{column.Name}' violated.");
         }
     }
 

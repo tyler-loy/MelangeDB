@@ -41,7 +41,7 @@ internal sealed class EngineTelemetry : IDisposable
             "Transactions between the log head and each applier's checkpoint.");
     }
 
-    public Activity? StartReducer(string reducerName, Identity caller, IReadOnlyList<object?>? arguments)
+    public Activity? StartReducer(string reducerName, Identity caller, IReadOnlyList<object?>? arguments, ReadOnlyMemory<byte> encodedArguments)
     {
         var activity = Source.StartActivity("melange.reducer");
         if (activity is null)
@@ -49,9 +49,25 @@ internal sealed class EngineTelemetry : IDisposable
         activity.SetTag("melange.reducer.name", reducerName);
         if (_options.IncludeCallerIdentity)
             activity.SetTag("melange.caller", caller.ToString());
-        if (_options.IncludeReducerArguments && arguments is { Count: > 0 })
-            activity.SetTag("melange.reducer.args", string.Join(", ", arguments.Select(a => a?.ToString() ?? "null")));
+        if (_options.IncludeReducerArguments)
+        {
+            // In-process calls carry boxed values worth formatting; encoded dispatch carries the
+            // wire payload, tagged as bounded hex so the opt-in still works for real traffic.
+            if (arguments is { Count: > 0 })
+                activity.SetTag("melange.reducer.args", string.Join(", ", arguments.Select(a => a?.ToString() ?? "null")));
+            else if (!encodedArguments.IsEmpty)
+                activity.SetTag("melange.reducer.args", FormatEncodedArguments(encodedArguments.Span));
+        }
+
         return activity;
+    }
+
+    private static string FormatEncodedArguments(ReadOnlySpan<byte> encoded)
+    {
+        const int capBytes = 256;
+        return encoded.Length <= capBytes
+            ? Convert.ToHexStringLower(encoded)
+            : $"{Convert.ToHexStringLower(encoded[..capBytes])}… ({encoded.Length} bytes)";
     }
 
     public Activity? StartCommit() => Source.StartActivity("melange.commit");

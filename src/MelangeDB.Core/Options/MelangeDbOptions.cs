@@ -11,6 +11,29 @@ public sealed class MelangeDbOptions
     public CommitLogOptions CommitLog { get; set; } = new();
 
     public TelemetryOptions Telemetry { get; set; } = new();
+
+    public ValidationOptions Validation { get; set; } = new();
+}
+
+/// <summary>
+/// Caps applied to reducer arguments while they are decoded (<c>MelangeDb:Validation:*</c>) —
+/// before any transaction opens, so a rejected call appends nothing. The framework cannot check
+/// semantics, but it rejects the inputs that corrupt state regardless of game rules.
+/// </summary>
+public sealed class ValidationOptions
+{
+    /// <summary>
+    /// Rejects <see cref="double.NaN"/> and ±infinity float arguments. A NaN position propagates
+    /// through terrain and chunk math and poisons rows that then replicate to every client.
+    /// Turning this off should feel alarming.
+    /// </summary>
+    public bool RejectNonFiniteFloats { get; set; } = true;
+
+    /// <summary>Maximum length, in characters, of a string argument.</summary>
+    public int MaxStringLength { get; set; } = 4096;
+
+    /// <summary>Maximum element count of an array or blob argument.</summary>
+    public int MaxCollectionLength { get; set; } = 4096;
 }
 
 /// <summary>Options for the hot store (<c>MelangeDb:HotStore:*</c>).</summary>
@@ -73,4 +96,10 @@ public sealed class TelemetryOptions
     /// already records them.
     /// </summary>
     public bool IncludeReducerArguments { get; set; }
+
+    /// <summary>
+    /// Reducers running longer than this many milliseconds get a span event and a warning log
+    /// entry. Read per invocation, so a changed value takes effect on the next call.
+    /// </summary>
+    public int SlowReducerMs { get; set; } = 50;
 }

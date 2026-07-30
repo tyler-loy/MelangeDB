@@ -68,7 +68,7 @@ Source name: `MelangeDB`.
 
 | Span | Phase | Attributes | Notes |
 | --- | --- | --- | --- |
-| `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows`; `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off; `melange.reducer.args` only when `Telemetry:IncludeReducerArguments` is opted in | The root span for client-initiated work. |
+| `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows`; `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off; `melange.reducer.args` only when `Telemetry:IncludeReducerArguments` is opted in (formatted values for in-process calls; the hex-encoded argument payload, capped at 256 bytes, for encoded dispatch) | The root span for client-initiated work. |
 | `melange.commit` | 01 | `melange.lsn`, `melange.writeset.bytes` | The critical section; a child `melange.fsync` span isolates durability cost from serialization cost. |
 | `melange.apply` | 01 | `melange.applier` | One per applier, per batch. |
 | `melange.subscription.initial` | 03 | `melange.table`, `melange.rows`, `melange.bytes` | The expensive half of a subscription; worth its own span. |
@@ -76,6 +76,10 @@ Source name: `MelangeDB`.
 | `melange.event.handle` | 06 | `melange.event.type`, `melange.handler` | **Linked, not parented** — see below. |
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
+
+A `melange.reducer` span whose duration exceeds `Telemetry:SlowReducerMs` additionally carries a
+`melange.slow_reducer` span event (with `melange.duration_ms`) and produces a warning log entry — shipped
+with phase 02, threshold live-reloadable.
 
 ### Context propagation
 
@@ -146,14 +150,19 @@ corresponds to a documented silent failure mode:
 Structured through `ILogger` with stable `EventId`s so log-based alerts don't break on message rewording.
 No parallel logging abstraction — the host's configured providers are the whole story.
 
+Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
+`1101 MelangeStarted`, `1102 MelangeStopped` (02).
+
 ## Health checks
 
 Standard `IHealthCheck` registrations, since they're nearly free once the metrics exist. These require a DI
-host to register into, so the first one lands with phase 02's host integration rather than phase 01:
+host to register into, so the first one landed with phase 02's host integration rather than phase 01.
+`AddMelangeDb` registers each check automatically; the host only opts into health checks at all
+(`AddHealthChecks()`).
 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
-| `melange-log` | The commit log is unwritable or out of disk | 02 |
+| `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
 | `melange-applier` | Any applier's lag exceeds its threshold | 08 |
 | `melange-shard` | This node's shard assignment is unknown or contested | 09 |
 
