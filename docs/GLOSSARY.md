@@ -90,6 +90,10 @@ policy-enforced and owner. Not a subscription.
 **Applier** — A component consuming the commit log to advance one projection, holding its own LSN checkpoint so
 it may lag independently and resume where it stopped.
 
+**Attachment** — A client's live connection to one commit log. Single-node deployments have exactly one per
+connection; a clustered client (phase 09) holds several — hub plus shard. The resume cursor (log epoch + acked
+LSN) is per attachment, never per subscription and never global.
+
 **AutoInc** — A column whose value is assigned from a durable per-table sequence, allocated into the write set
 *before* the log append so replay never reassigns different ids. The contract is **unique, not dense** — gaps
 are normal, which is what lets each shard allocate from an originator-prefixed range with no coordination.
@@ -143,6 +147,9 @@ log. A projection, not a second source of truth.
 **Fencing token** — A guard ensuring a node wrongly suspected of being dead cannot keep writing rows it no
 longer owns.
 
+**Frame** — One protocol message on the wire: one MessagePack-encoded unit carrying its type, its channel tag,
+and its fields. Ordering is guaranteed only within a frame's channel.
+
 **Generated model** — The per-assembly registration the source generator emits: every `[Table]` schema with
 its row codec attached, and every `[Reducer]` descriptor. `AddTablesFrom`/`AddReducersFrom` discover it
 through an assembly attribute, which is why a new table or reducer needs no manual registration anywhere.
@@ -164,6 +171,10 @@ assignment. Every client holds a permanent hub attachment. Originally "master no
 
 **Identity** — The stable identifier for who is acting: a hash of a token's **issuer and subject**. Issuer
 included so subjects from two token sources can never collide into one identity.
+
+**Initial set** — The rows a subscription matches at registration, computed consistent at one anchor LSN and
+streamed as chunks on the subscription's own bulk channel. The delta stream carries only LSNs above the
+anchor, which is what makes the boundary gap-free and duplicate-free.
 
 **Instance** — Under the instancing strategy, a shard identified by an explicit id column. Instances are
 causally disjoint — no interest overlap between them.

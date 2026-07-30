@@ -110,20 +110,44 @@ not an unreliable channel.
 - ~~**Query representation.**~~ **Settled: a SQL subset**, chosen for portability — a typed builder would be
   C#-only and would block the eventual TypeScript client. Cost accepted: we own a parser and must define the
   subset precisely enough that "valid MelangeDB SQL" is unambiguous.
-- **Delta granularity for projections.** Does a projected subscription emit an update when a *non-projected*
-  column changes? It must not — that's wasted bandwidth on the hottest path — but it requires per-
-  subscription column masking in the delta computation.
-- **Backpressure.** A client on a slow link during bulk terrain streaming will fall behind. Buffer, drop and
-  resync, or disconnect? Needs an answer here, because it shapes the protocol.
-- **Fan-out cost.** Naively testing every predicate against every row op is O(subscriptions × ops). Indexing
-  subscriptions by table and key range is the fix; know whether phase 03 needs it or can defer it.
-- **Head-of-line blocking — the one that shows up as bad game feel.** A single socket carrying a 30MB terrain
-  initial set *and* movement reducer responses lets terrain block movement. Chunk-and-interleave by priority is
-  the simplest fix and is probably sufficient. But see the channel-tag constraint below: whichever fix ships,
-  the *protocol* must not foreclose the better substrates.
-- **How much log to retain for `Resume`.** Too little and every reconnect degrades to a full resync; too much
-  and retention fights phase 07's compaction. Probably a time window rather than a transaction count, since what
-  matters is surviving a plausible network outage.
+- ~~**Delta granularity for projections.**~~ **Settled: a projected subscription never emits when only
+  non-projected columns change.** The fan-out runs as a commit observer *before* the hot store applies, so the
+  store still holds each row's pre-image; a projected update whose projected column slices are byte-identical
+  between pre- and post-image is suppressed. The same pre-image is what turns an update that crosses a
+  predicate boundary into the correct insert or delete. One caveat, documented in code: resume replay reads
+  the log, which has no pre-images, so replayed gaps are conservative (an update that no longer matches emits
+  a delete the client may no-op) — correctness holds, suppression applies only on the live path.
+- ~~**Backpressure.**~~ **Settled: bounded per-connection delta buffer (`Subscriptions:MaxBufferedBytes`);
+  on overflow the policy applies — `DropAndResync` (default), `Buffer`, or `Disconnect`.** `DropAndResync`
+  discards the queued delta stream, forgets the connection's subscriptions server-side, and sends one small
+  connection-scoped error telling the client to re-establish — bounded memory, kept connection, and the client
+  converges through the same path a rejected `Resume` uses. `Buffer` (unbounded past the trigger) is an
+  explicit opt-in for trusted links; `Disconnect` is the last resort. This changed the registered default in
+  CONFIGURATION.md from `Buffer` to `DropAndResync`: a default that buffers without bound past the bound's own
+  trigger would make the trigger meaningless. Bulk initial sets are exempt by construction — chunks are
+  generated lazily as the sender drains, so they occupy no buffer.
+- ~~**Fan-out cost.**~~ **Settled: indexed by table now; key-range indexing within a table deferred with a
+  measurement.** A commit tests only the subscriptions registered on the tables its write set touches. Within
+  one table the per-op predicate test is an encode plus a byte-compare (~tens of nanoseconds); at the reference
+  workload's scale — tens of subscriptions per hot table, single-digit row ops per commit — that is thousands
+  of comparisons per second against a fan-out budget of millions. The race-test suite hammers 400 commits
+  against eight live whole-table subscriptions without measurable fan-out cost. Key-range interval indexing
+  earns its complexity only when per-table subscription counts reach the hundreds; revisit with phase 10's
+  load rig.
+- ~~**Head-of-line blocking.**~~ **Settled: chunk-and-interleave by priority on one socket, shipped.** The
+  sender drains lanes in order — control/results, then one committed delta, then one bulk chunk of at most
+  `Transport:MaxInitialSetChunkBytes` — so a reducer response waits at most one chunk behind a 30MB initial
+  set. Asserted by a wire-order test. The channel tag on every frame keeps multi-socket HTTP/2 and QUIC
+  streams open as substrates with no protocol change.
+- ~~**How much log to retain for `Resume`.**~~ **Settled: a time window, `Resume:RetentionWindowSeconds`
+  (default 300).** What matters is surviving a plausible network outage, which is measured in seconds, not
+  transactions. A resume whose oldest missed record is older than the window answers full resync. Interaction
+  with phase 07 noted here deliberately: compaction's log truncation must treat the retention window as a
+  floor — truncating inside it silently converts every reconnect in flight into a full resync — and the
+  truncated-log case must keep answering full resync explicitly, which the epoch/LSN check already does.
+  Implementation note recorded for the same reason: the log epoch id lives in a `melange.epoch` sidecar
+  beside the log file, minted whenever the log file itself is freshly initialized — the phase-01 header
+  format needed no version bump, and pre-epoch logs are adopted under a minted epoch exactly once.
 
 ### Don't assume one totally-ordered byte stream
 

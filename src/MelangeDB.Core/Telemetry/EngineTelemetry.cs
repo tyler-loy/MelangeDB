@@ -41,9 +41,18 @@ internal sealed class EngineTelemetry : IDisposable
             "Transactions between the log head and each applier's checkpoint.");
     }
 
-    public Activity? StartReducer(string reducerName, Identity caller, IReadOnlyList<object?>? arguments, ReadOnlyMemory<byte> encodedArguments)
+    public Activity? StartReducer(
+        string reducerName,
+        Identity caller,
+        IReadOnlyList<object?>? arguments,
+        ReadOnlyMemory<byte> encodedArguments,
+        ActivityContext parentContext = default)
     {
-        var activity = Source.StartActivity("melange.reducer");
+        // A transport-propagated traceparent parents the reducer span directly, so a click in a
+        // game client and the server-side transaction are one trace.
+        var activity = parentContext == default
+            ? Source.StartActivity("melange.reducer")
+            : Source.StartActivity("melange.reducer", ActivityKind.Server, parentContext);
         if (activity is null)
             return null;
         activity.SetTag("melange.reducer.name", reducerName);

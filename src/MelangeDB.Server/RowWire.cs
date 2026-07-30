@@ -1,0 +1,104 @@
+using MelangeDB.Core;
+
+namespace MelangeDB.Server;
+
+/// <summary>
+/// Schema-interpreted access to serialized v1 rows: wire maps for frames, column-slice comparison
+/// for projection masking, and predicate encoding. Walks the row bytes by column kind — no
+/// reflection, no row type instance — so it works identically for generated and reflection-built
+/// schemas on the fan-out hot path.
+/// </summary>
+internal static class RowWire
+{
+    /// <summary>
+    /// Decodes a row into wire column values, restricted to <paramref name="projection"/> when it
+    /// is non-null. This is the partial-row path client projection uses and phase 04's column
+    /// policies reuse from the server side.
+    /// </summary>
+    public static Dictionary<string, object?> ToColumns(TableSchema schema, ReadOnlySpan<byte> row, IReadOnlySet<string>? projection)
+    {
+        var reader = new RowReader(row);
+        var columns = new Dictionary<string, object?>(projection?.Count ?? schema.Columns.Count, StringComparer.Ordinal);
+        foreach (var column in schema.Columns)
+        {
+            var value = ReadValue(ref reader, column.Kind);
+            if (projection is null || projection.Contains(column.Name))
+                columns[column.Name] = value;
+        }
+
+        return columns;
+    }
+
+    /// <summary>
+    /// Whether two versions of a row are byte-identical on every projected column — the test that
+    /// keeps a projected subscription silent when only non-projected columns changed.
+    /// </summary>
+    public static bool ProjectedEqual(TableSchema schema, ReadOnlySpan<byte> oldRow, ReadOnlySpan<byte> newRow, IReadOnlySet<string> projection)
+    {
+        var oldOffset = 0;
+        var newOffset = 0;
+        foreach (var column in schema.Columns)
+        {
+            var oldLength = MeasureColumn(oldRow[oldOffset..], column.Kind);
+            var newLength = MeasureColumn(newRow[newOffset..], column.Kind);
+            if (projection.Contains(column.Name))
+            {
+                if (!oldRow.Slice(oldOffset, oldLength).SequenceEqual(newRow.Slice(newOffset, newLength)))
+                    return false;
+            }
+
+            oldOffset += oldLength;
+            newOffset += newLength;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Encodes one column's value from a serialized row into its order-preserving key form, or
+    /// null when the value is null. Dispatches through the generated codec when the schema has one.
+    /// </summary>
+    public static RowKey? EncodeColumn(TableSchema schema, string column, ReadOnlySpan<byte> row)
+    {
+        if (schema.Codec is { } codec)
+            return codec.EncodeColumnFromBytes(column, row);
+
+        var boxed = RowSerializer.Deserialize(schema, row.ToArray());
+        var columnSchema = schema.Column(column);
+        var value = columnSchema.GetValue(boxed);
+        return value is null ? null : KeyCodec.Encode(columnSchema, value);
+    }
+
+    private static object? ReadValue(ref RowReader reader, ColumnKind kind) => kind switch
+    {
+        ColumnKind.Bool => reader.ReadBool(),
+        ColumnKind.Int8 => reader.ReadInt8(),
+        ColumnKind.UInt8 => reader.ReadUInt8(),
+        ColumnKind.Int16 => reader.ReadInt16(),
+        ColumnKind.UInt16 => reader.ReadUInt16(),
+        ColumnKind.Int32 => reader.ReadInt32(),
+        ColumnKind.UInt32 => reader.ReadUInt32(),
+        ColumnKind.Int64 => reader.ReadInt64(),
+        ColumnKind.UInt64 => reader.ReadUInt64(),
+        ColumnKind.Float32 => reader.ReadFloat32(),
+        ColumnKind.Float64 => reader.ReadFloat64(),
+        ColumnKind.String => reader.ReadString(),
+        ColumnKind.Bytes => reader.ReadBytes(),
+        ColumnKind.Identity => reader.ReadIdentity(),
+        ColumnKind.Timestamp => reader.ReadTimestamp(),
+        _ => throw new NotSupportedException($"Unknown column kind {kind}."),
+    };
+
+    private static int MeasureColumn(ReadOnlySpan<byte> data, ColumnKind kind) => kind switch
+    {
+        ColumnKind.Bool or ColumnKind.Int8 or ColumnKind.UInt8 => 1,
+        ColumnKind.Int16 or ColumnKind.UInt16 => 2,
+        ColumnKind.Int32 or ColumnKind.UInt32 or ColumnKind.Float32 => 4,
+        ColumnKind.Int64 or ColumnKind.UInt64 or ColumnKind.Float64 or ColumnKind.Timestamp => 8,
+        ColumnKind.Identity => Identity.Size,
+        ColumnKind.String or ColumnKind.Bytes => data[0] == 0
+            ? 1
+            : 5 + System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(data[1..]),
+        _ => throw new NotSupportedException($"Unknown column kind {kind}."),
+    };
+}

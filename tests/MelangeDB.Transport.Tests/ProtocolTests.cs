@@ -1,0 +1,187 @@
+using MelangeDB.Core;
+using MelangeDB.Protocol;
+using MelangeDB.Server;
+using Xunit;
+
+namespace MelangeDB.Transport.Tests;
+
+/// <summary>
+/// The wire format itself: every frame type round-trips, MessagePack integer boundaries encode
+/// correctly, and the client-side argument encoder is byte-compatible with the server-side
+/// decoder the generated dispatchers use.
+/// </summary>
+public class ProtocolTests
+{
+    private readonly MessagePackFrameSerializer _serializer = new();
+
+    public static TheoryData<Frame> Frames() => new((Frame[])
+    [
+        new HelloFrame(1, 3, "token") { Channel = MelangeChannels.Control },
+        new WelcomeFrame(1, Guid.NewGuid(), Guid.NewGuid(), 42UL, "HTTP/2"),
+        new CallReducerFrame(7, "Greet", [1, 2, 3], "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01") { Channel = MelangeChannels.Calls },
+        new ReducerResultFrame(7, true, 9UL, null, null) { Channel = MelangeChannels.Calls },
+        new ReducerResultFrame(8, false, 0UL, "rejected", "PvP is off"),
+        new SubscribeFrame(3, "SELECT * FROM t WHERE a = :p", new Dictionary<string, object?> { ["p"] = 5L }) { Channel = MelangeChannels.Data },
+        new SubscribeFrame(4, "SELECT * FROM t", null),
+        new UnsubscribeFrame(3),
+        new UnsubscribedFrame(3),
+        new SubscriptionAppliedFrame(3, 10UL, 2, false, [new WireRow([1, 2], new Dictionary<string, object?> { ["Id"] = 1L, ["Name"] = "x" })]) { Channel = 19 },
+        new SubscriptionAppliedFrame(3, 10UL, 3, true, []),
+        new TransactionUpdateFrame(11UL, [new SubscriptionUpdate(3, [
+            new WireRowOp(RowOpKind.Insert, [1], new Dictionary<string, object?> { ["Id"] = 1L }),
+            new WireRowOp(RowOpKind.Delete, [2], null),
+        ])])
+        { Channel = MelangeChannels.Data },
+        new ErrorFrame("parse", "Expected FROM", 0, 3),
+        new PingFrame(1),
+        new PongFrame(1),
+        new ResumeFrame(Guid.NewGuid(), 100UL, [new ResumeSubscription(3, "SELECT * FROM t", null)]),
+        new ResumeResultFrame(false, "retention exceeded"),
+        new ReauthenticateFrame("fresh-token"),
+        new ReauthenticateResultFrame(true, null),
+    ]);
+
+    [Theory]
+    [MemberData(nameof(Frames))]
+    public void Every_frame_type_round_trips_with_its_channel_tag(Frame frame)
+    {
+        var decoded = _serializer.Deserialize(_serializer.Serialize(frame));
+        Assert.Equal(frame.Type, decoded.Type);
+        Assert.Equal(frame.Channel, decoded.Channel);
+        Assert.Equal(Convert.ToHexString(_serializer.Serialize(frame)), Convert.ToHexString(_serializer.Serialize(decoded)));
+    }
+
+    [Fact]
+    public void Wire_values_round_trip_across_messagepack_boundaries()
+    {
+        object?[] values =
+        [
+            null, true, false,
+            0L, 1L, 127L, 128L, 255L, 256L, 65535L, 65536L, (long)uint.MaxValue, (long)uint.MaxValue + 1,
+            long.MaxValue, -1L, -31L, -32L, -33L, -127L, -128L, -129L, -32768L, -32769L, long.MinValue,
+            ulong.MaxValue, 3.5d, 2.25f, "", "short", new string('x', 31), new string('y', 32), new string('z', 300),
+            Array.Empty<byte>(), new byte[] { 1, 2, 3 }, new byte[300],
+        ];
+        foreach (var value in values)
+        {
+            var writer = new MsgPackWriter(16);
+            MessagePackFrameSerializer.WriteValue(ref writer, value);
+            var reader = new MsgPackReader(writer.ToArray());
+            var decoded = MessagePackFrameSerializer.ReadValue(ref reader);
+            var expected = value switch
+            {
+                ulong big when big <= long.MaxValue => (long)big,
+                _ => value,
+            };
+            Assert.Equal(expected, decoded);
+        }
+    }
+
+    [Fact]
+    public void Client_encoded_arguments_decode_through_the_server_side_reader()
+    {
+        var identity = Identity.Hash("alice");
+        var payload = ReducerArgs.Encode(
+            true, (sbyte)-5, (byte)200, (short)-1000, (ushort)50000, -123456, 3000000000U,
+            long.MinValue, ulong.MaxValue, 2.5f, 3.25d, "hello", (string?)null,
+            new byte[] { 9, 8 }, identity, new Timestamp(1234567), new[] { 1, 2, 3 });
+
+        var reader = new ReducerArgsReader(payload, new ValidationOptions());
+        reader.ExpectCount(17);
+        Assert.True(reader.ReadBool());
+        Assert.Equal((sbyte)-5, reader.ReadInt8());
+        Assert.Equal((byte)200, reader.ReadUInt8());
+        Assert.Equal((short)-1000, reader.ReadInt16());
+        Assert.Equal((ushort)50000, reader.ReadUInt16());
+        Assert.Equal(-123456, reader.ReadInt32());
+        Assert.Equal(3000000000U, reader.ReadUInt32());
+        Assert.Equal(long.MinValue, reader.ReadInt64());
+        Assert.Equal(ulong.MaxValue, reader.ReadUInt64());
+        Assert.Equal(2.5f, reader.ReadFloat32());
+        Assert.Equal(3.25d, reader.ReadFloat64());
+        Assert.Equal("hello", reader.ReadString());
+        Assert.Null(reader.ReadString());
+        Assert.Equal(new byte[] { 9, 8 }, reader.ReadByteArray());
+        Assert.Equal(identity, reader.ReadIdentity());
+        Assert.Equal(new Timestamp(1234567), reader.ReadTimestamp());
+        Assert.Equal(3, reader.BeginArray());
+        Assert.Equal(1, reader.ReadInt32());
+        Assert.Equal(2, reader.ReadInt32());
+        Assert.Equal(3, reader.ReadInt32());
+        reader.End();
+    }
+
+    [Fact]
+    public void Malformed_frames_throw_rather_than_tear()
+    {
+        Assert.Throws<MelangeProtocolException>(() => _serializer.Deserialize([0x99, 0x01]));
+        Assert.Throws<MelangeProtocolException>(() => _serializer.Deserialize([]));
+        Assert.Throws<MelangeProtocolException>(() => _serializer.Deserialize([0x93, 0x63, 0x00, 0x00]));
+
+        // A truncated valid frame:
+        var bytes = _serializer.Serialize(new CallReducerFrame(1, "Greet", [1, 2, 3], null));
+        Assert.Throws<MelangeProtocolException>(() => _serializer.Deserialize(bytes.AsSpan(0, bytes.Length - 2)));
+    }
+}
+
+/// <summary>The SQL subset, parsed: exactly four shapes are valid, and everything else says why not.</summary>
+public class SqlSubsetParserTests
+{
+    [Fact]
+    public void Parses_the_four_supported_shapes()
+    {
+        var wholeTable = SqlSubsetParser.Parse("SELECT * FROM recipe", null);
+        Assert.Equal("recipe", wholeTable.Table);
+        Assert.Null(wholeTable.Projection);
+        Assert.Equal(PredicateKind.None, wholeTable.Predicate);
+
+        var equality = SqlSubsetParser.Parse(
+            "SELECT * FROM inventory_item WHERE owner_id = :id",
+            new Dictionary<string, object?> { ["id"] = 7L });
+        Assert.Equal(PredicateKind.Equality, equality.Predicate);
+        Assert.Equal("owner_id", equality.Column);
+        Assert.Equal(7L, equality.EqualsValue);
+
+        var range = SqlSubsetParser.Parse(
+            "select * from terrain_chunk_data where chunk_id between :lo and :hi",
+            new Dictionary<string, object?> { ["lo"] = 1L, ["hi"] = 9L });
+        Assert.Equal(PredicateKind.Range, range.Predicate);
+        Assert.Equal(1L, range.RangeLow);
+        Assert.Equal(9L, range.RangeHigh);
+
+        var projection = SqlSubsetParser.Parse(
+            "SELECT skill_id, total_xp, level FROM player_skill WHERE player_num = :id",
+            new Dictionary<string, object?> { ["id"] = 3L });
+        Assert.Equal(["skill_id", "total_xp", "level"], projection.Projection);
+    }
+
+    [Fact]
+    public void Literals_are_accepted_where_parameters_are()
+    {
+        var query = SqlSubsetParser.Parse("SELECT * FROM t WHERE a BETWEEN -5 AND 12", null);
+        Assert.Equal(-5L, query.RangeLow);
+        Assert.Equal(12L, query.RangeHigh);
+        Assert.Equal("x y", SqlSubsetParser.Parse("SELECT * FROM t WHERE a = 'x y'", null).EqualsValue);
+        Assert.Equal(2.5d, SqlSubsetParser.Parse("SELECT * FROM t WHERE a = 2.5", null).EqualsValue);
+    }
+
+    [Theory]
+    [InlineData("DELETE FROM t")]
+    [InlineData("SELECT * FROM t WHERE a > 5")]
+    [InlineData("SELECT * FROM t WHERE a = :p AND b = :q")]
+    [InlineData("SELECT * FROM t JOIN u ON t.a = u.a")]
+    [InlineData("SELECT * FROM t WHERE a = 'unterminated")]
+    [InlineData("SELECT FROM t")]
+    [InlineData("SELECT *")]
+    [InlineData("")]
+    public void Everything_outside_the_subset_is_rejected(string query) =>
+        Assert.ThrowsAny<Exception>(() => SqlSubsetParser.Parse(query, null));
+
+    [Fact]
+    public void A_named_parameter_without_a_value_names_itself_in_the_error()
+    {
+        var error = Assert.Throws<SqlParseException>(() =>
+            SqlSubsetParser.Parse("SELECT * FROM t WHERE a = :missing", new Dictionary<string, object?>()));
+        Assert.Contains(":missing", error.Message);
+    }
+}

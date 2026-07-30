@@ -43,12 +43,23 @@ public sealed class FileCommitLog : ICommitLog
         _telemetry = telemetry;
         Directory.CreateDirectory(options.Path);
         FilePath = System.IO.Path.Combine(options.Path, "melange.log");
+        EpochFilePath = System.IO.Path.Combine(options.Path, "melange.epoch");
         _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         Recover();
     }
 
     /// <summary>The full path of the log file.</summary>
     public string FilePath { get; }
+
+    /// <summary>
+    /// The full path of the epoch sidecar. The epoch lives beside the log rather than in its
+    /// header so phase-01 logs stay readable with no header version bump: initializing a fresh log
+    /// file mints a new epoch, and an existing log without a sidecar is adopted under a freshly
+    /// minted one exactly once.
+    /// </summary>
+    public string EpochFilePath { get; }
+
+    public Guid EpochId { get; private set; }
 
     /// <summary>
     /// Test-only fault injection, invoked after a record's bytes are written but before the flush —
@@ -219,8 +230,14 @@ public sealed class FileCommitLog : ICommitLog
             BinaryPrimitives.WriteUInt16LittleEndian(header[6..], 0);
             _stream.Write(header);
             _stream.Flush(flushToDisk: true);
+
+            // A fresh log file is a fresh incarnation: any epoch left behind by a deleted log must
+            // not survive it, or an old resume cursor would count against the wrong history.
+            EpochId = MintEpoch();
             return;
         }
+
+        EpochId = ReadOrMintEpoch();
 
         Span<byte> fileHeader = stackalloc byte[HeaderSize];
         _stream.Seek(0, SeekOrigin.Begin);
@@ -274,6 +291,25 @@ public sealed class FileCommitLog : ICommitLog
             _headLsn = record.Lsn;
             intactEnd = position + FrameSize + payloadLength;
         }
+    }
+
+    private Guid MintEpoch()
+    {
+        var epoch = Guid.NewGuid();
+        File.WriteAllBytes(EpochFilePath, epoch.ToByteArray());
+        return epoch;
+    }
+
+    private Guid ReadOrMintEpoch()
+    {
+        if (File.Exists(EpochFilePath))
+        {
+            var bytes = File.ReadAllBytes(EpochFilePath);
+            if (bytes.Length == 16)
+                return new Guid(bytes);
+        }
+
+        return MintEpoch();
     }
 
     private void TruncateTorn(long intactEnd, string reason)

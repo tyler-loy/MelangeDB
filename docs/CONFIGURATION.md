@@ -28,6 +28,13 @@ reach the running engine through the hosted service's reload bridge — a config
 the next operation with no restart. One doc correction made when it shipped: `Diagnostics:EmitGeneratedFiles`
 is a build-time switch and lives in the project file, not in `appsettings.json` — see its row.
 
+**Shipped as of phase 03** (defaults verified against `TransportOptions`, `SubscriptionsOptions`, and
+`ResumeOptions`): every `Transport:*` key, every `Subscriptions:*` key, `Resume:RetentionWindowSeconds`, and
+`Telemetry:DeltaSpanSampleRatio`. One doc correction made when it shipped: the default of
+`Subscriptions:BackpressurePolicy` is **`DropAndResync`**, not the `Buffer` this register originally planned —
+`MaxBufferedBytes` exists to bound per-connection memory, and a default that buffers without bound past its own
+trigger would make the trigger meaningless. `Buffer` remains as an explicit opt-in for trusted links.
+
 ## Conventions
 
 - **Everything lives under the `MelangeDb:` configuration section**, so a host can bind it from
@@ -116,12 +123,12 @@ to fix it without a code change and a redeploy.
 | `Transport:MaxInitialSetChunkBytes` | int | `262144` | live | 03 | Large initial sets are chunked and interleaved so a 30MB terrain subscription can't block a movement reducer response. |
 | `Resume:RetentionWindowSeconds` | int | `300` | live | 03 | How far back a reconnecting client can resume. Too small and every blip becomes a full resync; too large and it fights log compaction. |
 | `Subscriptions:MaxPerConnection` | int | `64` | live | 03 | |
-| `Subscriptions:BackpressurePolicy` | enum | `Buffer` | live | 03 | `Buffer` \| `DropAndResync` \| `Disconnect`. Matters most during bulk terrain streaming to a slow client. |
+| `Subscriptions:BackpressurePolicy` | enum | `DropAndResync` | live | 03 | `DropAndResync` \| `Buffer` \| `Disconnect`. Applied when buffered deltas exceed `MaxBufferedBytes`: drop the delta stream and tell the client to re-establish (default, bounded memory), keep buffering (explicit opt-in, unbounded), or close the socket. Matters most during bulk terrain streaming to a slow client. |
 | `Subscriptions:MaxBufferedBytes` | long | `16777216` | live | 03 | Per connection; the trigger for the policy above. |
 | `Subscriptions:MaxRowsPerSubscription` | long | `100000` | live | 03 | Ceiling on an initial result set. Rejected before execution, not mid-stream. |
 | `Subscriptions:MaxBytesPerSubscription` | long | `67108864` | live | 03 | The one that actually matters for blob tables. |
 | `Subscriptions:MaxRangeSpan` | long | `1024` | live | 03 | Maximum width of a `BETWEEN` predicate. Lets a client stream a ring around itself but not the whole map. |
-| `Subscriptions:RequirePredicateOn` | string[] | — | live | 03 | Tables where an unbounded subscription is rejected. Terrain and blob tables belong here. |
+| `Subscriptions:RequirePredicateOn` | string[] | — | live | 03 | Tables where an unbounded subscription is rejected. An entry is a table name (any predicate satisfies) or `Table.Column` (the predicate must constrain that column). Terrain and blob tables belong here. |
 
 ## Identity and policies
 

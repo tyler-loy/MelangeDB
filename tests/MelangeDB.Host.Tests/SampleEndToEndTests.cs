@@ -92,6 +92,8 @@ public class SampleEndToEndTests : IDisposable
             ["MelangeDb:HotStore:Path"] = Path.Combine(_root, "hot"),
             ["Sample:Greeting:Excited"] = "false",
             ["Logging:LogLevel:Default"] = "Warning",
+            // The sample's appsettings pins a port for humans; tests take an ephemeral one.
+            ["Urls"] = "http://127.0.0.1:0",
         }));
 
     private static async Task<ulong> WaitForCommitAsync(MelangeEngine engine, ulong pastLsn)

@@ -5,6 +5,7 @@
     <Project Path="src/MelangeDB.CodeGen/MelangeDB.CodeGen.csproj" />
     <Project Path="src/MelangeDB.Core/MelangeDB.Core.csproj" />
     <Project Path="src/MelangeDB.OpenTelemetry/MelangeDB.OpenTelemetry.csproj" />
+    <Project Path="src/MelangeDB.Protocol/MelangeDB.Protocol.csproj" />
     <Project Path="src/MelangeDB.Server/MelangeDB.Server.csproj" />
     <Project Path="src/MelangeDB.Storage.Faster/MelangeDB.Storage.Faster.csproj" />
     <Project Path="src/MelangeDB.Storage.Postgres/MelangeDB.Storage.Postgres.csproj" />
@@ -13,8 +14,10 @@
     <Project Path="tests/MelangeDB.CodeGen.Tests/MelangeDB.CodeGen.Tests.csproj" />
     <Project Path="tests/MelangeDB.Core.Tests/MelangeDB.Core.Tests.csproj" />
     <Project Path="tests/MelangeDB.Host.Tests/MelangeDB.Host.Tests.csproj" />
+    <Project Path="tests/MelangeDB.Transport.Tests/MelangeDB.Transport.Tests.csproj" />
   </Folder>
   <Folder Name="/samples/">
+    <Project Path="samples/MelangeDB.Sample.Client/MelangeDB.Sample.Client.csproj" />
     <Project Path="samples/MelangeDB.Sample.Worker/MelangeDB.Sample.Worker.csproj" />
   </Folder>
 </Solution>

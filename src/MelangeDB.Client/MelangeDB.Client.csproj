@@ -6,7 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
+    <ProjectReference Include="..\MelangeDB.Protocol\MelangeDB.Protocol.csproj" />
   </ItemGroup>
 
 </Project>
