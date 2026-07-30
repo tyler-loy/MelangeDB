@@ -41,17 +41,23 @@ public class ReducerAuthTests
     {
         // The report asserted, so it cannot silently regress: the set of unpoliced reducers is
         // exactly the client-callable descriptors with no Policy attached — nothing more (a
-        // policied reducer must not be listed) and nothing less (no reducer escapes both).
+        // policied or scheduled reducer must not be listed, since neither is client-callable)
+        // and nothing less (no reducer escapes both).
         await using var host = await TransportTestHost.StartAsync();
+        var scheduled = host.Engine.Schema.Tables
+            .Where(t => t.Scheduled is not null)
+            .Select(t => t.Scheduled!)
+            .ToHashSet(StringComparer.Ordinal);
         var expected = host.Reducers.Reducers
-            .Where(r => r.Kind == ReducerKind.Standard && r.Policy is null)
+            .Where(r => r.Kind == ReducerKind.Standard && r.Policy is null && !scheduled.Contains(r.Name))
             .Select(r => r.Name)
             .OrderBy(n => n, StringComparer.Ordinal);
 
         Assert.Equal(expected, host.Reducers.UnpolicedReducers.OrderBy(n => n, StringComparer.Ordinal));
         Assert.DoesNotContain("ClearCreatures", host.Reducers.UnpolicedReducers);
+        Assert.DoesNotContain("Respawn", host.Reducers.UnpolicedReducers);
         Assert.Contains("Spawn", host.Reducers.UnpolicedReducers);
-        foreach (var reducer in host.Reducers.Reducers.Where(r => r.Kind == ReducerKind.Standard))
+        foreach (var reducer in host.Reducers.Reducers.Where(r => r.Kind == ReducerKind.Standard && !scheduled.Contains(r.Name)))
             Assert.True(reducer.Policy is not null || host.Reducers.UnpolicedReducers.Contains(reducer.Name));
     }
 

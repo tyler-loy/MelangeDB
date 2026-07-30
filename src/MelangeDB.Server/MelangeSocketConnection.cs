@@ -44,6 +44,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private uint _nextPingId;
     private ITimer? _heartbeat;
     private bool _handshaken;
+    private bool _lifecycleConnected;
     private volatile bool _senderBusy;
     private int _terminated;
 
@@ -100,6 +101,11 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _heartbeat?.Dispose();
             await _closed.CancelAsync().ConfigureAwait(false);
             UnregisterAllSubscriptions();
+
+            // The session ended — by close frame, aborted socket, or heartbeat-detected drop
+            // alike; ClientDisconnected pairs with the ClientConnected the handshake fired.
+            if (_lifecycleConnected)
+                _transport.FireClientDisconnected(Caller, ConnectionId);
             if (_slotReserved)
             {
                 _transport.ReleaseConnectionSlot(Caller);
@@ -366,6 +372,12 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _transport.Engine.Log.EpochId,
             _transport.Engine.Log.HeadLsn,
             _httpProtocol));
+
+        // A completed handshake is a session start — the thing an admin query is not. Firing on
+        // the read loop, before any further frame is processed, means a client's first Subscribe
+        // already sees whatever state ClientConnected committed.
+        _transport.FireClientConnected(Caller, ConnectionId);
+        _lifecycleConnected = true;
     }
 
     /// <summary>

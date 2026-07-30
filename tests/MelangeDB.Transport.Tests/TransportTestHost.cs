@@ -55,6 +55,9 @@ internal sealed class TransportTestHost : IAsyncDisposable
 
     public MelangeSessions Sessions => _app!.Services.GetRequiredService<MelangeSessions>();
 
+    /// <summary>Lifecycle-fire record shared across restarts, so pairing asserts survive a bounce.</summary>
+    public SessionEvents SessionEvents { get; } = new();
+
     public IServiceProvider Services => _app!.Services;
 
     public static async Task<TransportTestHost> StartAsync(
@@ -173,6 +176,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
             }
         });
         builder.Services.AddSingleton<MelangeSessions>();
+        builder.Services.AddSingleton(SessionEvents);
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Chunk).Assembly)
             .AddReducersFrom(typeof(TransportReducers).Assembly));
