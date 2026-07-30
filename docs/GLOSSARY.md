@@ -131,6 +131,8 @@ longer owns.
 **Global** — Placement: the table lives on the hub only. In practice the relational tier.
 
 **Guest identity** — A server-signed identity issued to an unauthenticated client, durable across reconnects.
+Ordinary in every respect: a guest holds a token like anyone else, so "converting" a guest is IdP-side account
+linking rather than anything MelangeDB does. Preserve the subject and the `Identity` never changes.
 
 **Handoff** — Transferring a player's ownership from one shard node to another. Explicit and discrete under
 instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction.

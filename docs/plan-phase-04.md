@@ -37,6 +37,24 @@ means a revoked or expired credential keeps working indefinitely. Instead the cl
 (frame defined in phase 03) with a fresh token before expiry, and the server enforces a configurable grace
 window past expiry before closing the connection.
 
+**The invariant that makes re-auth safe: `Reauthenticate` may refresh a token but must never change the
+identity.** Every subscription's initial set and every delta on this connection was computed under the current
+identity's row and column policies. Permitting a mid-session identity switch would mean rows filtered for
+identity A arriving at identity B — a leak, in the phase whose entire job is preventing leaks. If the presented
+token resolves to a different identity, the correct response is to close the connection and make the client
+reconnect, not to re-evaluate state in place.
+
+**Guest conversion needs no merge machinery.** A guest holds a signed token like anyone else. When they sign up,
+account linking is the **identity provider's** job: if the IdP preserves the subject when linking a guest id to a
+new account, the resulting JWT resolves to the *same* `Identity`, MelangeDB sees no change, and the live session
+picks the new token up through `Reauthenticate`. Nothing merges because nothing moved.
+
+This keeps MelangeDB out of the identity business, consistent with using the host's ASP.NET Core authentication
+rather than inventing a parallel one. The obligation it creates is a **documented contract** rather than a
+feature: *if you want guest progress to survive sign-up, your IdP must preserve the subject when linking.* An
+integrator whose IdP mints a fresh subject instead will strand guest characters, and that consequence belongs in
+their hands with the reason stated plainly — not solved by a merge operation inside the database.
+
 **Revocation.** Banning a cheater must take effect now, not in 55 minutes when their token expires. Needs an
 explicit "terminate all sessions for this identity" operation, and a revocation check on re-auth. Without this,
 moderation in a live game doesn't work.
@@ -126,13 +144,11 @@ does with data it legitimately receives.
   declare their dependencies, or admin changes force a resubscribe. The second is cruder and probably right.
 - **Do policies apply to ad-hoc SQL (phase 08)?** They must, or RLS is trivially bypassable — but an owner/
   admin path needs to bypass them deliberately. Two explicit modes, no ambiguity.
-- **Guest identity durability.** Cookie, local token file, or client-persisted key? Affects whether a guest
-  keeps their character after a client restart.
-- **Guest → authenticated upgrade.** A guest plays for two hours, then signs in. Do they keep their character?
-  In a full-loot game identity *is* inventory, so this is a product decision with real weight, not a technical
-  detail. Either support an identity-merge operation (and accept that merging is a fraud vector worth
-  rate-limiting) or refuse it explicitly and tell players up front. Silence here means players lose characters
-  and blame the game.
+- **Guest identity durability.** Cookie, local token file, or client-persisted key? This is the one part of
+  guest continuity that *is* MelangeDB's problem — a guest token the client can't persist means a lost character
+  on every client restart, regardless of how well conversion works.
+- ~~**Guest → authenticated upgrade.**~~ **Settled: not MelangeDB's concern.** Guest conversion is IdP-side
+  account linking; if the subject is preserved the identity never changes. See the deliverable above.
 - **Reducer authorization default posture.** Deny-by-default is safer but makes every ordinary gameplay reducer
   carry an annotation. Allow-by-default plus the unpoliced-reducer report is probably the right trade — the
   omission becomes visible without being fatal — but decide it explicitly rather than by accident.
@@ -149,6 +165,10 @@ does with data it legitimately receives.
 - A session whose token expires mid-connection survives if the client re-authenticates within the grace window,
   and is closed if it doesn't — both asserted, since only testing the happy path here is how the insecure
   variant ships.
+- `Reauthenticate` with a token resolving to a **different** identity closes the connection rather than switching
+  in place. This is the leak test for the frame, so it gets written before the happy path.
+- A guest token and a later account-linked token sharing a subject resolve to the same `Identity`, and the live
+  session continues across the swap with its subscriptions intact.
 - Revoking an identity terminates its live sessions and prevents re-auth, without restarting the server.
 - Player A cannot see Player B's inventory rows, skills, or attributes — asserted at the protocol level, not
   just the API level.

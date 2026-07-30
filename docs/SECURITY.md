@@ -147,12 +147,18 @@ can and should reject the class of inputs that corrupts state regardless of game
 - **Collection length caps** on array arguments.
 - Integer range constraints where declared.
 
-## Gap 6 — Identity abuse
+## Gap 6 — Identity abuse and session identity binding
 
 `Auth:AllowGuests` grants an identity to anyone who asks, with no cap. Unlimited guest identities means
 unlimited connections, unlimited subscriptions, and unlimited rate-limit buckets — every per-identity defense
 above is bypassed by getting a new identity. Needs a connection cap per identity and a guest-issuance limit
 keyed on something scarcer than "asked nicely."
+
+Related, and easy to implement permissively by accident: **a connection is bound to one identity for its
+lifetime.** `Reauthenticate` refreshes a token; it must not switch identity. Every initial set and delta on that
+connection was computed under the current identity's row and column policies, so an in-place switch delivers
+A's filtered rows to B — a leak that bypasses the entire policy layer without triggering any of it. A token
+resolving to a different identity closes the connection instead.
 
 ## Explicitly not defended against
 
