@@ -4,6 +4,7 @@
     <Project Path="src/MelangeDB.Client/MelangeDB.Client.csproj" />
     <Project Path="src/MelangeDB.CodeGen/MelangeDB.CodeGen.csproj" />
     <Project Path="src/MelangeDB.Core/MelangeDB.Core.csproj" />
+    <Project Path="src/MelangeDB.OpenTelemetry/MelangeDB.OpenTelemetry.csproj" />
     <Project Path="src/MelangeDB.Server/MelangeDB.Server.csproj" />
     <Project Path="src/MelangeDB.Storage.Faster/MelangeDB.Storage.Faster.csproj" />
     <Project Path="src/MelangeDB.Storage.Postgres/MelangeDB.Storage.Postgres.csproj" />

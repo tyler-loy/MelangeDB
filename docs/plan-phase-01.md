@@ -42,6 +42,14 @@ interface.
 - **`InMemoryHotStore`** — dictionary-backed projection plus indexes, rebuilt from the log on startup.
 - **Dispatcher** — invoke a reducer, build the write set, append, apply. Return means commit; throw means
   abort with nothing appended.
+- **OpenTelemetry instrumentation** — established here, not retrofitted. A single `ActivitySource` and `Meter`
+  named `MelangeDB`, with **no telemetry package reference in core at all** — both types are in the `net10.0`
+  framework, so MelangeDB emits the built-in signals and the host chooses exporters, exactly as ASP.NET Core and
+  EF Core do. Spans `melange.reducer`,
+  `melange.commit` (with an `melange.fsync` child so durability cost is separable from serialization cost), and
+  `melange.apply`; metrics for transaction count, reducer and commit duration, write-set size, log head LSN, and
+  **`melange.applier.lag`**. See [OBSERVABILITY.md](OBSERVABILITY.md) for the full register and the
+  cardinality rules — caller identity goes on spans and never on metric dimensions.
 
 ## Out of scope
 
@@ -70,7 +78,15 @@ Codegen (02), networking (03), auth (04), scheduling (05), events (06), FASTER a
   rebuildable without re-executing reducers.
 - A log with a deliberately truncated final record recovers to the last intact LSN.
 - Two tables mutated in one reducer either both commit or neither does.
-- `dotnet test` green; the core path has no dependency on ASP.NET Core, FASTER, or Npgsql.
+- `dotnet test` green; the core path has no dependency on ASP.NET Core, FASTER, Npgsql, **or any OpenTelemetry
+  package** — asserted by a test over `MelangeDB.Core`'s resolved dependencies, since this is easy to violate
+  accidentally and painful to walk back.
+- A test host collecting `ActivitySource("MelangeDB")` sees a `melange.reducer` span per invocation with the
+  correct outcome attribute, and a `melange.commit` span with an `melange.fsync` child.
+- `melange.applier.lag` reports a non-zero value when an applier is deliberately paused, and returns to zero
+  when it resumes.
+- Instrumentation with no listener attached costs no measurable throughput — benchmarked, because "it's just a
+  null check" is an assumption worth verifying once.
 
 ## Risks
 

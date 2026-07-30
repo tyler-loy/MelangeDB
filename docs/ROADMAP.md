@@ -9,6 +9,10 @@ definition of done.
 - **Every configuration item goes in [CONFIGURATION.md](CONFIGURATION.md)**, in the same change that introduces
   it — not at the end of a phase. That document is the source of truth for key names, defaults, and reload
   semantics. Undocumented knobs are how a library becomes folklore.
+- **Every phase instruments what it adds**, recorded in [OBSERVABILITY.md](OBSERVABILITY.md) in the same change.
+  Span and metric names are public API — once a dashboard or alert depends on `melange.applier.lag`, renaming it
+  is a breaking change. A phase is not done if its failure modes are invisible, which is why several phases name
+  specific metrics in their done-criteria rather than saying "add telemetry."
 
 ## Ordering principles
 

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>Optional convenience package: registers MelangeDB's ActivitySource and Meter names with OpenTelemetry via AddMelangeDbInstrumentation(). Not required — MelangeDB.Core emits standard .NET signals that any OpenTelemetry setup can consume directly.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.17.0" />
+  </ItemGroup>
+
+</Project>

@@ -44,6 +44,8 @@ app.Run();
 - **[docs/DESIGN.md](docs/DESIGN.md)** — the architecture, the trade-offs it accepts, and the open questions.
 - **[docs/CLUSTERING.md](docs/CLUSTERING.md)** — the four table placements, hub/shard node roles, and
   why *you* define the sharding function rather than MelangeDB.
+- **[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)** — the span and metric register. OpenTelemetry from the
+  first commit, with no OpenTelemetry dependency in core.
 - **[docs/SECURITY.md](docs/SECURITY.md)** — what a server can enforce against an untrusted client, and what
   it deliberately doesn't.
 - **[docs/VIBE-SHAFT-COVERAGE.md](docs/VIBE-SHAFT-COVERAGE.md)** — the design audited against a live
@@ -60,6 +62,7 @@ app.Run();
 | `src/MelangeDB.Server` | WebSocket transport, subscription engine, auth. |
 | `src/MelangeDB.Client` | C# client. |
 | `src/MelangeDB.CodeGen` | Roslyn generator: registrations, serializers, typed clients. |
+| `src/MelangeDB.OpenTelemetry` | Optional: registers MelangeDB's signal names with OpenTelemetry. |
 
 ## Building
 

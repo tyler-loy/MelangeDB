@@ -159,5 +159,19 @@ Ignored entirely by single-node deployments.
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `Diagnostics:ReportApplierLag` | bool | `true` | live | 08 | A silently stalled Postgres applier — writes succeeding while the tier falls hours behind — is the dangerous failure mode. Not optional in practice. |
-| `Diagnostics:SlowReducerMs` | int | `50` | live | 02 | Logs reducer invocations over this threshold. |
 | `Diagnostics:EmitGeneratedFiles` | bool | `false` | restart | 02 | Writes source-generator output to disk. Incremental generators fail obscurely; this pays for itself. |
+
+## Telemetry
+
+MelangeDB emits `ActivitySource` and `Meter` signals named `MelangeDB`; the **host** configures exporters and
+sampling through OpenTelemetry's own configuration. These settings only control what MelangeDB emits, never
+where it goes. See [OBSERVABILITY.md](OBSERVABILITY.md).
+
+| Key | Type | Default | Reload | Phase | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `Telemetry:Enabled` | bool | `true` | restart | 01 | Off short-circuits instrumentation entirely. With no listener attached the cost is already negligible, so this is for the paranoid rather than the pragmatic. |
+| `Telemetry:IncludeCallerIdentity` | bool | `true` | live | 01 | Adds caller identity to **spans only** — never a metric dimension, which would be one time series per player. Turn off where identity is a privacy requirement. |
+| `Telemetry:IncludeReducerArguments` | bool | `false` | live | 01 | Off by default: arguments can contain anything, including secrets, and the commit log already records them. |
+| `Telemetry:DeltaSpanSampleRatio` | double | `0.01` | live | 03 | `melange.subscription.delta` is the highest-frequency operation in the system; tracing every one at full rate would cost more than the work. |
+| `Telemetry:SlowReducerMs` | int | `50` | live | 02 | Reducers over this threshold get a span event and a log entry. |
+| `HealthChecks:ApplierLagThreshold` | long | `10000` | live | 08 | Transactions behind before the `melange-applier` check reports unhealthy. |

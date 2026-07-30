@@ -347,6 +347,7 @@ src/MelangeDB.Storage.Postgres  relational applier + reader
 src/MelangeDB.Server            websocket transport, subscription engine, auth
 src/MelangeDB.Client            C# client
 src/MelangeDB.CodeGen           Roslyn source generator: registrations, serializers, typed clients
+src/MelangeDB.OpenTelemetry     optional: registers MelangeDB's ActivitySource/Meter names with OTel
 tests/                          unit + integration
 samples/                        worker-service sample
 ```
