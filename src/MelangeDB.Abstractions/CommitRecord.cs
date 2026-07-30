@@ -25,6 +25,13 @@ public sealed class CommitRecord
     /// <summary>The authoritative payload: the collapsed, ordered row operations of the transaction.</summary>
     public required IReadOnlyList<RowOp> WriteSet { get; init; }
 
+    /// <summary>
+    /// The domain events the transaction published, in publish order. Part of the committed
+    /// payload: an event exists exactly when its transaction does. Records written before format
+    /// version 2 read back as empty.
+    /// </summary>
+    public IReadOnlyList<EventRecord> Events { get; init; } = [];
+
     /// <summary>The record's size on disk in bytes, framing included.</summary>
     public required int SerializedLength { get; init; }
 }
@@ -35,4 +42,5 @@ public readonly record struct CommitRequest(
     Identity Caller,
     string ReducerName,
     ReadOnlyMemory<byte> Arguments,
-    IReadOnlyList<RowOp> WriteSet);
+    IReadOnlyList<RowOp> WriteSet,
+    IReadOnlyList<EventRecord>? Events = null);

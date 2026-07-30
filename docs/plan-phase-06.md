@@ -55,16 +55,55 @@ idempotent handlers is the contract, and saying so plainly is better than implyi
 
 ## Decisions to settle
 
-- **Are events in the log record, or derived from it?** Storing them makes replay trivially correct and the
-  contract obvious, but grows the log for data that is often transient. Deriving them from row deltas avoids
-  the bloat but couples handlers to schema. Leaning "in the record" for clarity; note the cost.
-- **May a handler call a reducer?** Yes — but that's a new transaction, and an event → reducer → event cycle
-  is an infinite loop. Depth limiting or cycle detection needed.
-- **Do handlers block the applier?** They must not. Which means a queue, which means bounded buffers and a
-  policy for what happens when they fill.
-- **Is the bus visible to clients?** Pushing events to subscribed clients is tempting (combat feed, chat) but
-  it's a second delivery channel next to subscriptions. Defer — subscriptions to an append-only table cover
-  it with one mechanism.
+- ~~**Are events in the log record, or derived from it?**~~ **Settled: in the record.** Commit-record format
+  version 2 appends an event section (type name, publish depth, opaque payload) after the write set; version-1
+  records read back with no events, so every pre-phase-06 log stays readable with no migration — the same bar
+  the phase-03 epoch sidecar set. Deriving events from row deltas was rejected because it couples every handler
+  to table schema and cannot express facts that aren't row-shaped (`PlayerDied` is not an update). The cost is
+  real and stated: events grow the log, and a publish-only transaction now appends a record where before it
+  appended nothing. The retention interaction is bounded by design: events pin retention only up to the slowest
+  *live* subscriber checkpoint, because `Events:SubscriberExpirySeconds` evicts abandoned ones (phase 07 reads
+  the floor from `MelangeEventBus.MinimumLiveCheckpointLsn`). Serialization is reflection-based JSON
+  (`System.Text.Json`, in the framework — no package) with converters for `Identity` and `Timestamp`; the
+  record format treats the payload as opaque bytes plus a type name, so a schema-registered binary codec can
+  supersede it later without a format change.
+- ~~**May a handler call a reducer?**~~ **Settled: yes, as a new transaction, depth-limited.** Each event
+  carries the publish depth it was born at — one more than the event whose handler (transitively) published it,
+  stamped from an ambient `AsyncLocal` that flows through the handler's reducer calls. A publish at
+  `Events:MaxPublishDepth` (default 4) throws, aborting the publishing reducer; the handler's failure then
+  follows the ordinary retry → dead-letter path, so a cycle ends loudly with a durable record instead of
+  spinning. Depth is persisted in the event record, so the guard holds across restarts and replays. Chosen over
+  cycle *detection* because detection needs event identity across hops, which handlers can trivially defeat by
+  rewrapping payloads; a depth bound cannot be defeated.
+- ~~**Do handlers block the applier?**~~ **Settled: never — the log is the buffer.** The commit path only hands
+  envelopes to the transport (which enqueues) and wakes the per-subscriber dispatch loops; no user code ever
+  runs under the write lock. The in-memory delivery window is bounded by `Events:MaxQueueDepth`; on overflow the
+  oldest entries are evicted and a subscriber that needed them replays from the commit log, its checkpoint lag
+  saying honestly how far behind it is. This is the phase-03 backpressure precedent (`DropAndResync` over
+  unbounded buffering) applied where it costs nothing: the log already holds every event durably and
+  checkpoints already model lag, so "drop from the window" loses nothing at all. A slow or retrying subscriber
+  delays only itself — each subscriber has its own loop and its own checkpoint.
+- ~~**Is the bus visible to clients?**~~ **Settled: deferred, unchanged.** Handlers are the only consumers in
+  this phase. A client-visible feed is a subscription to an append-only table a handler (or the reducer itself)
+  writes — one delivery channel, not two. Revisit only if phase 09's world events produce a concrete need.
+
+### Implementation decisions recorded
+
+- **Checkpoint durability**: a JSON sidecar beside the log (`<CommitLog:Path>/melange.events.json`), per the
+  epoch-sidecar precedent — the log format is untouched, and losing the file costs only redelivery, which
+  at-least-once already permits. Each entry holds the subscriber's LSN, its last-active timestamp (the expiry
+  clock), and, after eviction, a tombstone — which is how a returning subscriber is *told* it lost its place
+  (EventId 1404) rather than silently resuming. Writes replace the file atomically (temp + move).
+- **Subscriber identity**: the handler type's full name. Renaming a handler class is therefore a new subscriber
+  that starts from current state — documented behavior, not an accident.
+- **New subscribers start at the current head.** A handler deployed for the first time does not replay world
+  history into itself; catch-up is for subscribers that *have* a checkpoint. (A returning-after-eviction
+  subscriber is the same rule plus the loud log.)
+- **Dead letters**: one JSON line per poisoned event in `<Events:DeadLetterPath>/melange.deadletter.ndjson` —
+  subscriber, event type, LSN, depth, attempt count, error, and the payload as raw JSON, fsynced per append.
+  Delivery then advances past the event; the checkpoint never wedges on a poison message.
+- **Retry backoff** is exponential: `Events:RetryBackoffMs`, doubling per retry, capped at 30 s, driven by the
+  injected `TimeProvider` so tests hand-crank it.
 
 ## Done when
 

@@ -26,6 +26,8 @@ internal sealed class EngineTelemetry : IDisposable
     private readonly Counter<long> _rateLimited;
     private readonly Counter<long> _schedulerOverruns;
     private readonly Histogram<double> _schedulerTickDuration;
+    private readonly Counter<long> _deadLettered;
+    private Func<long>? _eventQueueDepth;
 
     public EngineTelemetry(TelemetryOptions options, Func<ulong> headLsn, Func<IEnumerable<(string Applier, long Lag)>> applierLags)
     {
@@ -39,6 +41,8 @@ internal sealed class EngineTelemetry : IDisposable
         _rateLimited = _meter.CreateCounter<long>("melange.ratelimit.rejected", "{call}", "Client reducer calls rejected by the rate limiter before any transaction opened.");
         _schedulerOverruns = _meter.CreateCounter<long>("melange.scheduler.overruns", "{tick}", "Ticks that ran past their timer's interval — the death-spiral early warning.");
         _schedulerTickDuration = _meter.CreateHistogram<double>("melange.scheduler.tick.duration", "ms", "Scheduled fire duration, dispatch and transaction included.");
+        _deadLettered = _meter.CreateCounter<long>("melange.events.deadlettered", "{event}", "Events whose delivery exhausted its retries and was recorded to the dead-letter path.");
+        _meter.CreateObservableGauge("melange.events.queue_depth", () => _eventQueueDepth?.Invoke() ?? 0L, "{event}", "Events held in the bus's in-memory delivery window.");
         _meter.CreateObservableGauge("melange.log.head_lsn", () => (long)headLsn(), "{lsn}", "LSN of the newest log record.");
         _meter.CreateObservableGauge(
             "melange.applier.lag",
@@ -125,6 +129,29 @@ internal sealed class EngineTelemetry : IDisposable
 
     public void RecordSchedulerTick(string reducerName, double durationMs) =>
         _schedulerTickDuration.Record(durationMs, new KeyValuePair<string, object?>("reducer", reducerName));
+
+    /// <summary>Wires the delivery window's depth into the <c>melange.events.queue_depth</c> gauge.</summary>
+    public void SetEventQueueDepthProvider(Func<long> provider) => _eventQueueDepth = provider;
+
+    /// <summary>
+    /// Starts a <c>melange.event.handle</c> span. A handler runs after — possibly long after — the
+    /// emitting transaction, so its span is a new trace <em>linked</em> to the emitter, never
+    /// parented under it: a child span would distort the reducer's duration and produce traces
+    /// that never close.
+    /// </summary>
+    public Activity? StartEventHandle(string eventType, string handler, ActivityContext emitterContext)
+    {
+        if (Activity.Current is not null)
+            Activity.Current = null;
+        var links = emitterContext == default ? null : new[] { new ActivityLink(emitterContext) };
+        var activity = Source.StartActivity("melange.event.handle", ActivityKind.Internal, default(ActivityContext), links: links);
+        activity?.SetTag("melange.event.type", eventType);
+        activity?.SetTag("melange.handler", handler);
+        return activity;
+    }
+
+    public void RecordDeadLettered(string eventType) =>
+        _deadLettered.Add(1, new KeyValuePair<string, object?>("event_type", eventType));
 
     public void RecordCommitDuration(double durationMs) => _commitDuration.Record(durationMs);
 

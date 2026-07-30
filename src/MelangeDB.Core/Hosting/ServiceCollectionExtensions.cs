@@ -41,6 +41,20 @@ public static class ServiceCollectionExtensions
                 services.TryAddScoped(policy);
         }
 
+        var handlerTypes = builder.EventHandlers;
+        services.TryAddSingleton(new EventHandlerRegistry(handlerTypes));
+        foreach (var handlerType in handlerTypes)
+            services.TryAddScoped(handlerType);
+        services.TryAddSingleton<IEventTransport, InProcessEventTransport>();
+        services.TryAddSingleton(provider => new MelangeEventBus(
+            provider.GetRequiredService<MelangeEngine>(),
+            provider.GetRequiredService<EventHandlerRegistry>(),
+            provider.GetRequiredService<IEventTransport>(),
+            provider.GetRequiredService<IServiceScopeFactory>(),
+            provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>(),
+            provider.GetService<ILoggerFactory>(),
+            provider.GetService<TimeProvider>()));
+
         var tables = builder.Tables;
         services.TryAddSingleton(_ => new SchemaRegistry(tables));
         services.TryAddSingleton(provider => new MelangeEngine(

@@ -67,7 +67,7 @@ public class CommitLogTests : IDisposable
 
         var record = _harness.Engine.Log.ReadFrom(1).Single();
         Assert.Equal(1UL, record.Lsn);
-        Assert.Equal((ushort)1, record.FormatVersion);
+        Assert.Equal((ushort)2, record.FormatVersion);
         Assert.Equal(EngineHarness.Caller, record.Caller);
         Assert.Equal("Join", record.ReducerName);
         Assert.False(record.Arguments.IsEmpty);

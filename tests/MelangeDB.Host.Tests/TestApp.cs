@@ -205,7 +205,11 @@ internal static class TestApp
 {
     public static Identity Caller { get; } = Identity.Hash("host-tests");
 
-    public static IHost Build(string root, IDictionary<string, string?>? settings = null, Action<HostApplicationBuilder>? configure = null)
+    public static IHost Build(
+        string root,
+        IDictionary<string, string?>? settings = null,
+        Action<HostApplicationBuilder>? configure = null,
+        Action<MelangeDbBuilder>? events = null)
     {
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
         {
@@ -215,6 +219,7 @@ internal static class TestApp
         {
             ["MelangeDb:CommitLog:Path"] = Path.Combine(root, "log"),
             ["MelangeDb:HotStore:Path"] = Path.Combine(root, "hot"),
+            ["MelangeDb:Events:DeadLetterPath"] = Path.Combine(root, "deadletter"),
         });
         if (settings is not null)
             builder.Configuration.AddInMemoryCollection(settings);
@@ -223,10 +228,22 @@ internal static class TestApp
         builder.Services.AddScoped<ScopedProbe>();
         builder.Services.AddSingleton<SingletonProbe>();
         builder.Services.AddSingleton<SchedulerProbe>();
-        builder.Services.AddMelangeDb(melange => melange
-            .AddTablesFrom(typeof(Note).Assembly)
-            .AddReducersFrom(typeof(NoteReducers).Assembly));
+        builder.Services.AddSingleton<EventProbe>();
+
+        builder.Services.AddMelangeDb(melange =>
+        {
+            melange
+                .AddTablesFrom(typeof(Note).Assembly)
+                .AddReducersFrom(typeof(NoteReducers).Assembly);
+            if (events is null)
+                melange.AddEventHandlersFrom(typeof(Note).Assembly);
+            else
+                events(melange);
+        });
         builder.Services.AddHealthChecks();
+
+        // Runs after AddMelangeDb, so a test's registrations win by running last — including
+        // replacing IEventTransport, since the last registration resolves.
         configure?.Invoke(builder);
         return builder.Build();
     }
@@ -242,4 +259,6 @@ internal static class TestApp
     public static MelangeEngine Engine(this IHost host) => host.Services.GetRequiredService<MelangeEngine>();
 
     public static MelangeReducerHost Reducers(this IHost host) => host.Services.GetRequiredService<MelangeReducerHost>();
+
+    public static MelangeEventBus Bus(this IHost host) => host.Services.GetRequiredService<MelangeEventBus>();
 }
