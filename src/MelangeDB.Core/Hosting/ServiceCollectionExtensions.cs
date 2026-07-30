@@ -49,6 +49,12 @@ public static class ServiceCollectionExtensions
             provider.GetService<ILoggerFactory>(),
             provider.GetService<TimeProvider>()));
         services.TryAddSingleton<MelangeReducerHost>();
+        services.TryAddSingleton(provider => new MelangeScheduler(
+            provider.GetRequiredService<MelangeEngine>(),
+            provider.GetRequiredService<MelangeReducerHost>(),
+            provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>(),
+            provider.GetService<ILoggerFactory>(),
+            provider.GetService<TimeProvider>()));
         services.TryAddSingleton<MelangeDbRuntimeState>();
         services.TryAddSingleton<MelangeLogHealthCheck>();
         services.AddHostedService<MelangeDbHostedService>();

@@ -18,3 +18,6 @@ MELANGE0010 | MelangeDB | Warning | Reducer bodies must perform no I/O
 MELANGE0011 | MelangeDB | Error | Column type is not supported
 MELANGE0012 | MelangeDB | Error | Column type cannot serve as a key
 MELANGE0013 | MelangeDB | Error | Table names must be unique within a compilation
+MELANGE0014 | MelangeDB | Error | Scheduled table names a reducer that does not exist
+MELANGE0015 | MelangeDB | Error | Scheduled reducer signature is invalid
+MELANGE0016 | MelangeDB | Error | ScheduleAt column placement is invalid

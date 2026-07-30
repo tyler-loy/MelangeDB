@@ -19,6 +19,8 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
     private readonly ConcurrentDictionary<ConnectionId, MelangeSocketConnection> _connections = new();
     private readonly ConcurrentDictionary<Identity, int> _connectionsPerIdentity = new();
     private readonly IDisposable _sessionsAttachment;
+    private readonly string[] _clientConnectedReducers;
+    private readonly string[] _clientDisconnectedReducers;
 
     public MelangeTransport(
         MelangeEngine engine,
@@ -53,6 +55,8 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
             : null;
         Subscriptions = new SubscriptionEngine(engine, Telemetry);
         Tickets = new TicketStore(Time, () => _options.CurrentValue.Auth.TicketTtlSeconds);
+        _clientConnectedReducers = LifecycleReducers(reducers, ReducerKind.ClientConnected);
+        _clientDisconnectedReducers = LifecycleReducers(reducers, ReducerKind.ClientDisconnected);
         _sessionsAttachment = sessions.Attach(TerminateSessions);
         engine.AddCommitObserver(this);
     }
@@ -128,6 +132,46 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
         }
     }
 
+    /// <summary>
+    /// Fires every <see cref="ReducerKind.ClientConnected"/> reducer for a session that completed
+    /// its handshake — a real session start, which an HTTP one-shot call, ad-hoc SQL, or a ticket
+    /// mint is not. Each fire is its own transaction.
+    /// </summary>
+    public void FireClientConnected(Identity caller, ConnectionId connectionId) =>
+        FireLifecycle(_clientConnectedReducers, caller, connectionId);
+
+    /// <summary>
+    /// Fires every <see cref="ReducerKind.ClientDisconnected"/> reducer for a session that ends —
+    /// graceful close and heartbeat-detected drop alike. Each fire is its own transaction.
+    /// </summary>
+    public void FireClientDisconnected(Identity caller, ConnectionId connectionId) =>
+        FireLifecycle(_clientDisconnectedReducers, caller, connectionId);
+
+    private void FireLifecycle(string[] reducers, Identity caller, ConnectionId connectionId)
+    {
+        foreach (var reducer in reducers)
+        {
+            if (Reducers.IsStopping)
+                return;
+            try
+            {
+                Reducers.Call(reducer, caller, connectionId, ReadOnlyMemory<byte>.Empty);
+            }
+            catch (Exception exception)
+            {
+                // A throwing lifecycle reducer must not take the session (or its close) with it:
+                // the failure is logged and the remaining lifecycle reducers still run.
+                LogMessages.LifecycleReducerFailed(Logger, reducer, exception);
+            }
+        }
+    }
+
+    private static string[] LifecycleReducers(MelangeReducerHost host, ReducerKind kind) =>
+        host.Reducers
+            .Where(descriptor => descriptor.Kind == kind)
+            .Select(descriptor => descriptor.Name)
+            .ToArray();
+
     /// <summary>Closes every live connection held by an identity — the moderation path.</summary>
     public int TerminateSessions(Identity identity)
     {
@@ -142,4 +186,16 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
     }
 
     public void Dispose() => _sessionsAttachment.Dispose();
+
+    private static class LogMessages
+    {
+        private static readonly Action<ILogger, string, Exception?> LifecycleReducerFailedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Error,
+                new EventId(1205, "LifecycleReducerFailed"),
+                "Lifecycle reducer '{Reducer}' threw; the session is unaffected and nothing was appended.");
+
+        public static void LifecycleReducerFailed(ILogger logger, string reducer, Exception failure) =>
+            LifecycleReducerFailedMessage(logger, reducer, failure);
+    }
 }

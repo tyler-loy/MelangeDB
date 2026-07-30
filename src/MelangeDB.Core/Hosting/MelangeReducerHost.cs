@@ -13,11 +13,19 @@ namespace MelangeDB.Core;
 /// </summary>
 public sealed class MelangeReducerHost
 {
+    private static readonly ValidationOptions ScheduledValidation = new()
+    {
+        RejectNonFiniteFloats = false,
+        MaxStringLength = int.MaxValue,
+        MaxCollectionLength = int.MaxValue,
+    };
+
     private readonly MelangeEngine _engine;
     private readonly ReducerRegistry _registry;
     private readonly IServiceScopeFactory _scopes;
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
     private readonly ReducerRateLimiter _rateLimiter;
+    private readonly HashSet<string> _scheduledReducers;
     private volatile bool _stopping;
 
     public MelangeReducerHost(
@@ -36,6 +44,10 @@ public sealed class MelangeReducerHost
         _scopes = scopes;
         _options = options;
         _rateLimiter = new ReducerRateLimiter(timeProvider ?? TimeProvider.System);
+        _scheduledReducers = engine.Schema.Tables
+            .Where(table => table.Scheduled is not null)
+            .Select(table => table.Scheduled!)
+            .ToHashSet(StringComparer.Ordinal);
     }
 
     /// <summary>The registered reducers.</summary>
@@ -48,7 +60,9 @@ public sealed class MelangeReducerHost
     /// </summary>
     public IReadOnlyList<string> UnpolicedReducers =>
         _registry.Reducers
-            .Where(descriptor => descriptor.Kind == ReducerKind.Standard && descriptor.Policy is null)
+            .Where(descriptor => descriptor.Kind == ReducerKind.Standard
+                && descriptor.Policy is null
+                && !_scheduledReducers.Contains(descriptor.Name))
             .Select(descriptor => descriptor.Name)
             .ToArray();
 
@@ -81,9 +95,10 @@ public sealed class MelangeReducerHost
         var options = _options.CurrentValue;
         if (source.ClientOriginated)
         {
-            // Lifecycle and scheduled reducers are not client-callable; answering "unknown"
-            // rather than "forbidden" keeps their existence unconfirmed.
-            if (descriptor.Kind != ReducerKind.Standard)
+            // Lifecycle and scheduled reducers are not client-callable — a client must not be
+            // able to force a world tick. Answering "unknown" rather than "forbidden" keeps
+            // their existence unconfirmed.
+            if (descriptor.Kind != ReducerKind.Standard || _scheduledReducers.Contains(descriptor.Name))
                 throw new ArgumentException($"No reducer named '{reducerName}' is registered.", nameof(reducerName));
 
             if (options.RateLimit.Enabled && !_rateLimiter.TryAcquire(caller, descriptor.Name, options.RateLimit))
@@ -119,6 +134,37 @@ public sealed class MelangeReducerHost
     }
 
     internal void SignalStopping() => _stopping = true;
+
+    /// <summary>Whether graceful shutdown has begun; lifecycle and scheduled fires check this.</summary>
+    public bool IsStopping => _stopping;
+
+    /// <summary>
+    /// Dispatches one scheduled fire: the timer row travels as the encoded argument (so the log's
+    /// audit metadata carries it), the generated invoker decodes it through the table's codec, and
+    /// a one-shot timer's row is deleted inside the same transaction — the fire and its
+    /// consumption are one commit. Internal dispatch: no rate limit, no policy, no client caps.
+    /// </summary>
+    internal ulong CallScheduled(TableSchema timerTable, RowKey timerKey, byte[] timerRow, bool deleteOnFire)
+    {
+        if (_stopping)
+            return 0;
+        var descriptor = _registry.Get(timerTable.Scheduled!);
+        var encodedArguments = ArgsCodec.Encode([timerRow]);
+        using var scope = _scopes.CreateScope();
+        var instance = scope.ServiceProvider.GetRequiredService(descriptor.ReducerClass);
+        return _engine.Invoke(
+            descriptor.Name,
+            MelangeScheduler.Caller,
+            encodedArguments,
+            context =>
+            {
+                var reader = new ReducerArgsReader(encodedArguments, ScheduledValidation);
+                descriptor.Invoke(instance, context, ref reader);
+                if (deleteOnFire)
+                    ((TransactionDb)context.Db).DeleteExisting(timerTable, timerKey);
+            },
+            ConnectionId.None);
+    }
 
     private void Authorize(
         ReducerDescriptor descriptor,

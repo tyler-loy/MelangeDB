@@ -98,6 +98,13 @@ public struct RowWriter
 
     public void WriteTimestamp(Timestamp value) => WriteInt64(value.UnixTimeMicroseconds);
 
+    /// <summary>One discriminant byte (0 instant, 1 interval), then the int64 microsecond payload.</summary>
+    public void WriteScheduleAt(ScheduleAt value)
+    {
+        WriteUInt8(value.IsInterval ? (byte)1 : (byte)0);
+        WriteInt64(value.Microseconds);
+    }
+
     /// <summary>The written bytes as a right-sized array.</summary>
     public readonly byte[] ToArray() => _buffer.AsSpan(0, _position).ToArray();
 
@@ -184,4 +191,10 @@ public ref struct RowReader
     }
 
     public Timestamp ReadTimestamp() => new(ReadInt64());
+
+    public ScheduleAt ReadScheduleAt()
+    {
+        var interval = ReadUInt8() != 0;
+        return ScheduleAt.FromMicroseconds(interval, ReadInt64());
+    }
 }

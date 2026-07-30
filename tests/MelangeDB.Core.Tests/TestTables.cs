@@ -61,3 +61,24 @@ public partial struct TerrainChunk
 
     public ChunkKind Kind;
 }
+
+/// <summary>Timer rows: implicitly private, implicitly Local, exactly one ScheduleAt column.</summary>
+[Table(Scheduled = nameof(DecayReducers.Decay))]
+public partial struct DecayTimer
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public ScheduleAt ScheduledAt;
+
+    public string Target;
+}
+
+public sealed class DecayReducers
+{
+    [Reducer]
+    public void Decay(ReducerContext ctx, DecayTimer timer)
+    {
+    }
+}

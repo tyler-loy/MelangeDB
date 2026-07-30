@@ -52,11 +52,13 @@ public sealed class MelangeEngine : IDisposable
             var store = new InMemoryHotStore(schema);
 
             // Recovery: one pass over the log rebuilds the projection and re-observes every durably
-            // allocated AutoInc id, so replay never reassigns different ids.
+            // allocated AutoInc id, so replay never reassigns different ids. The tail record's
+            // timestamp is kept as the scheduler's downtime anchor — when the world last moved.
             foreach (var record in _log.ReadFrom(1))
             {
                 store.Apply(record);
                 _sequencer.Observe(record, schema);
+                RecoveredTailTimestamp = record.Timestamp;
             }
 
             HotStore = store;
@@ -80,6 +82,12 @@ public sealed class MelangeEngine : IDisposable
 
     /// <summary>The commit log's poisoned-state failure, if any — the melange-log health signal.</summary>
     internal Exception? LogFailure => _log.Failure;
+
+    /// <summary>
+    /// The timestamp of the newest record recovered at startup, or null for an empty log — the
+    /// scheduler's approximation of when the process went down.
+    /// </summary>
+    internal Timestamp? RecoveredTailTimestamp { get; private set; }
 
     public IHotStore HotStore { get; }
 

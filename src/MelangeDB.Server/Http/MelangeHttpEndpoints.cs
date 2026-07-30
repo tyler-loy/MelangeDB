@@ -266,6 +266,8 @@ internal static class MelangeHttpEndpoints
     /// <summary>
     /// JSON to argument mapping: numbers to long/ulong/double, plus <c>{"$identity": "hex"}</c>,
     /// <c>{"$bytes": "base64"}</c>, and <c>{"$timestamp": micros}</c> for the kinds JSON lacks.
+    /// <c>{"$interval": micros}</c> exists for bulk-loading repeating timer rows: it coerces to a
+    /// repeating <c>ScheduleAt</c>, where a <c>$timestamp</c> coerces to a one-shot.
     /// </summary>
     private static object? ToArgument(JsonElement element) => element.ValueKind switch
     {
@@ -283,6 +285,8 @@ internal static class MelangeHttpEndpoints
             Convert.FromBase64String(base64.GetString() ?? string.Empty),
         JsonValueKind.Object when element.TryGetProperty("$timestamp", out var micros) =>
             new Timestamp(micros.GetInt64()),
+        JsonValueKind.Object when element.TryGetProperty("$interval", out var interval) =>
+            TimeSpan.FromMicroseconds(interval.GetInt64()),
         _ => throw new JsonException($"JSON value of kind {element.ValueKind} is not a valid argument."),
     };
 

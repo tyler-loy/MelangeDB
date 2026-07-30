@@ -183,6 +183,11 @@ causally disjoint — no interest overlap between them.
 
 **Local** — Placement: the table lives on one node and never leaves it. Caches, scratch state, telemetry.
 
+**Lifecycle reducer** — A reducer fired on a session transition: `ReducerKind.ClientConnected` on a
+completed websocket handshake, `ReducerKind.ClientDisconnected` on graceful close or heartbeat-detected
+drop, paired one-to-one per connection. Each fire is its own transaction. Not client-callable, and never
+fired by HTTP one-shots, ad-hoc SQL, or ticket minting — a session, not a query.
+
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
 
 **Overlay** — The read path inside a transaction: the uncommitted write set layered over the store, which is
@@ -253,7 +258,20 @@ rather than discovered under load.
 **Saga** — A multi-step, eventually-consistent operation with compensating actions, used for handoff and the
 rare cross-shard case. Explicitly not ACID.
 
-**Scheduled reducer** — A reducer fired by a timer row rather than by a client. Not client-callable.
+**ScheduleAt** — The discriminated column type a timer row carries: a one-shot **instant** or a repeating
+**interval**. A `Scheduled` table declares exactly one, and the type is valid nowhere else. A one-shot's
+row is deleted transactionally with its fire; a repeating timer's next fire is *derived* from the interval
+rather than persisted per fire — which is what keeps an idle tick from appending anything.
+
+**Scheduled reducer** — A reducer fired by a timer row rather than by a client, with signature
+`void Name(ReducerContext ctx, TimerTable timer)` — the timer row is the argument. Not client-callable
+(clients are told "unknown"), and excluded from the unpoliced-reducer report for the same reason.
+
+**Scheduler** — The component that fires timer rows: a projection consumer rebuilt from current rows at
+startup and maintained through the commit-observer seam, dispatching from a single-threaded loop over one
+`TimeProvider` timer. A tick that outruns its interval follows `Scheduler:OverrunPolicy`; downtime follows
+`Scheduler:CatchUpAfterDowntime`. Fires run as `MelangeScheduler.Caller`, exempt from rate limits and
+reducer policies — internal dispatch is not a client call.
 
 **`[ServerOnly]`** — A column attribute: never sent to any client, admin included, in any mode — ad-hoc SQL's
 owner mode included, because "never leaves the process" has no modes. Enforced on the wire since phase 04:

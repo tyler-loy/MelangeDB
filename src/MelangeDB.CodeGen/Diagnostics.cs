@@ -4,7 +4,7 @@ namespace MelangeDB.CodeGen;
 
 /// <summary>
 /// Every diagnostic MelangeDB reports at compile time. Ids are stable public API: MELANGE0001
-/// through MELANGE0012, never renumbered, each with a fires-test and a compiles-clean test.
+/// through MELANGE0016, never renumbered, each with a fires-test and a compiles-clean test.
 /// </summary>
 public static class Diagnostics
 {
@@ -115,7 +115,32 @@ public static class Diagnostics
     public static readonly DiagnosticDescriptor KeyColumnNotEncodable = new(
         "MELANGE0012",
         "Column type cannot serve as a key",
-        "Table '{0}': column '{1}' of type {2} cannot be a primary key or index — floats have no order-preserving byte encoding",
+        "Table '{0}': column '{1}' of type {2} cannot be a primary key or index — the type has no order-preserving byte encoding",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ScheduledReducerMissing = new(
+        "MELANGE0014",
+        "Scheduled table names a reducer that does not exist",
+        "Table '{0}' declares Scheduled = \"{1}\", but no reducer named '{1}' exists in this compilation. " +
+        "Declare [Reducer] public void {1}(ReducerContext ctx, {0} timer) on a reducer class.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ScheduledReducerSignature = new(
+        "MELANGE0015",
+        "Scheduled reducer signature is invalid",
+        "Reducer '{0}' {1}",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ScheduleAtColumnMisplaced = new(
+        "MELANGE0016",
+        "ScheduleAt column placement is invalid",
+        "Table '{0}' {1}",
         Category,
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);

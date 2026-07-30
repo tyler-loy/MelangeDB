@@ -172,6 +172,17 @@ internal sealed class TransactionDb : IDbView
         }
     }
 
+    /// <summary>
+    /// Stages a delete by pre-encoded key when the row still exists in the overlay — the
+    /// scheduler's one-shot consumption, which must tolerate the reducer body having already
+    /// deleted (or replaced) its own timer row.
+    /// </summary>
+    internal void DeleteExisting(TableSchema schema, RowKey key)
+    {
+        if (Exists(schema.Id, key))
+            _writeSet.Stage(new RowOp(RowOpKind.Delete, schema.Id, key));
+    }
+
     private static ColumnSchema RequireIndexed(TableSchema schema, string column)
     {
         var columnSchema = schema.Column(column);

@@ -14,7 +14,7 @@ public static class KeyCodec
 {
     /// <summary>Whether values of this kind may serve as primary keys or index values.</summary>
     public static bool IsKeyEncodable(ColumnKind kind) =>
-        kind is not (ColumnKind.Float32 or ColumnKind.Float64);
+        kind is not (ColumnKind.Float32 or ColumnKind.Float64 or ColumnKind.ScheduleAt);
 
     public static RowKey EncodeBool(bool value) => new([value ? (byte)1 : (byte)0]);
 

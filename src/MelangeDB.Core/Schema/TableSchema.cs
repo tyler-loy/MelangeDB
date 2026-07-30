@@ -24,6 +24,21 @@ public sealed class TableSchema
         if (columns.Count == 0)
             throw new ArgumentException($"Table '{name}' has no columns.", nameof(columns));
 
+        // A table declaring Scheduled holds timer rows: exactly one ScheduleAt column, implicitly
+        // private, implicitly Local until clustering gives timer tables a placement.
+        var scheduleAtColumns = columns.Count(c => c.Kind == ColumnKind.ScheduleAt);
+        if (scheduled is not null)
+        {
+            if (scheduleAtColumns != 1)
+                throw new NotSupportedException($"Table '{name}' declares Scheduled and must declare exactly one ScheduleAt column; found {scheduleAtColumns}.");
+            isPublic = false;
+            placement = Placement.Local;
+        }
+        else if (scheduleAtColumns > 0)
+        {
+            throw new NotSupportedException($"Table '{name}': a ScheduleAt column is only valid on a table declaring Scheduled.");
+        }
+
         var primaryKeys = columns.Where(c => c.IsPrimaryKey).ToList();
         if (primaryKeys.Count != 1)
             throw new NotSupportedException($"Table '{name}' must declare exactly one [PrimaryKey] column; found {primaryKeys.Count}.");

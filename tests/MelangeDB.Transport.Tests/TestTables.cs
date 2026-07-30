@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+
 namespace MelangeDB.Transport.Tests;
 
 /// <summary>Terrain-shaped: blob rows addressed by id, spatially indexed — the range-streaming table.</summary>
@@ -246,9 +248,67 @@ public sealed class TransportReducers
     {
     }
 
+    /// <summary>Scheduled by <see cref="RespawnTick"/>; a client naming it is told "unknown".</summary>
+    [Reducer]
+    public void Respawn(ReducerContext ctx, RespawnTick timer)
+    {
+    }
+}
+
+/// <summary>Timer rows for the wire-facing scheduled-reducer tests. Implicitly private and Local.</summary>
+[Table(Scheduled = nameof(TransportReducers.Respawn))]
+public partial struct RespawnTick
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public ScheduleAt ScheduledAt;
+}
+
+/// <summary>Private: what the lifecycle reducers write when asked to, one row per transition.</summary>
+[Table]
+public partial struct SessionLog
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public string Kind;
+
+    public Identity Who;
+}
+
+/// <summary>
+/// In-memory record of lifecycle fires. Recording costs no log records, so unrelated tests keep
+/// their LSN arithmetic; <see cref="WriteRows"/> opts a test into row-writing lifecycle reducers.
+/// </summary>
+public sealed class SessionEvents
+{
+    public ConcurrentQueue<(string Kind, Identity Caller, ConnectionId Connection)> Events { get; } = [];
+
+    public bool WriteRows { get; set; }
+
+    public int Count(string kind, Identity caller) =>
+        Events.Count(e => e.Kind == kind && e.Caller == caller);
+}
+
+public sealed class LifecycleReducers(SessionEvents events)
+{
     /// <summary>Not client-callable; a client naming it is told "unknown", never "forbidden".</summary>
     [Reducer(ReducerKind.ClientConnected)]
     public void OnConnect(ReducerContext ctx)
     {
+        events.Events.Enqueue(("connect", ctx.Caller, ctx.ConnectionId));
+        if (events.WriteRows)
+            ctx.Db.SessionLog.Insert(new SessionLog { Kind = "connect", Who = ctx.Caller });
+    }
+
+    [Reducer(ReducerKind.ClientDisconnected)]
+    public void OnDisconnect(ReducerContext ctx)
+    {
+        events.Events.Enqueue(("disconnect", ctx.Caller, ctx.ConnectionId));
+        if (events.WriteRows)
+            ctx.Db.SessionLog.Insert(new SessionLog { Kind = "disconnect", Who = ctx.Caller });
     }
 }

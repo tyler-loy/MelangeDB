@@ -18,6 +18,7 @@ public enum ColumnKind : byte
     Bytes = 13,
     Identity = 14,
     Timestamp = 15,
+    ScheduleAt = 16,
 }
 
 /// <summary>

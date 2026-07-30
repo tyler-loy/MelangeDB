@@ -84,6 +84,14 @@ public static class RowSerializer
                     Timestamp timestamp => timestamp,
                     _ => new Timestamp(ToInt64(value)),
                 },
+                ColumnKind.ScheduleAt => value switch
+                {
+                    null => default(ScheduleAt),
+                    ScheduleAt schedule => schedule,
+                    Timestamp instant => ScheduleAt.Instant(instant),
+                    TimeSpan interval => ScheduleAt.Interval(interval),
+                    _ => throw new InvalidCastException(),
+                },
                 _ => throw new NotSupportedException($"Unknown column kind {column.Kind}."),
             };
         }
@@ -208,6 +216,11 @@ public static class RowSerializer
             case ColumnKind.Timestamp:
                 writer.Write(((Timestamp)value!).UnixTimeMicroseconds);
                 break;
+            case ColumnKind.ScheduleAt:
+                var schedule = (ScheduleAt)value!;
+                writer.Write(schedule.IsInterval ? (byte)1 : (byte)0);
+                writer.Write(schedule.Microseconds);
+                break;
             default:
                 throw new NotSupportedException($"Unknown column kind {column.Kind}.");
         }
@@ -232,6 +245,7 @@ public static class RowSerializer
             ColumnKind.Bytes => reader.ReadByte() == 0 ? null : reader.ReadBytes(reader.ReadInt32()),
             ColumnKind.Identity => new Identity(reader.ReadBytes(Identity.Size)),
             ColumnKind.Timestamp => new Timestamp(reader.ReadInt64()),
+            ColumnKind.ScheduleAt => ScheduleAt.FromMicroseconds(reader.ReadByte() != 0, reader.ReadInt64()),
             _ => throw new NotSupportedException($"Unknown column kind {column.Kind}."),
         };
         if (column.IsEnum && value is not null)

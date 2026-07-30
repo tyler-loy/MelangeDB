@@ -44,8 +44,9 @@ internal static class Emitter
         builder.AppendLine("        public global::System.Collections.Generic.IReadOnlyList<global::MelangeDB.Core.ReducerDescriptor> Reducers() =>");
         builder.AppendLine("            new global::MelangeDB.Core.ReducerDescriptor[]");
         builder.AppendLine("            {");
+        var tableTypeNames = tables.ToDictionary(static t => t.TypeFqn, static t => t.TypeName);
         foreach (var reducer in reducers)
-            EmitDescriptor(builder, reducer);
+            EmitDescriptor(builder, reducer, tableTypeNames);
         builder.AppendLine("            };");
         builder.AppendLine("    }");
         builder.AppendLine("}");
@@ -262,7 +263,7 @@ internal static class Emitter
         }
     }
 
-    private static void EmitDescriptor(StringBuilder builder, ReducerModel reducer)
+    private static void EmitDescriptor(StringBuilder builder, ReducerModel reducer, IReadOnlyDictionary<string, string> tableTypeNames)
     {
         builder.AppendLine("                new global::MelangeDB.Core.ReducerDescriptor(");
         builder.AppendLine($"                    {Literal(reducer.ReducerName)},");
@@ -272,14 +273,14 @@ internal static class Emitter
         builder.AppendLine("                    {");
         builder.AppendLine($"                        reader.ExpectCount({reducer.Parameters.Length});");
         for (var i = 0; i < reducer.Parameters.Length; i++)
-            EmitArgumentRead(builder, reducer.Parameters[i], i, "                        ", bind: false);
+            EmitArgumentRead(builder, reducer.Parameters[i], i, "                        ", bind: false, tableTypeNames);
         builder.AppendLine("                        reader.End();");
         builder.AppendLine("                    },");
         builder.AppendLine("                    static (object instance, global::MelangeDB.ReducerContext context, ref global::MelangeDB.Core.ReducerArgsReader reader) =>");
         builder.AppendLine("                    {");
         builder.AppendLine($"                        reader.ExpectCount({reducer.Parameters.Length});");
         for (var i = 0; i < reducer.Parameters.Length; i++)
-            EmitArgumentRead(builder, reducer.Parameters[i], i, "                        ", bind: true);
+            EmitArgumentRead(builder, reducer.Parameters[i], i, "                        ", bind: true, tableTypeNames);
         var arguments = string.Concat(Enumerable.Range(0, reducer.Parameters.Length).Select(static i => $", arg{i}"));
         builder.AppendLine($"                        (({reducer.ContainingTypeFqn})instance).{reducer.MethodName}(context{arguments});");
         builder.AppendLine("                        reader.End();");
@@ -294,8 +295,31 @@ internal static class Emitter
         }
     }
 
-    private static void EmitArgumentRead(StringBuilder builder, ParameterModel parameter, int index, string indent, bool bind)
+    private static void EmitArgumentRead(
+        StringBuilder builder,
+        ParameterModel parameter,
+        int index,
+        string indent,
+        bool bind,
+        IReadOnlyDictionary<string, string> tableTypeNames)
     {
+        if (parameter.IsTimerRow)
+        {
+            // The timer row travels as one blob argument: the scheduler encodes the stored row
+            // bytes, and the table's own codec decodes them — the same v1 format as the store.
+            if (bind)
+            {
+                builder.AppendLine($"{indent}var raw{index} = reader.ReadByteArray() ?? throw new global::MelangeDB.Core.ReducerArgumentException(\"The timer-row argument is null.\");");
+                builder.AppendLine($"{indent}var arg{index} = global::MelangeDB.Generated.{tableTypeNames[parameter.ClrFqn]}Codec.Instance.Deserialize(raw{index});");
+            }
+            else
+            {
+                builder.AppendLine($"{indent}_ = reader.ReadByteArray();");
+            }
+
+            return;
+        }
+
         if (!parameter.IsArray)
         {
             var read = ArgRead(parameter.Kind);

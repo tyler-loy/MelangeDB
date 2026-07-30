@@ -65,9 +65,77 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
             .OrderBy(static r => r.ReducerName, StringComparer.Ordinal)
             .ThenBy(static r => r.ContainingTypeFqn, StringComparer.Ordinal)
             .ToArray();
+        validReducers = ValidateScheduling(production, reducers, validTables, validReducers);
         if (validTables.Length == 0 && validReducers.Length == 0)
             return;
         production.AddSource("MelangeModel.g.cs", Emitter.EmitModel(validTables, validReducers));
+    }
+
+    /// <summary>
+    /// The checks that need tables and reducers side by side: a <c>Scheduled</c> table must name
+    /// a reducer that exists (MELANGE0014) with the timer-row signature
+    /// <c>void R(ReducerContext, TTimer)</c> (MELANGE0015), and a timer-row parameter is only
+    /// valid on the reducer its table schedules. Reducers failing the shape are dropped from the
+    /// emitted model, turning a runtime dispatch failure into a compile error.
+    /// </summary>
+    private static ReducerModel[] ValidateScheduling(
+        SourceProductionContext production,
+        ImmutableArray<ReducerModel> allReducers,
+        TableModel[] validTables,
+        ReducerModel[] validReducers)
+    {
+        var invalid = new HashSet<ReducerModel>();
+        var scheduledTables = validTables.Where(static t => t.Scheduled is not null).ToArray();
+        foreach (var table in scheduledTables)
+        {
+            if (allReducers.All(r => r.ReducerName != table.Scheduled))
+            {
+                production.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.ScheduledReducerMissing,
+                    table.Location.ToLocation(),
+                    table.TableName,
+                    table.Scheduled));
+                continue;
+            }
+
+            // A reducer that exists but already carries its own diagnostics reports those instead.
+            var reducer = validReducers.FirstOrDefault(r => r.ReducerName == table.Scheduled);
+            if (reducer is null)
+                continue;
+            if (reducer.Kind != "Standard"
+                || reducer.Parameters.Length != 1
+                || !reducer.Parameters[0].IsTimerRow
+                || reducer.Parameters[0].ClrFqn != table.TypeFqn)
+            {
+                production.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.ScheduledReducerSignature,
+                    reducer.Location.ToLocation(),
+                    reducer.ReducerName,
+                    $"is scheduled by table '{table.TableName}' and must be declared void {reducer.ReducerName}(ReducerContext ctx, {table.TypeName} timer)"));
+                invalid.Add(reducer);
+            }
+        }
+
+        foreach (var reducer in validReducers)
+        {
+            if (!reducer.HasTimerRowParameter || invalid.Contains(reducer))
+                continue;
+            var wellFormed = reducer.Kind == "Standard"
+                && reducer.Parameters.Length == 1
+                && reducer.Parameters[0].IsTimerRow
+                && scheduledTables.Any(t => t.Scheduled == reducer.ReducerName && t.TypeFqn == reducer.Parameters[0].ClrFqn);
+            if (!wellFormed)
+            {
+                production.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.ScheduledReducerSignature,
+                    reducer.Location.ToLocation(),
+                    reducer.ReducerName,
+                    "takes a [Table] struct parameter, which is only valid as the single timer-row parameter of the reducer that table's Scheduled declaration names"));
+                invalid.Add(reducer);
+            }
+        }
+
+        return invalid.Count == 0 ? validReducers : validReducers.Where(r => !invalid.Contains(r)).ToArray();
     }
 
     /// <summary>

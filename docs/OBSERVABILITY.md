@@ -16,7 +16,10 @@ sampled `melange.subscription.delta` (ratio: `Telemetry:DeltaSpanSampleRatio`), 
 parents the `melange.reducer` span directly. The phase 04 rows — `melange.ratelimit.rejected` (dimension:
 reducer) and `melange.policy.rows_filtered` (dimension: table) — shipped with identity and policies, on the
 same meter. Neither carries an identity dimension, per the cardinality rule below: *whose* call was limited
-belongs on the span and in the log, never on a time series.
+belongs on the span and in the log, never on a time series. The phase 05 rows — the `melange.scheduler.tick`
+span (a new trace root, with the fire's `melange.reducer` span as its child), `melange.scheduler.overruns`
+(dimension: reducer; one increment per overrun event), and `melange.scheduler.tick.duration` — shipped with
+the scheduler. `melange.shard` stays off the tick span until phase 09 gives timer tables a placement.
 
 ## The dependency decision
 
@@ -160,7 +163,8 @@ No parallel logging abstraction — the host's configured providers are the whol
 
 Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
-`1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04).
+`1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
+`1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05).
 
 ## Health checks
 
