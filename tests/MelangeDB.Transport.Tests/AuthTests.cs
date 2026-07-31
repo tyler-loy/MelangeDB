@@ -169,7 +169,7 @@ public class AuthTests
 
         var closed = host.Sessions.Revoke(TransportTestHost.Caller);
         Assert.Equal(1, closed);
-        await dropped.Task.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+        await dropped.Task.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(15)), TestContext.Current.CancellationToken);
 
         // No restart happened, and the same valid token no longer connects.
         await using var again = host.CreateClient();
