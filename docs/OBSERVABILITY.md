@@ -221,8 +221,16 @@ observer's border cursor from its log (truncated past, another epoch, or a chang
 band went as a reset instead of the stream silently resuming past the gap — `1716 BorrowedRegistryRebuilt`
 — a shard's borrowed-row sidecar was missing or unusable while its log is truncated, so the read-only
 registry was rebuilt from row content: correct but a full scan, expected once when upgrading a pre-phase-10
-shard directory — and `1717 TransferListenerFailed`, an `IShardTransferListener` that threw: the transfer is
-durable regardless, but the application's session map may lag until the idempotent listener runs again (10).
+shard directory — `1717 TransferListenerFailed`, an `IShardTransferListener` that threw: the transfer is
+durable regardless, but the application's session map may lag until the idempotent listener runs again —
+`1718 GatewaySwapCompleted` (Debug: a client's shard attachment swapped seamlessly — how many subscriptions
+re-scoped and held calls flushed; the client observed nothing), `1719 GatewaySwapFailed` (the swap could not
+complete; the client converges through the ordinary resync path), `1720 GatewayHandoffQueueOverflow` (a
+client queued more than the cap during one transfer; further calls get a retryable error),
+`1721 GatewayPreopened` (Debug: a destination session opened on approach, so the swap is instant), and
+`1722 HandoffRequestStale` (Debug: a transfer request dropped because the sender is not the entity's current
+owner — the fencing rule applied to triggers, and the guard that stops a stale origin from re-importing the
+past over the present) (10).
 
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when

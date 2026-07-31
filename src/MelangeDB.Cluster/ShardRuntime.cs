@@ -248,22 +248,37 @@ internal sealed partial class ShardRuntime : IDisposable
     public ulong? BorrowedOwnerOf(TableId table, RowKey key) =>
         _borrowedRows.TryGetValue((table, key), out var owner) ? owner : null;
 
+    /// <summary>Whether the row is frozen mid-handoff — a transfer for it is already in flight.</summary>
+    public bool IsFrozen(TableId table, RowKey key)
+    {
+        lock (_handoffLock)
+        {
+            return _frozenRows.Contains((table, key));
+        }
+    }
+
     /// <summary>How many read-only border copies this shard currently holds — the band's footprint in rows.</summary>
     public int BorrowedRowCount => _borrowedRows.Count;
 
     /// <summary>
-    /// Applies one border batch from a neighbouring owner shard. Owner-wins rules, judged per op
-    /// under the ownership lock: an op never touches a row this shard holds authoritatively (the
-    /// import supersedes any stale copy in flight), and a delete only lands if the copy was
-    /// borrowed from the same owner that sent it — during an ownership transfer two neighbours
-    /// briefly publish the same entity, and the origin's trailing delete must not erase the
-    /// destination's fresh copy. The cursor is persisted before the caller acks, so delivery is
-    /// at-least-once and re-application reconciles.
+    /// Applies one border batch from a neighbouring owner shard, judged per op under the
+    /// ownership lock. The rules, in blast-radius order: a row this shard holds unmarked and
+    /// unfrozen is <em>authoritative</em> — including an owned entity strayed across the line
+    /// awaiting its handoff — and no border op may touch it. A frozen unmarked row is the zombie
+    /// of a transfer whose import is durable elsewhere; the new owner's publication <em>adopts</em>
+    /// it as a marked copy, because a silent skip would desync the publisher's sent-set (it
+    /// believes the observer holds what the observer dropped) and the stale unmarked copy would
+    /// later masquerade as an owned entity. Deletes touch only marked copies, and only when sent
+    /// by the copy's recorded owner — during a transfer two neighbours briefly publish the same
+    /// entity, and the previous owner's trailing retraction must not erase the new owner's fresh
+    /// copy. The cursor is persisted before the caller acks, so delivery is at-least-once and
+    /// re-application reconciles.
     /// </summary>
     public void ApplyBorder(BorderBatch batch)
     {
         lock (_ownershipLock)
         {
+            var frozen = FrozenSnapshot();
             var ops = new List<RowOp>(batch.Ops.Length);
             foreach (var wire in batch.Ops)
             {
@@ -271,9 +286,9 @@ internal sealed partial class ShardRuntime : IDisposable
                     continue;
                 var key = (table.Id, new RowKey(wire.Key));
                 var borrowed = _borrowedRows.TryGetValue(key, out var owner);
-                var ownedHere = !borrowed && Engine.HotStore.TryGetRow(key.Item1, key.Item2, out _);
-                if (ownedHere)
-                    continue;
+                var exists = Engine.HotStore.TryGetRow(key.Item1, key.Item2, out _);
+                if (exists && !borrowed && !frozen.Contains(key))
+                    continue; // Authoritative here (owned, possibly strayed): no border op may touch it.
                 if (wire.Kind == (byte)RowOpKind.Delete)
                 {
                     if (!borrowed || owner != batch.OwnerShard)
@@ -310,6 +325,7 @@ internal sealed partial class ShardRuntime : IDisposable
     {
         lock (_ownershipLock)
         {
+            var frozen = FrozenSnapshot();
             var ops = new List<RowOp>();
             var seen = new HashSet<(TableId, RowKey)>();
             foreach (var table in reset.Tables)
@@ -321,8 +337,8 @@ internal sealed partial class ShardRuntime : IDisposable
                     var key = (schema.Id, new RowKey(wire.Key));
                     seen.Add(key);
                     var borrowed = _borrowedRows.ContainsKey(key);
-                    if (!borrowed && Engine.HotStore.TryGetRow(key.Item1, key.Item2, out _))
-                        continue; // Owned here authoritatively; the snapshot's copy is the stale one.
+                    if (!borrowed && !frozen.Contains(key) && Engine.HotStore.TryGetRow(key.Item1, key.Item2, out _))
+                        continue; // Authoritative here (owned, possibly strayed); the snapshot's copy is the stale one.
                     ops.Add(wire.ToRowOp());
                     _borrowedRows[key] = reset.OwnerShard;
                 }
@@ -416,6 +432,17 @@ internal sealed partial class ShardRuntime : IDisposable
                         $"a read-only border copy owned by shard:{owner} — this shard does not own the entity and " +
                         "cannot be its transfer origin.");
                 }
+            }
+
+            // An empty transfer set means this shard does not actually hold the entity — a stale
+            // or duplicate trigger racing a transfer that already happened. Importing nothing
+            // would "succeed", flip session maps, and teach everyone a lie; failing loudly makes
+            // the confused trigger visible and costs nothing real.
+            if (collector.Rows.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Handoff {handoffId}: the transfer set for {player} out of {Shard} is empty — this shard holds " +
+                    "no rows for the entity, so it cannot be the transfer origin. A stale trigger; nothing was frozen.");
             }
 
             lock (_handoffLock)
@@ -549,7 +576,10 @@ internal sealed partial class ShardRuntime : IDisposable
     /// <summary>
     /// The origin half, last step: delete the transferred rows and unfreeze. Only called once the
     /// destination confirmed its import is durable — between import and release the player exists
-    /// on both logs but is writable on neither, which is the invariant.
+    /// on both logs but is writable on neither, which is the invariant. A row the new owner's
+    /// border stream already <em>adopted</em> as a marked copy is kept, not deleted: it is the
+    /// border copy this shard is entitled to (the entity stands just across the line), and
+    /// deleting it would silently desync the owner's publisher, which believes we hold it.
     /// </summary>
     public void Release(string handoffId)
     {
@@ -561,12 +591,17 @@ internal sealed partial class ShardRuntime : IDisposable
             marker = pending.Marker;
         }
 
-        var ops = (marker.Rows ?? [])
-            .Select(static r => new RowOp(RowOpKind.Delete, new TableId(r.Table), new RowKey(r.Key)))
-            .ToList();
-        Engine.ApplyInternal(
-            ClusterRecordNames.HandoffRelease, ClusterCaller, ops,
-            arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
+        lock (_ownershipLock)
+        {
+            var ops = (marker.Rows ?? [])
+                .Where(r => !_borrowedRows.ContainsKey((new TableId(r.Table), new RowKey(r.Key))))
+                .Select(static r => new RowOp(RowOpKind.Delete, new TableId(r.Table), new RowKey(r.Key)))
+                .ToList();
+            Engine.ApplyInternal(
+                ClusterRecordNames.HandoffRelease, ClusterCaller, ops,
+                arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
+        }
+
         Unfreeze(handoffId, marker);
     }
 

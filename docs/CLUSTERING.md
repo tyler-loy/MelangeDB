@@ -214,6 +214,40 @@ Two shapes, following from the strategy:
   arrives, the player's partitioned rows transfer, then the origin drops the band. Seamless, and the
   reason interest overlap exists.
 
+Continuous handoff shipped in phase 10 on top of phase 09's saga, and its moving parts are worth naming
+because each is the answer to a specific failure mode:
+
+- **The origin decides** (settled). Its committed rows are the only trusted position — the client's claimed
+  position never is, and the gateway cannot see positions at all. A boundary monitor per owned shard assesses
+  every committed write of an anchored entity (`IMigrationAnchors`): entering the band notifies an
+  *approach* (the gateway pre-opens the destination session on it); crossing past the margin requests a
+  transfer. A sweep re-signals standing strays, so an entity that stops just past the margin after a
+  rate-limited trigger is never stranded.
+- **Hysteresis is layered** (settled): the margin (`Cluster:HandoffMarginChunks` — after a transfer the
+  entity must walk back through the whole margin before the reverse can fire), the hub's per-entity rate
+  limit (`Cluster:HandoffMinIntervalMs`), and a local notify cooldown. Pacing across a boundary triggers a
+  bounded number of transfers, never one per step.
+- **The gateway swap is invisible** (settled: mid-handoff reducer calls are *queued*). From saga start the
+  gateway holds the client's shard-routed calls; at the destination-authoritative moment — after the import
+  is durable, before the release is requested — the saga synchronously lets the gateway mute the origin (so
+  the release's row deletions never reach the client), then the gateway re-issues the client's shard
+  subscriptions on the destination and flushes the held calls in order. Re-subscribing under an existing id
+  re-scopes it: the destination's initial set (border band included, which is why the terrain behind the
+  player is already there) atomically replaces the client's cache. No disconnect, no resync error, no gap.
+  The trade: those calls wait out the transfer window, and a wedged transfer caps the queue with a retryable
+  error.
+- **Stale origins cannot transfer** (defense in depth, each independently sufficient for its case): the hub
+  drops a request whose sender is not the entity's recorded owner (1722); a freeze refuses to collect
+  borrowed rows and aborts on an empty transfer set; the monitor never signals frozen or borrowed rows. A
+  saga built on a stale copy would re-import the past over the present — the one lesson of this phase's
+  hardest bug.
+- **Creatures transfer on crossing** (settled: ownership-transfer, not don't-chase). A creature chases by
+  reading its target's border copy — pathing toward a player in the next shard needs only the band — and
+  when it crosses, it migrates immediately (no margin: its AI only ticks rows resolving to its own block, so
+  a margin would leave it standing unticked at the line). Scheduled AI ticks the shard's own entities and
+  must skip rows resolving elsewhere — the read-only guard makes a violation loud, and one throwing row
+  would abort the whole tick.
+
 Either way, transfer is the one unavoidable distributed transaction: the player must not be writable on
 two nodes at once, and must not vanish if a node dies mid-transfer. It runs as a small saga — *freeze on
 origin → append on destination → confirm → release on origin* — recoverable because both logs record

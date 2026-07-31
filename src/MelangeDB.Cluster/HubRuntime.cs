@@ -64,6 +64,17 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly ConcurrentDictionary<string, Saga> _sagas = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Identity, string> _sagasByPlayer = new();
     private readonly ConcurrentDictionary<Identity, long> _lastHandoffStartTicks = new();
+
+    /// <summary>
+    /// The hub's own record of where each transferred entity lives — written at every
+    /// destination-authoritative moment, consulted before starting a boundary-triggered saga. A
+    /// request naming a stale origin is dropped outright: an origin that no longer owns the
+    /// entity can only be offering a stale copy, and a saga built on one re-imports the past over
+    /// the present. In-memory by design — after a hub restart the node-side defenses (borrowed
+    /// registry, frozen set, empty-collect abort) carry the same invariant until this map
+    /// repopulates.
+    /// </summary>
+    private readonly ConcurrentDictionary<Identity, ShardKey> _entityOwner = new();
     private readonly CancellationTokenSource _stopped = new();
     private TcpListener? _listener;
     private Task? _acceptLoop;
@@ -276,6 +287,7 @@ internal sealed partial class HubRuntime : IDisposable
     /// </summary>
     private void NotifyTransferred(Identity player, ShardKey from, ShardKey to)
     {
+        _entityOwner[player] = to;
         foreach (var listener in _services.GetServices<IShardTransferListener>())
         {
             try
@@ -299,15 +311,28 @@ internal sealed partial class HubRuntime : IDisposable
     /// </summary>
     private void HandleHandoffRequest(NodeSession session, HandoffRequest request)
     {
+        Metrics.HandoffRequestReceived();
         var from = new ShardKey(request.FromShard);
         var to = new ShardKey(request.ToShard);
         var assignment = _membership.GetAssignment(from);
         if (assignment is null || assignment.NodeName != session.NodeName || assignment.FencingToken != request.FencingToken)
-            return; // A previous owner's view of the world; the fencing rule, applied to triggers.
+        {
+            // A previous owner's view of the world; the fencing rule, applied to triggers.
+            LogHandoffRequestStale(_logger, request.PlayerHex, from.Value, session.NodeName ?? "?", assignment?.NodeName, assignment?.FencingToken ?? -1, request.FencingToken);
+            return;
+        }
 
         var player = new Identity(Convert.FromHexString(request.PlayerHex));
         if (_sagasByPlayer.ContainsKey(player))
             return; // Already moving; the saga's outcome supersedes this trigger.
+        if (_entityOwner.TryGetValue(player, out var currentOwner) && currentOwner != from)
+        {
+            // The requesting shard is not where the last completed transfer put the entity: a
+            // stale trigger (a lingering copy, a delayed sweep). A saga from a stale origin would
+            // re-import the past over the present, so it never starts.
+            LogHandoffRequestStale(_logger, request.PlayerHex, from.Value, session.NodeName ?? "?", $"owner {currentOwner}", -1, request.FencingToken);
+            return;
+        }
 
         var minInterval = TimeSpan.TicksPerMillisecond * Math.Max(0, Cluster.HandoffMinIntervalMs);
         if (_lastHandoffStartTicks.TryGetValue(player, out var last)
@@ -752,6 +777,11 @@ internal sealed partial class HubRuntime : IDisposable
             "destination may or may not hold the import. Player {Player} stays frozen on shard {FromShard} until the " +
             "origin's reconciler learns the truth from the destination's log; unavailable beats duplicated.")]
     private static partial void LogHandoffUnresolved(ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1722, EventName = "HandoffRequestStale", Level = LogLevel.Debug,
+        Message = "Dropped a transfer request for {Player} from shard {FromShard}: sender '{SenderNode}' vs owner '{OwnerNode}', token {OwnerToken} vs {RequestToken}.")]
+    private static partial void LogHandoffRequestStale(
+        ILogger logger, string player, ulong fromShard, string senderNode, string? ownerNode, long ownerToken, long requestToken);
 
     [LoggerMessage(EventId = 1712, EventName = "HandoffRequested", Level = LogLevel.Information,
         Message = "Player {Player} crossed shard {FromShard}'s boundary past the margin; the origin requested a transfer to shard {ToShard}.")]

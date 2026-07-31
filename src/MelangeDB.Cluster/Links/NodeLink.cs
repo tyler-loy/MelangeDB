@@ -102,6 +102,13 @@ public sealed class ClusterMetrics
 
     internal void HandoffRateLimited() => Interlocked.Increment(ref _handoffsRateLimited);
 
+    private long _handoffRequestsReceived;
+
+    /// <summary>Boundary-triggered transfer requests the hub received, dropped or not.</summary>
+    public long HandoffRequestsReceived => Interlocked.Read(ref _handoffRequestsReceived);
+
+    internal void HandoffRequestReceived() => Interlocked.Increment(ref _handoffRequestsReceived);
+
     internal void HandoffResolvedRemotely(bool released)
     {
         if (released)

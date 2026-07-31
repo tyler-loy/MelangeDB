@@ -38,6 +38,7 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
     private readonly MelangeEngine _engine;
     private readonly ShardKey _shard;
     private readonly IShardStrategy _strategy;
+    private readonly Func<TableId, RowKey, ulong?> _borrowedOwner;
     private readonly Func<NodeLink?> _link;
     private readonly ILogger _logger;
     private readonly ConcurrentDictionary<ulong, Stream> _streams = new();
@@ -45,11 +46,18 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
     private readonly CancellationTokenSource _stopped = new();
     private Task? _loop;
 
-    public BorderPublisher(MelangeEngine engine, ShardKey shard, IShardStrategy strategy, Func<NodeLink?> link, ILogger logger)
+    public BorderPublisher(
+        MelangeEngine engine,
+        ShardKey shard,
+        IShardStrategy strategy,
+        Func<TableId, RowKey, ulong?> borrowedOwner,
+        Func<NodeLink?> link,
+        ILogger logger)
     {
         _engine = engine;
         _shard = shard;
         _strategy = strategy;
+        _borrowedOwner = borrowedOwner;
         _link = link;
         _logger = logger;
     }
@@ -243,6 +251,17 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
                 continue;
             }
 
+            // A row this shard now merely borrows is the true owner's to publish, whatever this
+            // shard's log says about its past — publishing it would gossip copies of copies with
+            // the wrong owner attribution, and a wrongly attributed copy is how a shard's own
+            // strayed entity ends up read-only everywhere.
+            if (_borrowedOwner(op.Table, op.Key) is not null)
+            {
+                if (stream.Sent.Remove(sentKey))
+                    ops.Add(new WireOp((byte)RowOpKind.Delete, op.Table.Value, op.Key.ToArray(), null));
+                continue;
+            }
+
             var row = table.ToRowRef(op.Row);
             if (RelevantTo(observer, op.Table, row))
             {
@@ -277,6 +296,9 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
                 var slice = new List<WireOp>();
                 foreach (var (key, bytes) in _engine.HotStore.Scan(table.Id))
                 {
+                    // Borrowed rows are the true owner's to publish; see CollectBorderOps.
+                    if (_borrowedOwner(table.Id, key) is not null)
+                        continue;
                     if (RelevantTo(observerKey, table.Id, table.ToRowRef(bytes)))
                     {
                         slice.Add(new WireOp((byte)RowOpKind.Insert, table.Id.Value, key.ToArray(), bytes.ToArray()));

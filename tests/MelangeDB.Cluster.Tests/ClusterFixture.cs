@@ -132,12 +132,32 @@ internal sealed class ClusterFixture : IAsyncDisposable
     public MelangeClient CreateClient(string? token = null) =>
         new(new MelangeClientOptions { Uri = GatewayUri, Token = token ?? TestTokens.Default });
 
+    /// <summary>
+    /// Kills a node. Graceful stop is attempted but not required — these tests kill nodes
+    /// mid-request on purpose, and a stop that trips over its own in-flight work must still
+    /// release the node's resources (above all its log file handles), or the "revive the node"
+    /// half of the test fails on a leaked lock instead of testing recovery.
+    /// </summary>
     public async Task StopNodeAsync(string name)
     {
         var node = Node(name);
-        await node.App!.StopAsync();
-        await node.App.DisposeAsync();
-        node.App = null;
+        try
+        {
+            // Two seconds of grace, then abort: phase 10's gateway holds live websockets into
+            // shard nodes, and a default graceful stop would wait the host's full shutdown
+            // timeout for connections that only close when the process dies.
+            using var abrupt = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await node.App!.StopAsync(abrupt.Token);
+        }
+        catch (Exception)
+        {
+            // A kill, not a shutdown; disposal below still releases everything.
+        }
+        finally
+        {
+            await node.App!.DisposeAsync();
+            node.App = null;
+        }
     }
 
     public async Task StartNodeAsync(string name)
@@ -223,6 +243,11 @@ internal sealed class ClusterFixture : IAsyncDisposable
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        if (Environment.GetEnvironmentVariable("MELANGE_TEST_LOG") is { Length: > 0 } path)
+        {
+            builder.Logging.AddProvider(new FileLoggerProvider(path, nodeName));
+            builder.Logging.AddFilter("MelangeDB.Cluster", LogLevel.Debug);
+        }
         builder.WebHost.ConfigureKestrel(kestrel =>
             kestrel.Listen(IPAddress.Loopback, httpPort, static listen => listen.Protocols = HttpProtocols.Http1));
         builder.Configuration.AddInMemoryCollection(settings);
@@ -284,6 +309,36 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
         await app.StartAsync();
         return app;
+    }
+
+    /// <summary>Diagnostics only: MELANGE_TEST_LOG routes cluster-layer logs to one shared file.</summary>
+    private sealed class FileLoggerProvider(string path, string node) : ILoggerProvider
+    {
+        private static readonly Lock Sync = new();
+
+        public ILogger CreateLogger(string categoryName) => new FileLogger(path, node, categoryName);
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class FileLogger(string path, string node, string category) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            {
+                lock (Sync)
+                {
+                    File.AppendAllText(
+                        path,
+                        $"{DateTime.UtcNow:HH:mm:ss.fff} [{node}] {category} {eventId.Name}: {formatter(state, exception)}\n");
+                }
+            }
+        }
     }
 
     public static async Task WaitUntilAsync(Func<bool> condition, string what, int timeoutSeconds = 20)

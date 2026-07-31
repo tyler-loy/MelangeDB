@@ -27,14 +27,41 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
     private readonly Func<NodeLink?> _link;
     private readonly Func<long> _fencingToken;
     private readonly Func<TableId, RowKey, ulong?> _borrowedOwner;
+    private readonly Func<TableId, RowKey, bool> _isFrozen;
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
     private readonly TimeProvider _time;
     private readonly Channel<Signal> _signals = Channel.CreateBounded<Signal>(
         new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.DropOldest });
     private readonly Dictionary<Identity, long> _lastRequestTicks = [];
     private readonly Dictionary<(Identity, ShardKey), long> _lastApproachTicks = [];
+
+    /// <summary>
+    /// Anchored entities currently strayed across the boundary, keyed by anchor. Triggers are
+    /// commit-driven, but a suppressed (rate-limited) trigger with no further movement would
+    /// otherwise never re-fire — an entity standing still just past the margin would be stranded.
+    /// The sweep re-assesses these from the store until each either transfers (its row leaves
+    /// this shard) or walks back inside.
+    /// </summary>
+    private readonly Dictionary<Identity, (TableId Table, RowKey Key, bool Immediate)> _strays = [];
     private readonly CancellationTokenSource _stopped = new();
     private Task? _loop;
+    private Task? _straySweep;
+
+    /// <summary>Test-visible counters: what this monitor saw, and what it asked the hub for.</summary>
+    internal long CrossingsObserved;
+    internal long RequestsSent;
+    internal long SweepPasses;
+
+    internal int StrayCount
+    {
+        get
+        {
+            lock (_strays)
+            {
+                return _strays.Count;
+            }
+        }
+    }
 
     public BoundaryMonitor(
         MelangeEngine engine,
@@ -44,9 +71,11 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
         Func<NodeLink?> link,
         Func<long> fencingToken,
         Func<TableId, RowKey, ulong?> borrowedOwner,
+        Func<TableId, RowKey, bool> isFrozen,
         IOptionsMonitor<MelangeDbOptions> options,
         TimeProvider time)
     {
+        _isFrozen = isFrozen;
         _engine = engine;
         _shard = shard;
         _boundary = (IBoundaryStrategy)strategy;
@@ -63,6 +92,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
     {
         _engine.AddCommitObserver(this);
         _loop = Task.Run(LoopAsync);
+        _straySweep = Task.Run(SweepStraysAsync);
 
         // Recovery re-assessment: an anchored entity that crossed the boundary in the instant
         // before a crash has no future commit to re-trigger it (its AI skips foreign-resolving
@@ -87,6 +117,19 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
             if (_anchors.AnchorOf(table, row) is not { } anchor)
                 continue;
             var assessment = _boundary.Assess(_shard, op.Table, row);
+            lock (_strays)
+            {
+                if (assessment.CrossedInto is not null)
+                {
+                    Interlocked.Increment(ref CrossingsObserved);
+                    _strays[anchor.Id] = (op.Table, op.Key, anchor.Immediate);
+                }
+                else
+                {
+                    _strays.Remove(anchor.Id);
+                }
+            }
+
             if (assessment.CrossedInto is not null || assessment.Approaching.Count > 0)
                 _signals.Writer.TryWrite(new Signal(anchor, assessment));
         }
@@ -105,12 +148,89 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
             {
                 if (_borrowedOwner(table.Id, key) is not null)
                     continue; // Border copies resolve to their owner by construction; never ours to move.
+                if (_isFrozen(table.Id, key))
+                    continue; // Mid-transfer already; the reconciler owns its fate, not this monitor.
                 var row = table.ToRowRef(bytes);
                 if (_anchors.AnchorOf(table, row) is not { } anchor)
                     continue;
                 var assessment = _boundary.Assess(_shard, table.Id, row);
                 if (assessment.CrossedInto is not null)
+                {
+                    lock (_strays)
+                    {
+                        _strays[anchor.Id] = (table.Id, key, anchor.Immediate);
+                    }
+
                     _signals.Writer.TryWrite(new Signal(anchor, assessment));
+                }
+            }
+        }
+    }
+
+    /// <summary>Re-signals standing strays until each transfers away or walks back inside.</summary>
+    private async Task SweepStraysAsync()
+    {
+        var ct = _stopped.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(1_000, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref SweepPasses);
+            List<(Identity Id, TableId Table, RowKey Key, bool Immediate)> strays;
+            lock (_strays)
+            {
+                if (_strays.Count == 0)
+                    continue;
+                strays = [.. _strays.Select(static pair => (pair.Key, pair.Value.Table, pair.Value.Key, pair.Value.Immediate))];
+            }
+
+            foreach (var stray in strays)
+            {
+                try
+                {
+                    // Transferred away (the release deleted it), re-borrowed, or moved back: done.
+                    if (!_engine.HotStore.TryGetRow(stray.Table, stray.Key, out var bytes)
+                        || _borrowedOwner(stray.Table, stray.Key) is not null)
+                    {
+                        lock (_strays)
+                        {
+                            _strays.Remove(stray.Id);
+                        }
+
+                        continue;
+                    }
+
+                    // Frozen means a transfer for it is in flight right now: keep watching, but
+                    // never re-request — a second saga for a mid-transfer entity re-imports its
+                    // pre-freeze bytes over whatever the destination has done since.
+                    if (_isFrozen(stray.Table, stray.Key))
+                        continue;
+
+                    var table = _engine.Schema.Get(stray.Table);
+                    var assessment = _boundary.Assess(_shard, stray.Table, table.ToRowRef(bytes.ToArray()));
+                    if (assessment.CrossedInto is null)
+                    {
+                        lock (_strays)
+                        {
+                            _strays.Remove(stray.Id);
+                        }
+
+                        continue;
+                    }
+
+                    _signals.Writer.TryWrite(new Signal(new MigrationAnchor(stray.Id, stray.Immediate), assessment));
+                }
+                catch (Exception) when (!ct.IsCancellationRequested)
+                {
+                    // One stray must not kill the sweep; the entity re-signals next pass.
+                }
             }
         }
     }
@@ -167,6 +287,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
                 _lastRequestTicks[signal.Anchor.Id] = now;
             }
 
+            Interlocked.Increment(ref RequestsSent);
             await link.NotifyAsync(
                 "handoff-request",
                 new HandoffRequest(signal.Anchor.Id.ToString(), _shard.Value, destination.Value, _fencingToken()),

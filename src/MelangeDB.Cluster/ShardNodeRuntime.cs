@@ -85,6 +85,15 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         }
     }
 
+    /// <summary>Test hook: the boundary monitor for one owned shard, if any.</summary>
+    internal BoundaryMonitor? TryGetMonitor(ShardKey shard)
+    {
+        lock (_shardsLock)
+        {
+            return _boundaryMonitors.GetValueOrDefault(shard);
+        }
+    }
+
     /// <summary>
     /// Whether this node's lease is live: a heartbeat (or registration) succeeded within
     /// Cluster:FailureTimeoutMs. Expired means self-fenced — the hub has, by the same clock,
@@ -269,7 +278,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 forwarder.Start();
                 if (_strategy is { } strategy)
                 {
-                    var publisher = new BorderPublisher(runtime.Engine, assignment.Shard, strategy, () => _link, _logger);
+                    var publisher = new BorderPublisher(
+                        runtime.Engine, assignment.Shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger);
                     _borderPublishers[assignment.Shard] = publisher;
                     publisher.Start();
 
@@ -280,7 +290,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     {
                         var monitor = new BoundaryMonitor(
                             runtime.Engine, assignment.Shard, strategy, anchors,
-                            () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, _options, _time);
+                            () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, runtime.IsFrozen,
+                            _options, _time);
                         _boundaryMonitors[assignment.Shard] = monitor;
                         monitor.Start();
                     }
