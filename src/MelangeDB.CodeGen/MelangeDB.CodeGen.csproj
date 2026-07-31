@@ -5,6 +5,12 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
     <IncludeBuildOutput>false</IncludeBuildOutput>
+    <!-- Compile-time-only: the consuming PackageReference defaults to PrivateAssets="all", so
+         the generator never flows transitively to the consumer's own consumers. -->
+    <DevelopmentDependency>true</DevelopmentDependency>
+    <!-- Roslyn is provided by the consuming compiler and the package has no lib/ output, so a
+         dependencies element would be meaningless (and NU5128 agrees). -->
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <Description>Roslyn source generator: table/reducer registrations, serializers, and typed clients.</Description>
   </PropertyGroup>
 

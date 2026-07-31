@@ -12,7 +12,34 @@
     <Authors>Tyler Loy</Authors>
     <Product>MelangeDB</Product>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/tylerloy/MelangeDB</RepositoryUrl>
+    <RepositoryUrl>https://github.com/tyler-loy/MelangeDB</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/tyler-loy/MelangeDB</PackageProjectUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>database;realtime;game;subscriptions;commit-log</PackageTags>
   </PropertyGroup>
+
+  <PropertyGroup Label="Versioning">
+    <!-- The single source of truth for the next release. A release tag `v*` must equal this
+         value exactly (publish.yml enforces it); pushes to main publish it with a `-ci.N`
+         prerelease suffix stamped on. See docs/RELEASING.md. -->
+    <VersionPrefix>0.1.0</VersionPrefix>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Reproducible builds and symbols">
+    <!-- Symbols travel embedded in the assemblies rather than as .snupkg packages: GitHub
+         Packages has no symbol server, so a separate symbol package would have nowhere to go.
+         SourceLink itself ships in the SDK (.NET 8+) and needs no package reference. -->
+    <DebugType>embedded</DebugType>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <!-- Path normalization for deterministic package builds; GitHub Actions sets CI=true. -->
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+  <ItemGroup Label="Packaged README">
+    <!-- Every package carries the repo README; tests, samples, and tools opt out of packing
+         entirely with IsPackable=false. -->
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" Condition="'$(IsPackable)' != 'false'" />
+  </ItemGroup>
 
 </Project>
