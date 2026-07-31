@@ -60,6 +60,22 @@ public class EventBusTests : IDisposable
 
     private string DeadLetterFile => Path.Combine(_root, "deadletter", "melange.deadletter.ndjson");
 
+    /// <summary>
+    /// Only fully flushed dead-letter lines. The store creates the file before its first flush,
+    /// so an existence check can observe an empty file, and a plain <c>File.ReadLines</c> can
+    /// both surface a partial trailing line and collide with the writer's open handle mid-append.
+    /// </summary>
+    private string[] CompleteDeadLetterLines()
+    {
+        using var stream = new FileStream(DeadLetterFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var reader = new StreamReader(stream);
+        var text = reader.ReadToEnd();
+        var end = text.LastIndexOf('\n');
+        return end < 0
+            ? []
+            : text[..end].Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(static l => l.TrimEnd('\r')).ToArray();
+    }
+
     [Fact]
     public async Task A_committed_event_reaches_both_DI_resolved_handlers_outside_the_transaction()
     {
@@ -211,7 +227,7 @@ public class EventBusTests : IDisposable
             },
             "the poisoned event never dead-lettered");
 
-        var line = File.ReadLines(DeadLetterFile).First(l => l.Contains("poison"));
+        var line = CompleteDeadLetterLines().First(l => l.Contains("poison"));
         using var record = JsonDocument.Parse(line);
         Assert.Equal(typeof(FailingNoteHandler).FullName, record.RootElement.GetProperty("Subscriber").GetString());
         Assert.Equal(typeof(NotePublished).FullName, record.RootElement.GetProperty("EventType").GetString());
@@ -260,7 +276,9 @@ public class EventBusTests : IDisposable
         });
 
         host.Reducers().Call("StartChain", TestApp.Caller);
-        await EventProbe.WaitUntilAsync(() => File.Exists(DeadLetterFile), "the chain never hit the depth limit");
+        await EventProbe.WaitUntilAsync(
+            () => File.Exists(DeadLetterFile) && CompleteDeadLetterLines().Length >= 1,
+            "the chain never hit the depth limit");
         await EventProbe.WaitUntilAsync(() => Probe(host).ChainObserved.Count >= 4, "chain deliveries missing");
 
         // Depths 0..3 published; the publish at ambient depth 4 (= Events:MaxPublishDepth) threw,
@@ -269,7 +287,7 @@ public class EventBusTests : IDisposable
         Assert.Equal(4, host.Engine().Log.ReadFrom(1).SelectMany(r => r.Events)
             .Count(e => e.EventType == typeof(ChainEvent).FullName));
 
-        var line = File.ReadLines(DeadLetterFile).Single();
+        var line = CompleteDeadLetterLines().Single();
         using var record = JsonDocument.Parse(line);
         Assert.Equal(typeof(ChainEvent).FullName, record.RootElement.GetProperty("EventType").GetString());
         Assert.Equal(3, record.RootElement.GetProperty("Depth").GetInt32());
