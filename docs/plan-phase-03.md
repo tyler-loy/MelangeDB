@@ -125,7 +125,12 @@ not an unreliable channel.
   explicit opt-in for trusted links; `Disconnect` is the last resort. This changed the registered default in
   CONFIGURATION.md from `Buffer` to `DropAndResync`: a default that buffers without bound past the bound's own
   trigger would make the trigger meaningless. Bulk initial sets are exempt by construction — chunks are
-  generated lazily as the sender drains, so they occupy no buffer.
+  generated lazily as the sender drains, so they occupy no buffer. The drop is synchronous with the overflow,
+  under the engine lock the fan-out already holds: the connection's registrations are gone before the error
+  frame exists, so a prompt re-subscribe always takes the fresh-registration path. The deferred sweep this
+  replaced raced exactly that re-subscribe (observable under CPU starvation): the stale registration made the
+  re-subscribe re-scope — no initial set — and the sweep then unregistered the replacement, leaving a silently
+  dead subscription.
 - ~~**Fan-out cost.**~~ **Settled: indexed by table now; key-range indexing within a table deferred with a
   measurement.** A commit tests only the subscriptions registered on the tables its write set touches. Within
   one table the per-op predicate test is an encode plus a byte-compare (~tens of nanoseconds); at the reference
@@ -137,8 +142,11 @@ not an unreliable channel.
 - ~~**Head-of-line blocking.**~~ **Settled: chunk-and-interleave by priority on one socket, shipped.** The
   sender drains lanes in order — control/results, then one committed delta, then one bulk chunk of at most
   `Transport:MaxInitialSetChunkBytes` — so a reducer response waits at most one chunk behind a 30MB initial
-  set. Asserted by a wire-order test. The channel tag on every frame keeps multi-socket HTTP/2 and QUIC
-  streams open as substrates with no protocol change.
+  set. Asserted by a wire-order test. One exception, added with phase 10's swap in hand: the **first-chunk
+  rule** — the first chunk of a not-yet-started initial set outranks committed deltas, because until that
+  chunk is on the wire a subscription re-issued by a gateway swap is still judged by the client against the
+  previous log's anchor (the phase 10 soft-spot record has the full story). The channel tag on every frame
+  keeps multi-socket HTTP/2 and QUIC streams open as substrates with no protocol change.
 - ~~**How much log to retain for `Resume`.**~~ **Settled: a time window, `Resume:RetentionWindowSeconds`
   (default 300).** What matters is surviving a plausible network outage, which is measured in seconds, not
   transactions. A resume whose oldest missed record is older than the window answers full resync. Interaction

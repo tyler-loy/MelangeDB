@@ -119,4 +119,63 @@ public class ChannelOrderingTests
             Assert.Equal(["result", "last-chunk"], order);
         }
     }
+
+    /// <summary>
+    /// The swap-window ordering rule: a freshly registered subscription's first initial-set chunk
+    /// precedes any delta for that subscription on the wire. A gateway swap re-issues a
+    /// subscription on the destination node under an id the client already holds live against the
+    /// origin's log; a delta overtaking the replacement set's first chunk (deltas normally outrank
+    /// bulk) would be judged against the origin's anchor — a different log — and silently dropped.
+    /// That was the phase 10 walk losing a PlayerPos step under CPU starvation: the starved sender
+    /// let the post-registration commit's delta reach the wire before the set that would have
+    /// flipped the client to buffering. The schedule is forced without timing assumptions: an
+    /// unread ~16MB initial set wedges the sender against TCP, and the second subscribe and the
+    /// commit ride the same socket in order, so the delta is always enqueued while the fresh
+    /// stream's first chunk is still pending.
+    /// </summary>
+    [Fact]
+    public async Task A_fresh_subscriptions_first_chunk_precedes_its_deltas_on_the_wire()
+    {
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
+        {
+            // Buffer: the wedged sender is the scenario, not the thing to punish.
+            ["MelangeDb:Subscriptions:BackpressurePolicy"] = "Buffer",
+            ["MelangeDb:Validation:MaxCollectionLength"] = "524288",
+            ["MelangeDb:Transport:HeartbeatTimeoutMs"] = (45_000 * TestTime.Scale).ToString(),
+        });
+        host.Call("Spawn", "walker", 1);
+
+        // ~16MB: the unread set must overflow the kernel's socket buffering (Linux loopback
+        // autotunes the send buffer to ~4MB), or the sender never wedges and the race below is
+        // vacuously unexercised.
+        for (var i = 0; i < 64; i++)
+            host.Call("SetChunk", (long)i, (long)i, new byte[256 * 1024]);
+
+        await using var raw = new RawSocketClient();
+        await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
+
+        // Nothing is read until all three frames are sent: subscription 1's ~16MB set fills TCP
+        // and wedges the sender mid-stream, subscription 2 registers while its first chunk is
+        // still pending, and the Move commit fans out a subscription 2 delta strictly after the
+        // registration (same-socket order).
+        await raw.SendAsync(new SubscribeFrame(1, "SELECT * FROM Chunk", null) { Channel = MelangeChannels.Data }, TestContext.Current.CancellationToken);
+        await raw.SendAsync(new SubscribeFrame(2, "SELECT * FROM PlayerState", null) { Channel = MelangeChannels.Data }, TestContext.Current.CancellationToken);
+        await raw.SendAsync(new CallReducerFrame(1, "Move", ReducerArgs.Encode([1.5f]), null) { Channel = MelangeChannels.Calls }, TestContext.Current.CancellationToken);
+
+        // Resume reading: the delta for subscription 2 must ride behind its first chunk, never
+        // ahead of it. (On the pre-rule sender, the delta lane outranked bulk unconditionally and
+        // the delta won the race whenever the sender was wedged — exactly this schedule.)
+        var sawFirstChunk = false;
+        while (true)
+        {
+            var frame = await raw.ReceiveAsync(TestContext.Current.CancellationToken);
+            if (frame is SubscriptionAppliedFrame { SubscriptionId: 2 })
+                sawFirstChunk = true;
+            if (frame is TransactionUpdateFrame update && update.Updates.Any(u => u.SubscriptionId == 2))
+            {
+                Assert.True(sawFirstChunk, "a delta for subscription 2 reached the wire before its initial set's first chunk");
+                break;
+            }
+        }
+    }
 }

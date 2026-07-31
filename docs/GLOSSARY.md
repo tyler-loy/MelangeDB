@@ -215,6 +215,14 @@ every saga step. Paired with lease-based self-fencing, it is what ensures a node
 dead cannot keep writing rows it no longer owns. Tokens persist in the membership store, so a restarted hub
 can never re-mint an old one.
 
+**First-chunk rule** — The one exception to delta-outranks-bulk in the sender's lane priority: the first
+chunk of a not-yet-started initial set precedes any committed delta on the wire. Until that chunk is out, a
+client whose subscription was re-issued by a gateway swap is still live on the previous attachment's anchor —
+an anchor counting against another log — and a delta overtaking the chunk would be judged against it and
+silently dropped. The first chunk is what flips the client to buffering; behind it, every delta replays
+against the anchor the set names. Closes the phase 10 cross-log soft spot server-side; the epoch-qualified
+anchor remains the deferred protocol-level hardening.
+
 **Frame** — One protocol message on the wire: one MessagePack-encoded unit carrying its type, its channel tag,
 and its fields. Ordering is guaranteed only within a frame's channel.
 

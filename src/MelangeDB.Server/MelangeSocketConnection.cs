@@ -39,7 +39,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private bool _slotReserved;
     private long _bufferedDeltaBytes;
     private bool _resumeBuffering;
-    private bool _resyncPending;
+    private byte[]? _heldDelta; // Sender-loop only: a delta held back behind a fresh stream's first chunk.
     private long _lastReceivedTicks;
     private uint _nextPingId;
     private ITimer? _heartbeat;
@@ -190,8 +190,6 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     /// <summary>Queues one transaction's deltas. Called under the engine's write lock, in LSN order.</summary>
     public void EnqueueDelta(TransactionUpdateFrame frame)
     {
-        if (_resyncPending)
-            return;
         if (_resumeBuffering)
         {
             _resumeBuffer.Add(frame);
@@ -222,26 +220,24 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         // DropAndResync: the client on a too-slow link loses its delta stream, not its connection.
         // Queued deltas are discarded, the server forgets its subscriptions, and one small error
         // frame tells the client to re-establish them — the same convergence path a rejected
-        // Resume uses. Unregistration is deferred off the fan-out iteration.
-        _resyncPending = true;
+        // Resume uses. The forgetting is synchronous: the caller already holds the engine lock
+        // (fan-out reaches a sink only after it finished iterating the per-table registries, and
+        // the re-scope diff enqueues under ReadConsistent), so the drop completes before the
+        // error frame even exists, and a prompt re-subscribe always finds a clean slate. The
+        // deferred sweep this replaces raced that re-subscribe: the stale registration made it
+        // re-scope — no initial set — and the sweep then unregistered the replacement, leaving a
+        // silently dead subscription (a wedged DropAndResync under CPU starvation).
         while (_delta.TryDequeue(out _))
         {
         }
 
         _resumeBuffer.Clear();
         Interlocked.Exchange(ref _bufferedDeltaBytes, 0);
+        UnregisterAllSubscriptionsUnderLock();
         EnqueuePriority(new ErrorFrame(
             MelangeErrorCodes.OverflowResync,
             "The connection fell behind its delta stream (Subscriptions:MaxBufferedBytes); re-establish subscriptions.")
         { Channel = MelangeChannels.Control });
-        _ = Task.Run(() =>
-        {
-            _transport.Engine.ReadConsistent(_ =>
-            {
-                UnregisterAllSubscriptionsUnderLock();
-                _resyncPending = false;
-            });
-        });
     }
 
     private void EnqueuePriority(Frame frame)
@@ -485,20 +481,27 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         {
             var query = SqlSubsetParser.Parse(subscribe.Query, subscribe.Parameters);
             var limits = _transport.Options.Subscriptions;
-            if (_subscriptions.TryGetValue(subscribe.SubscriptionId, out var existing))
+
+            // The live-or-fresh decision runs under the engine lock because a backpressure drop —
+            // which forgets this connection's subscriptions — fires on a committing thread:
+            // decided outside the lock, a just-dropped id could still look live here, and the
+            // client's re-establishing subscribe would re-scope a registration the drop removed.
+            var rescoped = _transport.Engine.ReadConsistent(_ =>
             {
+                if (!_subscriptions.TryGetValue(subscribe.SubscriptionId, out var existing))
+                    return false;
+
                 // Re-scope: the moving-range pattern. The diff rides the data channel under the
                 // engine lock, so it cannot interleave incorrectly with commit deltas. It is
                 // synthetic rather than commit-tied, so it carries LSN 0, which a client applies
                 // unconditionally instead of judging against its anchor.
-                _transport.Engine.ReadConsistent(_ =>
-                {
-                    var ops = _transport.Subscriptions.Rescope(existing, query, limits);
-                    if (ops.Count > 0)
-                        EnqueueDelta(new TransactionUpdateFrame(0, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
-                });
+                var ops = _transport.Subscriptions.Rescope(existing, query, limits);
+                if (ops.Count > 0)
+                    EnqueueDelta(new TransactionUpdateFrame(0, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
+                return true;
+            });
+            if (rescoped)
                 return;
-            }
 
             if (_subscriptions.Count >= limits.MaxPerConnection)
             {
@@ -508,19 +511,23 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             }
 
             using var activity = _transport.Telemetry?.StartInitialSet(query.Table);
-            var (subscription, initialSet) = _transport.Engine.ReadConsistent(head =>
+            var initialSet = _transport.Engine.ReadConsistent(head =>
             {
                 var registered = _transport.Subscriptions.Register(
                     this, subscribe.SubscriptionId, query, limits, head, computeInitialSet: true, _transport.Policies, _policyContext);
                 _subscriptions[subscribe.SubscriptionId] = registered.Subscription;
-                return registered;
+
+                // The bulk stream is listed under the same lock hold as the registration, so any
+                // commit fanning out after this block finds the stream already present — the
+                // sender's first-chunk rule (see TryDequeueNext) depends on exactly that.
+                lock (_bulk)
+                {
+                    _bulk.Add(new BulkStream(registered.Subscription, registered.InitialSet));
+                }
+
+                return registered.InitialSet;
             });
             ServerTelemetry.CompleteInitialSet(activity, initialSet.Rows.Count, initialSet.Bytes);
-            lock (_bulk)
-            {
-                _bulk.Add(new BulkStream(subscription, initialSet));
-            }
-
             _sendSignal.Release();
         }
         catch (SqlParseException parse)
@@ -537,17 +544,16 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
     private void HandleUnsubscribe(UnsubscribeFrame unsubscribe)
     {
-        if (_subscriptions.TryGetValue(unsubscribe.SubscriptionId, out var subscription))
+        // The lookup rides inside the lock for the same reason the subscribe path's does: a
+        // backpressure drop mutates this connection's registrations from a committing thread.
+        _transport.Engine.ReadConsistent(_ =>
         {
-            _transport.Engine.ReadConsistent(_ =>
-            {
+            if (_subscriptions.Remove(unsubscribe.SubscriptionId, out var subscription))
                 _transport.Subscriptions.Unregister(subscription);
-                _subscriptions.Remove(unsubscribe.SubscriptionId);
-            });
-            lock (_bulk)
-            {
-                _bulk.RemoveAll(stream => stream.Subscription.Id == unsubscribe.SubscriptionId);
-            }
+        });
+        lock (_bulk)
+        {
+            _bulk.RemoveAll(stream => stream.Subscription.Id == unsubscribe.SubscriptionId);
         }
 
         EnqueuePriority(new UnsubscribedFrame(unsubscribe.SubscriptionId));
@@ -720,19 +726,57 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
     /// <summary>
     /// Lane priority: control and call results first, then one committed delta, then one bulk
-    /// chunk — so a 30MB initial set never delays a reducer response by more than one chunk.
+    /// chunk — so a 30MB initial set never delays a reducer response by more than one chunk. One
+    /// exception outranks a delta: the first chunk of a not-yet-started initial set. Until that
+    /// chunk is on the wire the client may still be live on the subscription's previous anchor (a
+    /// gateway swap re-issues a subscription on the destination node under an id the client
+    /// already holds, and that anchor counts against another log), and a delta arriving ahead of
+    /// the chunk would be judged against the wrong log's anchor and silently dropped. The first
+    /// chunk is what flips the client to buffering; behind it, every delta replays against the
+    /// anchor the set actually names. Deltas for such a subscription exist only after it
+    /// registered, and registration lists the bulk stream under the same engine-lock hold, so a
+    /// successfully dequeued delta is proof the stream is already visible here.
     /// </summary>
     private bool TryDequeueNext(out byte[] bytes)
     {
         if (_priority.TryDequeue(out bytes!))
             return true;
-        if (_delta.TryDequeue(out bytes!))
+        var delta = _heldDelta;
+        if (delta is null && _delta.TryDequeue(out delta!))
+            Interlocked.Add(ref _bufferedDeltaBytes, -delta.Length);
+        if (delta is not null)
         {
-            Interlocked.Add(ref _bufferedDeltaBytes, -bytes.Length);
+            if (TryBuildFirstChunk(out bytes!))
+            {
+                _heldDelta = delta;
+                return true;
+            }
+
+            _heldDelta = null;
+            bytes = delta;
             return true;
         }
 
         return TryBuildBulkChunk(out bytes!);
+    }
+
+    /// <summary>Builds the first chunk of a stream that has not started, if any; see <see cref="TryDequeueNext"/>.</summary>
+    private bool TryBuildFirstChunk(out byte[]? bytes)
+    {
+        BulkStream? fresh;
+        lock (_bulk)
+        {
+            fresh = _bulk.Find(static stream => !stream.Started);
+        }
+
+        if (fresh is null)
+        {
+            bytes = null;
+            return false;
+        }
+
+        bytes = BuildChunk(fresh);
+        return true;
     }
 
     private bool TryBuildBulkChunk(out byte[]? bytes)
@@ -749,9 +793,15 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             return false;
         }
 
+        bytes = BuildChunk(stream);
+        return true;
+    }
+
+    private byte[] BuildChunk(BulkStream stream)
+    {
         var chunkBudget = _transport.Options.Transport.MaxInitialSetChunkBytes;
         var frame = stream.NextChunk(chunkBudget);
-        bytes = _serializer.Serialize(frame);
+        var bytes = _serializer.Serialize(frame);
         if (frame.IsLast)
         {
             lock (_bulk)
@@ -764,7 +814,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _sendSignal.Release();
         }
 
-        return true;
+        return bytes;
     }
 
     private void UnregisterAllSubscriptions() =>
@@ -788,6 +838,9 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         private uint _chunk;
 
         public ServerSubscription Subscription { get; } = subscription;
+
+        /// <summary>Whether the first chunk has been built — read and advanced by the sender loop only.</summary>
+        public bool Started => _chunk > 0;
 
         public SubscriptionAppliedFrame NextChunk(int chunkBudget)
         {

@@ -140,12 +140,24 @@ loudly by the read-only border guard.
   ~52,000 commits/s under interval fsync (~2,600 players at 20 Hz), Windows/NVMe dev machine, methodology in
   `HotspotMeasurementTests`. No cluster size changes either number; that is the trade spatial partitioning
   is.
-- **One known protocol soft spot, documented rather than hidden:** during the swap, a delta committed on the
-  destination while its initial set is still streaming can be dropped by the client if its LSN happens to
-  fall at or below the *previous* attachment's anchor — the anchor comparison is not epoch-qualified across
-  logs. The window is the initial-set stream of a young, quiet log; a dropped delta self-heals on the row's
-  next change. The clean fix is an epoch-qualified anchor in the subscription protocol — a protocol change
-  deferred with this note as its record.
+- **One known protocol soft spot, documented rather than hidden — since closed behaviorally:** during the
+  swap, a delta committed on the destination could be dropped by the client if its LSN happened to fall at
+  or below the *previous* attachment's anchor — the anchor comparison is not epoch-qualified across logs.
+  Under CPU starvation this was not a self-healing rarity: the walk test lost the player's own position 5
+  runs in 6 (`--cpus=2`, the starved sender let a post-registration delta reach the wire ahead of the
+  replacement set's first chunk, and the test's awaited row never changed again). Closed in two steps, both
+  below the protocol: the client flips back to buffering on the first chunk of any new initial set and
+  replays against the anchor that set names; and the node's sender enforces the **first-chunk rule** — a
+  freshly registered subscription's first chunk precedes any delta for it on the wire (deltas otherwise
+  outrank bulk), asserted by a wire-order test that forces the schedule with a TCP-wedged sender. The
+  epoch-qualified anchor in the subscription protocol remains the deferred *protocol-level* hardening, with
+  this note still its record: the wire-order guarantee is server behavior, and a client speaking to a server
+  without it — or a future substrate that reorders the data and bulk channels — would reopen the window.
+  A second reason the protocol change matters: initial-set chunks carry no set identity, so a client hit by
+  two swaps in quick succession concatenates the abandoned set's partial rows with the replacement's
+  (`MelangeSubscription.AcceptInitialChunk` accumulates until an `IsLast`), and stale rows scoped only to the
+  abandoned attachment can linger in the cache until touched. Unobserved in tests — it needs a second handoff
+  inside one set's streaming time — and undetectable client-side without a set marker on the wire.
 
 ## Done when
 
