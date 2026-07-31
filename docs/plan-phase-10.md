@@ -153,6 +153,11 @@ loudly by the read-only border guard.
   epoch-qualified anchor in the subscription protocol remains the deferred *protocol-level* hardening, with
   this note still its record: the wire-order guarantee is server behavior, and a client speaking to a server
   without it — or a future substrate that reorders the data and bulk channels — would reopen the window.
+  A second reason the protocol change matters: initial-set chunks carry no set identity, so a client hit by
+  two swaps in quick succession concatenates the abandoned set's partial rows with the replacement's
+  (`MelangeSubscription.AcceptInitialChunk` accumulates until an `IsLast`), and stale rows scoped only to the
+  abandoned attachment can linger in the cache until touched. Unobserved in tests — it needs a second handoff
+  inside one set's streaming time — and undetectable client-side without a set marker on the wire.
 
 ## Done when
 
