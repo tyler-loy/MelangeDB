@@ -183,6 +183,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
             }
 
             Interlocked.Increment(ref SweepPasses);
+            PruneCooldowns();
             List<(Identity Id, TableId Table, RowKey Key, bool Immediate)> strays;
             lock (_strays)
             {
@@ -231,6 +232,57 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
                 {
                     // One stray must not kill the sweep; the entity re-signals next pass.
                 }
+            }
+        }
+    }
+
+    /// <summary>Test seam: live cooldown entries across both suppression maps.</summary>
+    internal int CooldownEntryCount
+    {
+        get
+        {
+            lock (_lastRequestTicks)
+            {
+                return _lastRequestTicks.Count + _lastApproachTicks.Count;
+            }
+        }
+    }
+
+    /// <summary>Test seam: records one request and one approach cooldown, as HandleSignal would.</summary>
+    internal void SeedCooldownsForTest(Identity anchor, ShardKey approached, long ticks)
+    {
+        lock (_lastRequestTicks)
+        {
+            _lastRequestTicks[anchor] = ticks;
+            _lastApproachTicks[(anchor, approached)] = ticks;
+        }
+    }
+
+    /// <summary>
+    /// Drops cooldown entries old enough to be unambiguously dead weight. The maps exist only to
+    /// suppress duplicates inside their windows (500 ms for requests, 3 s for approaches), so
+    /// anything past sixty seconds can never influence a decision again — it is the residue of an
+    /// entity that transferred away, despawned, or stopped moving, and without pruning the maps
+    /// grow by one entry per entity that ever touched a boundary for the life of the shard. The
+    /// hub's rate-limit memory is pruned on the same reasoning (its heartbeat sweep); this is the
+    /// monitor-side equivalent, on the injected clock so deterministic tests stay deterministic.
+    /// Internal so the deterministic test drives it directly; the stray sweep drives it in life.
+    /// </summary>
+    internal void PruneCooldowns()
+    {
+        var floor = _time.GetUtcNow().UtcTicks - 60 * TimeSpan.TicksPerSecond;
+        lock (_lastRequestTicks)
+        {
+            if (_lastRequestTicks.Count > 0)
+            {
+                foreach (var anchor in _lastRequestTicks.Where(pair => pair.Value < floor).Select(static pair => pair.Key).ToList())
+                    _lastRequestTicks.Remove(anchor);
+            }
+
+            if (_lastApproachTicks.Count > 0)
+            {
+                foreach (var key in _lastApproachTicks.Where(pair => pair.Value < floor).Select(static pair => pair.Key).ToList())
+                    _lastApproachTicks.Remove(key);
             }
         }
     }
