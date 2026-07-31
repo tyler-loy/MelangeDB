@@ -1,0 +1,54 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  FEED: https://nuget.pkg.github.com/tyler-loy/index.json
+  PACKABLE: >-
+    Abstractions Core Protocol Client Server CodeGen
+    Storage.Faster Storage.Postgres Cluster OpenTelemetry
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify tag matches VersionPrefix (stable releases)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          prefix=$(sed -n 's/.*<VersionPrefix>\(.*\)<\/VersionPrefix>.*/\1/p' Directory.Build.props)
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$tag" != "$prefix" ]; then
+            echo "::error::Tag v$tag does not match VersionPrefix $prefix in Directory.Build.props."
+            exit 1
+          fi
+
+      - name: Compute prerelease suffix (main builds)
+        if: github.ref == 'refs/heads/main'
+        run: echo "VERSION_SUFFIX=ci.${{ github.run_number }}+${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Pack
+        run: |
+          for name in $PACKABLE; do
+            dotnet pack "src/MelangeDB.$name/MelangeDB.$name.csproj" -c Release -o packages \
+              ${VERSION_SUFFIX:+--version-suffix "$VERSION_SUFFIX"}
+          done
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push 'packages/*.nupkg' \
+            --source "$FEED" \
+            --api-key '${{ secrets.GITHUB_TOKEN }}' \
+            --skip-duplicate

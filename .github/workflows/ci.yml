@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore MelangeDB.slnx
+
+      - name: Build (Release, warnings as errors)
+        run: dotnet build MelangeDB.slnx -c Release --no-restore
+
+      - name: Test (Release)
+        run: |
+          dotnet test MelangeDB.slnx -c Release --no-build 2>&1 | tee test-release.log
+          # Zero-skip enforcement: the Postgres suite self-skips when Docker is missing, and a
+          # silently skipped suite must fail loudly here. Matches any nonzero "Skipped:" count
+          # in the per-project result summaries.
+          if grep -E 'Skipped:\s*[1-9]' test-release.log; then
+            echo '::error::Skipped tests detected in the Release run; CI requires zero skips.'
+            exit 1
+          fi
+
+      - name: Test (Debug)
+        run: |
+          dotnet test MelangeDB.slnx -c Debug 2>&1 | tee test-debug.log
+          if grep -E 'Skipped:\s*[1-9]' test-debug.log; then
+            echo '::error::Skipped tests detected in the Debug run; CI requires zero skips.'
+            exit 1
+          fi
