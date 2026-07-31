@@ -243,6 +243,13 @@ bytes** in each direction (phase 10 added the bytes). Border-band bandwidth is r
 `border-apply` / `border-reset-apply` types received on a node to see what holding its neighbours' edges
 costs, and the `border-batch` / `border-reset` types sent to see what serving its own edges costs.
 
+The **shard ownership map** is a first-class query: `MelangeClusterCoordinator.OwnershipMap()` returns every
+shard, its owning node, and its fencing term, straight from the membership store — the same truth the hub
+routes by, so debugging "who owns this?" is one call, not a log archaeology session. **Per-shard transaction
+rate and lag** come from the fact that a shard *is* an engine: each per-shard engine emits the standard
+engine telemetry (transaction counters, applier lag, log head) under `Telemetry:*` exactly as a single node
+does, and a shard's log head LSN over time is its transaction rate.
+
 ## Health checks
 
 Standard `IHealthCheck` registrations, since they're nearly free once the metrics exist. These require a DI
