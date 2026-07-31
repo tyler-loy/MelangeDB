@@ -204,6 +204,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     {
         var assigned = assignments.Select(static a => a.ToAssignment()).ToDictionary(static a => a.Shard);
         List<ShardRuntime> closed = [];
+        var shardSetChanged = false;
         lock (_shardsLock)
         {
             foreach (var (shard, runtime) in _shards.ToList())
@@ -218,6 +219,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     if (_forwarders.Remove(shard, out var forwarder))
                         forwarder.Dispose();
                     closed.Add(runtime);
+                    shardSetChanged = true;
                     LogShardReleased(_logger, shard.Value, NodeName);
                 }
             }
@@ -252,12 +254,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     _logger);
                 _forwarders[assignment.Shard] = forwarder;
                 forwarder.Start();
+                shardSetChanged = true;
                 LogShardOpened(_logger, assignment.Shard.Value, NodeName, runtime.Engine.Log.HeadLsn);
                 ResolvePendingHandoffs(runtime);
             }
 
             // A shard-set change moves the replication low-water mark; force a re-subscribe.
-            _replicaSubscribedFrom = ulong.MaxValue;
+            if (shardSetChanged)
+                _replicaSubscribedFrom = ulong.MaxValue;
         }
 
         foreach (var runtime in closed)

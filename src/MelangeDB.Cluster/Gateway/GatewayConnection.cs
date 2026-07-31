@@ -283,11 +283,23 @@ internal sealed class GatewayConnection
             _shard = null;
         }
 
-        var (_, publicAddress) = _gateway.Hub.ResolveShard(shard);
-        _shard = await ConnectUpstreamAsync(_gateway.ShardSocketUri(publicAddress, shard), firesLifecycle: false, ct)
-            .ConfigureAwait(false);
-        _shardKey = shard;
-        return _shard;
+        // A freshly created (or freshly reassigned) shard is opened by its owner on the owner's
+        // next heartbeat; retry across that window rather than surfacing a transient 404.
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                var (_, publicAddress) = _gateway.Hub.ResolveShard(shard);
+                _shard = await ConnectUpstreamAsync(_gateway.ShardSocketUri(publicAddress, shard), firesLifecycle: false, ct)
+                    .ConfigureAwait(false);
+                _shardKey = shard;
+                return _shard;
+            }
+            catch (Exception) when (attempt < 20)
+            {
+                await Task.Delay(250, ct).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task HandleReauthenticateAsync(ReauthenticateFrame reauthenticate, CancellationToken ct)

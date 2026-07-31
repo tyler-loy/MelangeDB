@@ -21,6 +21,8 @@ internal sealed partial class HubRuntime : IDisposable
 {
     private sealed class NodeSession
     {
+        private long _replicaCursor = -1;
+
         public required string ServerNonce { get; init; }
 
         public string? NodeName { get; set; }
@@ -28,6 +30,24 @@ internal sealed partial class HubRuntime : IDisposable
         public SemaphoreSlim ReplicaSignal { get; } = new(0, 1);
 
         public Task? ReplicaPump { get; set; }
+
+        /// <summary>The pump's cursor; -1 means not subscribed. A re-subscribe may move it back.</summary>
+        public long ReplicaCursor
+        {
+            get => Interlocked.Read(ref _replicaCursor);
+            set => Interlocked.Exchange(ref _replicaCursor, value);
+        }
+
+        /// <summary>Moves the cursor backwards only — a re-subscribe for a shard that needs older records.</summary>
+        public void LowerReplicaCursor(long cursor)
+        {
+            long current;
+            while ((current = Interlocked.Read(ref _replicaCursor)) < 0 || cursor < current)
+            {
+                if (Interlocked.CompareExchange(ref _replicaCursor, cursor, current) == current)
+                    return;
+            }
+        }
     }
 
     /// <summary>An in-flight handoff saga on the coordinator.</summary>
@@ -245,6 +265,10 @@ internal sealed partial class HubRuntime : IDisposable
         {
             case "heartbeat":
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
+
+                // A node returning from a partition is alive again; shards orphaned while it was
+                // suspected dead get owners before the reply reports this node's assignments.
+                _membership.AssignUnowned(_time.GetUtcNow());
                 return new HeartbeatReply(AssignmentsDto(session.NodeName));
             case "replica-subscribe":
                 var subscribe = body!.Value.Deserialize<ReplicaSubscribe>()!;
@@ -309,22 +333,24 @@ internal sealed partial class HubRuntime : IDisposable
     /// </summary>
     private void StartReplicaPump(NodeLink link, NodeSession session, ulong fromLsn)
     {
+        session.LowerReplicaCursor((long)fromLsn);
         session.ReplicaPump ??= Task.Run(async () =>
         {
-            var cursor = fromLsn;
             var ct = _stopped.Token;
             while (!ct.IsCancellationRequested && link.IsAlive)
             {
                 try
                 {
+                    var cursor = (ulong)Math.Max(0, session.ReplicaCursor);
                     var head = _engine.Log.HeadLsn;
                     if (cursor < head)
                     {
                         var lsns = new List<ulong>();
                         var records = new List<WireOp[]>();
+                        var scanned = cursor;
                         foreach (var record in _engine.Log.ReadFrom(cursor + 1))
                         {
-                            cursor = record.Lsn;
+                            scanned = record.Lsn;
                             var replicated = ReplicatedOps(record);
                             if (replicated.Length > 0)
                             {
@@ -342,6 +368,9 @@ internal sealed partial class HubRuntime : IDisposable
                                 .ConfigureAwait(false);
                         }
 
+                        // Advance only if no re-subscribe moved the cursor back meanwhile.
+                        if (session.ReplicaCursor == (long)cursor)
+                            session.ReplicaCursor = (long)scanned;
                         continue;
                     }
 
@@ -353,7 +382,17 @@ internal sealed partial class HubRuntime : IDisposable
                 }
                 catch (Exception)
                 {
-                    return; // Link death ends the pump; the node re-subscribes on reconnect.
+                    if (!link.IsAlive)
+                        return; // The node re-subscribes on reconnect, from its persisted cursors.
+                    try
+                    {
+                        // A transient batch failure must not end replication for the link's life.
+                        await Task.Delay(250, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
                 }
             }
         });

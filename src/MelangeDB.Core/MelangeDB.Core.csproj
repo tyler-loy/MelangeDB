@@ -18,6 +18,7 @@
     <!-- The cluster package starts and stops per-shard schedulers and reads the engine's live
          options instance when composing per-shard engines. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
+    <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
   </ItemGroup>
 
   <ItemGroup>
