@@ -435,6 +435,18 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 return Task.FromResult<object?>(null);
             }
 
+            case "shard-execute":
+            {
+                var execute = body!.Value.Deserialize<ShardExecute>()!;
+                var runtime = RequireShard(new ShardKey(execute.Shard), execute.FencingToken);
+                var lsn = runtime.ReducerHost.Call(
+                    execute.Reducer,
+                    new Identity(Convert.FromHexString(execute.CallerHex)),
+                    ConnectionId.None,
+                    Convert.FromBase64String(execute.ArgsB64));
+                return Task.FromResult<object?>(new ShardExecuteReply(lsn));
+            }
+
             case "handoff-query-owner":
             {
                 var query = body!.Value.Deserialize<HandoffQuery>()!;

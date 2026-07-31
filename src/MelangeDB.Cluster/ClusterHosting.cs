@@ -41,6 +41,22 @@ public sealed class MelangeClusterCoordinator
 
     /// <summary>Creates (or looks up) a shard and returns its assignment — instancing's "spin up instance 7".</summary>
     public void EnsureShard(ShardKey shard) => Hub.ResolveShard(shard);
+
+    /// <summary>
+    /// Executes one reducer on the shard owning <paramref name="shard"/> — the building block of
+    /// the rare genuine cross-shard interaction, composed as a saga over the event bus:
+    /// eventually consistent steps with compensating actions, <b>explicitly not ACID</b> (see
+    /// docs/CLUSTERING.md). Each call is one ordinary local transaction on the owning shard; a
+    /// step that throws a peer error definitively did not commit, and the caller compensates.
+    /// Co-location is always the first choice — this exists for the interactions spatial locality
+    /// genuinely cannot cover.
+    /// </summary>
+    public Task<ulong> ExecuteOnShardAsync(
+        ShardKey shard, string reducer, Identity caller, object?[] arguments, CancellationToken ct = default) =>
+        Hub.ExecuteOnShardAsync(shard, reducer, caller, arguments, ct);
+
+    /// <summary>The cluster's shard ownership map: every shard, its owner, and its fencing term.</summary>
+    public IReadOnlyList<ShardAssignment> OwnershipMap() => Hub.Membership.AllAssignments();
 }
 
 /// <summary>Registers MelangeDB clustering in the host. Call after <c>AddMelangeDb</c>.</summary>

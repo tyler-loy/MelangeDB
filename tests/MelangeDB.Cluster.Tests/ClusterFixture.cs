@@ -265,7 +265,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Mob).Assembly)
             .AddReducersFrom(typeof(ClusterReducers).Assembly)
-            .AddEventHandler<MobDiedHandler>());
+            .AddEventHandler<MobDiedHandler>()
+            .AddEventHandler<GiftSagaHandler>());
         if (_spatial)
         {
             builder.Services.AddSingleton<IShardStrategy>(static provider => new SpatialShardStrategy(

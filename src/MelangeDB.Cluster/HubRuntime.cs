@@ -380,6 +380,31 @@ internal sealed partial class HubRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Executes one reducer on the node owning <paramref name="shard"/> — the building block of a
+    /// cross-shard saga. One call is one ordinary local transaction on that shard; the
+    /// distributed part is only the composition, which is the application's saga to drive (and
+    /// compensate). Throws when the owner is unreachable or the reducer rejects; a
+    /// <see cref="NodeLinkException.IsPeerError"/> means the step definitively did not commit.
+    /// </summary>
+    public async Task<ulong> ExecuteOnShardAsync(
+        ShardKey shard, string reducer, Identity caller, object?[] arguments, CancellationToken ct = default)
+    {
+        var (assignment, _) = ResolveShard(shard);
+        var link = LinkOf(assignment.NodeName!)
+            ?? throw new InvalidOperationException($"No live link to '{assignment.NodeName}', the owner of {shard}.");
+        var reply = await link.RequestAsync(
+            "shard-execute",
+            new ShardExecute(
+                shard.Value,
+                assignment.FencingToken,
+                reducer,
+                caller.ToString(),
+                Convert.ToBase64String(ReducerArguments.Encode(arguments))),
+            ct).ConfigureAwait(false);
+        return reply!.Value.Deserialize<ShardExecuteReply>()!.Lsn;
+    }
+
     private NodeLink? LinkOf(string nodeName) =>
         _linksByNode.TryGetValue(nodeName, out var link) && link.IsAlive ? link : null;
 

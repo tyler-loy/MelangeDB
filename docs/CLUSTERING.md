@@ -274,6 +274,24 @@ the fix for a silent failure mode:
   *nowhere*) until the reconciler learns the truth from the destination's log. Unavailable beats duplicated.
   Only an error *reply* from the destination — a definitive "did not happen" — aborts immediately.
 
+### Cross-shard interaction, in priority order
+
+Settled in phase 10, and the order is the design:
+
+1. **Co-locate, then transact locally.** Interaction in a game is proximity-gated — you trade with someone
+   adjacent, you attack what's in range — so interacting entities already share a shard and the transaction
+   is one ordinary local commit with zero per-transaction cross-node messages (asserted by counting them).
+   This covers nearly everything and is why spatial sharding is tractable at all.
+2. **Ownership transfer** for an entity crossing a boundary — the handoff protocol with a different entity
+   class (a creature chasing, a vehicle driven across).
+3. **A saga over the event bus** for the rare genuine remote case. The initiating shard commits its half
+   locally and publishes the fact; a hub-side handler drives the remote steps with
+   `MelangeClusterCoordinator.ExecuteOnShardAsync` — each step one ordinary local transaction on the owning
+   shard, fencing-checked — and compensates on a definitive failure. **Eventually consistent, explicitly not
+   ACID**: between a debit and its remote credit (or compensating refund) the value is simply in flight, and
+   delivery is at-least-once, so steps must be idempotent-enough for the game's semantics. If a flow cannot
+   tolerate that, the answer is placement (put the tables together), not a distributed transaction.
+
 One structural rule falls out of how re-homing works: **`ShardBy` must not be the primary key** (compile
 error MELANGE0018, mirrored at schema registration). Handoff rewrites the row's `ShardBy` column while the
 stored row key — the encoded primary key — stays fixed; a primary-key shard column would silently diverge

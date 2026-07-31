@@ -112,6 +112,16 @@ internal sealed record HandoffApproach(string PlayerHex, ulong FromShard, ulong[
 /// </summary>
 internal sealed record HandoffResolved(string HandoffId, string PlayerHex, ulong FromShard, ulong ToShard, bool Released);
 
+/// <summary>
+/// A hub-initiated reducer execution on the shard owning <see cref="Shard"/> — the primitive a
+/// cross-shard saga's steps are made of. Arguments travel pre-encoded (the hub validates and
+/// encodes with the same registry the node decodes with); the fencing token makes a step against
+/// a stale owner fail loudly instead of executing on the wrong term.
+/// </summary>
+internal sealed record ShardExecute(ulong Shard, long FencingToken, string Reducer, string CallerHex, string ArgsB64);
+
+internal sealed record ShardExecuteReply(ulong Lsn);
+
 internal sealed record HandoffQuery(string HandoffId, ulong ToShard);
 
 internal sealed record HandoffQueryReply(bool Imported);
