@@ -212,12 +212,23 @@ its link: the destination may or may not hold the import, so the player delibera
 origin's reconciler learns the truth from the destination's log; unavailable beats duplicated — and
 `1711 ReplicaStreamBootstrapped`: a node subscribed replication from below the hub log's truncation base, so
 the gap could not be served from the log and the full Replicated state was sent as a reset instead of the
-stream silently resuming past it (09); `1715 BorderStreamReset` — an owner shard could not serve an
+stream silently resuming past it (09); `1712 HandoffRequested` — an origin node's boundary monitor saw an
+anchored entity cross past the margin and asked for a transfer — `1713 HandoffRateLimited` (Debug: a trigger
+suppressed by `Cluster:HandoffMinIntervalMs`; hysteresis working as intended), `1714 HandoffResolvedRemotely`
+— a node's reconciler resolved a saga the coordinator lost mid-flight, and the hub ran its session-map and
+gateway notifications late but correctly — `1715 BorderStreamReset` — an owner shard could not serve an
 observer's border cursor from its log (truncated past, another epoch, or a changed band depth), so the full
-band went as a reset instead of the stream silently resuming past the gap — and `1716 BorrowedRegistryRebuilt`
+band went as a reset instead of the stream silently resuming past the gap — `1716 BorrowedRegistryRebuilt`
 — a shard's borrowed-row sidecar was missing or unusable while its log is truncated, so the read-only
 registry was rebuilt from row content: correct but a full scan, expected once when upgrading a pre-phase-10
-shard directory (10).
+shard directory — and `1717 TransferListenerFailed`, an `IShardTransferListener` that threw: the transfer is
+durable regardless, but the application's session map may lag until the idempotent listener runs again (10).
+
+The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
+`HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
+the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`
+gauge. Handoff *rate* is the first counter over time; a growing `HandoffsUnresolved` with a flat
+`HandoffsCompleted` means reconcilers cannot reach the truth — look at the node links.
 
 Cluster link traffic is additionally counted per message type in `ClusterMetrics`, as messages **and payload
 bytes** in each direction (phase 10 added the bytes). Border-band bandwidth is read straight off it: sum the

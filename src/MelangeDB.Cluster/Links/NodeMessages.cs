@@ -95,6 +95,23 @@ internal sealed record HandoffImport(
 
 internal sealed record HandoffRelease(string HandoffId, ulong FromShard, long FencingToken);
 
+/// <summary>
+/// A shard node telling the hub an anchored entity crossed its boundary past the margin — the
+/// origin-decides trigger of a seamless handoff. A notification, not a request: the hub owns the
+/// decision (in-flight dedupe, rate limit) and the origin keeps serving the entity meanwhile.
+/// </summary>
+internal sealed record HandoffRequest(string PlayerHex, ulong FromShard, ulong ToShard, long FencingToken);
+
+/// <summary>An anchored entity entered the border band: the gateway pre-opens destination sessions on it.</summary>
+internal sealed record HandoffApproach(string PlayerHex, ulong FromShard, ulong[] ToShards);
+
+/// <summary>
+/// A node's reconciler resolved a stranded handoff (the coordinator died or lost its link
+/// mid-saga): released means the destination owns the entity now, so the hub must run its
+/// transfer listeners and gateway notifications late — better late than a stale session map.
+/// </summary>
+internal sealed record HandoffResolved(string HandoffId, string PlayerHex, ulong FromShard, ulong ToShard, bool Released);
+
 internal sealed record HandoffQuery(string HandoffId, ulong ToShard);
 
 internal sealed record HandoffQueryReply(bool Imported);

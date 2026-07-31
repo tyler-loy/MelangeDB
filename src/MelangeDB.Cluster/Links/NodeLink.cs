@@ -57,6 +57,58 @@ public sealed class ClusterMetrics
     /// <summary>Total messages sent, excluding the given types (typically the heartbeat pair).</summary>
     public long TotalSentExcept(params string[] exceptTypes) =>
         _sent.Where(pair => !exceptTypes.Contains(pair.Key, StringComparer.Ordinal)).Sum(static pair => pair.Value);
+
+    private long _handoffsStarted;
+    private long _handoffsCompleted;
+    private long _handoffsAborted;
+    private long _handoffsUnresolved;
+    private long _handoffsRateLimited;
+    private long _handoffsInFlight;
+
+    /// <summary>Transfer sagas this hub started (explicit and boundary-triggered alike).</summary>
+    public long HandoffsStarted => Interlocked.Read(ref _handoffsStarted);
+
+    /// <summary>Sagas whose destination became authoritative.</summary>
+    public long HandoffsCompleted => Interlocked.Read(ref _handoffsCompleted);
+
+    /// <summary>Sagas that aborted definitively: the entity stayed on its origin.</summary>
+    public long HandoffsAborted => Interlocked.Read(ref _handoffsAborted);
+
+    /// <summary>Sagas whose import fate was unknowable when the coordinator gave up; a reconciler resolves each later.</summary>
+    public long HandoffsUnresolved => Interlocked.Read(ref _handoffsUnresolved);
+
+    /// <summary>Boundary-triggered requests suppressed by Cluster:HandoffMinIntervalMs — hysteresis working.</summary>
+    public long HandoffsRateLimited => Interlocked.Read(ref _handoffsRateLimited);
+
+    /// <summary>Sagas currently in flight on this hub.</summary>
+    public long HandoffsInFlight => Interlocked.Read(ref _handoffsInFlight);
+
+    internal void HandoffStarted()
+    {
+        Interlocked.Increment(ref _handoffsStarted);
+        Interlocked.Increment(ref _handoffsInFlight);
+    }
+
+    internal void HandoffEnded(bool completed, bool aborted, bool unresolved)
+    {
+        Interlocked.Decrement(ref _handoffsInFlight);
+        if (completed)
+            Interlocked.Increment(ref _handoffsCompleted);
+        if (aborted)
+            Interlocked.Increment(ref _handoffsAborted);
+        if (unresolved)
+            Interlocked.Increment(ref _handoffsUnresolved);
+    }
+
+    internal void HandoffRateLimited() => Interlocked.Increment(ref _handoffsRateLimited);
+
+    internal void HandoffResolvedRemotely(bool released)
+    {
+        if (released)
+            Interlocked.Increment(ref _handoffsCompleted);
+        else
+            Interlocked.Increment(ref _handoffsAborted);
+    }
 }
 
 /// <summary>

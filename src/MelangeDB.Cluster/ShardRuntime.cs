@@ -403,6 +403,21 @@ internal sealed partial class ShardRuntime : IDisposable
         Engine.ReadConsistent(_ =>
         {
             _handoffSet.Collect(player, Shard, Engine.CommittedView, collector);
+
+            // Defense in depth against a confused trigger: a freeze may only cover rows this
+            // shard owns. A border copy in the transfer set means someone asked the wrong origin
+            // to move an entity — exporting the stale copy would overwrite the true owner's row.
+            foreach (var (table, key, _) in collector.Rows)
+            {
+                if (_borrowedRows.TryGetValue((table.Id, key), out var owner))
+                {
+                    throw new InvalidOperationException(
+                        $"Handoff {handoffId}: the transfer set for {player} includes a row of '{table.Name}' that is " +
+                        $"a read-only border copy owned by shard:{owner} — this shard does not own the entity and " +
+                        "cannot be its transfer origin.");
+                }
+            }
+
             lock (_handoffLock)
             {
                 foreach (var (table, key, _) in collector.Rows)

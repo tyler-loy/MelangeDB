@@ -29,6 +29,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private readonly Dictionary<ShardKey, ShardRuntime> _shards = [];
     private readonly Dictionary<ShardKey, EventForwarder> _forwarders = [];
     private readonly Dictionary<ShardKey, BorderPublisher> _borderPublishers = [];
+    private readonly Dictionary<ShardKey, BoundaryMonitor> _boundaryMonitors = [];
     private readonly Dictionary<(ulong Observer, ulong Owner), (int Band, long LastSentTicks)> _borderSubscriptions = [];
     private readonly CancellationTokenSource _stopped = new();
     private volatile NodeLink? _link;
@@ -228,6 +229,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                         forwarder.Dispose();
                     if (_borderPublishers.Remove(shard, out var publisher))
                         publisher.Dispose();
+                    if (_boundaryMonitors.Remove(shard, out var monitor))
+                        monitor.Dispose();
                     closed.Add(runtime);
                     shardSetChanged = true;
                     LogShardReleased(_logger, shard.Value, NodeName);
@@ -269,6 +272,18 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     var publisher = new BorderPublisher(runtime.Engine, assignment.Shard, strategy, () => _link, _logger);
                     _borderPublishers[assignment.Shard] = publisher;
                     publisher.Start();
+
+                    // Seamless (walking-triggered) handoff needs a strategy that can judge
+                    // boundaries and an application that names its migratable entities; with
+                    // both, the origin decides — its committed rows are the only trusted position.
+                    if (strategy is IBoundaryStrategy && _services.GetService<IMigrationAnchors>() is { } anchors)
+                    {
+                        var monitor = new BoundaryMonitor(
+                            runtime.Engine, assignment.Shard, strategy, anchors,
+                            () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, _options, _time);
+                        _boundaryMonitors[assignment.Shard] = monitor;
+                        monitor.Start();
+                    }
                 }
 
                 shardSetChanged = true;
@@ -561,10 +576,19 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     {
                         var reply = await link.RequestAsync(
                             "handoff-query", new HandoffQuery(pending.HandoffId, pending.ToShard), ct).ConfigureAwait(false);
-                        if (reply!.Value.Deserialize<HandoffQueryReply>()!.Imported)
+                        var imported = reply!.Value.Deserialize<HandoffQueryReply>()!.Imported;
+                        if (imported)
                             runtime.Release(pending.HandoffId);
                         else
                             runtime.Abort(pending.HandoffId);
+
+                        // The coordinator that would have told the world is gone (that is why this
+                        // reconciler resolved it), so this node reports the outcome: the hub runs
+                        // its transfer listeners and gateway notifications late but correctly.
+                        await link.NotifyAsync(
+                            "handoff-resolved",
+                            new HandoffResolved(pending.HandoffId, pending.PlayerHex, pending.FromShard, pending.ToShard, imported),
+                            ct).ConfigureAwait(false);
                     }
                     catch (Exception) when (!ct.IsCancellationRequested)
                     {
@@ -684,6 +708,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             foreach (var publisher in _borderPublishers.Values)
                 publisher.Dispose();
             _borderPublishers.Clear();
+            foreach (var monitor in _boundaryMonitors.Values)
+                monitor.Dispose();
+            _boundaryMonitors.Clear();
             foreach (var runtime in _shards.Values)
                 runtime.Dispose();
             _shards.Clear();

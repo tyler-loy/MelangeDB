@@ -62,6 +62,8 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly ForeignEventDispatcher _foreignEvents;
     private readonly ConcurrentDictionary<string, NodeLink> _linksByNode = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Saga> _sagas = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Identity, string> _sagasByPlayer = new();
+    private readonly ConcurrentDictionary<Identity, long> _lastHandoffStartTicks = new();
     private readonly CancellationTokenSource _stopped = new();
     private TcpListener? _listener;
     private Task? _acceptLoop;
@@ -84,6 +86,9 @@ internal sealed partial class HubRuntime : IDisposable
     }
 
     public ClusterMetrics Metrics { get; } = new();
+
+    /// <summary>The gateway connections' view into in-flight handoffs, keyed by player identity.</summary>
+    public HandoffNotifier Handoffs { get; } = new();
 
     public MelangeEngine Engine => _engine;
 
@@ -165,7 +170,14 @@ internal sealed partial class HubRuntime : IDisposable
         if (from == to)
             return;
         var handoffId = Guid.NewGuid().ToString("n");
+        if (!_sagasByPlayer.TryAdd(player, handoffId))
+            throw new InvalidOperationException($"A transfer is already in flight for {player}; one entity, one saga at a time.");
         _sagas[handoffId] = new Saga(handoffId, player, from, to);
+        _lastHandoffStartTicks[player] = _time.GetUtcNow().UtcTicks;
+        Metrics.HandoffStarted();
+        Handoffs.NotifyStarted(player, from, to);
+        var completed = false;
+        var aborted = false;
         try
         {
             var origin = _membership.GetAssignment(from);
@@ -213,6 +225,7 @@ internal sealed partial class HubRuntime : IDisposable
                         "handoff-abort", new HandoffRelease(handoffId, from.Value, origin.FencingToken), ct).ConfigureAwait(false);
                 }
 
+                aborted = true;
                 LogHandoffAborted(_logger, handoffId, player.ToString(), from.Value, to.Value);
                 throw;
             }
@@ -227,6 +240,12 @@ internal sealed partial class HubRuntime : IDisposable
                 throw;
             }
 
+            // The destination's import is durable: it owns the player from this instant. The
+            // session map flips and the gateways swap BEFORE the release is requested, so the
+            // release's row deletions on the origin can never reach a client still attached there.
+            completed = true;
+            NotifyTransferred(player, from, to);
+
             if (originLink is not null && origin is not null)
             {
                 if (HandoffStepHook is { } beforeRelease)
@@ -240,6 +259,99 @@ internal sealed partial class HubRuntime : IDisposable
         finally
         {
             _sagas.TryRemove(handoffId, out _);
+            _sagasByPlayer.TryRemove(new KeyValuePair<Identity, string>(player, handoffId));
+            Metrics.HandoffEnded(completed, aborted, unresolved: !completed && !aborted);
+            if (completed || aborted)
+                Handoffs.NotifyClosed(player, from, to, completed);
+
+            // An unresolved exit notifies nothing: the gateway keeps queueing until this node's
+            // or the origin's reconciler learns the truth and reports it (handoff-resolved).
+        }
+    }
+
+    /// <summary>
+    /// The destination-authoritative moment: application transfer listeners update the session
+    /// map, and gateway observers swap the client's attachment. Listener failures are logged, not
+    /// fatal — the transfer itself is already durable.
+    /// </summary>
+    private void NotifyTransferred(Identity player, ShardKey from, ShardKey to)
+    {
+        foreach (var listener in _services.GetServices<IShardTransferListener>())
+        {
+            try
+            {
+                listener.OnTransferred(player, from, to);
+            }
+            catch (Exception exception)
+            {
+                LogTransferListenerFailed(_logger, listener.GetType().Name, player.ToString(), exception);
+            }
+        }
+
+        Handoffs.NotifyDestinationAuthoritative(player, from, to);
+    }
+
+    /// <summary>
+    /// A boundary-triggered transfer request from an origin node. The hub owns hysteresis: an
+    /// in-flight saga for the entity dedupes, and a start within Cluster:HandoffMinIntervalMs of
+    /// the entity's previous one is suppressed (EventId 1713) — pacing across a boundary triggers
+    /// a bounded number of transfers, never one per step.
+    /// </summary>
+    private void HandleHandoffRequest(NodeSession session, HandoffRequest request)
+    {
+        var from = new ShardKey(request.FromShard);
+        var to = new ShardKey(request.ToShard);
+        var assignment = _membership.GetAssignment(from);
+        if (assignment is null || assignment.NodeName != session.NodeName || assignment.FencingToken != request.FencingToken)
+            return; // A previous owner's view of the world; the fencing rule, applied to triggers.
+
+        var player = new Identity(Convert.FromHexString(request.PlayerHex));
+        if (_sagasByPlayer.ContainsKey(player))
+            return; // Already moving; the saga's outcome supersedes this trigger.
+
+        var minInterval = TimeSpan.TicksPerMillisecond * Math.Max(0, Cluster.HandoffMinIntervalMs);
+        if (_lastHandoffStartTicks.TryGetValue(player, out var last)
+            && _time.GetUtcNow().UtcTicks - last < minInterval)
+        {
+            Metrics.HandoffRateLimited();
+            LogHandoffRateLimited(_logger, request.PlayerHex, from.Value, to.Value, Cluster.HandoffMinIntervalMs);
+            return;
+        }
+
+        LogHandoffRequested(_logger, request.PlayerHex, from.Value, to.Value);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await TransferPlayerAsync(player, from, to, _stopped.Token).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Logged by the saga itself (aborted or unresolved); the trigger owes no reply.
+            }
+        });
+    }
+
+    /// <summary>
+    /// A node's reconciler resolved a stranded saga this hub lost track of (a crash, a dead
+    /// link). Released means the destination owns the entity: the session map and the gateways
+    /// learn it now, late but correct — and idempotently, since the listeners' contract says so.
+    /// </summary>
+    private void HandleHandoffResolved(HandoffResolved resolved)
+    {
+        var player = new Identity(Convert.FromHexString(resolved.PlayerHex));
+        var from = new ShardKey(resolved.FromShard);
+        var to = new ShardKey(resolved.ToShard);
+        LogHandoffResolvedRemotely(_logger, resolved.HandoffId, resolved.PlayerHex, resolved.Released, from.Value, to.Value);
+        Metrics.HandoffResolvedRemotely(resolved.Released);
+        if (resolved.Released)
+        {
+            NotifyTransferred(player, from, to);
+            Handoffs.NotifyClosed(player, from, to, success: true);
+        }
+        else
+        {
+            Handoffs.NotifyClosed(player, from, to, success: false);
         }
     }
 
@@ -334,6 +446,36 @@ internal sealed partial class HubRuntime : IDisposable
                 return null;
             }
 
+            case "handoff-request":
+                HandleHandoffRequest(session, body!.Value.Deserialize<HandoffRequest>()!);
+                return null;
+            case "handoff-approach":
+            {
+                var approach = body!.Value.Deserialize<HandoffApproach>()!;
+                var player = new Identity(Convert.FromHexString(approach.PlayerHex));
+                foreach (var target in approach.ToShards)
+                {
+                    // Ensure the destination exists and has an owner, so a pre-opened session (and
+                    // the eventual import) has somewhere to land — approach is what wakes up an
+                    // empty neighbouring region.
+                    try
+                    {
+                        ResolveShard(new ShardKey(target));
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        continue; // No live node can own it right now; the approach re-fires.
+                    }
+
+                    Handoffs.NotifyApproach(player, new ShardKey(approach.FromShard), new ShardKey(target));
+                }
+
+                return null;
+            }
+
+            case "handoff-resolved":
+                HandleHandoffResolved(body!.Value.Deserialize<HandoffResolved>()!);
+                return null;
             case "handoff-query":
                 return await HandleHandoffQueryAsync(body!.Value.Deserialize<HandoffQuery>()!).ConfigureAwait(false);
             case "handoff-freeze-query":
@@ -562,6 +704,14 @@ internal sealed partial class HubRuntime : IDisposable
             var moved = _membership.MarkDead(node.NodeName, now);
             LogNodeSuspectedDead(_logger, node.NodeName, (now - node.LastSeen).TotalMilliseconds, moved.Count);
         }
+
+        // The rate-limit memory is bounded: entries older than any conceivable window are noise.
+        var floor = now.AddMilliseconds(-10L * Math.Max(1, Cluster.HandoffMinIntervalMs)).UtcTicks;
+        foreach (var (player, ticks) in _lastHandoffStartTicks)
+        {
+            if (ticks < floor)
+                _lastHandoffStartTicks.TryRemove(new KeyValuePair<Identity, long>(player, ticks));
+        }
     }
 
     public void Dispose()
@@ -602,6 +752,26 @@ internal sealed partial class HubRuntime : IDisposable
             "destination may or may not hold the import. Player {Player} stays frozen on shard {FromShard} until the " +
             "origin's reconciler learns the truth from the destination's log; unavailable beats duplicated.")]
     private static partial void LogHandoffUnresolved(ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1712, EventName = "HandoffRequested", Level = LogLevel.Information,
+        Message = "Player {Player} crossed shard {FromShard}'s boundary past the margin; the origin requested a transfer to shard {ToShard}.")]
+    private static partial void LogHandoffRequested(ILogger logger, string player, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1713, EventName = "HandoffRateLimited", Level = LogLevel.Debug,
+        Message = "Suppressed a boundary-triggered transfer of player {Player} (shard {FromShard} -> {ToShard}): within " +
+            "Cluster:HandoffMinIntervalMs ({MinIntervalMs}ms) of the previous transfer. Hysteresis working as intended.")]
+    private static partial void LogHandoffRateLimited(ILogger logger, string player, ulong fromShard, ulong toShard, int minIntervalMs);
+
+    [LoggerMessage(EventId = 1714, EventName = "HandoffResolvedRemotely", Level = LogLevel.Information,
+        Message = "Handoff {HandoffId}: a node's reconciler resolved the stranded saga for player {Player} — released: " +
+            "{Released} (shard {FromShard} -> {ToShard}); session maps and gateways were notified late but correctly.")]
+    private static partial void LogHandoffResolvedRemotely(
+        ILogger logger, string handoffId, string player, bool released, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1717, EventName = "TransferListenerFailed", Level = LogLevel.Error,
+        Message = "IShardTransferListener '{Listener}' threw for player {Player}; the transfer itself is durable, but the " +
+            "application's session map may be stale until the listener is invoked again (it is idempotent by contract).")]
+    private static partial void LogTransferListenerFailed(ILogger logger, string listener, string player, Exception exception);
 
     [LoggerMessage(EventId = 1711, EventName = "ReplicaStreamBootstrapped", Level = LogLevel.Warning,
         Message = "Node '{NodeName}' subscribed replication from LSN {StaleCursor}, below the hub log's truncation base " +

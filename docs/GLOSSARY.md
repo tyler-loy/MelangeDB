@@ -128,6 +128,13 @@ ids; the spatial strategy is handed a decoder (`SpatialGeometry.DecodeChunk`) an
 to be at least 32 bits wide, because a `ushort` encoding (`cx * 157 + cy`) tops out at 65,535 and overflows
 when the world grows — a migration trap closed at registration, not discovered in production.
 
+**Boundary monitor** — The origin-decides half of seamless handoff: a commit observer per owned shard that
+assesses every committed Partitioned write of an anchored entity against the shard's boundary, notifies the
+hub of approaches (the gateway pre-opens on them) and requests a transfer once the entity crosses past the
+hysteresis margin. The origin decides because its committed rows are the only trusted position — the client's
+claimed position never is. On shard open it re-assesses existing rows once, so an entity that crossed in the
+instant before a crash still migrates.
+
 **Buffer pool** — The capped in-memory portion of the paging store's hybrid logs, bounded by
 `HotStore:MemoryBudgetBytes`. **Excludes** resident tables, which are pinned and accounted separately — the
 store's total declared footprint is the pool cap plus the residency report. Split between main records and
@@ -272,6 +279,12 @@ the node dead. An expired lease means **self-fencing**: the node's shard engines
 (`ShardFencedException`) until it re-registers and holds a current fencing token.
 
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
+
+**Migration anchor (`IMigrationAnchors`)** — The application's declaration of which rows anchor automatic
+migration: a player's position row (with hysteresis — pacing on the line must not thrash) or a creature
+(immediate — its AI only ticks it on the shard its position resolves to, so a margin would leave it standing
+unticked at the boundary). Companion rows follow their anchor via the `IHandoffSet`; terrain anchors nothing
+and never migrates.
 
 **Membership store (`IMembershipStore`)** — The cluster's ownership registry: which nodes exist, which node
 owns each shard under which fencing token, and each shard's originator id. Owned and written exclusively by

@@ -256,6 +256,9 @@ internal sealed class ClusterFixture : IAsyncDisposable
                     ?? SpatialShardStrategy.ShardOfBlock(0, 0).Value),
                 provider.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<MelangeDbOptions>>()));
             builder.Services.AddSingleton<IHandoffSet, SpatialHandoffSet>();
+            builder.Services.AddSingleton<IMigrationAnchors, SpatialAnchors>();
+            builder.Services.AddSingleton<IShardTransferListener>(
+                static provider => new SpatialTransferListener(provider));
         }
         else
         {

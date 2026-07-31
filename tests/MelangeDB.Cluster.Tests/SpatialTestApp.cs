@@ -1,4 +1,5 @@
 using MelangeDB.Cluster;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace MelangeDB.Cluster.Tests;
 
@@ -224,4 +225,27 @@ public sealed class SpatialHandoffSet : IHandoffSet
         if (shardDb.Find<Critter>(anchor) is { } critter)
             rows.Add(critter);
     }
+}
+
+/// <summary>
+/// Which rows anchor migration: a player's position row (hysteresis applies — pacing on the line
+/// must not thrash) and a critter (immediate — its AI only ticks it on the shard its position
+/// resolves to, so waiting out a margin would leave it standing unticked at the boundary).
+/// </summary>
+public sealed class SpatialAnchors : IMigrationAnchors
+{
+    public MigrationAnchor? AnchorOf(MelangeDB.Core.TableSchema table, in RowRef row) => table.Name switch
+    {
+        nameof(PlayerPos) => new MigrationAnchor((Identity)row.Column(nameof(PlayerPos.PlayerId))!, Immediate: false),
+        nameof(Critter) => new MigrationAnchor((Identity)row.Column(nameof(Critter.Id))!, Immediate: true),
+        _ => null,
+    };
+}
+
+/// <summary>Keeps the hub's session-to-shard map current: the locator reads what this writes. Idempotent.</summary>
+public sealed class SpatialTransferListener(IServiceProvider services) : IShardTransferListener
+{
+    public void OnTransferred(Identity entity, ShardKey from, ShardKey to) =>
+        services.GetRequiredService<MelangeDB.Core.MelangeReducerHost>()
+            .Call("SetPlayerShard", entity, to.Value);
 }
