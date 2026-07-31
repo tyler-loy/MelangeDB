@@ -94,6 +94,13 @@ public sealed class MelangeSubscription
         List<(ulong, IReadOnlyList<WireRowOp>)>? replay = null;
         lock (_lock)
         {
+            // An initial set arriving for a live subscription is a server-driven re-scope — the
+            // gateway swapped the attachment to another shard and re-issued the subscription
+            // there. The old anchor counts against the old log, so applying the new node's
+            // deltas against it while this set streams would corrupt the cache it is about to
+            // replace; buffer them (exactly as during the first subscribe) and let the replay
+            // below filter them against the anchor this set actually names.
+            _live = false;
             _initialRows.AddRange(chunk.Rows);
             if (!chunk.IsLast)
                 return;
