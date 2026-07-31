@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Description>Clustering: hub and shard node roles, per-shard engines and commit logs, the membership store, the gateway, explicit handoff, and the distributed event transport.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
+    <ProjectReference Include="..\MelangeDB.Protocol\MelangeDB.Protocol.csproj" />
+    <ProjectReference Include="..\MelangeDB.Server\MelangeDB.Server.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
+  </ItemGroup>
+
+</Project>
