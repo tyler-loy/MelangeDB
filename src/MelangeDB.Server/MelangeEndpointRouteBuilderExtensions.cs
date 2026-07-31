@@ -37,7 +37,12 @@ public static class MelangeEndpointRouteBuilderExtensions
         var services = endpoints.ServiceProvider;
         var options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
         var engine = services.GetRequiredService<MelangeEngine>();
-        var authenticator = new MelangeAuthenticator(services, () => options.CurrentValue.Auth, () => options.CurrentValue.Sql);
+        var authenticator = new MelangeAuthenticator(
+            services,
+            () => options.CurrentValue.Auth,
+            () => options.CurrentValue.Sql,
+            () => options.CurrentValue.Cluster,
+            services.GetService<TimeProvider>());
         authenticator.EnsureSchemeConfigured();
         var transport = new MelangeTransport(
             engine,
@@ -116,15 +121,18 @@ public static class MelangeEndpointRouteBuilderExtensions
                 return;
             }
 
-            if (!transport.TryReserveConnectionSlot(session.Identity))
+            if (!session.IsInternal)
             {
-                context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
-                await context.Response.WriteAsync(
-                    $"This identity already holds Auth:MaxConnectionsPerIdentity ({transport.Options.Auth.MaxConnectionsPerIdentity}) connections.").ConfigureAwait(false);
-                return;
-            }
+                if (!transport.TryReserveConnectionSlot(session.Identity))
+                {
+                    context.Response.StatusCode = StatusCodes.Status429TooManyRequests;
+                    await context.Response.WriteAsync(
+                        $"This identity already holds Auth:MaxConnectionsPerIdentity ({transport.Options.Auth.MaxConnectionsPerIdentity}) connections.").ConfigureAwait(false);
+                    return;
+                }
 
-            slotReserved = true;
+                slotReserved = true;
+            }
         }
 
         var accept = new WebSocketAcceptContext

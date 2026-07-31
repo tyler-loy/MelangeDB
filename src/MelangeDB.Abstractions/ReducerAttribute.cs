@@ -14,6 +14,26 @@ public enum ReducerKind
 }
 
 /// <summary>
+/// Which node a reducer executes on in a cluster. Single-node deployments ignore it entirely.
+/// </summary>
+public enum ReducerSite
+{
+    /// <summary>
+    /// Derived at compile time from the tables the reducer body touches: only <c>Global</c> and
+    /// <c>Replicated</c> tables means <see cref="Hub"/>, anything else (or a body the analysis
+    /// cannot see through, e.g. one passing <c>ctx</c> to a helper) means <see cref="Shard"/>.
+    /// The default.
+    /// </summary>
+    Auto,
+
+    /// <summary>Executes on the hub — the reducer touches only Global and Replicated tables.</summary>
+    Hub,
+
+    /// <summary>Executes on the shard node owning the caller's shard attachment.</summary>
+    Shard,
+}
+
+/// <summary>
 /// Marks a method as a reducer: invoked as a single transaction against the database. A reducer is
 /// synchronous, performs no I/O, returns to commit, and throws to abort with nothing appended.
 /// </summary>
@@ -39,4 +59,12 @@ public sealed class ReducerAttribute : Attribute
     /// (<c>Policies:UnpolicedReducerReport</c>).
     /// </summary>
     public Type? Policy { get; set; }
+
+    /// <summary>
+    /// Where the reducer executes in a cluster; see <see cref="ReducerSite"/>. Leave at
+    /// <see cref="ReducerSite.Auto"/> unless the compile-time analysis cannot see the body's table
+    /// touches (it says so by routing to the shard, where a Global read fails with a placement
+    /// error naming this property).
+    /// </summary>
+    public ReducerSite Site { get; set; }
 }

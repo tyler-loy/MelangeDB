@@ -17,6 +17,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+    <!-- The cluster package composes per-shard transports and the gateway from the same
+         connection, authenticator, and subscription machinery a single node uses. -->
+    <InternalsVisibleTo Include="MelangeDB.Cluster" />
   </ItemGroup>
 
 </Project>

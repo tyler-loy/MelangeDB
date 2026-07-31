@@ -13,19 +13,30 @@ internal sealed class TransactionDb : IDbView
     private readonly IHotStore _store;
     private readonly WriteSet _writeSet;
     private readonly AutoIncStage _autoInc;
+    private readonly TableAccessGuard? _guard;
 
-    public TransactionDb(SchemaRegistry registry, IHotStore store, WriteSet writeSet, AutoIncStage autoInc)
+    public TransactionDb(SchemaRegistry registry, IHotStore store, WriteSet writeSet, AutoIncStage autoInc, TableAccessGuard? guard = null)
     {
         _registry = registry;
         _store = store;
         _writeSet = writeSet;
         _autoInc = autoInc;
+        _guard = guard;
+    }
+
+    /// <summary>Resolves a row type's schema, consulting the placement visibility guard when one is installed.</summary>
+    private TableSchema Resolve<TRow>(TableAccess access)
+        where TRow : struct
+    {
+        var schema = _registry.Get(typeof(TRow));
+        _guard?.Invoke(schema, access);
+        return schema;
     }
 
     public TRow Insert<TRow>(TRow row)
         where TRow : struct
     {
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Write);
         if (schema.Codec is RowCodec<TRow> codec)
         {
             codec.AssignAutoInc(ref row, _autoInc, schema.Id);
@@ -63,7 +74,7 @@ internal sealed class TransactionDb : IDbView
     public void Update<TRow>(TRow row)
         where TRow : struct
     {
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Write);
         if (schema.Codec is RowCodec<TRow> codec)
         {
             var key = codec.EncodePrimaryKey(in row);
@@ -86,7 +97,7 @@ internal sealed class TransactionDb : IDbView
         where TRow : struct
     {
         ArgumentNullException.ThrowIfNull(primaryKey);
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Write);
         var key = KeyCodec.Encode(schema.PrimaryKey, primaryKey);
         if (!Exists(schema.Id, key))
             return false;
@@ -98,7 +109,7 @@ internal sealed class TransactionDb : IDbView
         where TRow : struct
     {
         ArgumentNullException.ThrowIfNull(primaryKey);
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Read);
         var key = KeyCodec.Encode(schema.PrimaryKey, primaryKey);
         if (_writeSet.TryGetPending(schema.Id, key, out var pending))
         {
@@ -115,7 +126,7 @@ internal sealed class TransactionDb : IDbView
     public IEnumerable<TRow> Scan<TRow>()
         where TRow : struct
     {
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Read);
         foreach (var (_, bytes) in ScanMerged(schema))
             yield return Materialize<TRow>(schema, bytes);
     }
@@ -125,7 +136,7 @@ internal sealed class TransactionDb : IDbView
     {
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(value);
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Read);
         var columnSchema = RequireIndexed(schema, column);
         var encoded = KeyCodec.Encode(columnSchema, value);
 
@@ -146,7 +157,7 @@ internal sealed class TransactionDb : IDbView
         ArgumentException.ThrowIfNullOrEmpty(column);
         ArgumentNullException.ThrowIfNull(low);
         ArgumentNullException.ThrowIfNull(high);
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Read);
         var columnSchema = RequireIndexed(schema, column);
         var lowKey = KeyCodec.Encode(columnSchema, low);
         var highKey = KeyCodec.Encode(columnSchema, high);
@@ -184,7 +195,7 @@ internal sealed class TransactionDb : IDbView
     public long Count<TRow>()
         where TRow : struct
     {
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Read);
         var count = _store.Count(schema.Id);
         foreach (var op in _writeSet.OpsFor(schema.Id))
         {
@@ -205,7 +216,7 @@ internal sealed class TransactionDb : IDbView
     public TRow? First<TRow>()
         where TRow : struct
     {
-        var schema = _registry.Get(typeof(TRow));
+        var schema = Resolve<TRow>(TableAccess.Read);
         var hasPending = false;
         foreach (var _ in _writeSet.OpsFor(schema.Id))
         {

@@ -115,4 +115,18 @@ public sealed class TableSchema
     public ColumnSchema Column(string name) =>
         Columns.FirstOrDefault(c => c.Name == name)
         ?? throw new ArgumentException($"Table '{Name}' has no column '{name}'.", nameof(name));
+
+    /// <summary>
+    /// Wraps a serialized row of this table as a <see cref="RowRef"/> for the shard strategy.
+    /// Column access deserializes lazily, once, on first read.
+    /// </summary>
+    public RowRef ToRowRef(ReadOnlyMemory<byte> bytes)
+    {
+        object? cached = null;
+        return new RowRef(bytes, name =>
+        {
+            cached ??= RowSerializer.Deserialize(this, bytes);
+            return Column(name).GetValue(cached);
+        });
+    }
 }

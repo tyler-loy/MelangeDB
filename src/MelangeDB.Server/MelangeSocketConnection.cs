@@ -350,15 +350,22 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                         throw new MelangeProtocolException("Revoked identity.");
                     }
 
-                    if (!_transport.TryReserveConnectionSlot(session.Identity))
+                    // Internal (gateway) sessions bypass the per-identity cap: the identity's real
+                    // client connections are capped at the gateway, and one client may fan out to
+                    // several upstream node sessions.
+                    if (!session.IsInternal)
                     {
-                        EnqueuePriority(new ErrorFrame(
-                            MelangeErrorCodes.ConnectionCap,
-                            $"This identity already holds Auth:MaxConnectionsPerIdentity ({_transport.Options.Auth.MaxConnectionsPerIdentity}) connections."));
-                        throw new MelangeProtocolException("Connection cap exceeded.");
+                        if (!_transport.TryReserveConnectionSlot(session.Identity))
+                        {
+                            EnqueuePriority(new ErrorFrame(
+                                MelangeErrorCodes.ConnectionCap,
+                                $"This identity already holds Auth:MaxConnectionsPerIdentity ({_transport.Options.Auth.MaxConnectionsPerIdentity}) connections."));
+                            throw new MelangeProtocolException("Connection cap exceeded.");
+                        }
+
+                        _slotReserved = true;
                     }
 
-                    _slotReserved = true;
                     _session = session;
                     _policyContext = new PolicyContext(session.Identity, session.IsGuest, _transport.Engine.CommittedView);
                     break;
@@ -375,9 +382,14 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
         // A completed handshake is a session start — the thing an admin query is not. Firing on
         // the read loop, before any further frame is processed, means a client's first Subscribe
-        // already sees whatever state ClientConnected committed.
-        _transport.FireClientConnected(Caller, ConnectionId);
-        _lifecycleConnected = true;
+        // already sees whatever state ClientConnected committed. Gateway-internal sessions fire
+        // only when their assertion says they represent the client's real session (the hub
+        // attachment) — shard attachments are plumbing, and firing there would double-count.
+        if (_session is null || !_session.IsInternal || _session.FiresLifecycle)
+        {
+            _transport.FireClientConnected(Caller, ConnectionId);
+            _lifecycleConnected = true;
+        }
     }
 
     /// <summary>
