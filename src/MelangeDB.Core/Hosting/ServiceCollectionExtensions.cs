@@ -77,6 +77,7 @@ public static class ServiceCollectionExtensions
             provider.GetService<TimeProvider>()));
         services.TryAddSingleton<MelangeDbRuntimeState>();
         services.TryAddSingleton<MelangeLogHealthCheck>();
+        services.TryAddSingleton<MelangeApplierHealthCheck>();
         services.AddHostedService<MelangeDbHostedService>();
         services.Configure<HealthCheckServiceOptions>(options =>
         {
@@ -85,6 +86,15 @@ public static class ServiceCollectionExtensions
                 options.Registrations.Add(new HealthCheckRegistration(
                     "melange-log",
                     provider => provider.GetRequiredService<MelangeLogHealthCheck>(),
+                    failureStatus: null,
+                    tags: null));
+            }
+
+            if (options.Registrations.All(r => r.Name != "melange-applier"))
+            {
+                options.Registrations.Add(new HealthCheckRegistration(
+                    "melange-applier",
+                    provider => provider.GetRequiredService<MelangeApplierHealthCheck>(),
                     failureStatus: null,
                     tags: null));
             }

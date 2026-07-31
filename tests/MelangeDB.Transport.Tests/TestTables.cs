@@ -89,6 +89,24 @@ public partial struct AdminIdentity
     public Identity Id;
 }
 
+/// <summary>
+/// Relational-tier and private — the WorldStat shape: written by gameplay, read by admin tooling.
+/// What owner-mode ad-hoc SQL (rows and aggregates) exists for.
+/// </summary>
+[Table(Tier = StorageTier.Relational)]
+public partial struct WorldStat
+{
+    [PrimaryKey]
+    [AutoInc]
+    public long Id;
+
+    public string Metric;
+
+    public long Value;
+
+    public Timestamp At;
+}
+
 /// <summary>AI-shaped: [ServerOnly] columns are a complete AI oracle if they ever reach a frame.</summary>
 [Table(Public = true, Residency = Residency.Resident)]
 public partial struct Creature
@@ -242,6 +260,10 @@ public sealed class TransportReducers
     [Reducer]
     public void AddSecret(ReducerContext ctx, ulong id, string data) =>
         ctx.Db.SecretTable.Insert(new SecretTable { Id = id, Data = data });
+
+    [Reducer]
+    public void RecordStat(ReducerContext ctx, string metric, long value) =>
+        ctx.Db.WorldStat.Insert(new WorldStat { Metric = metric, Value = value, At = ctx.Timestamp });
 
     [Reducer]
     public void Noop(ReducerContext ctx)

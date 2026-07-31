@@ -94,14 +94,50 @@ it may lag independently and resume where it stopped.
 connection; a clustered client (phase 09) holds several — hub plus shard. The resume cursor (log epoch + acked
 LSN) is per attachment, never per subscription and never global.
 
+**Approach** — The boundary monitor's early signal: an anchored entity entered the border band toward a
+neighbouring shard. The gateway pre-opens a session to the (possibly just-created) destination on it, so the
+eventual swap is instant. Not a commitment — most approaches never become crossings.
+
 **AutoInc** — A column whose value is assigned from a durable per-table sequence, allocated into the write set
 *before* the log append so replay never reassigns different ids. The contract is **unique, not dense** — gaps
 are normal, which is what lets each shard allocate from an originator-prefixed range with no coordination.
 Ids are 64-bit but allocated within 63 (sign bit clear: 16-bit originator, 47-bit sequence), so a value
 round-trips through Postgres `bigint` and signed-only client languages unchanged.
 
-**Border band** — In the spatial strategy, the ring of chunks a shard node holds read-only copies of so it can
-serve entities just beyond its own boundary. Derived from `InterestOf`.
+**Block** — Under the spatial strategy, the rectangular group of chunks that is one shard: the shard key packs
+the block's two 32-bit coordinates, so a world can grow in any direction without ever migrating key encodings.
+Block dimensions are the developer's geometry (`SpatialGeometry`), not MelangeDB's.
+
+**Border band** — In the spatial strategy, the ring of chunks (depth `Cluster:BorderBandChunks`) a shard node
+holds read-only copies of so it can serve entities just beyond its own boundary. Derived from `InterestOf`,
+narrowed per row by `InterestedInRow`. The band is also the ownership *seam*: an entity its origin still owns
+may stand up to the band's depth inside a neighbouring block while its handoff is pending — beyond it, writes
+fail loudly, because that means handoffs are not keeping up.
+
+**Border stream** — The at-least-once replication of one owner shard's border slice to one observer shard:
+owner node → hub → observer node, log-driven on the owner with the observer's durable cursor as the truth.
+Nothing pins the owner's log for it — a cursor the log can no longer serve is answered by a full band reset
+(EventId 1715), never silently resumed past. An update that moves a row out of the observer's scope ships as
+a retraction, so the observer stops seeing what walked away.
+
+**Borrowed row** — A border-band copy: a row present in a shard engine's store that a *neighbouring* shard
+owns. Visible to reads and subscriptions, refused at every commit (`BorderReadOnlyException`) — always
+enforced, never debug-only, because a copy silently diverging from its owner is the failure no test surfaces.
+The registry of borrowed rows persists as a sidecar beside the shard's log (snapshot-plus-tail, like the
+engine's own recovery), since border records below a truncation base are gone while their rows survive in the
+snapshot.
+
+**Chunk** — The developer's unit of world space (Vibe Shaft: 64 m squares). MelangeDB never interprets chunk
+ids; the spatial strategy is handed a decoder (`SpatialGeometry.DecodeChunk`) and requires the chunk-id column
+to be at least 32 bits wide, because a `ushort` encoding (`cx * 157 + cy`) tops out at 65,535 and overflows
+when the world grows — a migration trap closed at registration, not discovered in production.
+
+**Boundary monitor** — The origin-decides half of seamless handoff: a commit observer per owned shard that
+assesses every committed Partitioned write of an anchored entity against the shard's boundary, notifies the
+hub of approaches (the gateway pre-opens on them) and requests a transfer once the entity crosses past the
+hysteresis margin. The origin decides because its committed rows are the only trusted position — the client's
+claimed position never is. On shard open it re-assesses existing rows once, so an entity that crossed in the
+instant before a crash still migrates.
 
 **Buffer pool** — The capped in-memory portion of the paging store's hybrid logs, bounded by
 `HotStore:MemoryBudgetBytes`. **Excludes** resident tables, which are pinned and accounted separately — the
@@ -159,14 +195,29 @@ transaction, after the commit point. Delivery is at-least-once, so handlers must
 *type* is one logical subscriber with its own subscriber checkpoint.
 
 **Event transport (`IEventTransport`)** — The seam between the commit point and event delivery: in-process by
-default, distributed in phase 09. Handler code never sees it, which is what lets the transport change
-underneath unchanged handlers.
+default, distributed in a cluster (phase 09's `ClusterEventTransport`, where shard-published events forward
+to the hub from each shard's log with an acked cursor and are handled there). Handler code never sees it,
+which is what lets the transport change underneath unchanged handlers.
 
-**Fencing token** — A guard ensuring a node wrongly suspected of being dead cannot keep writing rows it no
-longer owns.
+**Execution site** — Which node runs a reducer in a cluster: `Hub` when the body provably touches only
+`Global` and `Replicated` tables, else `Shard` — resolved at compile time into the reducer descriptor, or
+declared with `[Reducer(Site = ...)]` when the analysis cannot see through the body. What the gateway routes
+calls by. Ignored on a single node.
+
+**Fencing token** — The monotonically increasing number the membership store mints per shard ownership term,
+bumped on every reassignment: a message carrying an older token is from a previous owner and is rejected at
+every saga step. Paired with lease-based self-fencing, it is what ensures a node wrongly suspected of being
+dead cannot keep writing rows it no longer owns. Tokens persist in the membership store, so a restarted hub
+can never re-mint an old one.
 
 **Frame** — One protocol message on the wire: one MessagePack-encoded unit carrying its type, its channel tag,
 and its fields. Ordering is guaranteed only within a frame's channel.
+
+**Gateway** — The one endpoint clients connect to in a cluster. It terminates the client socket on the hub,
+validates the IdP token once, and holds the client's dual attachment — a permanent hub session and a moving
+shard session, both authenticated with internal identity assertions — routing reducer calls by execution site
+and subscriptions by table placement, forwarding node frames to the client verbatim. The client sees one
+endpoint, one protocol, and never learns the topology.
 
 **Generated model** — The per-assembly registration the source generator emits: every `[Table]` schema with
 its row codec attached, and every `[Reducer]` descriptor. `AddTablesFrom`/`AddReducersFrom` discover it
@@ -179,7 +230,17 @@ nothing — **the IdP is the gate** for guests as for everyone — so "convertin
 linking rather than anything MelangeDB does. Preserve the issuer and subject and the `Identity` never changes.
 
 **Handoff** — Transferring a player's ownership from one shard node to another. Explicit and discrete under
-instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction.
+instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction,
+run as a saga — freeze on origin, import on destination, confirm, release on origin — with each half appended
+as a marker to its own commit log before it is acknowledged, so a crash at any step recovers to exactly one
+owner. Between freeze and release the player is writable nowhere — including when an import's fate is
+unknowable (a timed-out request), which deliberately leaves the player frozen rather than risk two owners.
+Live markers pin log truncation until their saga resolves, and each node's periodic reconciler resolves
+stranded halves idempotently; see docs/CLUSTERING.md.
+
+**Handoff set (`IHandoffSet`)** — The developer-supplied selector naming which rows follow a player between
+shards — the "player-owned tables share the player's shard key" convention made concrete, on the same
+mechanism-versus-meaning line as the shard strategy itself.
 
 **Hot store / hot tier** — The in-process log-structured store holding world state. "Hot" describes *access
 pattern*, not volatility: it is durable, and it is not a cache.
@@ -197,6 +258,11 @@ anchor, which is what makes the boundary gap-free and duplicate-free.
 **Instance** — Under the instancing strategy, a shard identified by an explicit id column. Instances are
 causally disjoint — no interest overlap between them.
 
+**Internal identity assertion** — The HMAC-signed token (cluster secret) the hub mints saying "this
+connection acts as identity X": the gateway validated the client's IdP token once, and shard nodes trust the
+assertion instead of re-validating JWTs — which also covers identities no external issuer can vouch for. The
+trust boundary it draws is stated in docs/SECURITY.md. Never accepted from clients.
+
 **Interest** — The set of foreign shards a node holds read-only slices of, returned by `InterestOf`.
 
 **Local** — Placement: the table lives on one node and never leaves it. Caches, scratch state, telemetry.
@@ -211,7 +277,38 @@ completed websocket handshake, `ReducerKind.ClientDisconnected` on graceful clos
 drop, paired one-to-one per connection. Each fire is its own transaction. Not client-callable, and never
 fired by HTTP one-shots, ad-hoc SQL, or ticket minting — a session, not a query.
 
+**Lease** — A shard node's rolling permission to keep writing its shards, renewed by every successful hub
+heartbeat and expiring after `Cluster:FailureTimeoutMs` of silence — the same clock on which the hub suspects
+the node dead. An expired lease means **self-fencing**: the node's shard engines refuse writes
+(`ShardFencedException`) until it re-registers and holds a current fencing token.
+
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
+
+**Migration anchor (`IMigrationAnchors`)** — The application's declaration of which rows anchor automatic
+migration: a player's position row (with hysteresis — pacing on the line must not thrash) or a creature
+(immediate — its AI only ticks it on the shard its position resolves to, so a margin would leave it standing
+unticked at the boundary). Companion rows follow their anchor via the `IHandoffSet`; terrain anchors nothing
+and never migrates.
+
+**Membership store (`IMembershipStore`)** — The cluster's ownership registry: which nodes exist, which node
+owns each shard under which fencing token, and each shard's originator id. Owned and written exclusively by
+the hub; shard nodes learn assignments over their node links, never by reading the store. Postgres-backed in
+production (the hub already has Postgres — the settled alternative to introducing Raft), in-memory for tests
+and single-process clusters.
+
+**Node link** — The one mutually authenticated TCP connection between a shard node and the hub: registration
+and heartbeats, replication of `Replicated` write sets, event forwarding, and handoff saga steps. Both ends
+prove possession of the cluster secret over exchanged nonces at connect. Cluster-internal traffic only — the
+client plane is websockets through the gateway.
+
+**Node-local engine** — The ordinary DI-registered engine on a shard node, which owns no shard and therefore
+holds only `Local` tables. Shard state lives in the per-shard engines the node opens and closes as
+assignments change.
+
+**Originator** — The 16-bit prefix of every AutoInc id, naming which allocator minted it: 0 is the hub, and
+the membership store assigns each shard a distinct originator for life — so two shards can never mint the
+same value with no coordination on the hot path, and the sequence continues from the shard's own log when
+ownership moves.
 
 **Out of line** — Where a large `byte[]` payload (256 bytes and up) lives in the paging store: a separate blob
 log, keyed by row and column, while the main record keeps only the column's framing. Scanning a blob table by
@@ -250,8 +347,33 @@ reflection fallback for reducers.
 up the descriptor by name, decodes and validates arguments *before* any transaction opens, creates one DI
 scope per call, and invokes the body as one transaction. The transport phases call it; so do tests.
 
+**Owner role** — The `Sql:OwnerRole` claim (default `melange-owner`) that authorizes a caller when ad-hoc SQL
+runs in owner mode. The per-caller half of the two-mode contract, per the guest-role precedent: the IdP is the
+gate, owner capability is a claim it issues, and a caller without it is refused — never silently downgraded to
+policy-enforced.
+
+**Postgres applier** — The relational tier's applier: consumes the commit log on its own dispatch loop, off
+the commit path, projecting relational-tier rows into Postgres in batches whose checkpoint commits *inside*
+the same Postgres transaction — which is what makes resume after any failure gap-free and duplicate-free with
+no 2PC. Registered as a decoupled applier: tracked for lag and truncation floors, never driven by the commit
+path, so Postgres down is not server down.
+
 **Relational tier** — Opt-in Postgres storage for tables declaring `Tier = Relational`. The "servicey" half:
-accounts, registration, statistics. Eventually consistent with the log by design.
+accounts, registration, statistics. Eventually consistent with the log by design. Settled in phase 08: a
+relational table's rows **also** project into the hot store like any table's — tier is *additionally
+Postgres*, not *instead of the hot store* — so reducer reads, the overlay, uniqueness, and (for public
+tables) subscriptions work unchanged, and memory stays bounded by phase 07's paging. Postgres is the extra
+projection that serves SQL tooling and aggregates.
+
+**WaitForApplied** — `PostgresRelationalTier.WaitForAppliedAsync(lsn)`: completes when the tier's checkpoint
+reaches the LSN — the narrow primitive for the rare flow that genuinely needs cross-tier read-after-write.
+An honest wait: it can take as long as Postgres is down. Most code should not use it; the lag is the design,
+and the hot store already serves read-your-writes.
+
+**Re-homing** — What handoff does to a transferred row on the destination: instancing rewrites the explicit
+`ShardBy` column (`RowRehoming.RewriteShardBy`); the spatial strategy's rows already carry their location, so
+the import leaves the bytes untouched and *asserts* they resolve to the destination
+(`RowRehoming.ByContent`) — rewriting a chunk id to a shard key would be silent corruption.
 
 **Replicated** — Placement: a full copy on every node, written only by the hub. Small bounded reference data.
 

@@ -61,7 +61,11 @@ public sealed class TableAttribute : Attribute
 
     public Placement Placement { get; set; } = Placement.Partitioned;
 
-    /// <summary>The column the shard strategy derives this table's shard key from.</summary>
+    /// <summary>
+    /// The column the shard strategy derives this table's shard key from. Never the primary key
+    /// (compile error MELANGE0018): handoff re-homes a row by rewriting this column while the
+    /// row's stored key stays fixed, so the shard id must be its own column.
+    /// </summary>
     public string? ShardBy { get; set; }
 
     /// <summary>

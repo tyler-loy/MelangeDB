@@ -47,12 +47,32 @@ public sealed class ApplierPipeline
         }
     }
 
+    /// <summary>
+    /// Registers an applier that advances on its own dispatch loop, off the commit path — the
+    /// Postgres applier's shape. The pipeline never calls <see cref="ILogApplier.Apply"/> on it;
+    /// it only tracks the checkpoint, so the applier still shows in <c>melange.applier.lag</c>
+    /// and still floors log truncation like any other applier.
+    /// </summary>
+    public void RegisterDecoupled(ILogApplier applier)
+    {
+        ArgumentNullException.ThrowIfNull(applier);
+        lock (_lock)
+        {
+            if (_entries.Any(e => e.Applier.Name == applier.Name))
+                throw new ArgumentException($"An applier named '{applier.Name}' is already registered.", nameof(applier));
+            _entries.Add(new Entry(applier) { Decoupled = true });
+        }
+    }
+
     /// <summary>Stops advancing the named applier. Its checkpoint holds; its lag grows.</summary>
     public void Pause(string name)
     {
         lock (_lock)
         {
-            Find(name).Paused = true;
+            var entry = Find(name);
+            if (entry.Decoupled)
+                throw new InvalidOperationException($"Applier '{name}' advances on its own dispatch loop; the pipeline cannot pause it.");
+            entry.Paused = true;
         }
     }
 
@@ -63,31 +83,34 @@ public sealed class ApplierPipeline
         lock (_lock)
         {
             entry = Find(name);
+            if (entry.Decoupled)
+                throw new InvalidOperationException($"Applier '{name}' advances on its own dispatch loop; the pipeline cannot resume it.");
             entry.Paused = false;
         }
 
         CatchUp(entry);
     }
 
-    /// <summary>Advances every unpaused applier to the log head.</summary>
+    /// <summary>Advances every unpaused, pipeline-driven applier to the log head.</summary>
     public void CatchUpAll()
     {
         foreach (var entry in Snapshot())
         {
-            if (!entry.Paused)
+            if (!entry.Paused && !entry.Decoupled)
                 CatchUp(entry);
         }
     }
 
     /// <summary>
     /// Hands a freshly appended record to every unpaused, caught-up applier; an applier that fell
-    /// behind is caught up from the log instead.
+    /// behind is caught up from the log instead. Decoupled appliers are skipped — their own loops
+    /// advance them, and blocking the commit path on them is exactly what decoupling forbids.
     /// </summary>
     internal void NotifyAppended(CommitRecord record)
     {
         foreach (var entry in Snapshot())
         {
-            if (entry.Paused)
+            if (entry.Paused || entry.Decoupled)
                 continue;
             if (entry.Applier.AppliedLsn == record.Lsn - 1)
             {
@@ -134,5 +157,8 @@ public sealed class ApplierPipeline
         public ILogApplier Applier { get; } = applier;
 
         public bool Paused { get; set; }
+
+        /// <summary>True for appliers the pipeline tracks but never drives; see <see cref="RegisterDecoupled"/>.</summary>
+        public bool Decoupled { get; init; }
     }
 }

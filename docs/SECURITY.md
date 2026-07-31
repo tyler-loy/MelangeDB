@@ -187,6 +187,36 @@ effective immediately, no restart. Session-level on purpose: it answers "the ban
 tokens. Expiry is enforced mid-session too — a token past its lifetime plus `Auth:ReauthGraceSeconds`
 without a successful `Reauthenticate` closes the connection.
 
+## The cluster trust boundary (phase 09)
+
+Clustering adds exactly one new credential and one new boundary, and both are stated rather than implied.
+
+**The credential** is `Cluster:Secret`: one shared HMAC key behind (a) node-link mutual authentication — both
+ends of every hub↔node TCP link prove possession over exchanged nonces at connect, so neither a rogue process
+dialing the hub's node port nor something impersonating the hub gets past the handshake — and (b) the
+**internal identity assertion**, the signed token the hub mints saying "this connection acts as identity X."
+The gateway validates a client's IdP JWT exactly once (the IdP is still the gate), then vouches for the
+identity to shard nodes with assertions; shard nodes never see IdP tokens, which is what makes hub-issued
+guest identities and per-shard routing workable at all. Assertions expire (`Cluster:AssertionTtlSeconds`,
+never outliving the client token), are constant-time verified, and are refused at the gateway itself — a
+client cannot present one.
+
+**The boundary this draws, stated as an assumption and not an accident:** *any holder of the cluster secret
+can assert any identity.* Concretely, a compromised shard node can impersonate every player in its shards —
+and, since it holds the secret, mint assertions for anyone. That is accepted: nodes are your infrastructure,
+exactly like the host process that already runs reducers with full authority (see below). What follows from
+it operationally: treat `Cluster:Secret` like a database password; keep node links and per-shard websocket
+endpoints (`Cluster:PublicAddress`, `{path}/shard/{key}`) on an internal network — the gateway is the only
+client-facing endpoint; and rotate the secret by restarting the cluster with a new one, which invalidates
+every outstanding assertion at once. The node-link listener binds `127.0.0.1` by default
+(`Cluster:NodeListenAddress`), so a single-machine cluster exposes nothing off-box by accident; widening the
+bind for a multi-machine cluster relies on the cluster-secret mutual authentication above and should be
+paired with network-level controls (an internal interface, firewall rules, or both) — defense in depth, not a
+substitute for it.
+
+Fencing tokens and leases are a *correctness* mechanism, not a security one: they stop a wrongly-suspected-dead
+node from split-brain writes, but a node that ignores them is already inside the trust boundary above.
+
 ## Explicitly not defended against
 
 Stating these plainly is part of the design, not an omission:

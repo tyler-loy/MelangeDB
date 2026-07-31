@@ -83,6 +83,14 @@ internal static class ModelExtractor
                 new EquatableArray<string>([tableName, primaryKeys.ToString()])));
         }
 
+        if (shardBy is not null && columns.Any(c => c.IsPrimaryKey && c.Name == shardBy))
+        {
+            diagnostics.Add(new DiagnosticInfo(
+                "MELANGE0018",
+                typeLocation,
+                new EquatableArray<string>([tableName, shardBy])));
+        }
+
         var scheduleAtColumns = columns.Count(static c => c.Kind == WireKind.ScheduleAt);
         if (scheduled is not null && scheduleAtColumns != 1)
         {
@@ -126,12 +134,15 @@ internal static class ModelExtractor
             : "Standard";
         var reducerName = method.Name;
         string? policyFqn = null;
+        var declaredSite = "Auto";
         foreach (var named in attribute.NamedArguments)
         {
             if (named.Key == "Name" && named.Value.Value is string explicitName)
                 reducerName = explicitName;
             if (named.Key == "Policy" && named.Value.Value is INamedTypeSymbol policyType)
                 policyFqn = Fqn(policyType);
+            if (named.Key == "Site" && named.Value.Value is int site)
+                declaredSite = site switch { 1 => "Hub", 2 => "Shard", _ => "Auto" };
         }
 
         var location = LocationInfo.From(
@@ -205,6 +216,7 @@ internal static class ModelExtractor
         if (kind is "ClientConnected" or "ClientDisconnected" && parameters.Count > 0)
             AddSignature(diagnostics, location, reducerName, "is a lifecycle reducer, which takes only ReducerContext — the transport has no arguments to supply");
 
+        var (touched, opaque) = AnalyzeTableTouches(method, context.TargetNode as MethodDeclarationSyntax);
         return new ReducerModel(
             ContainingTypeFqn: method.ContainingType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
             MethodName: method.Name,
@@ -213,8 +225,90 @@ internal static class ModelExtractor
             PolicyFqn: policyFqn,
             Location: location,
             Parameters: new EquatableArray<ParameterModel>([.. parameters]),
-            Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]));
+            Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]),
+            DeclaredSite: declaredSite,
+            TouchedTables: touched,
+            OpaqueBody: opaque);
     }
+
+    /// <summary>
+    /// Members of <c>IDbView</c> whose non-generic use infers the row type from an argument —
+    /// invisible to a syntactic walk, so a body using one is opaque to the site analysis.
+    /// </summary>
+    private static readonly string[] DbViewMembers =
+        ["Insert", "Update", "Delete", "Find", "Scan", "Filter", "FilterRange", "Any", "Count", "First"];
+
+    /// <summary>
+    /// The purely syntactic half of execution-site resolution: which table names the body reaches
+    /// through <c>ctx.Db</c>. Every use of the context parameter must be a plain
+    /// <c>ctx.Member</c> access — the moment <c>ctx</c> or <c>ctx.Db</c> escapes into a helper,
+    /// an alias, or an inferred-generic <c>IDbView</c> call, the body is opaque and the reducer
+    /// resolves to the shard, where a misplaced Global read fails loudly rather than silently.
+    /// </summary>
+    private static (EquatableArray<string> Touched, bool Opaque) AnalyzeTableTouches(
+        IMethodSymbol method,
+        MethodDeclarationSyntax? declaration)
+    {
+        if (method.Parameters.Length == 0 || declaration is null)
+            return (new EquatableArray<string>([]), true);
+        SyntaxNode? body = (SyntaxNode?)declaration.Body ?? declaration.ExpressionBody;
+        if (body is null)
+            return (new EquatableArray<string>([]), true);
+
+        var contextName = method.Parameters[0].Name;
+        var touched = new SortedSet<string>(StringComparer.Ordinal);
+        var opaque = false;
+        foreach (var identifier in body.DescendantNodes().OfType<IdentifierNameSyntax>())
+        {
+            if (identifier.Identifier.Text != contextName)
+                continue;
+            if (identifier.Parent is not MemberAccessExpressionSyntax contextAccess
+                || contextAccess.Expression != identifier)
+            {
+                opaque = true;
+                continue;
+            }
+
+            if (contextAccess.Name.Identifier.Text != "Db")
+                continue;
+            if (contextAccess.Parent is not MemberAccessExpressionSyntax dbAccess || dbAccess.Expression != contextAccess)
+            {
+                opaque = true;
+                continue;
+            }
+
+            if (dbAccess.Name is GenericNameSyntax generic)
+            {
+                if (generic.TypeArgumentList.Arguments.Count == 1
+                    && RightmostIdentifier(generic.TypeArgumentList.Arguments[0]) is { } rowName)
+                {
+                    touched.Add(rowName);
+                }
+                else
+                {
+                    opaque = true;
+                }
+            }
+            else if (DbViewMembers.Contains(dbAccess.Name.Identifier.Text, StringComparer.Ordinal))
+            {
+                opaque = true;
+            }
+            else
+            {
+                // A generated typed accessor: the property is named after the table struct.
+                touched.Add(dbAccess.Name.Identifier.Text);
+            }
+        }
+
+        return (new EquatableArray<string>([.. touched]), opaque);
+    }
+
+    private static string? RightmostIdentifier(TypeSyntax type) => type switch
+    {
+        IdentifierNameSyntax identifier => identifier.Identifier.Text,
+        QualifiedNameSyntax qualified => qualified.Right.Identifier.Text,
+        _ => null,
+    };
 
     internal static (WireKind Kind, bool IsEnum, string EnumUnderlyingFqn) Classify(ITypeSymbol type)
     {
