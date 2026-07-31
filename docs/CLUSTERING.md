@@ -174,6 +174,31 @@ origin → append on destination → confirm → release on origin* — recovera
 their half, so an interrupted handoff replays. A fencing token prevents a wrongly-suspected-dead node
 from continuing to write a player it no longer owns.
 
+Three consequences of "recoverable from both logs," shipped in phase 09 and worth stating because each is
+the fix for a silent failure mode:
+
+- **Live saga markers pin log truncation.** A pending freeze pins the origin's log from the marker onward;
+  an import pins the destination's log until the origin is known settled. Without the pin, the shard's own
+  routine snapshot could erase the marker mid-transfer — a restarted origin would silently unfreeze a
+  half-transferred player, and a restarted destination would answer "never imported" while holding the rows:
+  two owners either way. The pin is bounded, because every saga resolves.
+- **A reconciler, not just crash recovery, resolves stranded sagas.** Each shard node periodically resolves
+  every saga half it holds: a pending freeze asks (via the hub) whether the destination's import became
+  durable — release if yes, abort if definitively no, wait otherwise — and an unsettled import asks whether
+  the origin's freeze is still pending, settling (and unpinning) once it is not. Every step is idempotent,
+  which is what makes it correct across any combination of crashes, and an in-flight saga always answers
+  "wait" so the reconciler never races its own coordinator.
+- **An unknowable import failure leaves the player frozen, deliberately.** If the import request times out
+  or the link dies, the destination may or may not hold the import — an ack lost in transit looks identical
+  to a dead node. Aborting blind could mint two owners, so the freeze stays (the player is writable
+  *nowhere*) until the reconciler learns the truth from the destination's log. Unavailable beats duplicated.
+  Only an error *reply* from the destination — a definitive "did not happen" — aborts immediately.
+
+One structural rule falls out of how re-homing works: **`ShardBy` must not be the primary key** (compile
+error MELANGE0018, mirrored at schema registration). Handoff rewrites the row's `ShardBy` column while the
+stored row key — the encoded primary key — stays fixed; a primary-key shard column would silently diverge
+from its key on the first transfer. The shard id is its own column.
+
 ## What holds regardless of strategy
 
 - **Each shard is internally single-writer** — one serialized transaction loop, one commit log, exactly
@@ -192,6 +217,25 @@ from continuing to write a player it no longer owns.
   whichever node owns its shard — no global timer wheel, no leader election. Vibe Shaft's single global
   `CreatureAiTick` row becomes one row per shard, and the hand-written "only chunks near a player"
   filtering becomes implicit in the partition.
+- **A replication gap that truncation erased is bootstrapped, never skipped.** A node whose replica cursor
+  fell below the hub log's truncation base (down while the hub snapshotted) cannot be served from the log —
+  the gap's records are gone. The hub sends the full current `Replicated` state at one LSN instead
+  (EventId 1711), and the node applies it as upserts *plus deletion of local rows absent from the snapshot*,
+  because a pure upsert bootstrap would resurrect rows the hub deleted during the gap. The same rigor the
+  Postgres tier's phase 08 bootstrap established; silently resuming past a truncated gap is the bug class
+  both exist to kill.
+- **Policies evaluate where the subscription fans out, and may read only tables present there** (settled,
+  phase 09). Subscription fan-out for a `Partitioned` table runs on its shard node, so a row policy there may
+  read `Replicated`, `Partitioned`, and `Local` tables; a read of a hub-only `Global` table fails loudly with
+  the fix in the message rather than answering empty. The flagship "admins see everything" policy reads an
+  `AdminIdentity` table — which is exactly the small, bounded, read-mostly shape `Replicated` exists for.
+  DESIGN.md §7's "policies may freely read private tables" carries this placement qualifier now: private is
+  not the constraint; placement is.
+- **Reducers touching only `Global` and `Replicated` tables are hub-executed** (settled, phase 09). The
+  execution site is resolved at compile time from the body's table touches into the reducer descriptor —
+  `Hub` when every touch is `Global`/`Replicated`, `Shard` otherwise, including bodies the analysis cannot
+  see through (which fail loudly on the shard if they were really hub-shaped, with
+  `[Reducer(Site = ReducerSite.Hub)]` as the stated fix). The gateway routes calls by it.
 - **A shard may itself be replicated** (Raft across nodes) for HA later, independently of this design.
 
 ## Two axes of scale, not one
@@ -214,16 +258,23 @@ bigger term and needs no coordination layer at all.
 
 ## Open questions
 
-- **Shard assignment and rebalancing.** Static assignment first. Player density is wildly uneven, so
-  fixed shards will hotspot; dynamic splitting (a quadtree subdividing under load) is where the spatial
-  strategy ends up, and it's a substantial subsystem. Instancing sidesteps it — another reason to ship
-  that first.
+- **Shard assignment and rebalancing.** Static assignment shipped in phase 09: shards are created at
+  runtime, assigned least-loaded-first by the hub's membership store, and reassigned only on node death
+  (fencing tokens bumped; the new owner recovers the shard from the shard's own log on shared storage).
+  Player density is wildly uneven, so fixed shards will hotspot; dynamic splitting (a quadtree subdividing
+  under load) is where the spatial strategy ends up, and it's a substantial subsystem. Instancing sidesteps
+  it — another reason it shipped first.
 - **The hotspot ceiling is strategy-dependent, and worth telling users plainly.** Spatial partitioning
   cannot split a single crowded location; instancing can. A developer choosing a strategy is choosing
   which failure mode they get, and that should be documented at the point of choice.
-- **Cluster membership.** Ownership registry, failure detection, reassigning a dead node's shards and
-  recovering its log.
-- **Client protocol during dual attachment.** A client holds a hub session plus a shard session, and
-  briefly two shard sessions mid-handoff. The gateway must present that as one endpoint.
+- ~~**Cluster membership.**~~ **Settled in phase 09: Postgres-backed, not Raft.** The ownership registry —
+  nodes, per-shard owner, fencing token, and originator id — lives in the hub's own Postgres
+  (`AddPostgresClusterMembership()`; in-memory for tests), the hub is its sole writer, failure detection is
+  heartbeat silence past `Cluster:FailureTimeoutMs`, and a dead node's shards reassign under bumped fencing
+  tokens while the suspect self-fences on the same clock. See docs/plan-phase-09.md for the rationale.
+- ~~**Client protocol during dual attachment.**~~ **Settled in phase 09: the dual attachment is
+  server-internal.** The wire protocol stays one socket, one session; the gateway owns the hub-plus-shard
+  mapping and the client never learns it. See docs/plan-phase-09.md.
 - **Does the hub shard?** For a very large deployment the hub's `Global` tables become the ceiling. Since
   they're the Postgres tier, the answer is probably "Postgres's problem, not ours" — but it needs saying.
+  Explicitly out of phase 09's scope; still open.

@@ -22,7 +22,9 @@ public sealed class MelangeEngine : IDisposable
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
     private readonly List<ICommitObserver> _commitObservers = [];
+    private readonly List<ICommitGuard> _commitGuards = [];
     private readonly List<Func<ulong?>> _truncationFloors = [];
+    private TableAccessGuard? _tableGuard;
     private readonly IDisposable? _storeLifetime;
     private long _commitsSinceSnapshot;
     private Timestamp? _tailTimestamp;
@@ -33,7 +35,8 @@ public sealed class MelangeEngine : IDisposable
         SchemaRegistry schema,
         ILoggerFactory? loggerFactory = null,
         TimeProvider? timeProvider = null,
-        IHotStoreProvider? hotStoreProvider = null)
+        IHotStoreProvider? hotStoreProvider = null,
+        ushort originator = 0)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(schema);
@@ -53,7 +56,7 @@ public sealed class MelangeEngine : IDisposable
         try
         {
             _log = new FileCommitLog(options.CommitLog, loggers.CreateLogger<FileCommitLog>(), _telemetry);
-            _sequencer = new AutoIncSequencer();
+            _sequencer = new AutoIncSequencer(originator);
             SnapshotPath = Path.Combine(options.CommitLog.Path, SnapshotFile.FileName);
             var store = CreateStore(options, schema, hotStoreProvider, loggers);
             _storeLifetime = store as IDisposable;
@@ -202,7 +205,7 @@ public sealed class MelangeEngine : IDisposable
     /// applies) that is the pre-transaction committed state, never a partially applied write set.
     /// </summary>
     public IDbView CommittedView =>
-        _committedView ??= new CommittedReadView(Schema, HotStore);
+        _committedView ??= new CommittedReadView(Schema, HotStore, _tableGuard);
 
     private IDbView? _committedView;
 
@@ -292,6 +295,110 @@ public sealed class MelangeEngine : IDisposable
     }
 
     /// <summary>
+    /// Registers a commit guard: it validates every subsequent transaction's collapsed write set
+    /// at the commit point, before the append, and a throw aborts with zero trace. The cluster
+    /// layer's seam; see <see cref="ICommitGuard"/>.
+    /// </summary>
+    public void AddCommitGuard(ICommitGuard guard)
+    {
+        ArgumentNullException.ThrowIfNull(guard);
+        lock (_writeLock)
+        {
+            _commitGuards.Add(guard);
+        }
+    }
+
+    /// <summary>
+    /// Installs the table-access guard consulted by every transactional and committed read view —
+    /// the cluster layer's placement visibility rule. Set once, before the engine serves calls;
+    /// null (the default) means every registered table is accessible, which is the whole
+    /// single-node behavior.
+    /// </summary>
+    public void SetTableAccessGuard(TableAccessGuard? guard)
+    {
+        lock (_writeLock)
+        {
+            _tableGuard = guard;
+            _committedView = null; // Rebuilt with the guard on next access.
+        }
+    }
+
+    /// <summary>
+    /// Appends one externally produced write set as a single committed record — the cluster's
+    /// replication and handoff apply path. Not a reducer: no DI scope, no policies, no rate
+    /// limits; <paramref name="reducerName"/> should carry a reserved <c>melange/</c> name.
+    /// <paramref name="reconcile"/> rewrites ops against current committed state so re-applying
+    /// after a crash is idempotent — an insert of an existing key becomes an update, a delete of a
+    /// missing key is dropped. <paramref name="alwaysAppend"/> appends even an empty write set:
+    /// saga markers must reach the log to be recoverable. Returns null when nothing was appended.
+    /// </summary>
+    public CommitRecord? ApplyInternal(
+        string reducerName,
+        Identity caller,
+        IReadOnlyList<RowOp> ops,
+        ReadOnlyMemory<byte> arguments = default,
+        bool reconcile = false,
+        bool alwaysAppend = false)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(reducerName);
+        ArgumentNullException.ThrowIfNull(ops);
+        if (_inReducer.Value)
+            throw new InvalidOperationException("ApplyInternal cannot run inside a reducer.");
+
+        lock (_writeLock)
+        {
+            var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
+            var effective = reconcile ? ReconcileOps(ops) : ops;
+            RunCommitGuards(reducerName, effective, CommitOrigin.Internal);
+            if (effective.Count == 0 && !alwaysAppend)
+                return null;
+            var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, arguments, effective));
+
+            // Runtime observation mirrors what recovery replay will re-observe, so AutoInc
+            // behavior is identical before and after a restart. Foreign-originator ids are
+            // filtered out by the sequencer itself.
+            _sequencer.Observe(record, Schema);
+            NotifyCommitObservers(record);
+            Appliers.NotifyAppended(record);
+            AfterCommit(timestamp);
+            return record;
+        }
+    }
+
+    /// <summary>
+    /// Rewrites externally produced ops against current committed state so they apply cleanly:
+    /// the at-least-once import paths re-deliver after a crash, and the second delivery must be a
+    /// no-op-shaped update rather than a duplicate-key insert.
+    /// </summary>
+    private IReadOnlyList<RowOp> ReconcileOps(IReadOnlyList<RowOp> ops)
+    {
+        var effective = new List<RowOp>(ops.Count);
+        foreach (var op in ops)
+        {
+            var exists = HotStore.TryGetRow(op.Table, op.Key, out _);
+            switch (op.Kind)
+            {
+                case RowOpKind.Delete when exists:
+                    effective.Add(op);
+                    break;
+                case RowOpKind.Delete:
+                    break;
+                case RowOpKind.Insert or RowOpKind.Update:
+                    effective.Add(new RowOp(exists ? RowOpKind.Update : RowOpKind.Insert, op.Table, op.Key, op.Row));
+                    break;
+            }
+        }
+
+        return effective;
+    }
+
+    private void RunCommitGuards(string reducerName, IReadOnlyList<RowOp> ops, CommitOrigin origin)
+    {
+        foreach (var guard in _commitGuards)
+            guard.Validate(reducerName, ops, origin);
+    }
+
+    /// <summary>
     /// Runs a read under the write lock, handing it the head LSN the read is consistent at. No
     /// commit — and no commit observer — runs concurrently, so state observed here plus every
     /// observed record after that LSN is a gap-free, duplicate-free view. This is the anchor a
@@ -340,10 +447,13 @@ public sealed class MelangeEngine : IDisposable
             var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
             var writeSet = new WriteSet();
             var stage = _sequencer.BeginStage();
+            IReadOnlyList<RowOp> ops;
             try
             {
                 foreach (var row in rows)
                     StageBulkRow(row, writeSet, stage);
+                ops = writeSet.ToOps();
+                RunCommitGuards(BulkReducerName, ops, CommitOrigin.Bulk);
             }
             catch (Exception exception)
             {
@@ -353,7 +463,6 @@ public sealed class MelangeEngine : IDisposable
                 throw;
             }
 
-            var ops = writeSet.ToOps();
             var record = _log.Append(new CommitRequest(timestamp, caller, BulkReducerName, ReadOnlyMemory<byte>.Empty, ops));
             stage.Commit();
             NotifyCommitObservers(record);
@@ -604,11 +713,14 @@ public sealed class MelangeEngine : IDisposable
         var stage = _sequencer.BeginStage();
         var random = new Random(unchecked((int)timestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
         var events = new EventStage(_options.Events);
-        var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage), events);
+        var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events);
 
+        IReadOnlyList<RowOp> ops;
         try
         {
             body(context);
+            ops = writeSet.ToOps();
+            RunCommitGuards(reducerName, ops, CommitOrigin.Reducer);
         }
         catch (Exception exception)
         {
@@ -623,7 +735,6 @@ public sealed class MelangeEngine : IDisposable
         }
 
         ulong committedLsn = 0;
-        var ops = writeSet.ToOps();
         if (ops.Count > 0 || events.Events is { Count: > 0 })
         {
             using (var commit = _telemetry?.StartCommit())

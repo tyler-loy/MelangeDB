@@ -282,10 +282,15 @@ properties are load-bearing:
 - **Multiple policies on one table compose as a UNION, not an intersection.** A player must be able to
   see their own inventory *plus* the contents of any open chest or cart — that is three rules unioned,
   and intersection semantics would make it unexpressible.
-- **A policy may freely read private tables.** This is a real advantage over SQL-string filters: in
-  SpacetimeDB, an RLS rule that joins a private table fails to evaluate for ordinary clients and kills
-  their *entire* subscription. An in-process policy object has no restricted namespace, so
-  "admins bypass this filter" is a trivial lookup rather than an impossibility.
+- **A policy may freely read private tables — private is not the constraint; placement is.** This is a real
+  advantage over SQL-string filters: in SpacetimeDB, an RLS rule that joins a private table fails to evaluate
+  for ordinary clients and kills their *entire* subscription. An in-process policy object has no restricted
+  namespace, so "admins bypass this filter" is a trivial lookup rather than an impossibility. The one
+  qualifier, settled in phase 09: policies evaluate on the node that fans the subscription out, and may read
+  only tables **present on that node** — for a `Partitioned` table's subscription that means `Replicated`,
+  `Partitioned`, and `Local` tables, and a policy reading a hub-only `Global` table there fails loudly with
+  the fix in the message (make the table `Replicated`, which is what `AdminIdentity`-shaped reference data
+  wants anyway). See [CLUSTERING.md](CLUSTERING.md).
 
 ## 8. Storage engines
 

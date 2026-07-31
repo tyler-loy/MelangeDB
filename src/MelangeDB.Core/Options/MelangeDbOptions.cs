@@ -41,6 +41,8 @@ public sealed class MelangeDbOptions
     public DiagnosticsOptions Diagnostics { get; set; } = new();
 
     public HealthChecksOptions HealthChecks { get; set; } = new();
+
+    public ClusterOptions Cluster { get; set; } = new();
 }
 
 /// <summary>

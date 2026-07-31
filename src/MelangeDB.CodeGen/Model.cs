@@ -66,6 +66,7 @@ internal sealed record DiagnosticInfo(string DescriptorId, LocationInfo Location
         "MELANGE0011" => Diagnostics.UnsupportedColumnType,
         "MELANGE0012" => Diagnostics.KeyColumnNotEncodable,
         "MELANGE0016" => Diagnostics.ScheduleAtColumnMisplaced,
+        "MELANGE0018" => Diagnostics.ShardByIsPrimaryKey,
         _ => throw new InvalidOperationException($"Unknown diagnostic id {id}."),
     };
 }
@@ -158,10 +159,41 @@ internal sealed record ReducerModel(
     string? PolicyFqn,
     LocationInfo Location,
     EquatableArray<ParameterModel> Parameters,
-    EquatableArray<DiagnosticInfo> Diagnostics)
+    EquatableArray<DiagnosticInfo> Diagnostics,
+    string DeclaredSite = "Auto",
+    EquatableArray<string> TouchedTables = default,
+    bool OpaqueBody = false)
 {
     public bool IsValid => Diagnostics.Length == 0;
 
     /// <summary>Whether any parameter is a <c>[Table]</c> struct — the scheduled-reducer shape.</summary>
     public bool HasTimerRowParameter => Parameters.Items.Any(static p => p.IsTimerRow);
+
+    /// <summary>
+    /// Resolves the reducer's execution site against the compilation's tables. Lifecycle reducers
+    /// are hub-executed (a session start is a hub-attachment event); an explicit
+    /// <c>[Reducer(Site = ...)]</c> wins; otherwise the body's table touches decide — only Global
+    /// and Replicated touches means hub, and a body the analysis cannot see through (it passes
+    /// <c>ctx</c> or <c>ctx.Db</c> to a helper, or names a table this compilation does not know)
+    /// resolves to the shard, where a Global read fails loudly with the fix in the message.
+    /// </summary>
+    public string ResolveSite(IReadOnlyDictionary<string, string> placementByTypeName)
+    {
+        if (Kind is "ClientConnected" or "ClientDisconnected")
+            return "Hub";
+        if (DeclaredSite is "Hub" or "Shard")
+            return DeclaredSite;
+        if (OpaqueBody)
+            return "Shard";
+        foreach (var table in TouchedTables.Items)
+        {
+            if (!placementByTypeName.TryGetValue(table, out var placement)
+                || placement is not ("Global" or "Replicated"))
+            {
+                return "Shard";
+            }
+        }
+
+        return "Hub";
+    }
 }

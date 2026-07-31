@@ -45,8 +45,9 @@ internal static class Emitter
         builder.AppendLine("            new global::MelangeDB.Core.ReducerDescriptor[]");
         builder.AppendLine("            {");
         var tableTypeNames = tables.ToDictionary(static t => t.TypeFqn, static t => t.TypeName);
+        var placementByTypeName = tables.ToDictionary(static t => t.TypeName, static t => t.Placement, StringComparer.Ordinal);
         foreach (var reducer in reducers)
-            EmitDescriptor(builder, reducer, tableTypeNames);
+            EmitDescriptor(builder, reducer, tableTypeNames, reducer.ResolveSite(placementByTypeName));
         builder.AppendLine("            };");
         builder.AppendLine("    }");
         builder.AppendLine("}");
@@ -272,7 +273,11 @@ internal static class Emitter
         }
     }
 
-    private static void EmitDescriptor(StringBuilder builder, ReducerModel reducer, IReadOnlyDictionary<string, string> tableTypeNames)
+    private static void EmitDescriptor(
+        StringBuilder builder,
+        ReducerModel reducer,
+        IReadOnlyDictionary<string, string> tableTypeNames,
+        string site)
     {
         builder.AppendLine("                new global::MelangeDB.Core.ReducerDescriptor(");
         builder.AppendLine($"                    {Literal(reducer.ReducerName)},");
@@ -293,15 +298,10 @@ internal static class Emitter
         var arguments = string.Concat(Enumerable.Range(0, reducer.Parameters.Length).Select(static i => $", arg{i}"));
         builder.AppendLine($"                        (({reducer.ContainingTypeFqn})instance).{reducer.MethodName}(context{arguments});");
         builder.AppendLine("                        reader.End();");
-        if (reducer.PolicyFqn is null)
-        {
-            builder.AppendLine("                    }),");
-        }
-        else
-        {
-            builder.AppendLine("                    },");
-            builder.AppendLine($"                    policy: typeof({reducer.PolicyFqn})),");
-        }
+        builder.AppendLine("                    },");
+        if (reducer.PolicyFqn is not null)
+            builder.AppendLine($"                    policy: typeof({reducer.PolicyFqn}),");
+        builder.AppendLine($"                    site: global::MelangeDB.ReducerSite.{site}),");
     }
 
     private static void EmitArgumentRead(

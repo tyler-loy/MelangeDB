@@ -33,7 +33,8 @@ namespace MelangeDB.Generated
                         ((global::Snapshot.CreatureReducers)instance).Cull(context);
                         reader.End();
                     },
-                    policy: typeof(global::Snapshot.AdminOnly)),
+                    policy: typeof(global::Snapshot.AdminOnly),
+                    site: global::MelangeDB.ReducerSite.Hub),
                 new global::MelangeDB.Core.ReducerDescriptor(
                     "Spawn",
                     global::MelangeDB.ReducerKind.Standard,
@@ -63,7 +64,8 @@ namespace MelangeDB.Generated
                         }
                         ((global::Snapshot.CreatureReducers)instance).Spawn(context, arg0, arg1, arg2);
                         reader.End();
-                    }),
+                    },
+                    site: global::MelangeDB.ReducerSite.Hub),
             };
     }
 }

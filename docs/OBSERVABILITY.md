@@ -198,7 +198,21 @@ so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (LSNs are
 epochs; the applier stalls rather than guesses), `1606 PostgresTierBootstrapped` (a tier attached after log
 truncation is rebuilt from the hot store at one consistent LSN), and `1607 RelationalTablesWithoutPostgres` —
 tables declared `Tier = Relational` in a deployment that configured no Postgres run fine in the hot store,
-and are told what they are missing (08).
+and are told what they are missing (08); `1700 ClusterHubStarted` (naming the node-link listener's bound
+port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
+loud: how long the silence was and how many shards moved under bumped fencing tokens —
+`1703 ClusterLinkAuthFailed` (a link that could not prove the cluster secret; a rogue dialer or a
+misconfigured node, either way worth an alert), `1704 ForeignEventHandlerFailed` — a hub handler exhausted
+its retries for a shard-forwarded event; foreign events have no dead-letter file, and the log says so
+plainly — `1705 HandoffCompleted` and `1706 HandoffAborted` (the two ends every transfer saga reaches),
+`1707 ShardOpened` (which node, recovered to which LSN — reassignment is recovery, and this is its receipt),
+`1708 ShardReleased`, `1709 HubLinkLost` — the node's own view of a partition, ending in self-fencing if
+`Cluster:FailureTimeoutMs` passes first — `1710 HandoffUnresolved` — an import request that timed out or lost
+its link: the destination may or may not hold the import, so the player deliberately stays frozen until the
+origin's reconciler learns the truth from the destination's log; unavailable beats duplicated — and
+`1711 ReplicaStreamBootstrapped`: a node subscribed replication from below the hub log's truncation base, so
+the gap could not be served from the log and the full Replicated state was sent as a reset instead of the
+stream silently resuming past it (09).
 
 ## Health checks
 
@@ -211,7 +225,7 @@ host to register into, so the first one landed with phase 02's host integration 
 | --- | --- | --- |
 | `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
 | `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form | 08 |
-| `melange-shard` | This node's shard assignment is unknown or contested | 09 |
+| `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
 
 ## Standing requirement
 

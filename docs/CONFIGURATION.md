@@ -92,6 +92,25 @@ disagree with them, the same reasoning as the deliberate absence of TLS knobs; (
 through the options monitor, and a cheaper-than-planned semantic is recorded, not rounded down; (3)
 `Policies:UnpolicedReducerReport` stays `restart` as planned (it acts at startup only).
 
+**Shipped as of phase 09** (defaults verified against `ClusterOptions`): every `Cluster:*` key in the table
+below. The register's planned rows were reshaped when they met the implementation, and the corrections are the
+design record: (1) `Cluster:Enabled` was **removed** — `Cluster:Role = None` (the default) *is* the off
+switch, and two switches that can disagree are one too many; the planned `Standalone` value is spelled `None`.
+(2) `Cluster:Shards` (a seed assignment list) was **removed**: shards are created at runtime
+(`MelangeClusterCoordinator.EnsureShard`, or implicitly by the gateway routing to a new instance) and
+ownership lives only in the membership store — a config-file copy of it would be a second source of truth.
+(3) `Cluster:MembershipStore` is **not a configuration string**: the store is a DI registration —
+`AddMelangeCluster()` defaults to in-memory, `AddPostgresClusterMembership()` opts into the hub's Postgres —
+because a store is a component with a connection, not a name. (4) `Cluster:ShardSpanCheck` shipped as
+`DebugOnly | Always | Off` rather than the planned four values: `Warn` was dropped (a warning about a
+distributed commit on the hot path is a page nobody reads until it is an outage), and `ThrowInDevelopment`
+is spelled `DebugOnly`, probing the entry assembly's build configuration. (5) The planned
+`Cluster:FencingTokenTimeoutMs` is spelled `Cluster:FailureTimeoutMs`, because one number serves both sides
+by design: the hub suspects a node dead after this much silence, and the node self-fences its writes on the
+same clock — which is exactly what stops a wrongly-suspected-dead node from writing players it no longer
+owns. It is `restart`, not the planned `live`: the two sides must agree on the value, and nodes learn it at
+registration.
+
 ## Conventions
 
 - **Everything lives under the `MelangeDb:` configuration section**, so a host can bind it from
@@ -229,15 +248,24 @@ to fix it without a code change and a redeploy.
 
 Ignored entirely by single-node deployments.
 
+Everything here is restart-only by design: a node's role, name, and addresses are its identity in the
+cluster, and changing them live would be a different node. See the phase 09 status note for the planned keys
+that were reshaped or removed when this shipped.
+
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Cluster:Enabled` | bool | `false` | restart | 09 | |
-| `Cluster:Role` | enum | `Standalone` | restart | 09 | `Standalone` \| `Hub` \| `Shard`. |
-| `Cluster:HubAddress` | string | — | restart | 09 | |
-| `Cluster:Shards` | string | — | restart | 09 | **Seed** assignment only — ownership lives in the membership store, which failover updates when a dead node's shards are reassigned. "Static" means no load-based rebalancing, not immutable. |
-| `Cluster:MembershipStore` | string | — | restart | 09 | Ownership registry. Likely the hub's Postgres rather than a new consensus dependency. |
-| `Cluster:ShardSpanCheck` | enum | `ThrowInDevelopment` | live | 09 | `Off` \| `Warn` \| `ThrowInDevelopment` \| `Throw`. Catches the one contract MelangeDB cannot verify statically: rows mutated in one transaction must resolve to one shard. |
-| `Cluster:FencingTokenTimeoutMs` | int | `5000` | live | 09 | Stops a wrongly-suspected-dead node from continuing to write a player it no longer owns. |
+| `Cluster:Role` | enum | `None` | restart | 09 | `None` \| `Hub` \| `Shard`. `None` (the default) is the whole off switch: a single-node deployment ignores placement entirely and behaves exactly as in M1. |
+| `Cluster:NodeName` | string | `""` | restart | 09 | This node's stable name — the membership store's key for assignments and fencing. Required for shard nodes; the hub is `hub`. |
+| `Cluster:Secret` | string | `""` | restart | 09 | The cluster secret: HMAC key behind node-link mutual authentication and hub-minted identity assertions. Required whenever `Role != None`; treat like a database password — see docs/SECURITY.md for the trust boundary it draws. |
+| `Cluster:NodeListenPort` | int | `0` | restart | 09 | Hub only: the TCP port the node-link listener binds. `0` binds an ephemeral port (tests); production names one. |
+| `Cluster:NodeListenAddress` | string | `127.0.0.1` | restart | 09 | Hub only: the interface the node-link listener binds. The default admits only same-machine nodes — safe by construction; a multi-machine cluster sets `0.0.0.0` or a specific internal interface. Every connection still proves the cluster secret, but widening the bind should be paired with network-level controls — see docs/SECURITY.md. |
+| `Cluster:HubAddress` | string | `""` | restart | 09 | Shard only: the hub's node-link address as `host:port`. |
+| `Cluster:PublicAddress` | string | `""` | restart | 09 | Shard only: the base HTTP address where this node's per-shard websocket endpoints are reachable **by the gateway**. Internal infrastructure — never handed to clients. |
+| `Cluster:AssertionTtlSeconds` | int | `300` | restart | 09 | Cap on an internal identity assertion's lifetime (an assertion never outlives the client token it vouches for). Bounds how long a captured assertion stays redeemable. |
+| `Cluster:HeartbeatIntervalMs` | int | `1000` | restart | 09 | How often a shard node heartbeats the hub. Heartbeats renew the node's lease and piggyback assignment changes. |
+| `Cluster:FailureTimeoutMs` | int | `10000` | restart | 09 | One number, both sides: silence after which the hub suspects a node dead and reassigns its shards (bumping fencing tokens), and after which the node itself considers its lease expired and fences its own writes. The self-fencing half is what stops a wrongly-suspected-dead node from writing players it no longer owns. |
+| `Cluster:ShardSpanCheck` | enum | `DebugOnly` | live | 09 | `DebugOnly` \| `Always` \| `Off`. Catches the one contract MelangeDB cannot verify statically: rows mutated in one transaction must resolve to one shard. `DebugOnly` probes whether the entry assembly is a Debug build; a violation throws `ShardSpanException` and aborts with zero trace. Also armed on single-node deployments that register an `IShardStrategy` and call `AddMelangeCluster()`. |
+| `Cluster:ShardDataPath` | string | `./data/shards` | restart | 09 | Shard only: the root under which per-shard engines keep their commit logs and hot stores (`{ShardDataPath}/shard-{key}`). Must be storage every shard node can reach — reassignment means the new owner opens the shard's directory and recovers it from the shard's own log (phase 09 assumes shared or re-attachable volumes; log shipping is a later phase). |
 | `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Deeper is smoother and costs bandwidth plus memory on every node. Default should be derived from movement speed and tick rate, not guessed. |
 | `Cluster:HandoffHysteresisMeters` | float | `16` | live | 10 | Stops a player pacing across a boundary from triggering a handoff per step. |
 

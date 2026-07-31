@@ -159,14 +159,29 @@ transaction, after the commit point. Delivery is at-least-once, so handlers must
 *type* is one logical subscriber with its own subscriber checkpoint.
 
 **Event transport (`IEventTransport`)** — The seam between the commit point and event delivery: in-process by
-default, distributed in phase 09. Handler code never sees it, which is what lets the transport change
-underneath unchanged handlers.
+default, distributed in a cluster (phase 09's `ClusterEventTransport`, where shard-published events forward
+to the hub from each shard's log with an acked cursor and are handled there). Handler code never sees it,
+which is what lets the transport change underneath unchanged handlers.
 
-**Fencing token** — A guard ensuring a node wrongly suspected of being dead cannot keep writing rows it no
-longer owns.
+**Execution site** — Which node runs a reducer in a cluster: `Hub` when the body provably touches only
+`Global` and `Replicated` tables, else `Shard` — resolved at compile time into the reducer descriptor, or
+declared with `[Reducer(Site = ...)]` when the analysis cannot see through the body. What the gateway routes
+calls by. Ignored on a single node.
+
+**Fencing token** — The monotonically increasing number the membership store mints per shard ownership term,
+bumped on every reassignment: a message carrying an older token is from a previous owner and is rejected at
+every saga step. Paired with lease-based self-fencing, it is what ensures a node wrongly suspected of being
+dead cannot keep writing rows it no longer owns. Tokens persist in the membership store, so a restarted hub
+can never re-mint an old one.
 
 **Frame** — One protocol message on the wire: one MessagePack-encoded unit carrying its type, its channel tag,
 and its fields. Ordering is guaranteed only within a frame's channel.
+
+**Gateway** — The one endpoint clients connect to in a cluster. It terminates the client socket on the hub,
+validates the IdP token once, and holds the client's dual attachment — a permanent hub session and a moving
+shard session, both authenticated with internal identity assertions — routing reducer calls by execution site
+and subscriptions by table placement, forwarding node frames to the client verbatim. The client sees one
+endpoint, one protocol, and never learns the topology.
 
 **Generated model** — The per-assembly registration the source generator emits: every `[Table]` schema with
 its row codec attached, and every `[Reducer]` descriptor. `AddTablesFrom`/`AddReducersFrom` discover it
@@ -179,7 +194,17 @@ nothing — **the IdP is the gate** for guests as for everyone — so "convertin
 linking rather than anything MelangeDB does. Preserve the issuer and subject and the `Identity` never changes.
 
 **Handoff** — Transferring a player's ownership from one shard node to another. Explicit and discrete under
-instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction.
+instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction,
+run as a saga — freeze on origin, import on destination, confirm, release on origin — with each half appended
+as a marker to its own commit log before it is acknowledged, so a crash at any step recovers to exactly one
+owner. Between freeze and release the player is writable nowhere — including when an import's fate is
+unknowable (a timed-out request), which deliberately leaves the player frozen rather than risk two owners.
+Live markers pin log truncation until their saga resolves, and each node's periodic reconciler resolves
+stranded halves idempotently; see docs/CLUSTERING.md.
+
+**Handoff set (`IHandoffSet`)** — The developer-supplied selector naming which rows follow a player between
+shards — the "player-owned tables share the player's shard key" convention made concrete, on the same
+mechanism-versus-meaning line as the shard strategy itself.
 
 **Hot store / hot tier** — The in-process log-structured store holding world state. "Hot" describes *access
 pattern*, not volatility: it is durable, and it is not a cache.
@@ -197,6 +222,11 @@ anchor, which is what makes the boundary gap-free and duplicate-free.
 **Instance** — Under the instancing strategy, a shard identified by an explicit id column. Instances are
 causally disjoint — no interest overlap between them.
 
+**Internal identity assertion** — The HMAC-signed token (cluster secret) the hub mints saying "this
+connection acts as identity X": the gateway validated the client's IdP token once, and shard nodes trust the
+assertion instead of re-validating JWTs — which also covers identities no external issuer can vouch for. The
+trust boundary it draws is stated in docs/SECURITY.md. Never accepted from clients.
+
 **Interest** — The set of foreign shards a node holds read-only slices of, returned by `InterestOf`.
 
 **Local** — Placement: the table lives on one node and never leaves it. Caches, scratch state, telemetry.
@@ -211,7 +241,32 @@ completed websocket handshake, `ReducerKind.ClientDisconnected` on graceful clos
 drop, paired one-to-one per connection. Each fire is its own transaction. Not client-callable, and never
 fired by HTTP one-shots, ad-hoc SQL, or ticket minting — a session, not a query.
 
+**Lease** — A shard node's rolling permission to keep writing its shards, renewed by every successful hub
+heartbeat and expiring after `Cluster:FailureTimeoutMs` of silence — the same clock on which the hub suspects
+the node dead. An expired lease means **self-fencing**: the node's shard engines refuse writes
+(`ShardFencedException`) until it re-registers and holds a current fencing token.
+
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
+
+**Membership store (`IMembershipStore`)** — The cluster's ownership registry: which nodes exist, which node
+owns each shard under which fencing token, and each shard's originator id. Owned and written exclusively by
+the hub; shard nodes learn assignments over their node links, never by reading the store. Postgres-backed in
+production (the hub already has Postgres — the settled alternative to introducing Raft), in-memory for tests
+and single-process clusters.
+
+**Node link** — The one mutually authenticated TCP connection between a shard node and the hub: registration
+and heartbeats, replication of `Replicated` write sets, event forwarding, and handoff saga steps. Both ends
+prove possession of the cluster secret over exchanged nonces at connect. Cluster-internal traffic only — the
+client plane is websockets through the gateway.
+
+**Node-local engine** — The ordinary DI-registered engine on a shard node, which owns no shard and therefore
+holds only `Local` tables. Shard state lives in the per-shard engines the node opens and closes as
+assignments change.
+
+**Originator** — The 16-bit prefix of every AutoInc id, naming which allocator minted it: 0 is the hub, and
+the membership store assigns each shard a distinct originator for life — so two shards can never mint the
+same value with no coordination on the hot path, and the sequence continues from the shard's own log when
+ownership moves.
 
 **Out of line** — Where a large `byte[]` payload (256 bytes and up) lives in the paging store: a separate blob
 log, keyed by row and column, while the main record keeps only the column's framing. Scanning a blob table by

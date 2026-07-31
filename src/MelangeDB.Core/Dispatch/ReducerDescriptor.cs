@@ -19,7 +19,8 @@ public sealed class ReducerDescriptor
         Type reducerClass,
         ReducerArgsValidator validate,
         ReducerBodyInvoker invoke,
-        Type? policy = null)
+        Type? policy = null,
+        ReducerSite site = ReducerSite.Shard)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(reducerClass);
@@ -31,6 +32,7 @@ public sealed class ReducerDescriptor
         Validate = validate;
         Invoke = invoke;
         Policy = policy;
+        ExecutionSite = site == ReducerSite.Auto ? ReducerSite.Shard : site;
     }
 
     /// <summary>The reducer's public name; the dispatcher's key.</summary>
@@ -51,6 +53,14 @@ public sealed class ReducerDescriptor
     /// <c>Policies:DefaultReducerPosture</c>).
     /// </summary>
     public Type? Policy { get; }
+
+    /// <summary>
+    /// Where the reducer executes in a cluster: <see cref="ReducerSite.Hub"/> when the body
+    /// touches only Global and Replicated tables, else <see cref="ReducerSite.Shard"/> — resolved
+    /// at compile time (or declared via <c>[Reducer(Site = ...)]</c>), never
+    /// <see cref="ReducerSite.Auto"/> here. Single-node deployments ignore it.
+    /// </summary>
+    public ReducerSite ExecutionSite { get; }
 }
 
 /// <summary>Encodes reducer arguments into the wire form the generated dispatcher decodes.</summary>

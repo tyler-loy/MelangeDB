@@ -2,6 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/MelangeDB.Abstractions/MelangeDB.Abstractions.csproj" />
     <Project Path="src/MelangeDB.Client/MelangeDB.Client.csproj" />
+    <Project Path="src/MelangeDB.Cluster/MelangeDB.Cluster.csproj" />
     <Project Path="src/MelangeDB.CodeGen/MelangeDB.CodeGen.csproj" />
     <Project Path="src/MelangeDB.Core/MelangeDB.Core.csproj" />
     <Project Path="src/MelangeDB.OpenTelemetry/MelangeDB.OpenTelemetry.csproj" />
@@ -11,6 +12,7 @@
     <Project Path="src/MelangeDB.Storage.Postgres/MelangeDB.Storage.Postgres.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/MelangeDB.Cluster.Tests/MelangeDB.Cluster.Tests.csproj" />
     <Project Path="tests/MelangeDB.CodeGen.Tests/MelangeDB.CodeGen.Tests.csproj" />
     <Project Path="tests/MelangeDB.Core.Tests/MelangeDB.Core.Tests.csproj" />
     <Project Path="tests/MelangeDB.Host.Tests/MelangeDB.Host.Tests.csproj" />
