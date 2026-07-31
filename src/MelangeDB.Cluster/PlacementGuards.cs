@@ -19,6 +19,13 @@ public sealed class ShardFencedException(string message) : InvalidOperationExcep
 /// </summary>
 public sealed class ShardSpanException(string message) : InvalidOperationException(message);
 
+/// <summary>
+/// Thrown when a reducer writes a border-band copy — a row this node holds read-only because a
+/// neighbouring shard owns it. Always enforced, never debug-only: a violated read-only invariant
+/// is silent state divergence between the copy and its owner, which no test would ever see.
+/// </summary>
+public sealed class BorderReadOnlyException(string message) : InvalidOperationException(message);
+
 /// <summary>Resolves whether the shard-span check runs, per <c>Cluster:ShardSpanCheck</c>.</summary>
 public static class ShardSpanCheck
 {
@@ -134,6 +141,7 @@ internal sealed class ShardCommitGuard : ICommitGuard
     private readonly Func<bool> _spanCheckEnabled;
     private readonly Func<bool> _leaseValid;
     private readonly Func<IReadOnlySet<(TableId, RowKey)>> _frozenRows;
+    private readonly Func<TableId, RowKey, ulong?> _borrowedOwner;
 
     public ShardCommitGuard(
         SchemaRegistry schema,
@@ -142,7 +150,8 @@ internal sealed class ShardCommitGuard : ICommitGuard
         IShardStrategy? strategy,
         Func<bool> spanCheckEnabled,
         Func<bool> leaseValid,
-        Func<IReadOnlySet<(TableId, RowKey)>> frozenRows)
+        Func<IReadOnlySet<(TableId, RowKey)>> frozenRows,
+        Func<TableId, RowKey, ulong?> borrowedOwner)
     {
         _schema = schema;
         _store = store;
@@ -151,6 +160,7 @@ internal sealed class ShardCommitGuard : ICommitGuard
         _spanCheckEnabled = spanCheckEnabled;
         _leaseValid = leaseValid;
         _frozenRows = frozenRows;
+        _borrowedOwner = borrowedOwner;
     }
 
     public void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin)
@@ -178,6 +188,22 @@ internal sealed class ShardCommitGuard : ICommitGuard
                         $"'{reducerName}' writes a row of '{name}' that is frozen mid-handoff; the player is being " +
                         "transferred to another shard and is writable nowhere until the transfer completes.");
                 }
+            }
+        }
+
+        // Always on, not debug-only: a border copy silently diverging from its owner is exactly
+        // the failure no test surfaces, so the invariant is enforced at every commit. The lookup
+        // is one dictionary probe per written row.
+        foreach (var op in writeSet)
+        {
+            if (_borrowedOwner(op.Table, op.Key) is { } owner)
+            {
+                var name = _schema.TryGet(op.Table, out var table) ? table.Name : op.Table.ToString();
+                throw new BorderReadOnlyException(
+                    $"'{reducerName}' writes a row of '{name}' that is a read-only border-band copy owned by " +
+                    $"shard:{owner}; only that shard's writer may mutate it. Interact with border entities by " +
+                    "transferring ownership (the entity crosses and re-homes) or through a cross-shard saga — " +
+                    "see docs/CLUSTERING.md.");
             }
         }
 

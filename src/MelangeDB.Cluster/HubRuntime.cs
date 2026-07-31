@@ -302,6 +302,38 @@ internal sealed partial class HubRuntime : IDisposable
                 var forward = body!.Value.Deserialize<EventsForward>()!;
                 await _foreignEvents.DispatchAsync(session.NodeName, forward.ShardValue, forward, _stopped.Token).ConfigureAwait(false);
                 return null;
+            case "border-subscribe":
+            {
+                // Routed, not answered: the hub knows who owns the owner shard; the stream itself
+                // is owner node -> hub -> observer node, so the star topology carries it.
+                var borderSubscribe = body!.Value.Deserialize<BorderSubscribe>()!;
+                var owner = _membership.GetAssignment(new ShardKey(borderSubscribe.OwnerShard));
+                if (owner?.NodeName is not { } ownerNode || LinkOf(ownerNode) is not { } ownerLink)
+                    return new BorderSubscribeReply(false); // Empty world region, or its owner is down: benign, retry later.
+                await ownerLink.RequestAsync("border-subscribe-owner", borderSubscribe, _stopped.Token).ConfigureAwait(false);
+                return new BorderSubscribeReply(true);
+            }
+
+            case "border-batch":
+            {
+                var batch = body!.Value.Deserialize<BorderBatch>()!;
+                var observer = _membership.GetAssignment(new ShardKey(batch.ObserverShard));
+                if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
+                    throw new InvalidOperationException($"Shard {batch.ObserverShard}'s owner is unreachable; the owner retries.");
+                await observerLink.RequestAsync("border-apply", batch, _stopped.Token).ConfigureAwait(false);
+                return null;
+            }
+
+            case "border-reset":
+            {
+                var reset = body!.Value.Deserialize<BorderReset>()!;
+                var observer = _membership.GetAssignment(new ShardKey(reset.ObserverShard));
+                if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
+                    throw new InvalidOperationException($"Shard {reset.ObserverShard}'s owner is unreachable; the owner retries.");
+                await observerLink.RequestAsync("border-reset-apply", reset, _stopped.Token).ConfigureAwait(false);
+                return null;
+            }
+
             case "handoff-query":
                 return await HandleHandoffQueryAsync(body!.Value.Deserialize<HandoffQuery>()!).ConfigureAwait(false);
             case "handoff-freeze-query":

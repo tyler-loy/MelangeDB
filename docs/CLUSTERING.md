@@ -53,6 +53,34 @@ not hand-configured.
 
 The invariant to teach: **one writer per shard, many readers.**
 
+Shipped in phase 10 as the **border stream**: each shard node keeps one subscription per (owned shard,
+interesting neighbour) pair, and the owner ships its border-relevant ops — rows in the observer's band, plus
+its own entities strayed into the observer's block mid-handoff — through the hub, in LSN order, at least
+once. The copies land in the observer's engine as **borrowed rows**: ordinary rows to every read and
+subscription, refused at every commit (`BorderReadOnlyException`, always on — a copy silently diverging from
+its owner is the failure no test surfaces). Four properties worth knowing:
+
+- **Owner wins.** A border op never touches a row the observer holds authoritatively (a completed import
+  supersedes any stale copy in flight), and a trailing delete from a previous owner cannot erase the new
+  owner's fresh copy — during a transfer two neighbours briefly publish the same entity, and the rules make
+  that window harmless.
+- **Out-of-scope means retracted.** An update that moves a row out of the observer's band ships as a delete,
+  so the observer stops seeing what walked away rather than keeping a stale ghost.
+- **Nothing pins the owner's log.** A border cursor the log can no longer serve — truncation, epoch change, a
+  changed band depth — is answered with a full band reset (upserts plus deletion of absent borrowed rows,
+  EventId 1715), never silently resumed past. Staleness is tolerable for a read-only cache; a pinned log is
+  not.
+- **The borrowed registry survives restarts** via a sidecar beside the shard's log (state at an LSN plus log
+  tail replay — the engine's own snapshot pattern), because border records below a truncation base are gone
+  while their rows survive in the snapshot. A missing sidecar rebuilds from row content, loudly (EventId
+  1716).
+
+One honesty note: `MayCommit`'s seam (an owner writing its strayed entity inside a neighbour's band) is a
+*debug net*, not a security boundary — the strategy cannot distinguish "my entity strayed across" from "I
+invented a row in my neighbour's territory" by content alone. The borrowed-row guard catches mutation of
+every replicated copy; creating fresh rows in a neighbour's near-band is the one contract the application
+keeps by convention, the same way it keeps the same-shard transaction contract.
+
 ## Node roles: hub and shard
 
 The **hub** / **shard node** split (originally framed as master/daughter — see

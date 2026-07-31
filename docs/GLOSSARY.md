@@ -110,6 +110,19 @@ narrowed per row by `InterestedInRow`. The band is also the ownership *seam*: an
 may stand up to the band's depth inside a neighbouring block while its handoff is pending — beyond it, writes
 fail loudly, because that means handoffs are not keeping up.
 
+**Border stream** — The at-least-once replication of one owner shard's border slice to one observer shard:
+owner node → hub → observer node, log-driven on the owner with the observer's durable cursor as the truth.
+Nothing pins the owner's log for it — a cursor the log can no longer serve is answered by a full band reset
+(EventId 1715), never silently resumed past. An update that moves a row out of the observer's scope ships as
+a retraction, so the observer stops seeing what walked away.
+
+**Borrowed row** — A border-band copy: a row present in a shard engine's store that a *neighbouring* shard
+owns. Visible to reads and subscriptions, refused at every commit (`BorderReadOnlyException`) — always
+enforced, never debug-only, because a copy silently diverging from its owner is the failure no test surfaces.
+The registry of borrowed rows persists as a sidecar beside the shard's log (snapshot-plus-tail, like the
+engine's own recovery), since border records below a truncation base are gone while their rows survive in the
+snapshot.
+
 **Chunk** — The developer's unit of world space (Vibe Shaft: 64 m squares). MelangeDB never interprets chunk
 ids; the spatial strategy is handed a decoder (`SpatialGeometry.DecodeChunk`) and requires the chunk-id column
 to be at least 32 bits wide, because a `ushort` encoding (`cx * 157 + cy`) tops out at 65,535 and overflows

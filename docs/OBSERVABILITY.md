@@ -212,7 +212,17 @@ its link: the destination may or may not hold the import, so the player delibera
 origin's reconciler learns the truth from the destination's log; unavailable beats duplicated — and
 `1711 ReplicaStreamBootstrapped`: a node subscribed replication from below the hub log's truncation base, so
 the gap could not be served from the log and the full Replicated state was sent as a reset instead of the
-stream silently resuming past it (09).
+stream silently resuming past it (09); `1715 BorderStreamReset` — an owner shard could not serve an
+observer's border cursor from its log (truncated past, another epoch, or a changed band depth), so the full
+band went as a reset instead of the stream silently resuming past the gap — and `1716 BorrowedRegistryRebuilt`
+— a shard's borrowed-row sidecar was missing or unusable while its log is truncated, so the read-only
+registry was rebuilt from row content: correct but a full scan, expected once when upgrading a pre-phase-10
+shard directory (10).
+
+Cluster link traffic is additionally counted per message type in `ClusterMetrics`, as messages **and payload
+bytes** in each direction (phase 10 added the bytes). Border-band bandwidth is read straight off it: sum the
+`border-apply` / `border-reset-apply` types received on a node to see what holding its neighbours' edges
+costs, and the `border-batch` / `border-reset` types sent to see what serving its own edges costs.
 
 ## Health checks
 

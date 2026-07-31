@@ -28,11 +28,15 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private readonly Lock _shardsLock = new();
     private readonly Dictionary<ShardKey, ShardRuntime> _shards = [];
     private readonly Dictionary<ShardKey, EventForwarder> _forwarders = [];
+    private readonly Dictionary<ShardKey, BorderPublisher> _borderPublishers = [];
+    private readonly Dictionary<(ulong Observer, ulong Owner), (int Band, long LastSentTicks)> _borderSubscriptions = [];
     private readonly CancellationTokenSource _stopped = new();
     private volatile NodeLink? _link;
+    private IShardStrategy? _strategy;
     private long _leaseValidUntilTicks;
     private Task? _connectLoop;
     private Task? _reconcileLoop;
+    private Task? _borderLoop;
     private ulong _replicaSubscribedFrom = ulong.MaxValue;
 
     public ShardNodeRuntime(IServiceProvider services)
@@ -102,8 +106,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         var engine = _services.GetRequiredService<MelangeEngine>();
         engine.SetTableAccessGuard(PlacementGuards.NodeLocalAccess(cluster.NodeName));
 
+        _strategy = _services.GetService<IShardStrategy>();
         _connectLoop = Task.Run(RunAsync);
         _reconcileLoop = Task.Run(ReconcileHandoffsAsync);
+        _borderLoop = Task.Run(MaintainBorderSubscriptionsAsync);
     }
 
     private async Task RunAsync()
@@ -220,6 +226,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     _shards.Remove(shard);
                     if (_forwarders.Remove(shard, out var forwarder))
                         forwarder.Dispose();
+                    if (_borderPublishers.Remove(shard, out var publisher))
+                        publisher.Dispose();
                     closed.Add(runtime);
                     shardSetChanged = true;
                     LogShardReleased(_logger, shard.Value, NodeName);
@@ -256,6 +264,13 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     _logger);
                 _forwarders[assignment.Shard] = forwarder;
                 forwarder.Start();
+                if (_strategy is { } strategy)
+                {
+                    var publisher = new BorderPublisher(runtime.Engine, assignment.Shard, strategy, () => _link, _logger);
+                    _borderPublishers[assignment.Shard] = publisher;
+                    publisher.Start();
+                }
+
                 shardSetChanged = true;
                 LogShardOpened(_logger, assignment.Shard.Value, NodeName, runtime.Engine.Log.HeadLsn);
             }
@@ -358,6 +373,39 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             {
                 var abort = body!.Value.Deserialize<HandoffRelease>()!;
                 RequireShard(new ShardKey(abort.FromShard), abort.FencingToken).Abort(abort.HandoffId);
+                return Task.FromResult<object?>(null);
+            }
+
+            case "border-subscribe-owner":
+            {
+                var subscribe = body!.Value.Deserialize<BorderSubscribe>()!;
+                BorderPublisher? publisher;
+                lock (_shardsLock)
+                {
+                    publisher = _borderPublishers.GetValueOrDefault(new ShardKey(subscribe.OwnerShard));
+                }
+
+                if (publisher is null)
+                    throw new InvalidOperationException($"This node does not own shard {subscribe.OwnerShard} (or runs no shard strategy).");
+                publisher.Subscribe(subscribe);
+                return Task.FromResult<object?>(null);
+            }
+
+            case "border-apply":
+            {
+                var batch = body!.Value.Deserialize<BorderBatch>()!;
+                var observer = TryGetShard(new ShardKey(batch.ObserverShard))
+                    ?? throw new InvalidOperationException($"This node does not own shard {batch.ObserverShard}.");
+                observer.ApplyBorder(batch);
+                return Task.FromResult<object?>(null);
+            }
+
+            case "border-reset-apply":
+            {
+                var reset = body!.Value.Deserialize<BorderReset>()!;
+                var observer = TryGetShard(new ShardKey(reset.ObserverShard))
+                    ?? throw new InvalidOperationException($"This node does not own shard {reset.ObserverShard}.");
+                observer.ApplyBorderReset(reset);
                 return Task.FromResult<object?>(null);
             }
 
@@ -551,6 +599,79 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
     private const int HandoffReconcileIntervalMs = 1_000;
 
+    /// <summary>
+    /// The observer half of interest-driven replication: a periodic sweep keeping one border
+    /// subscription alive per (owned shard, interesting neighbour) pair. Re-sent when the band
+    /// depth changes (forcing a reset — a widened band has rows the stream already scanned past)
+    /// and otherwise refreshed on a slow cadence, which is what re-establishes streams after an
+    /// owner node restarts and lost them. A neighbour shard that does not exist yet is a benign
+    /// "no" — empty world regions are not an error, and nothing subscribes to them.
+    /// </summary>
+    private async Task MaintainBorderSubscriptionsAsync()
+    {
+        const int SweepMs = 1_000;
+        const long RefreshTicks = 5 * TimeSpan.TicksPerSecond;
+        var ct = _stopped.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(SweepMs, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (_strategy is not { } strategy || _link is not { } link)
+                continue;
+            var band = Math.Max(1, Cluster.BorderBandChunks);
+            List<(ShardKey Shard, ShardRuntime Runtime)> owned;
+            lock (_shardsLock)
+            {
+                owned = [.. _shards.Select(static pair => (pair.Key, pair.Value))];
+            }
+
+            foreach (var (shard, runtime) in owned)
+            {
+                foreach (var owner in strategy.InterestOf(shard))
+                {
+                    var key = (shard.Value, owner.Value);
+                    var now = _time.GetUtcNow().UtcTicks;
+                    lock (_shardsLock)
+                    {
+                        if (_borderSubscriptions.TryGetValue(key, out var last)
+                            && last.Band == band && now - last.LastSentTicks < RefreshTicks)
+                        {
+                            continue;
+                        }
+                    }
+
+                    var (epoch, lsn, storedBand) = runtime.ReadBorderCursor(owner.Value, band);
+                    runtime.SetBorderCursorBand(band);
+                    try
+                    {
+                        var reply = await link.RequestAsync(
+                            "border-subscribe",
+                            new BorderSubscribe(owner.Value, shard.Value, epoch, lsn, band, ForceReset: storedBand != band),
+                            ct).ConfigureAwait(false);
+                        if (reply!.Value.Deserialize<BorderSubscribeReply>()!.Exists)
+                        {
+                            lock (_shardsLock)
+                            {
+                                _borderSubscriptions[key] = (band, now);
+                            }
+                        }
+                    }
+                    catch (Exception) when (!ct.IsCancellationRequested)
+                    {
+                        // Hub or owner unreachable; the next sweep retries.
+                    }
+                }
+            }
+        }
+    }
+
     public void Dispose()
     {
         _stopped.Cancel();
@@ -560,6 +681,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             foreach (var forwarder in _forwarders.Values)
                 forwarder.Dispose();
             _forwarders.Clear();
+            foreach (var publisher in _borderPublishers.Values)
+                publisher.Dispose();
+            _borderPublishers.Clear();
             foreach (var runtime in _shards.Values)
                 runtime.Dispose();
             _shards.Clear();

@@ -133,7 +133,7 @@ public sealed class SpatialReducers
     }
 
     [Reducer]
-    public void GrantGold(ReducerContext ctx, int amount)
+    public void EarnGold(ReducerContext ctx, int amount)
     {
         var pack = ctx.Db.Pack.PlayerId.Find(ctx.Caller) ?? throw new RejectedException("no pack; Move first");
         ctx.Db.Pack.Update(pack with { Gold = pack.Gold + amount });
@@ -158,6 +158,9 @@ public sealed class SpatialReducers
         var critter = ctx.Db.Critter.Id.Find(CritterId(seed)) ?? throw new RejectedException("no such critter");
         ctx.Db.Critter.Update(critter with { ChunkId = chunkId });
     }
+
+    [Reducer]
+    public void DespawnCritter(ReducerContext ctx, ulong seed) => ctx.Db.Critter.Id.Delete(CritterId(seed));
 
     [Reducer]
     public void ScheduleCritterTick(ReducerContext ctx, long everyMs, int bx, int by) =>

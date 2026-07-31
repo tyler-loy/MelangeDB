@@ -54,6 +54,38 @@ internal sealed record ReplicaReset(ulong Lsn, ReplicaTableSnapshot[] Tables);
 
 internal sealed record EventsForward(ulong UpToLsn, ulong ShardValue, WireEvent[] Events, long[] TimestampsMicros, ulong[] Lsns);
 
+/// <summary>
+/// An observer shard's request to receive an owner shard's border slice, carrying the observer's
+/// durable cursor (epoch-qualified — a cursor against another log incarnation means reset) and
+/// its current band depth, so the owner can detect a widened band and answer with a full reset.
+/// Sent observer node → hub, routed hub → owner node as <c>border-subscribe-owner</c>.
+/// </summary>
+internal sealed record BorderSubscribe(
+    ulong OwnerShard, ulong ObserverShard, string Epoch, ulong FromLsn, int BandChunks, bool ForceReset);
+
+/// <summary>False when the owner shard does not exist yet (empty world region) — benign, retry later.</summary>
+internal sealed record BorderSubscribeReply(bool Exists);
+
+/// <summary>
+/// One batch of an owner shard's border-relevant row ops for one observer, in LSN order up to
+/// <see cref="UpToLsn"/>. Sent owner node → hub as <c>border-batch</c>, routed hub → observer node
+/// as <c>border-apply</c>; the ack chain is the flow control, and the observer persists its cursor
+/// before acking, so delivery is at-least-once and re-application reconciles.
+/// </summary>
+internal sealed record BorderBatch(ulong OwnerShard, ulong ObserverShard, string Epoch, ulong UpToLsn, WireOp[] Ops);
+
+/// <summary>
+/// A full border-band reset: every row of the owner's slice for this observer, captured at one
+/// LSN. Sent when the observer's cursor cannot be served from the owner's log — truncated past, a
+/// different epoch, or a widened band — because silently resuming past a gap is the bug class the
+/// replica stream's bootstrap already kills; the observer applies upserts <em>plus deletion of
+/// rows previously borrowed from this owner that the snapshot lacks</em>.
+/// </summary>
+internal sealed record BorderReset(ulong OwnerShard, ulong ObserverShard, string Epoch, ulong Lsn, ReplicaTableSnapshot[] Tables);
+
+/// <summary>The log-arguments payload of a <c>melange/border</c> record: which shard owns the copied rows.</summary>
+internal sealed record BorderMarker(ulong Owner);
+
 internal sealed record HandoffFreeze(string HandoffId, ulong FromShard, ulong ToShard, long FencingToken, string PlayerHex);
 
 internal sealed record HandoffFrozenRows(WireOp[] Rows);

@@ -44,14 +44,19 @@ internal sealed class ClusterFixture : IAsyncDisposable
     private readonly string _root;
     private readonly int _heartbeatMs;
     private readonly int _failureTimeoutMs;
+    private readonly bool _spatial;
+    private readonly IReadOnlyDictionary<string, string?>? _extraSettings;
     private int _hubHttpPort;
     private int _nodeListenPort;
 
-    private ClusterFixture(string root, int heartbeatMs, int failureTimeoutMs)
+    private ClusterFixture(
+        string root, int heartbeatMs, int failureTimeoutMs, bool spatial, IReadOnlyDictionary<string, string?>? extraSettings)
     {
         _root = root;
         _heartbeatMs = heartbeatMs;
         _failureTimeoutMs = failureTimeoutMs;
+        _spatial = spatial;
+        _extraSettings = extraSettings;
     }
 
     public WebApplication HubApp { get; private set; } = null!;
@@ -75,10 +80,12 @@ internal sealed class ClusterFixture : IAsyncDisposable
     public static async Task<ClusterFixture> StartAsync(
         int shardNodes = 2,
         int heartbeatMs = 200,
-        int failureTimeoutMs = 10_000)
+        int failureTimeoutMs = 10_000,
+        bool spatial = false,
+        IReadOnlyDictionary<string, string?>? extraSettings = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-cluster-").FullName;
-        var fixture = new ClusterFixture(root, heartbeatMs, failureTimeoutMs);
+        var fixture = new ClusterFixture(root, heartbeatMs, failureTimeoutMs, spatial, extraSettings);
         fixture._hubHttpPort = FreePort();
         fixture._nodeListenPort = FreePort();
         fixture.HubApp = await fixture.StartAppAsync("hub", ClusterRole.Hub, fixture._hubHttpPort);
@@ -201,6 +208,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
             // what lets a reassigned shard's new owner open the shard's log and recover it.
             ["MelangeDb:Cluster:ShardDataPath"] = Path.Combine(_root, "shards"),
         };
+        foreach (var (key, value) in _extraSettings ?? new Dictionary<string, string?>())
+            settings[key] = value;
         if (role == ClusterRole.Hub)
         {
             settings["MelangeDb:Cluster:NodeListenPort"] = _nodeListenPort.ToString();
@@ -232,10 +241,30 @@ internal sealed class ClusterFixture : IAsyncDisposable
             .AddTablesFrom(typeof(Mob).Assembly)
             .AddReducersFrom(typeof(ClusterReducers).Assembly)
             .AddEventHandler<MobDiedHandler>());
-        builder.Services.AddSingleton<IShardStrategy>(static provider => new InstancingShardStrategy(
-            provider.GetRequiredService<SchemaRegistry>(),
-            static session => new ShardKey(session.HubDb.Find<PlayerLocation>(session.Identity)?.InstanceId ?? 1)));
-        builder.Services.AddSingleton<IHandoffSet, PlayerStateHandoffSet>();
+        if (_spatial)
+        {
+            builder.Services.AddSingleton<IShardStrategy>(static provider => new SpatialShardStrategy(
+                provider.GetRequiredService<SchemaRegistry>(),
+                new SpatialGeometry
+                {
+                    BlockWidthChunks = SpatialReducers.BlockW,
+                    BlockHeightChunks = SpatialReducers.BlockH,
+                    DecodeChunk = Chunks.At,
+                },
+                static session => new ShardKey(
+                    session.HubDb.Find<PlayerShardMap>(session.Identity)?.Shard
+                    ?? SpatialShardStrategy.ShardOfBlock(0, 0).Value),
+                provider.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<MelangeDbOptions>>()));
+            builder.Services.AddSingleton<IHandoffSet, SpatialHandoffSet>();
+        }
+        else
+        {
+            builder.Services.AddSingleton<IShardStrategy>(static provider => new InstancingShardStrategy(
+                provider.GetRequiredService<SchemaRegistry>(),
+                static session => new ShardKey(session.HubDb.Find<PlayerLocation>(session.Identity)?.InstanceId ?? 1)));
+            builder.Services.AddSingleton<IHandoffSet, PlayerStateHandoffSet>();
+        }
+
         builder.Services.AddMelangeCluster();
 
         var app = builder.Build();

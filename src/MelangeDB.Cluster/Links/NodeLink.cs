@@ -18,22 +18,41 @@ public sealed class NodeLinkException(string message, bool isPeerError = false) 
 }
 
 /// <summary>
-/// Per-node counters over node-link traffic, by message type. The "zero cross-node traffic"
-/// acceptance test counts these — network calls, not code inspection — so every frame that
-/// crosses a link increments here, heartbeats included (tests exclude them by type name).
+/// Per-node counters over node-link traffic, by message type — counts and payload bytes. The
+/// "zero cross-node traffic" acceptance test counts these — network calls, not code inspection —
+/// so every frame that crosses a link increments here, heartbeats included (tests exclude them by
+/// type name). The byte counters are the border-band bandwidth measure: sum the
+/// <c>border-apply</c>/<c>border-reset-apply</c> types on a node to see what its neighbours'
+/// edges cost it.
 /// </summary>
 public sealed class ClusterMetrics
 {
     private readonly ConcurrentDictionary<string, long> _sent = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _received = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _sentBytes = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _receivedBytes = new(StringComparer.Ordinal);
 
-    internal void RecordSent(string type) => _sent.AddOrUpdate(type, 1, static (_, count) => count + 1);
+    internal void RecordSent(string type, int bytes)
+    {
+        _sent.AddOrUpdate(type, 1, static (_, count) => count + 1);
+        _sentBytes.AddOrUpdate(type, bytes, (_, total) => total + bytes);
+    }
 
-    internal void RecordReceived(string type) => _received.AddOrUpdate(type, 1, static (_, count) => count + 1);
+    internal void RecordReceived(string type, int bytes)
+    {
+        _received.AddOrUpdate(type, 1, static (_, count) => count + 1);
+        _receivedBytes.AddOrUpdate(type, bytes, (_, total) => total + bytes);
+    }
 
     public IReadOnlyDictionary<string, long> SentByType => _sent;
 
     public IReadOnlyDictionary<string, long> ReceivedByType => _received;
+
+    /// <summary>Payload bytes sent per message type.</summary>
+    public IReadOnlyDictionary<string, long> SentBytesByType => _sentBytes;
+
+    /// <summary>Payload bytes received per message type.</summary>
+    public IReadOnlyDictionary<string, long> ReceivedBytesByType => _receivedBytes;
 
     /// <summary>Total messages sent, excluding the given types (typically the heartbeat pair).</summary>
     public long TotalSentExcept(params string[] exceptTypes) =>
@@ -126,7 +145,7 @@ internal sealed class NodeLink : IDisposable
             _sendLock.Release();
         }
 
-        _metrics.RecordSent(frame.Type);
+        _metrics.RecordSent(frame.Type, payload.Length);
     }
 
     private async Task ReadLoopAsync()
@@ -145,7 +164,7 @@ internal sealed class NodeLink : IDisposable
                 await _stream.ReadExactlyAsync(payload, ct).ConfigureAwait(false);
                 var frame = JsonSerializer.Deserialize<WireFrame>(payload)
                     ?? throw new InvalidDataException("Node-link frame deserialized to null.");
-                _metrics.RecordReceived(frame.Type);
+                _metrics.RecordReceived(frame.Type, payload.Length);
                 if (frame.Re != 0)
                 {
                     if (_pending.TryGetValue(frame.Re, out var tcs))
