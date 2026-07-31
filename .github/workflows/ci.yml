@@ -12,10 +12,15 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Shared runners are a handful of slow vCPUs: integration-test deadlines get 4x the wall
+      # clock (see the TestTime helpers in the test projects). Assertions are unchanged — the
+      # awaited conditions still have to come true, they are just allowed to take longer here.
+      MELANGE_TEST_TIME_SCALE: "4"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 
@@ -65,9 +70,9 @@ jobs:
         Abstractions Core Protocol Client Server CodeGen
         Storage.Faster Storage.Postgres Cluster OpenTelemetry
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 10.0.x
 

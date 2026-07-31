@@ -115,3 +115,8 @@ OutputItemType="Analyzer"` form does.
 Docker is missing, and CI treats a skip as a broken environment, not a pass. `ubuntu-latest` has
 Docker preinstalled, which is what the Testcontainers suites use. The `publish` job (above) is
 gated behind it with `needs: test` and runs only on push events, never for pull requests.
+
+CI sets `MELANGE_TEST_TIME_SCALE=4` (a test-infra knob, not a MelangeDB option): the integration
+suites' wait-helper deadlines multiply by it so shared slow vCPUs get proportionally more wall
+clock. Assertions are unchanged — the awaited conditions still have to come true. Unset (the
+default, scale 1) on real hardware.
