@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using MelangeDB.Core;
 using Xunit;
 
@@ -134,7 +135,21 @@ public class MemoryBoundTests
         GC.WaitForPendingFinalizers();
         GC.Collect();
         using var process = Process.GetCurrentProcess();
+
+        // Windows never trims a working set until the OS is under memory pressure, so pages the
+        // GC already freed — the transient batch rows built during the load — stay counted
+        // against the process indefinitely and the delta measures the loader's history, not the
+        // store's footprint. Trimming first makes WorkingSet64 the pages actually needed, which
+        // is the number the assertions are about. Linux RSS drops on decommit and needs no help.
+        if (OperatingSystem.IsWindows())
+            _ = EmptyWorkingSet(process.Handle);
+
         process.Refresh();
         return (process.WorkingSet64, GC.GetTotalMemory(forceFullCollection: true));
     }
+
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    [DllImport("psapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EmptyWorkingSet(IntPtr hProcess);
 }
