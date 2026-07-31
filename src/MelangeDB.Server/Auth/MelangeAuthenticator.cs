@@ -13,8 +13,16 @@ namespace MelangeDB.Server;
 /// One authenticated credential: the identity it resolves to and the token facts sessions need.
 /// <see cref="TokenExpiresAt"/> drives the re-auth grace window; <see cref="IsGuest"/> is the
 /// <c>Auth:GuestRole</c> claim — a guest is an ordinary identity policies may treat differently.
+/// <see cref="IsSqlOwner"/> is the <c>Sql:OwnerRole</c> claim — what authorizes a caller when
+/// ad-hoc SQL runs in owner mode.
 /// </summary>
-internal sealed record AuthResult(Identity Identity, bool IsGuest, DateTimeOffset TokenExpiresAt)
+internal sealed record AuthResult(
+    Identity Identity,
+    bool IsGuest,
+    DateTimeOffset TokenExpiresAt,
+    bool IsSqlOwner = false,
+    bool IsInternal = false,
+    bool FiresLifecycle = true)
 {
     /// <summary>A validation failure, carrying a reason safe to send to the client.</summary>
     public static AuthFailure Failure(string reason) => new(reason);
@@ -35,11 +43,22 @@ internal sealed class MelangeAuthenticator
 
     private readonly IServiceProvider _services;
     private readonly Func<AuthOptions> _options;
+    private readonly Func<SqlOptions> _sqlOptions;
+    private readonly Func<ClusterOptions>? _clusterOptions;
+    private readonly TimeProvider _time;
 
-    public MelangeAuthenticator(IServiceProvider services, Func<AuthOptions> options)
+    public MelangeAuthenticator(
+        IServiceProvider services,
+        Func<AuthOptions> options,
+        Func<SqlOptions>? sqlOptions = null,
+        Func<ClusterOptions>? clusterOptions = null,
+        TimeProvider? time = null)
     {
         _services = services;
         _options = options;
+        _sqlOptions = sqlOptions ?? (static () => new SqlOptions());
+        _clusterOptions = clusterOptions;
+        _time = time ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -65,6 +84,22 @@ internal sealed class MelangeAuthenticator
     {
         if (string.IsNullOrEmpty(token))
             return AuthResult.Failure("No bearer token was presented; every connection presents a valid token.");
+
+        // A hub-minted internal identity assertion, not a JWT: the gateway authenticated the
+        // client against the IdP once and vouches for it with the cluster secret. Only accepted
+        // when this node is clustered and holds the secret.
+        if (InternalIdentityAssertion.IsAssertion(token))
+        {
+            var cluster = _clusterOptions?.Invoke();
+            if (cluster is not { Role: not ClusterRole.None, Secret.Length: > 0 })
+                return AuthResult.Failure("This node accepts no internal identity assertions.");
+            var asserted = InternalIdentityAssertion.Validate(cluster.Secret, token, _time.GetUtcNow(), out var reason);
+            if (asserted is not { } valid)
+                return AuthResult.Failure(reason ?? "The assertion is invalid.");
+            return new AuthResult(
+                valid.Identity, valid.IsGuest, valid.ExpiresAt, valid.IsSqlOwner,
+                IsInternal: true, FiresLifecycle: valid.FiresLifecycle);
+        }
 
         var options = _services.GetRequiredService<IOptionsMonitor<JwtBearerOptions>>().Get(_options().Scheme);
         var parameters = options.TokenValidationParameters.Clone();
@@ -98,17 +133,20 @@ internal sealed class MelangeAuthenticator
         var expires = jwt.ValidTo == default
             ? DateTimeOffset.MaxValue
             : new DateTimeOffset(DateTime.SpecifyKind(jwt.ValidTo, DateTimeKind.Utc));
-        return new AuthResult(Identity.FromIssuerSubject(issuer, subject), IsGuest(result.ClaimsIdentity), expires);
+        return new AuthResult(
+            Identity.FromIssuerSubject(issuer, subject),
+            HasRole(result.ClaimsIdentity, _options().GuestRole),
+            expires,
+            HasRole(result.ClaimsIdentity, _sqlOptions().OwnerRole));
     }
 
-    private bool IsGuest(ClaimsIdentity? claims)
+    private static bool HasRole(ClaimsIdentity? claims, string role)
     {
-        var guestRole = _options().GuestRole;
-        if (string.IsNullOrEmpty(guestRole) || claims is null)
+        if (string.IsNullOrEmpty(role) || claims is null)
             return false;
         foreach (var claim in claims.Claims)
         {
-            if (claim.Value != guestRole)
+            if (claim.Value != role)
                 continue;
             if (claim.Type == claims.RoleClaimType || RoleClaimTypes.Contains(claim.Type, StringComparer.Ordinal))
                 return true;

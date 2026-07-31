@@ -10,6 +10,12 @@ public interface ICommitLog : IDisposable
     ulong HeadLsn { get; }
 
     /// <summary>
+    /// The highest LSN removed by truncation, or 0 for an untruncated log. Records at or below it
+    /// are gone; <see cref="ReadFrom"/> can serve nothing older than <c>BaseLsn + 1</c>.
+    /// </summary>
+    ulong BaseLsn { get; }
+
+    /// <summary>
     /// The identifier of this log incarnation. An LSN is meaningful only within one log, so a
     /// resume cursor names the epoch it counts against; a recreated log mints a fresh epoch, which
     /// is what turns a stale cursor into an explicit failure instead of silent divergence.

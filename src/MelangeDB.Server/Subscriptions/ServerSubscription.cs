@@ -80,6 +80,10 @@ internal sealed class ServerSubscription
     /// <paramref name="context"/> is the caller policies filter for; null (with a null
     /// <paramref name="policies"/>) is the deliberate owner-mode bypass — no policy can make a
     /// private table visible either way, since a private table never compiles.
+    /// <paramref name="allowPrivateRelational"/> is owner-mode ad-hoc SQL's one extra visibility:
+    /// private <em>relational-tier</em> tables compile, because that tier exists for tooling and
+    /// its tables (statistics, history) are private by default. Private hot tables stay
+    /// server-internal in every mode, and no subscription ever passes true here.
     /// </summary>
     public static ServerSubscription Compile(
         IDeltaSink sink,
@@ -88,9 +92,11 @@ internal sealed class ServerSubscription
         SchemaRegistry registry,
         SubscriptionsOptions limits,
         PolicySet? policies = null,
-        PolicyContext? context = null)
+        PolicyContext? context = null,
+        bool allowPrivateRelational = false)
     {
-        if (!registry.TryGetByName(query.Table, out var schema) || !schema.IsPublic)
+        if (!registry.TryGetByName(query.Table, out var schema)
+            || !(schema.IsPublic || (allowPrivateRelational && schema.Tier == StorageTier.Relational)))
         {
             // One message for unknown and private: a subscription cannot name a private table, and
             // the error must not reveal whether the name exists server-side.

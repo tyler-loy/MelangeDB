@@ -49,6 +49,55 @@ Postgres as the hot tier. Cross-tier joins in subscriptions. Sharding the relati
   N records per transaction is fast and still correct given the checkpoint, provided the checkpoint advances
   only with the batch.
 
+## Decisions settled (phase 08 shipped)
+
+- **Ad-hoc SQL reads both tiers, split by shape.** The four **row shapes** run against the **hot
+  store at head** for every queryable table — which includes relational tables, per the decision
+  below — exactly as phases 03/04 built them. **Aggregate shapes** (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`,
+  `GROUP BY`, `DATE_TRUNC` bucketing) run against **Postgres**, are valid **only for
+  relational-tier tables**, and reflect the applier's checkpoint (the documented lag). What admin
+  tooling can do: row queries over anything visible in its mode (current state, no lag), and
+  aggregates over relational tables. What it cannot: aggregates over hot-tier tables, and joins.
+  The "read-only SQL view over the hot store" beyond the four shapes stays future work — the four
+  shapes already are that view for the workload audited.
+- **Aggregates are owner-mode only.** Row policies are in-process DI code; they cannot be pushed
+  into Postgres, and computing an "enforced" aggregate without them would be the silent security
+  hole the two-mode contract exists to prevent. A policy-enforced aggregate is refused loudly
+  (`owner_required`), not computed unenforced and not answered empty.
+- **Owner-mode authorization is a role claim** — `Sql:OwnerRole`, default `melange-owner`, the
+  `Auth:GuestRole` precedent: the IdP is the gate, and an explicit owner-identity list in MelangeDB
+  config would be a second identity system. In `Owner` mode a caller without the claim gets
+  `403 owner_required`; there is no silent downgrade. Owner mode may additionally name **private
+  relational-tier** tables (rows and aggregates) — WorldStat-shaped data is private by default and
+  exists precisely for admin tooling — while private hot tables stay server-internal in every mode.
+- **Migration strategy: additive automatic, destructive manual.** Under `Postgres:AutoMigrate`,
+  missing tables are created and missing columns added (`ADD COLUMN`, NOT NULL kinds backfilled
+  with the kind's zero value) — data is never dropped or nulled. A changed column type — or any
+  other destructive disagreement — is refused loudly (EventId 1604) in **both** settings. With
+  AutoMigrate off (the default), the applier validates and stalls with the exact pending DDL in the
+  log; running it manually recovers without a restart. Postgres columns not in the schema are left
+  alone. This closes the relational half of DESIGN.md §10's migration deferral.
+- **Transactional grouping: batch per `Postgres:ApplyBatchSize` (default 100), checkpoint inside
+  the batch.** One Postgres transaction per batch of log records, the checkpoint row updated in
+  that same transaction — so "applied" and "checkpointed" cannot diverge and resume is gap-free and
+  duplicate-free by construction. Records touching no relational table still advance the
+  checkpoint. The batch size is live-reloadable and floor-clamped to 1.
+- **Relational rows also live in the hot store (option a).** Tier means *additionally Postgres*,
+  not *instead of the hot store* — the three axes (tier, placement, residency) stay orthogonal, as
+  the glossary always claimed. This keeps reducer reads, read-your-writes, uniqueness enforcement,
+  and public-table subscriptions working through the one existing path, with the bound made
+  explicit: relational tables page like any table under phase 07's buffer pool, and may be pinned
+  or paged via the ordinary residency knobs. The rejected option (b) — hot store holds nothing,
+  reducer reads error — would have made `[Unique]` on a relational column unenforceable at commit
+  time, turning every duplicate into a poisoned applier instead of a rejected transaction.
+- **Checkpoint provenance is checked.** The checkpoint row records the log epoch; a mismatch stalls
+  loudly (EventId 1605) rather than applying LSNs against the wrong log. A tier attached after log
+  truncation cannot replay from the start, so it bootstraps from the hot store at one consistent
+  LSN (EventId 1606) and continues from there.
+- **`WaitForApplied(lsn)` shipped minimal and honest** as
+  `PostgresRelationalTier.WaitForAppliedAsync` — it completes when the checkpoint reaches the LSN,
+  and it can wait as long as Postgres is down; callers bring their own timeout.
+
 ## Done when
 
 - A relational table's rows appear in Postgres after commit, with the applier checkpoint advancing.

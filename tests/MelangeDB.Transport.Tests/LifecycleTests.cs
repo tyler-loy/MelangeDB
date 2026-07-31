@@ -81,7 +81,10 @@ public class LifecycleTests
     [Fact]
     public async Task Http_one_shot_calls_sql_and_tickets_fire_no_lifecycle_reducers()
     {
-        await using var host = await TransportTestHost.StartAsync();
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
+        {
+            ["MelangeDb:Sql:AdHocEnabled"] = "true",
+        });
         var events = host.SessionEvents;
         using var http = host.CreateHttp();
 

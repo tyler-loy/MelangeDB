@@ -35,6 +35,66 @@ public sealed class MelangeDbOptions
     public ResidencyOptions Residency { get; set; } = new();
 
     public SnapshotsOptions Snapshots { get; set; } = new();
+
+    public PostgresOptions Postgres { get; set; } = new();
+
+    public DiagnosticsOptions Diagnostics { get; set; } = new();
+
+    public HealthChecksOptions HealthChecks { get; set; } = new();
+
+    public ClusterOptions Cluster { get; set; } = new();
+}
+
+/// <summary>
+/// Options for the relational tier (<c>MelangeDb:Postgres:*</c>). The tier is opt-in: an absent
+/// connection string means no Postgres at all, and a deployment with no relational tables needs
+/// none. The implementation lives in the MelangeDB.Storage.Postgres package; these options bind
+/// here so the whole <c>MelangeDb:</c> section stays one configuration surface.
+/// </summary>
+public sealed class PostgresOptions
+{
+    /// <summary>
+    /// The Npgsql connection string. Absent means no relational tier — the zero-infra single-file
+    /// story stays intact. Set by <c>AddPostgres(...)</c> or bound from configuration.
+    /// </summary>
+    public string? ConnectionString { get; set; }
+
+    /// <summary>The Postgres schema (namespace) relational tables and the applier checkpoint live in.</summary>
+    public string Schema { get; set; } = "melange";
+
+    /// <summary>
+    /// Log records per Postgres transaction. The applier checkpoint advances only with the batch —
+    /// batch and checkpoint commit atomically — so batching trades nothing for its speed.
+    /// </summary>
+    public int ApplyBatchSize { get; set; } = 100;
+
+    /// <summary>
+    /// Whether the applier creates missing tables and adds missing columns itself. Off by default:
+    /// schema changes against a production database should be deliberate. Only additive changes
+    /// are ever automatic — destructive ones are refused loudly in both settings.
+    /// </summary>
+    public bool AutoMigrate { get; set; }
+}
+
+/// <summary>Diagnostics toggles (<c>MelangeDb:Diagnostics:*</c>).</summary>
+public sealed class DiagnosticsOptions
+{
+    /// <summary>
+    /// Re-logs a stalled applier's growing lag periodically while the stall lasts. A silently
+    /// stalled Postgres applier — writes succeeding while the tier falls hours behind — is the
+    /// dangerous failure mode; the first stall always logs regardless of this setting.
+    /// </summary>
+    public bool ReportApplierLag { get; set; } = true;
+}
+
+/// <summary>Health check thresholds (<c>MelangeDb:HealthChecks:*</c>).</summary>
+public sealed class HealthChecksOptions
+{
+    /// <summary>
+    /// How many transactions behind an applier may be before the <c>melange-applier</c> check
+    /// reports unhealthy.
+    /// </summary>
+    public long ApplierLagThreshold { get; set; } = 10_000;
 }
 
 /// <summary>
@@ -323,8 +383,24 @@ public enum AdHocSqlMode
 /// <summary>Ad-hoc SQL options (<c>MelangeDb:Sql:*</c>).</summary>
 public sealed class SqlOptions
 {
+    /// <summary>
+    /// Whether <c>{path}/sql</c> answers at all. Off by default: ad-hoc SQL is a tooling surface,
+    /// and a deployment that never opted in should not be exposing one.
+    /// </summary>
+    public bool AdHocEnabled { get; set; }
+
     /// <summary>See <see cref="AdHocSqlMode"/>. Applies to <c>{path}/sql</c>.</summary>
     public AdHocSqlMode AdHocMode { get; set; } = AdHocSqlMode.PolicyEnforced;
+
+    /// <summary>
+    /// The role claim that authorizes a caller in <see cref="AdHocSqlMode.Owner"/> mode — the
+    /// per-caller half of the two-mode contract, following the <c>Auth:GuestRole</c> precedent:
+    /// the IdP is the gate, and owner capability is a claim it issues, not a list MelangeDB keeps.
+    /// In Owner mode a caller without this role is refused outright — never silently downgraded
+    /// to policy-enforced, because ambiguity here is a security hole. Empty makes Owner mode
+    /// unusable by everyone.
+    /// </summary>
+    public string OwnerRole { get; set; } = "melange-owner";
 }
 
 /// <summary>Options for the websocket and HTTP transport (<c>MelangeDb:Transport:*</c>).</summary>

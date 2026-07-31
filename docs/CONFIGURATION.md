@@ -68,6 +68,19 @@ changed override applies to the running store per table (pinning faults the tabl
 unpinning migrates it to the buffer pool) when the store supports runtime residency control; the
 in-memory store, which does not page, takes the label at restart.
 
+**Shipped as of phase 08** (defaults verified against `PostgresOptions`, `SqlOptions`, `DiagnosticsOptions`,
+and `HealthChecksOptions`): every `Postgres:*` key, `Sql:AdHocEnabled`, `Sql:OwnerRole` (a new key — see below),
+`Diagnostics:ReportApplierLag`, and `HealthChecks:ApplierLagThreshold`. Three notes made when it shipped:
+(1) `Sql:AdHocEnabled` gates the whole `/melange/sql` endpoint — off answers `403 sql_disabled` — and shipped
+at its planned default of `false`, which is a behavior change from phases 04–07, where the endpoint answered
+unconditionally; the register's row was always the contract, the endpoint simply predated it. (2) The
+owner-mode per-caller authorization deferred from phase 04 landed as **a role claim**, `Sql:OwnerRole`,
+following the `Auth:GuestRole` precedent — the IdP is the gate, owner capability is a claim it issues, and in
+`Owner` mode a caller without the claim is refused (`403 owner_required`), never silently downgraded to
+policy-enforced. (3) `Diagnostics:ReportApplierLag` gates only the *periodic re-logging* of a continuing
+stall; the first stall (EventId 1601) and the recovery (1602) always log, because a silent stall is the
+failure mode the phase exists to prevent.
+
 **Shipped as of phase 04** (defaults verified against `AuthOptions`, `PoliciesOptions`, `RateLimitOptions`,
 and `SqlOptions`): every `Auth:*`, `Policies:*`, and `RateLimit:*` key, plus `Sql:AdHocMode` — shipped ahead
 of its phase-08 row because `/melange/sql` already returns rows, so the policy contract could not wait. Three
@@ -78,6 +91,38 @@ disagree with them, the same reasoning as the deliberate absence of TLS knobs; (
 `Policies:DefaultReducerPosture` is `live`, not the `restart` this register planned — it is read per call
 through the options monitor, and a cheaper-than-planned semantic is recorded, not rounded down; (3)
 `Policies:UnpolicedReducerReport` stays `restart` as planned (it acts at startup only).
+
+**Shipped as of phase 09** (defaults verified against `ClusterOptions`): every `Cluster:*` key in the table
+below. The register's planned rows were reshaped when they met the implementation, and the corrections are the
+design record: (1) `Cluster:Enabled` was **removed** — `Cluster:Role = None` (the default) *is* the off
+switch, and two switches that can disagree are one too many; the planned `Standalone` value is spelled `None`.
+(2) `Cluster:Shards` (a seed assignment list) was **removed**: shards are created at runtime
+(`MelangeClusterCoordinator.EnsureShard`, or implicitly by the gateway routing to a new instance) and
+ownership lives only in the membership store — a config-file copy of it would be a second source of truth.
+(3) `Cluster:MembershipStore` is **not a configuration string**: the store is a DI registration —
+`AddMelangeCluster()` defaults to in-memory, `AddPostgresClusterMembership()` opts into the hub's Postgres —
+because a store is a component with a connection, not a name. (4) `Cluster:ShardSpanCheck` shipped as
+`DebugOnly | Always | Off` rather than the planned four values: `Warn` was dropped (a warning about a
+distributed commit on the hot path is a page nobody reads until it is an outage), and `ThrowInDevelopment`
+is spelled `DebugOnly`, probing the entry assembly's build configuration. (5) The planned
+`Cluster:FencingTokenTimeoutMs` is spelled `Cluster:FailureTimeoutMs`, because one number serves both sides
+by design: the hub suspects a node dead after this much silence, and the node self-fences its writes on the
+same clock — which is exactly what stops a wrongly-suspected-dead node from writing players it no longer
+owns. It is `restart`, not the planned `live`: the two sides must agree on the value, and nodes learn it at
+registration.
+
+**Shipped as of phase 10** (defaults verified against `ClusterOptions`): `Cluster:BorderBandChunks`,
+`Cluster:HandoffMarginChunks`, and `Cluster:HandoffMinIntervalMs`. The register's planned rows were reshaped
+when they met the implementation: (1) the planned `Cluster:HandoffHysteresisMeters` is spelled in **chunks**,
+not meters — MelangeDB never learns the world's metric scale (chunk decoding is the developer's
+`SpatialGeometry`), so a meters knob would have been a unit the library cannot interpret — and it split into
+the margin (`HandoffMarginChunks`, the crossing depth that triggers) and the rate limit
+(`HandoffMinIntervalMs`, the floor between an entity's transfers), because hysteresis needs both a distance
+and a time to bound pacing. (2) `Cluster:BorderBandChunks` shipped at its planned default of 2 with the
+derivation documented rather than guessed (margin + one handoff window of travel; docs/plan-phase-10.md
+shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> HandoffMarginChunks`, `≤` the
+block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
+next border re-subscribe, when the owner sends a full band reset.
 
 ## Conventions
 
@@ -142,12 +187,13 @@ to fix it without a code change and a redeploy.
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Postgres:ConnectionString` | string | — | restart | 08 | Absent means no relational tier. A deployment with no relational tables needs no Postgres at all. |
-| `Postgres:Schema` | string | `melange` | restart | 08 | |
-| `Postgres:ApplyBatchSize` | int | `100` | live | 08 | Log records per Postgres transaction. The applier checkpoint advances only with the batch, so batching stays correct. |
-| `Postgres:AutoMigrate` | bool | `false` | restart | 08 | Off by default: schema changes against a production database should be deliberate. |
-| `Sql:AdHocEnabled` | bool | `false` | live | 08 | |
-| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Per-caller owner authorization lands with 08's full contract. |
+| `Postgres:ConnectionString` | string | — | restart | 08 | Absent means no relational tier. A deployment with no relational tables needs no Postgres at all; one that declares relational tables without configuring this runs anyway (rows stay in the hot store) and is told so loudly at startup (EventId 1607). |
+| `Postgres:Schema` | string | `melange` | restart | 08 | The Postgres schema (namespace) relational tables and the applier checkpoint live in. The schema and the checkpoint table are always created — they are the tier's own plumbing; `AutoMigrate` governs user tables only. |
+| `Postgres:ApplyBatchSize` | int | `100` | live | 08 | Log records per Postgres transaction. The applier checkpoint advances only with the batch — batch and checkpoint commit atomically — so batching stays correct. |
+| `Postgres:AutoMigrate` | bool | `false` | restart | 08 | Off by default: schema changes against a production database should be deliberate. Governs only **additive** DDL (create table, add column); destructive disagreement is refused loudly (EventId 1604) in both settings. Off, the applier validates and stalls with the exact pending DDL in the log; running it manually recovers without a restart. |
+| `Sql:AdHocEnabled` | bool | `false` | live | 08 | Gates the whole `/melange/sql` endpoint; off answers `403 sql_disabled`. Ad-hoc SQL is a tooling surface, and a deployment that never opted in should not be exposing one. |
+| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Since 08, `Owner` additionally requires the caller's `Sql:OwnerRole` claim, may name private *relational-tier* tables, and is the only mode that runs aggregates. |
+| `Sql:OwnerRole` | string | `melange-owner` | live | 08 | The role claim that authorizes a caller when `AdHocMode` is `Owner` — the per-caller half of the two-mode contract, per the `Auth:GuestRole` precedent (the IdP is the gate). A caller without it is refused (`403 owner_required`), never silently downgraded to policy-enforced. Empty makes owner mode unusable by everyone. |
 
 ## Transport and subscriptions
 
@@ -215,23 +261,33 @@ to fix it without a code change and a redeploy.
 
 Ignored entirely by single-node deployments.
 
+Everything here is restart-only by design: a node's role, name, and addresses are its identity in the
+cluster, and changing them live would be a different node. See the phase 09 status note for the planned keys
+that were reshaped or removed when this shipped.
+
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Cluster:Enabled` | bool | `false` | restart | 09 | |
-| `Cluster:Role` | enum | `Standalone` | restart | 09 | `Standalone` \| `Hub` \| `Shard`. |
-| `Cluster:HubAddress` | string | — | restart | 09 | |
-| `Cluster:Shards` | string | — | restart | 09 | **Seed** assignment only — ownership lives in the membership store, which failover updates when a dead node's shards are reassigned. "Static" means no load-based rebalancing, not immutable. |
-| `Cluster:MembershipStore` | string | — | restart | 09 | Ownership registry. Likely the hub's Postgres rather than a new consensus dependency. |
-| `Cluster:ShardSpanCheck` | enum | `ThrowInDevelopment` | live | 09 | `Off` \| `Warn` \| `ThrowInDevelopment` \| `Throw`. Catches the one contract MelangeDB cannot verify statically: rows mutated in one transaction must resolve to one shard. |
-| `Cluster:FencingTokenTimeoutMs` | int | `5000` | live | 09 | Stops a wrongly-suspected-dead node from continuing to write a player it no longer owns. |
-| `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Deeper is smoother and costs bandwidth plus memory on every node. Default should be derived from movement speed and tick rate, not guessed. |
-| `Cluster:HandoffHysteresisMeters` | float | `16` | live | 10 | Stops a player pacing across a boundary from triggering a handoff per step. |
+| `Cluster:Role` | enum | `None` | restart | 09 | `None` \| `Hub` \| `Shard`. `None` (the default) is the whole off switch: a single-node deployment ignores placement entirely and behaves exactly as in M1. |
+| `Cluster:NodeName` | string | `""` | restart | 09 | This node's stable name — the membership store's key for assignments and fencing. Required for shard nodes; the hub is `hub`. |
+| `Cluster:Secret` | string | `""` | restart | 09 | The cluster secret: HMAC key behind node-link mutual authentication and hub-minted identity assertions. Required whenever `Role != None`; treat like a database password — see docs/SECURITY.md for the trust boundary it draws. |
+| `Cluster:NodeListenPort` | int | `0` | restart | 09 | Hub only: the TCP port the node-link listener binds. `0` binds an ephemeral port (tests); production names one. |
+| `Cluster:NodeListenAddress` | string | `127.0.0.1` | restart | 09 | Hub only: the interface the node-link listener binds. The default admits only same-machine nodes — safe by construction; a multi-machine cluster sets `0.0.0.0` or a specific internal interface. Every connection still proves the cluster secret, but widening the bind should be paired with network-level controls — see docs/SECURITY.md. |
+| `Cluster:HubAddress` | string | `""` | restart | 09 | Shard only: the hub's node-link address as `host:port`. |
+| `Cluster:PublicAddress` | string | `""` | restart | 09 | Shard only: the base HTTP address where this node's per-shard websocket endpoints are reachable **by the gateway**. Internal infrastructure — never handed to clients. |
+| `Cluster:AssertionTtlSeconds` | int | `300` | restart | 09 | Cap on an internal identity assertion's lifetime (an assertion never outlives the client token it vouches for). Bounds how long a captured assertion stays redeemable. |
+| `Cluster:HeartbeatIntervalMs` | int | `1000` | restart | 09 | How often a shard node heartbeats the hub. Heartbeats renew the node's lease and piggyback assignment changes. |
+| `Cluster:FailureTimeoutMs` | int | `10000` | restart | 09 | One number, both sides: silence after which the hub suspects a node dead and reassigns its shards (bumping fencing tokens), and after which the node itself considers its lease expired and fences its own writes. The self-fencing half is what stops a wrongly-suspected-dead node from writing players it no longer owns. |
+| `Cluster:ShardSpanCheck` | enum | `DebugOnly` | live | 09 | `DebugOnly` \| `Always` \| `Off`. Catches the one contract MelangeDB cannot verify statically: rows mutated in one transaction must resolve to one shard. `DebugOnly` probes whether the entry assembly is a Debug build; a violation throws `ShardSpanException` and aborts with zero trace. Also armed on single-node deployments that register an `IShardStrategy` and call `AddMelangeCluster()`. |
+| `Cluster:ShardDataPath` | string | `./data/shards` | restart | 09 | Shard only: the root under which per-shard engines keep their commit logs and hot stores (`{ShardDataPath}/shard-{key}`). Must be storage every shard node can reach — reassignment means the new owner opens the shard's directory and recovers it from the shard's own log (phase 09 assumes shared or re-attachable volumes; log shipping is a later phase). |
+| `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Spatial strategy only: how deep each shard's read-only border band reaches into its neighbours, in chunks. Deeper is smoother and costs bandwidth plus memory on every node. The default is derived (docs/CLUSTERING.md shows the derivation): margin + the distance an entity covers during one handoff window — for the reference workload `1 + ceil(8 m/s x ~1 s / 64 m) = 2`. Must be ≥ 1 and > `HandoffMarginChunks` and ≤ the block dimension — validated loudly at strategy construction; live reads clamp instead of crashing a running node. `careful` because deepening it live only fully materializes on the next border re-subscribe (the owner then sends a full band reset). |
+| `Cluster:HandoffMarginChunks` | int | `1` | live | 10 | Spatial strategy only: the hysteresis margin. An automatic handoff triggers only once an entity is *strictly more* than this many chunks past a block boundary, so after a transfer the entity must walk back through the whole margin before the reverse transfer can fire — pacing on the line triggers nothing. `0` disables the margin (creatures transfer on first crossing regardless of this setting). Must be ≥ 0 and < `BorderBandChunks`. |
+| `Cluster:HandoffMinIntervalMs` | int | `2000` | live | 10 | Rate limit on automatic (boundary-triggered) handoffs: the hub will not start a new transfer for the same entity within this window. The second half of hysteresis — even an entity oscillating deeper than the margin triggers a bounded number of transfers per unit time. Must be ≥ 0. |
 
 ## Diagnostics
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Diagnostics:ReportApplierLag` | bool | `true` | live | 08 | A silently stalled Postgres applier — writes succeeding while the tier falls hours behind — is the dangerous failure mode. Not optional in practice. |
+| `Diagnostics:ReportApplierLag` | bool | `true` | live | 08 | A silently stalled Postgres applier — writes succeeding while the tier falls hours behind — is the dangerous failure mode. Not optional in practice. Gates only the periodic (30s) re-logging of a continuing stall's growing lag; the stall itself (EventId 1601) and the recovery (1602) always log. |
 | `Diagnostics:EmitGeneratedFiles` | bool | `false` | restart | 02 | Writes source-generator output to disk. Incremental generators fail obscurely; this pays for itself. **Realized as the standard MSBuild property `<EmitCompilerGeneratedFiles>` in the consuming project file** — it acts at compile time, so it cannot be an `appsettings.json` key; the tests and sample set it, and output lands under `obj/.../generated`. |
 
 ## Telemetry
@@ -247,4 +303,4 @@ where it goes. See [OBSERVABILITY.md](OBSERVABILITY.md).
 | `Telemetry:IncludeReducerArguments` | bool | `false` | live | 01 | Off by default: arguments can contain anything, including secrets, and the commit log already records them. |
 | `Telemetry:DeltaSpanSampleRatio` | double | `0.01` | live | 03 | `melange.subscription.delta` is the highest-frequency operation in the system; tracing every one at full rate would cost more than the work. |
 | `Telemetry:SlowReducerMs` | int | `50` | live | 02 | Reducers over this threshold get a span event and a log entry. |
-| `HealthChecks:ApplierLagThreshold` | long | `10000` | live | 08 | Transactions behind before the `melange-applier` check reports unhealthy. |
+| `HealthChecks:ApplierLagThreshold` | long | `10000` | live | 08 | Transactions behind before the `melange-applier` check reports unhealthy. Applies to every applier — the hot store's included — though a decoupled applier (Postgres) is the one that realistically lags. |

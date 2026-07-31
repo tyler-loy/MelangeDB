@@ -71,6 +71,12 @@ public static class MelangeErrorCodes
     public const string ServerOnlyColumn = "server_only_column";
     public const string TokenExpired = "token_expired";
     public const string IdentityChanged = "identity_changed";
+    public const string SqlDisabled = "sql_disabled";
+    public const string OwnerRequired = "owner_required";
+    public const string InvalidAggregate = "invalid_aggregate";
+    public const string NotRelationalTier = "not_relational";
+    public const string NoRelationalTier = "no_relational_tier";
+    public const string RelationalUnavailable = "relational_unavailable";
 }
 
 /// <summary>One frame on the wire. Every frame carries its channel tag.</summary>
