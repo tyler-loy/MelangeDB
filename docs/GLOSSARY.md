@@ -94,6 +94,10 @@ it may lag independently and resume where it stopped.
 connection; a clustered client (phase 09) holds several — hub plus shard. The resume cursor (log epoch + acked
 LSN) is per attachment, never per subscription and never global.
 
+**Approach** — The boundary monitor's early signal: an anchored entity entered the border band toward a
+neighbouring shard. The gateway pre-opens a session to the (possibly just-created) destination on it, so the
+eventual swap is instant. Not a commitment — most approaches never become crossings.
+
 **AutoInc** — A column whose value is assigned from a durable per-table sequence, allocated into the write set
 *before* the log append so replay never reassigns different ids. The contract is **unique, not dense** — gaps
 are normal, which is what lets each shard allocate from an originator-prefixed range with no coordination.

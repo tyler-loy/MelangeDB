@@ -57,17 +57,95 @@ distributed transactions beyond the handoff saga.
 
 ## Decisions to settle
 
-- **Border band depth.** Deeper is smoother and costs bandwidth and memory on every node. Should be tunable,
-  with a documented default derived from movement speed and tick rate rather than guessed.
-- **Who decides a handoff — gateway, origin node, or client position?** The client cannot be trusted;
-  origin-decides is authoritative but adds latency to the decision.
-- **What happens to a player mid-handoff who calls a reducer?** Queue on the destination, reject and retry, or
-  serve from origin until release. Queueing is invisible to the player and hardest to get right.
-- **Do border-band rows count against residency?** They inflate every node's footprint by its neighbours'
-  edges; with eight neighbours that is not negligible.
-- **Creature AI across boundaries.** A creature pathing toward a player in the next shard cannot read that
-  player's authoritative row. Either creatures don't chase across boundaries (cheap, visibly wrong) or
-  ownership transfers on aggro (correct, more traffic).
+Each settled when the phase shipped; the subsections are the record.
+
+### Settled: border band depth is tunable, defaulting to a derived 2 chunks
+
+`Cluster:BorderBandChunks`, default 2 — derived, not guessed. The band must cover two things: the hysteresis
+margin (an entity is still origin-owned up to `HandoffMarginChunks` past the line, and its writes must stay
+legal), plus the distance an entity travels during one handoff window (crossing detection is one commit
+observation; the saga plus the gateway swap is comfortably under a second in-process and budgeted at ~1 s
+over a network). For the reference workload — 64 m chunks, ~8 m/s sprint —
+`margin (1) + ceil(8 m/s x 1 s / 64 m) = 1 + 1 = 2`. The band is also the ownership slack at the seam, so
+the strategy validates `margin < band ≤ block dimension` loudly at construction; the acceptance walk, which
+steps far faster than 8 m/s, runs at band 3 — the derivation applied to its own speed, which is exactly how
+a developer should size it.
+
+### Settled: the origin node decides a handoff
+
+The origin's committed rows are the only trusted position: the client's claim never is, and the gateway
+cannot see positions at all. A boundary monitor per owned shard assesses every committed Partitioned write
+of an anchored entity (`IMigrationAnchors` — the application names its migratable rows), notifies approaches
+(the gateway pre-opens the destination session on them, hiding the decision latency the plan worried about),
+and requests a transfer once the entity crosses past the margin. The hub still owns admission — in-flight
+dedupe, the per-entity rate limit, and the stale-origin check (a request from a shard that is not the
+entity's recorded owner is dropped, EventId 1722) — so a confused origin can trigger nothing worse than a
+dropped message. A sweep re-signals standing strays, so a rate-limited trigger with no further movement is
+never stranded.
+
+### Settled: a mid-handoff reducer call is queued at the gateway, invisibly
+
+Queue — the invisible option, taken deliberately with its costs stated. From saga start the gateway holds
+the client's shard-routed calls; at the destination-authoritative moment it re-issues the client's shard
+subscriptions on the destination (re-scoping atomically replaces the client's row cache, border band
+included) and flushes the held calls in order — to the destination on success, back to the origin on a
+definitive abort. The trades: held calls wait out the transfer window (bounded latency, no visible error); a
+wedged transfer caps the queue at 256 with a retryable error (EventId 1720); and calls held when the
+connection dies die with it, exactly as in-flight calls always have. Reject-and-retry was rejected because
+it makes every boundary a visible stutter; serve-from-origin was rejected because the origin's rows freeze
+mid-saga, so "serving" would mean failing.
+
+### Settled: border-band rows count against residency
+
+Yes. They are ordinary rows in the observer engine's store — paged, budgeted, and reported like everything
+else — because a separate unaccounted cache is a second storage path with a second failure mode, and an
+"honest footprint" that excludes the band would be neither. The inflation is bounded by geometry:
+perimeter x band depth, against an area — for the reference geometry (39x39-chunk blocks, band 2) about
+20% of a shard's chunks, and it shrinks as blocks grow. Size `HotStore:MemoryBudgetBytes` for owned area
+plus band; the residency report shows what the band actually costs.
+
+### Settled: creature AI transfers ownership on crossing
+
+Ownership transfer — correctness over cheapness — with the reads made cheap first: a creature *chases* by
+reading its target's border copy (pathing toward a player in the next shard needs only the band, no
+ownership machinery), and *transfers* only when it physically crosses, as an immediate anchor: no hysteresis
+margin, because its AI ticks only rows resolving to its own block, and a creature waiting out a margin would
+stand unticked at the line. The don't-chase option was rejected as visibly wrong at every boundary; the
+traffic cost of transfer-on-crossing is one saga per actual crossing, which the chase test measures as
+exactly one. The convention the AI must keep — tick only rows resolving to your own block — is enforced
+loudly by the read-only border guard.
+
+## Shipped notes
+
+- **Interest replication is a border stream per (owned shard, interesting neighbour) pair** — owner node →
+  hub → observer node, at-least-once, observer's durable cursor as the truth, full-band reset (1715) for any
+  cursor the owner's log can no longer serve. Copies land as *borrowed rows*: readable and subscribable,
+  refused at every commit (`BorderReadOnlyException`, always on). The borrowed registry survives
+  snapshot+truncate+restart via a sidecar beside the shard's log (snapshot-plus-tail, refreshed at
+  truncation time; content-scan fallback, 1716).
+- **Ownership rules were the hard part**, and the walk test flushed out the phase's worst bug: a stale
+  trigger starting a second saga from a shard that no longer owned the entity, re-importing pre-transfer
+  bytes over the destination's newer state. The fix is layered, each layer independently load-bearing: the
+  hub's entity-owner map drops stale-origin requests (1722); a freeze aborts on an empty transfer set and
+  refuses borrowed rows; the monitor never signals frozen or borrowed rows; publishers never publish rows
+  they merely borrow; and a released origin's zombie row is *adopted* as a marked copy by the new owner's
+  publication instead of silently skipped into sent-set desync.
+- **Shard-side interest-scoped event delivery stayed out.** Cross-shard interaction landed as
+  co-locate / ownership-transfer / hub-driven saga (`ExecuteOnShardAsync`), and none of the three needs
+  shard-side handler execution — the saga's remote steps are ordinary local transactions driven from the
+  hub, where handlers already run. It remains future work if an application needs handlers with shard-local
+  reads.
+- **The hotspot ceiling is measured and published** in docs/CLUSTERING.md at the strategy-choice point:
+  ~1,100 commits/s per crowded shard under default per-commit fsync (~55 players at a 20 Hz budget),
+  ~52,000 commits/s under interval fsync (~2,600 players at 20 Hz), Windows/NVMe dev machine, methodology in
+  `HotspotMeasurementTests`. No cluster size changes either number; that is the trade spatial partitioning
+  is.
+- **One known protocol soft spot, documented rather than hidden:** during the swap, a delta committed on the
+  destination while its initial set is still streaming can be dropped by the client if its LSN happens to
+  fall at or below the *previous* attachment's anchor — the anchor comparison is not epoch-qualified across
+  logs. The window is the initial-set stream of a young, quiet log; a dropped delta self-heals on the row's
+  next change. The clean fix is an epoch-qualified anchor in the subscription protocol — a protocol change
+  deferred with this note as its record.
 
 ## Done when
 

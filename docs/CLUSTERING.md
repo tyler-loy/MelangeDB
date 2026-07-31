@@ -364,7 +364,21 @@ bigger term and needs no coordination layer at all.
   it — another reason it shipped first.
 - **The hotspot ceiling is strategy-dependent, and worth telling users plainly.** Spatial partitioning
   cannot split a single crowded location; instancing can. A developer choosing a strategy is choosing
-  which failure mode they get, and that should be documented at the point of choice.
+  which failure mode they get. **Measured in phase 10** (in-process, one crowded shard on a real shard node
+  — engine, guards, and durable log in the path; 100 players in one chunk, movement reducers issued
+  round-robin, sustained commits/second over a 2 s window; Windows 11 dev machine with NVMe, Release build;
+  the methodology and the live measurement are `HotspotMeasurementTests`):
+  - Under the default `CommitLog:FsyncPolicy = OnCommit`, one shard sustains **~1,100 commits/s** — the
+    disk's fsync rate is the ceiling. That is ~55 players in one square at a 20 Hz per-player update budget,
+    ~110 at 10 Hz.
+  - Under `FsyncPolicy = Interval` (50 ms), the same shard sustains **~52,000 commits/s** — the serialized
+    transaction loop's own ceiling. ~2,600 players at 20 Hz, ~5,200 at 10 Hz.
+
+  Run the measurement on your hardware; the shape holds even where the numbers move. The point of publishing
+  it: 200 players in one town square fits comfortably under interval fsync and does not fit under per-commit
+  fsync — and *no cluster size changes either number*, because a crowded location is one shard on one node
+  by construction. Choosing spatial partitioning is choosing this ceiling; instancing trades it for the
+  inability to have one shared world.
 - ~~**Cluster membership.**~~ **Settled in phase 09: Postgres-backed, not Raft.** The ownership registry —
   nodes, per-shard owner, fencing token, and originator id — lives in the hub's own Postgres
   (`AddPostgresClusterMembership()`; in-memory for tests), the hub is its sole writer, failure detection is

@@ -111,6 +111,19 @@ same clock — which is exactly what stops a wrongly-suspected-dead node from wr
 owns. It is `restart`, not the planned `live`: the two sides must agree on the value, and nodes learn it at
 registration.
 
+**Shipped as of phase 10** (defaults verified against `ClusterOptions`): `Cluster:BorderBandChunks`,
+`Cluster:HandoffMarginChunks`, and `Cluster:HandoffMinIntervalMs`. The register's planned rows were reshaped
+when they met the implementation: (1) the planned `Cluster:HandoffHysteresisMeters` is spelled in **chunks**,
+not meters — MelangeDB never learns the world's metric scale (chunk decoding is the developer's
+`SpatialGeometry`), so a meters knob would have been a unit the library cannot interpret — and it split into
+the margin (`HandoffMarginChunks`, the crossing depth that triggers) and the rate limit
+(`HandoffMinIntervalMs`, the floor between an entity's transfers), because hysteresis needs both a distance
+and a time to bound pacing. (2) `Cluster:BorderBandChunks` shipped at its planned default of 2 with the
+derivation documented rather than guessed (margin + one handoff window of travel; docs/plan-phase-10.md
+shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> HandoffMarginChunks`, `≤` the
+block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
+next border re-subscribe, when the owner sends a full band reset.
+
 ## Conventions
 
 - **Everything lives under the `MelangeDb:` configuration section**, so a host can bind it from
