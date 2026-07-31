@@ -133,12 +133,29 @@ internal sealed class SubscriptionEngine
     public void Fanout(CommitRecord record)
     {
         var perSink = default(Dictionary<IDeltaSink, Dictionary<ServerSubscription, List<WireRowOp>>>);
+
+        // A record may carry several ops for one key (a border batch shipping a hot row's last
+        // few ticks; reducer write sets coalesce and never do). The store's pre-image is
+        // pre-*record*, so each op after the first must see the one before it as its old row, or
+        // every observer holding the row is sent duplicate inserts.
+        var withinRecord = record.WriteSet.Count > 1
+            ? new Dictionary<(TableId, RowKey), (bool Exists, ReadOnlyMemory<byte> Row)>()
+            : null;
         foreach (var op in record.WriteSet)
         {
             if (!_byTable.TryGetValue(op.Table, out var subscriptions) || subscriptions.Count == 0)
+            {
+                withinRecord?[(op.Table, op.Key)] = (op.Kind != RowOpKind.Delete, op.Row);
                 continue;
+            }
 
-            var hasOld = _engine.HotStore.TryGetRow(op.Table, op.Key, out var oldRow);
+            bool hasOld;
+            ReadOnlyMemory<byte> oldRow;
+            if (withinRecord is not null && withinRecord.TryGetValue((op.Table, op.Key), out var effect))
+                (hasOld, oldRow) = effect;
+            else
+                hasOld = _engine.HotStore.TryGetRow(op.Table, op.Key, out oldRow);
+            withinRecord?[(op.Table, op.Key)] = (op.Kind != RowOpKind.Delete, op.Row);
             _telemetry?.SampleDeltaSpan(subscriptions[0].Schema.Name, subscriptions.Count);
             foreach (var subscription in subscriptions)
             {
