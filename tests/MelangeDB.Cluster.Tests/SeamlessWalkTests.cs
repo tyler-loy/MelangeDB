@@ -133,7 +133,7 @@ public class SeamlessWalkTests
         var settled = System.Diagnostics.Stopwatch.StartNew();
         while (cluster.HubEngine.CommittedView.Find<PlayerShardMap>(player)?.Shard != BlockC)
         {
-            Assert.True(settled.Elapsed < TimeSpan.FromSeconds(20), "ownership must follow the walk to the far shard");
+            Assert.True(settled.Elapsed < TestTime.Dilated(TimeSpan.FromSeconds(20)), "ownership must follow the walk to the far shard");
             try
             {
                 await client.CallReducerAsync("Move", [Chunks.Id(10, 2)], TestContext.Current.CancellationToken);
@@ -195,7 +195,7 @@ public class SeamlessWalkTests
         {
             await client.CallReducerAsync("Move", [Chunks.Id(4, 2)], TestContext.Current.CancellationToken);
             await client.CallReducerAsync("Move", [Chunks.Id(5, 2)], TestContext.Current.CancellationToken);
-            await reachedImport.Task.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+            await reachedImport.Task.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(15)), TestContext.Current.CancellationToken);
 
             // Mid-freeze call: no error, no result yet — held at the gateway.
             var held = client.CallReducerAsync("Move", [Chunks.Id(6, 2)], TestContext.Current.CancellationToken);
@@ -203,7 +203,7 @@ public class SeamlessWalkTests
             Assert.False(held.IsCompleted, "the mid-handoff call must be held, not rejected");
 
             gate.TrySetResult();
-            await held.WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+            await held.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(20)), TestContext.Current.CancellationToken);
         }
         finally
         {
@@ -271,7 +271,7 @@ public class SeamlessWalkTests
         }
         Assert.True(client.IsConnected);
         await client.CallReducerAsync("Move", [Chunks.Id(2, 2)], TestContext.Current.CancellationToken)
-            .WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+            .WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(20)), TestContext.Current.CancellationToken);
         Assert.Equal(Chunks.Id(2, 2), origin.Engine.CommittedView.Find<PlayerPos>(player)!.Value.ChunkId);
     }
 
@@ -308,7 +308,7 @@ public class SeamlessWalkTests
         // Playable on the destination immediately, through the same connection.
         Assert.True(client.IsConnected);
         await client.CallReducerAsync("Move", [Chunks.Id(7, 2)], TestContext.Current.CancellationToken)
-            .WaitAsync(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken);
+            .WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(20)), TestContext.Current.CancellationToken);
         Assert.Equal(Chunks.Id(7, 2), destination.Engine.CommittedView.Find<PlayerPos>(player)!.Value.ChunkId);
         Assert.Equal(66, destination.Engine.CommittedView.Find<Pack>(player)!.Value.Gold);
 

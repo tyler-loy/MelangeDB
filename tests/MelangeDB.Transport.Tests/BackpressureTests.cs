@@ -19,6 +19,13 @@ public class BackpressureTests
         ["MelangeDb:Subscriptions:BackpressurePolicy"] = policy,
         ["MelangeDb:Subscriptions:MaxBufferedBytes"] = "65536",
         ["MelangeDb:Validation:MaxCollectionLength"] = "65536",
+        // The raw client deliberately stops reading during the flood, and it never pongs, so the
+        // server's liveness clock runs from the subscribe frame on. On hardware slow enough to
+        // stretch the flood past HeartbeatTimeoutMs, the heartbeat would abort the socket and
+        // this suite would measure liveness, not backpressure — the DropAndResync and Buffer
+        // policies keep the connection, and a liveness kill also false-passes Disconnect. The
+        // default timeout dilates with MELANGE_TEST_TIME_SCALE; at scale 1 nothing changes.
+        ["MelangeDb:Transport:HeartbeatTimeoutMs"] = (45_000 * TestTime.Scale).ToString(),
     };
 
     [Fact]

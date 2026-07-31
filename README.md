@@ -52,6 +52,8 @@ app.Run();
   it deliberately doesn't.
 - **[docs/VIBE-SHAFT-COVERAGE.md](docs/VIBE-SHAFT-COVERAGE.md)** — the design audited against a live
   82-table SpacetimeDB game, as a reality check on scope.
+- **[docs/RELEASING.md](docs/RELEASING.md)** — how the packages are versioned, where they publish, and
+  how a consumer authenticates to restore them.
 
 ## Layout
 

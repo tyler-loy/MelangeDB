@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Shared runners are a handful of slow vCPUs: integration-test deadlines get 4x the wall
+      # clock (see the TestTime helpers in the test projects). Assertions are unchanged — the
+      # awaited conditions still have to come true, they are just allowed to take longer here.
+      MELANGE_TEST_TIME_SCALE: "4"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore MelangeDB.slnx
+
+      - name: Build (Release, warnings as errors)
+        run: dotnet build MelangeDB.slnx -c Release --no-restore
+
+      # shell: bash on the test steps is load-bearing: it makes Actions run them with
+      # `bash -eo pipefail`, so a failing `dotnet test` propagates through the tee pipe.
+      # The default `run:` shell is `bash -e` WITHOUT pipefail, which would report tee's
+      # exit code — always green.
+      - name: Test (Release)
+        shell: bash
+        run: |
+          dotnet test MelangeDB.slnx -c Release --no-build 2>&1 | tee test-release.log
+          # Zero-skip enforcement: the Postgres suite self-skips when Docker is missing, and a
+          # silently skipped suite must fail loudly here. Matches any nonzero "Skipped:" count
+          # in the per-project result summaries.
+          if grep -E 'Skipped:\s*[1-9]' test-release.log; then
+            echo '::error::Skipped tests detected in the Release run; CI requires zero skips.'
+            exit 1
+          fi
+
+      - name: Test (Debug)
+        shell: bash
+        run: |
+          dotnet test MelangeDB.slnx -c Debug 2>&1 | tee test-debug.log
+          if grep -E 'Skipped:\s*[1-9]' test-debug.log; then
+            echo '::error::Skipped tests detected in the Debug run; CI requires zero skips.'
+            exit 1
+          fi
+
+  # Publishes only on push events — a -ci.N prerelease from main, a stable from a v* tag —
+  # and only after the test job above is green. Pull requests never publish.
+  publish:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      FEED: https://nuget.pkg.github.com/tyler-loy/index.json
+      PACKABLE: >-
+        Abstractions Core Protocol Client Server CodeGen
+        Storage.Faster Storage.Postgres Cluster OpenTelemetry
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify tag matches VersionPrefix (stable releases)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          prefix=$(sed -n 's/.*<VersionPrefix>\(.*\)<\/VersionPrefix>.*/\1/p' Directory.Build.props)
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$tag" != "$prefix" ]; then
+            echo "::error::Tag v$tag does not match VersionPrefix $prefix in Directory.Build.props."
+            exit 1
+          fi
+
+      - name: Compute prerelease suffix (main builds)
+        if: github.ref == 'refs/heads/main'
+        run: echo "VERSION_SUFFIX=ci.${{ github.run_number }}+${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Pack
+        run: |
+          for name in $PACKABLE; do
+            dotnet pack "src/MelangeDB.$name/MelangeDB.$name.csproj" -c Release -o packages \
+              ${VERSION_SUFFIX:+--version-suffix "$VERSION_SUFFIX"}
+          done
+
+      - name: Push to GitHub Packages
+        run: |
+          dotnet nuget push 'packages/*.nupkg' \
+            --source "$FEED" \
+            --api-key '${{ secrets.GITHUB_TOKEN }}' \
+            --skip-duplicate

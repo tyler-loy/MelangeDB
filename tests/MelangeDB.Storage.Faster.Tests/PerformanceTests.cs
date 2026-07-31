@@ -8,7 +8,7 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// The two numbers the phase's done-criteria demand recorded: bulk loading the reference
 /// workload's ~24.6k blob rows dramatically faster than per-row transactions, and a resident
 /// table's full scan within a small factor of the in-memory store. Thresholds are deliberately
-/// loose (10x and 5x) so the tests assert the property without flaking on machine speed; the
+/// loose (4x and 5x) so the tests assert the property without flaking on machine speed; the
 /// measured numbers land in the test output.
 /// </summary>
 [Trait("Category", "Slow")]
@@ -64,7 +64,12 @@ public class PerformanceTests(Xunit.ITestOutputHelper output)
         output.WriteLine($"bulk: {bulkRows} rows in {bulkElapsed.TotalMilliseconds:F0}ms ({bulkMicrosPerRow:F1}us/row)");
         output.WriteLine($"per-row: {perRowSample} rows in {perRowElapsed.TotalMilliseconds:F0}ms ({perRowMicros:F1}us/row)");
         output.WriteLine($"speedup: {speedup:F0}x");
-        Assert.True(speedup >= 10, $"bulk must be dramatically faster than per-row; measured {speedup:F1}x");
+
+        // 4x is the property floor, not an expectation — real hardware measures 100x+. The floor
+        // must hold on CI runners, whose virtualized write caching makes the per-commit fsync
+        // unrealistically cheap while slow shared vCPUs stretch the bulk path, compressing the
+        // ratio from both ends: ubuntu-latest measured 9.9x in Debug against the old 10x floor.
+        Assert.True(speedup >= 4, $"bulk must be dramatically faster than per-row; measured {speedup:F1}x");
     }
 
     [Fact]

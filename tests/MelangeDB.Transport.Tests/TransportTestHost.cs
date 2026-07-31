@@ -129,10 +129,12 @@ internal sealed class TransportTestHost : IAsyncDisposable
     /// <summary>Polls until <paramref name="condition"/> holds, failing loudly on timeout.</summary>
     public static async Task WaitUntilAsync(Func<bool> condition, string what, int timeoutSeconds = 15)
     {
+        // Deadlines dilate on slow hardware (MELANGE_TEST_TIME_SCALE); the condition does not.
+        var deadline = TestTime.Dilated(TimeSpan.FromSeconds(timeoutSeconds));
         var stopwatch = Stopwatch.StartNew();
         while (!condition())
         {
-            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(timeoutSeconds), $"Timed out waiting for: {what}");
+            Assert.True(stopwatch.Elapsed < deadline, $"Timed out waiting for: {what}");
             await Task.Yield();
             await Task.Delay(10, TestContext.Current.CancellationToken);
         }
