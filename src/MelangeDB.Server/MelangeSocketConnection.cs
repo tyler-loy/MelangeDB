@@ -39,7 +39,6 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private bool _slotReserved;
     private long _bufferedDeltaBytes;
     private bool _resumeBuffering;
-    private bool _resyncPending;
     private long _lastReceivedTicks;
     private uint _nextPingId;
     private ITimer? _heartbeat;
@@ -190,8 +189,6 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     /// <summary>Queues one transaction's deltas. Called under the engine's write lock, in LSN order.</summary>
     public void EnqueueDelta(TransactionUpdateFrame frame)
     {
-        if (_resyncPending)
-            return;
         if (_resumeBuffering)
         {
             _resumeBuffer.Add(frame);
@@ -222,26 +219,24 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         // DropAndResync: the client on a too-slow link loses its delta stream, not its connection.
         // Queued deltas are discarded, the server forgets its subscriptions, and one small error
         // frame tells the client to re-establish them — the same convergence path a rejected
-        // Resume uses. Unregistration is deferred off the fan-out iteration.
-        _resyncPending = true;
+        // Resume uses. The forgetting is synchronous: the caller already holds the engine lock
+        // (fan-out reaches a sink only after it finished iterating the per-table registries, and
+        // the re-scope diff enqueues under ReadConsistent), so the drop completes before the
+        // error frame even exists, and a prompt re-subscribe always finds a clean slate. The
+        // deferred sweep this replaces raced that re-subscribe: the stale registration made it
+        // re-scope — no initial set — and the sweep then unregistered the replacement, leaving a
+        // silently dead subscription (a wedged DropAndResync under CPU starvation).
         while (_delta.TryDequeue(out _))
         {
         }
 
         _resumeBuffer.Clear();
         Interlocked.Exchange(ref _bufferedDeltaBytes, 0);
+        UnregisterAllSubscriptionsUnderLock();
         EnqueuePriority(new ErrorFrame(
             MelangeErrorCodes.OverflowResync,
             "The connection fell behind its delta stream (Subscriptions:MaxBufferedBytes); re-establish subscriptions.")
         { Channel = MelangeChannels.Control });
-        _ = Task.Run(() =>
-        {
-            _transport.Engine.ReadConsistent(_ =>
-            {
-                UnregisterAllSubscriptionsUnderLock();
-                _resyncPending = false;
-            });
-        });
     }
 
     private void EnqueuePriority(Frame frame)
@@ -485,20 +480,27 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         {
             var query = SqlSubsetParser.Parse(subscribe.Query, subscribe.Parameters);
             var limits = _transport.Options.Subscriptions;
-            if (_subscriptions.TryGetValue(subscribe.SubscriptionId, out var existing))
+
+            // The live-or-fresh decision runs under the engine lock because a backpressure drop —
+            // which forgets this connection's subscriptions — fires on a committing thread:
+            // decided outside the lock, a just-dropped id could still look live here, and the
+            // client's re-establishing subscribe would re-scope a registration the drop removed.
+            var rescoped = _transport.Engine.ReadConsistent(_ =>
             {
+                if (!_subscriptions.TryGetValue(subscribe.SubscriptionId, out var existing))
+                    return false;
+
                 // Re-scope: the moving-range pattern. The diff rides the data channel under the
                 // engine lock, so it cannot interleave incorrectly with commit deltas. It is
                 // synthetic rather than commit-tied, so it carries LSN 0, which a client applies
                 // unconditionally instead of judging against its anchor.
-                _transport.Engine.ReadConsistent(_ =>
-                {
-                    var ops = _transport.Subscriptions.Rescope(existing, query, limits);
-                    if (ops.Count > 0)
-                        EnqueueDelta(new TransactionUpdateFrame(0, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
-                });
+                var ops = _transport.Subscriptions.Rescope(existing, query, limits);
+                if (ops.Count > 0)
+                    EnqueueDelta(new TransactionUpdateFrame(0, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
+                return true;
+            });
+            if (rescoped)
                 return;
-            }
 
             if (_subscriptions.Count >= limits.MaxPerConnection)
             {
@@ -537,17 +539,16 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
     private void HandleUnsubscribe(UnsubscribeFrame unsubscribe)
     {
-        if (_subscriptions.TryGetValue(unsubscribe.SubscriptionId, out var subscription))
+        // The lookup rides inside the lock for the same reason the subscribe path's does: a
+        // backpressure drop mutates this connection's registrations from a committing thread.
+        _transport.Engine.ReadConsistent(_ =>
         {
-            _transport.Engine.ReadConsistent(_ =>
-            {
+            if (_subscriptions.Remove(unsubscribe.SubscriptionId, out var subscription))
                 _transport.Subscriptions.Unregister(subscription);
-                _subscriptions.Remove(unsubscribe.SubscriptionId);
-            });
-            lock (_bulk)
-            {
-                _bulk.RemoveAll(stream => stream.Subscription.Id == unsubscribe.SubscriptionId);
-            }
+        });
+        lock (_bulk)
+        {
+            _bulk.RemoveAll(stream => stream.Subscription.Id == unsubscribe.SubscriptionId);
         }
 
         EnqueuePriority(new UnsubscribedFrame(unsubscribe.SubscriptionId));
