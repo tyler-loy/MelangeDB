@@ -34,7 +34,7 @@ Simple and boring, on purpose:
   e.g. `0.1.0-ci.42+a1b2c3d`. The run number makes prereleases sort correctly; the sha is build
   metadata for tracing a package back to its commit.
 - **A tag `v<VersionPrefix>` publishes the stable version**, e.g. tag `v0.1.0` publishes `0.1.0`.
-  The publish workflow refuses a tag that does not match `VersionPrefix` exactly — bump the prefix
+  The publish job refuses a tag that does not match `VersionPrefix` exactly — bump the prefix
   in the same PR that prepares the release, then tag the merge commit.
 - After tagging, bump `VersionPrefix` to the next version so `main` prereleases immediately start
   sorting above the release they follow.
@@ -50,10 +50,11 @@ Packages publish to the repo owner's GitHub Packages NuGet feed:
 https://nuget.pkg.github.com/tyler-loy/index.json
 ```
 
-Publishing is `.github/workflows/publish.yml`: on every push to `main` (prerelease) and on `v*`
-tags (stable), it packs all ten projects and pushes with `--skip-duplicate`, so re-running a
-workflow is idempotent. It authenticates with the built-in `GITHUB_TOKEN` under
-`permissions: packages: write` — no PAT is stored anywhere for publishing.
+Publishing is the `publish` job in `.github/workflows/ci.yml`: on every push to `main`
+(prerelease) and on `v*` tags (stable), it packs all ten projects and pushes with
+`--skip-duplicate`, so re-running a workflow is idempotent. It runs **only after the test job
+passes** — a broken main never publishes — and authenticates with the built-in `GITHUB_TOKEN`
+under `permissions: packages: write`, so no PAT is stored anywhere for publishing.
 
 **Visibility follows the repository.** The repo is currently private, so the packages are private:
 only accounts with read access to the repo can restore them. If the repo ever goes public, every
@@ -108,8 +109,9 @@ OutputItemType="Analyzer"` form does.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every PR and push to `main`: restore, Release build
-(warnings-as-errors), then the full test suite in **both** Release and Debug. Skipped tests fail
-the run — the Postgres suite self-skips when Docker is missing, and CI treats a skip as a broken
-environment, not a pass. `ubuntu-latest` has Docker preinstalled, which is what the Testcontainers
-suites use.
+`.github/workflows/ci.yml` is the whole pipeline. Its `test` job runs on every PR, push to
+`main`, and `v*` tag: restore, Release build (warnings-as-errors), then the full test suite in
+**both** Release and Debug. Skipped tests fail the run — the Postgres suite self-skips when
+Docker is missing, and CI treats a skip as a broken environment, not a pass. `ubuntu-latest` has
+Docker preinstalled, which is what the Testcontainers suites use. The `publish` job (above) is
+gated behind it with `needs: test` and runs only on push events, never for pull requests.
