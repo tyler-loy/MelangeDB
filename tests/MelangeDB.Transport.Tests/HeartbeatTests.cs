@@ -47,7 +47,7 @@ public class HeartbeatTests
 
         // Crossing Transport:HeartbeatTimeoutMs: the server gives up and aborts the socket.
         host.Time.Advance(TimeSpan.FromSeconds(45));
-        await died.Task.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+        await died.Task.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(15)), TestContext.Current.CancellationToken);
         await reader;
     }
 

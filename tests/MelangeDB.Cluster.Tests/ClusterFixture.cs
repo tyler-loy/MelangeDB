@@ -85,15 +85,29 @@ internal sealed class ClusterFixture : IAsyncDisposable
         IReadOnlyDictionary<string, string?>? extraSettings = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-cluster-").FullName;
-        var fixture = new ClusterFixture(root, heartbeatMs, failureTimeoutMs, spatial, extraSettings);
-        fixture._hubHttpPort = FreePort();
-        fixture._nodeListenPort = FreePort();
-        fixture.HubApp = await fixture.StartAppAsync("hub", ClusterRole.Hub, fixture._hubHttpPort);
+
+        // The failure timeout dilates with the wait deadlines (MELANGE_TEST_TIME_SCALE), and for
+        // the same reason: on starved shared vCPUs a heartbeat can stall long enough for the hub
+        // to declare a healthy node dead mid-test, which is the environment failing, not the
+        // cluster. Ratios are preserved — failover tests that provoke detection still see it well
+        // inside their equally-dilated deadlines — and at scale 1 nothing changes.
+        var fixture = new ClusterFixture(root, heartbeatMs, TestTime.Scale * failureTimeoutMs, spatial, extraSettings);
+        fixture.HubApp = await WithFreshPortsRetryAsync(() =>
+        {
+            fixture._hubHttpPort = FreePort();
+            fixture._nodeListenPort = FreePort();
+            return fixture.StartAppAsync("hub", ClusterRole.Hub, fixture._hubHttpPort);
+        });
         for (var i = 0; i < shardNodes; i++)
         {
-            var node = new ClusterNode { Name = $"node-{(char)('a' + i)}", HttpPort = FreePort() };
-            fixture.Nodes.Add(node);
-            node.App = await fixture.StartAppAsync(node.Name, ClusterRole.Shard, node.HttpPort);
+            var name = $"node-{(char)('a' + i)}";
+            var port = 0;
+            var app = await WithFreshPortsRetryAsync(() =>
+            {
+                port = FreePort();
+                return fixture.StartAppAsync(name, ClusterRole.Shard, port);
+            });
+            fixture.Nodes.Add(new ClusterNode { Name = name, HttpPort = port, App = app });
         }
 
         // Every node registered before any test proceeds.
@@ -146,7 +160,7 @@ internal sealed class ClusterFixture : IAsyncDisposable
             // Two seconds of grace, then abort: phase 10's gateway holds live websockets into
             // shard nodes, and a default graceful stop would wait the host's full shutdown
             // timeout for connections that only close when the process dies.
-            using var abrupt = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            using var abrupt = new CancellationTokenSource(TestTime.Dilated(TimeSpan.FromSeconds(2)));
             await node.App!.StopAsync(abrupt.Token);
         }
         catch (Exception)
@@ -189,7 +203,7 @@ internal sealed class ClusterFixture : IAsyncDisposable
         var stable = TotalLinkMessages();
         var quietFor = Stopwatch.StartNew();
         var overall = Stopwatch.StartNew();
-        while (overall.Elapsed < TimeSpan.FromSeconds(15))
+        while (overall.Elapsed < TestTime.Dilated(TimeSpan.FromSeconds(15)))
         {
             await Task.Delay(100);
             var now = TotalLinkMessages();
@@ -308,7 +322,19 @@ internal sealed class ClusterFixture : IAsyncDisposable
             app.MapMelangeShardSockets();
         }
 
-        await app.StartAsync();
+        try
+        {
+            await app.StartAsync();
+        }
+        catch
+        {
+            // A failed start (port stolen between FreePort and Kestrel's bind) must release
+            // everything the host already opened — engines hold the node's log files, and a
+            // fresh-port retry reuses the same data directories.
+            await app.DisposeAsync();
+            throw;
+        }
+
         return app;
     }
 
@@ -344,10 +370,12 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
     public static async Task WaitUntilAsync(Func<bool> condition, string what, int timeoutSeconds = 20)
     {
+        // Deadlines dilate on slow hardware (MELANGE_TEST_TIME_SCALE); the condition does not.
+        var deadline = TestTime.Dilated(TimeSpan.FromSeconds(timeoutSeconds));
         var stopwatch = Stopwatch.StartNew();
         while (!condition())
         {
-            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(timeoutSeconds), $"Timed out waiting for: {what}");
+            Assert.True(stopwatch.Elapsed < deadline, $"Timed out waiting for: {what}");
             await Task.Delay(25, TestContext.Current.CancellationToken);
         }
     }
@@ -359,6 +387,29 @@ internal sealed class ClusterFixture : IAsyncDisposable
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         listener.Stop();
         return port;
+    }
+
+    /// <summary>
+    /// <see cref="FreePort"/> is allocate-close-rebind, so another process can win the port in
+    /// the gap and the app's real bind then fails. Initial allocation retries with fresh ports;
+    /// restarts of an existing node deliberately do not — tests rely on stable ports across a
+    /// kill-and-revive, so a stolen port there should fail loudly.
+    /// </summary>
+    private static async Task<WebApplication> WithFreshPortsRetryAsync(Func<Task<WebApplication>> start)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await start();
+            }
+            catch (IOException) when (attempt < 5)
+            {
+            }
+            catch (SocketException) when (attempt < 5)
+            {
+            }
+        }
     }
 
     public async ValueTask DisposeAsync()

@@ -279,7 +279,7 @@ public class ClusterAcceptanceTests
             return Task.FromResult<object?>(null);
         };
         link.Start();
-        var nonce = await challenge.Task.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        var nonce = await challenge.Task.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(10)), TestContext.Current.CancellationToken);
 
         var failure = await Assert.ThrowsAsync<NodeLinkException>(() => link.RequestAsync(
             "auth",

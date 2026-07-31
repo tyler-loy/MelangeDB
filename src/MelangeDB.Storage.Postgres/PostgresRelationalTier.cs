@@ -383,9 +383,11 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         await WriteCheckpointAsync(connection, transaction, anchor, epoch, ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
+        // Log before publishing the checkpoint: anyone woken by WaitForAppliedAsync must be able
+        // to observe that the anchor came from a bootstrap, not replay.
+        LogMessages.Bootstrapped(_logger, rows.Count, anchor);
         Volatile.Write(ref _appliedLsn, anchor);
         SignalWaiters(anchor);
-        LogMessages.Bootstrapped(_logger, rows.Count, anchor);
     }
 
     private async Task<(ulong Lsn, Guid? Epoch)> ReadCheckpointAsync(NpgsqlConnection connection, CancellationToken ct)

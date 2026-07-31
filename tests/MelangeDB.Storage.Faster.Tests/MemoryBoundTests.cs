@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using MelangeDB.Core;
 using Xunit;
 
@@ -130,11 +131,35 @@ public class MemoryBoundTests
 
     private static (long WorkingSet, long Heap) MeasureMemory()
     {
-        GC.Collect();
+        // An Aggressive collection is the one mode that compacts every generation including the
+        // LOH the blobs live on and hands freed regions back to the OS immediately — a plain
+        // GC.Collect leaves free regions committed until the GC feels pressure, and committed
+        // free space reads as resident on both OSes.
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         GC.WaitForPendingFinalizers();
         GC.Collect();
         using var process = Process.GetCurrentProcess();
+
+        // Neither OS gives freed pages back eagerly, so an untrimmed measurement counts the
+        // loader's history — the transient batch rows built during the load — not the store's
+        // footprint. Windows never trims a working set until the machine is under memory
+        // pressure; glibc keeps freed arena pages mapped for reuse, so Linux RSS has the same
+        // problem (observed as a 79 MiB "growth" on a CI runner). Trimming first makes the
+        // number the pages actually needed, which is what the assertions are about.
+        if (OperatingSystem.IsWindows())
+            _ = EmptyWorkingSet(process.Handle);
+        else if (OperatingSystem.IsLinux())
+            _ = malloc_trim(0);
+
         process.Refresh();
         return (process.WorkingSet64, GC.GetTotalMemory(forceFullCollection: true));
     }
+
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    [DllImport("psapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EmptyWorkingSet(IntPtr hProcess);
+
+    [DllImport("libc", SetLastError = false, EntryPoint = "malloc_trim")]
+    private static extern int malloc_trim(nuint pad);
 }
