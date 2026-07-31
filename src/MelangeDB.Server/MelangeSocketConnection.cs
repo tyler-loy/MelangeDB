@@ -117,8 +117,12 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             {
                 await sender.ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (Exception exception) when (exception is OperationCanceledException or WebSocketException or ObjectDisposedException)
             {
+                // The sender tripped over the same dead socket the read loop did — an abort
+                // mid-send (a gateway dropping a retired shard attachment, a heartbeat kill).
+                // Nothing left to say to anyone, and letting it escape here would surface as an
+                // unhandled-exception error in Kestrel's log for an ordinary teardown.
             }
 
             if (protocolFault && _socket.State == WebSocketState.Open)

@@ -373,18 +373,30 @@ public sealed class MelangeEngine : IDisposable
     private IReadOnlyList<RowOp> ReconcileOps(IReadOnlyList<RowOp> ops)
     {
         var effective = new List<RowOp>(ops.Count);
+
+        // Existence must track the batch's own effects, not just the store: a border batch
+        // routinely carries several ops for one hot key, and judging each against pre-batch
+        // state alone would log Insert, Insert, Insert for one row — the store upserts, but
+        // subscription fan-out faithfully reports the logged kinds, so every observer holding
+        // the row would see duplicate inserts (and count them as cache inconsistencies).
+        Dictionary<(TableId Table, RowKey Key), bool>? batchState = null;
         foreach (var op in ops)
         {
-            var exists = HotStore.TryGetRow(op.Table, op.Key, out _);
+            var key = (op.Table, op.Key);
+            var exists = batchState?.TryGetValue(key, out var inBatch) is true
+                ? inBatch
+                : HotStore.TryGetRow(op.Table, op.Key, out _);
             switch (op.Kind)
             {
                 case RowOpKind.Delete when exists:
                     effective.Add(op);
+                    (batchState ??= [])[key] = false;
                     break;
                 case RowOpKind.Delete:
                     break;
                 case RowOpKind.Insert or RowOpKind.Update:
                     effective.Add(new RowOp(exists ? RowOpKind.Update : RowOpKind.Insert, op.Table, op.Key, op.Row));
+                    (batchState ??= [])[key] = true;
                     break;
             }
         }

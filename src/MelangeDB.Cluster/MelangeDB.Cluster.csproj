@@ -17,6 +17,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
+    <!-- The load-test tool's serve side composes a hub and shard nodes the same way the cluster
+         tests do (node runtimes, hub metrics); its drive side stays on the public client API. -->
+    <InternalsVisibleTo Include="MelangeDB.LoadTest" />
   </ItemGroup>
 
 </Project>
