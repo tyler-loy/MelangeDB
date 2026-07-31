@@ -39,6 +39,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private bool _slotReserved;
     private long _bufferedDeltaBytes;
     private bool _resumeBuffering;
+    private byte[]? _heldDelta; // Sender-loop only: a delta held back behind a fresh stream's first chunk.
     private long _lastReceivedTicks;
     private uint _nextPingId;
     private ITimer? _heartbeat;
@@ -510,19 +511,23 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             }
 
             using var activity = _transport.Telemetry?.StartInitialSet(query.Table);
-            var (subscription, initialSet) = _transport.Engine.ReadConsistent(head =>
+            var initialSet = _transport.Engine.ReadConsistent(head =>
             {
                 var registered = _transport.Subscriptions.Register(
                     this, subscribe.SubscriptionId, query, limits, head, computeInitialSet: true, _transport.Policies, _policyContext);
                 _subscriptions[subscribe.SubscriptionId] = registered.Subscription;
-                return registered;
+
+                // The bulk stream is listed under the same lock hold as the registration, so any
+                // commit fanning out after this block finds the stream already present — the
+                // sender's first-chunk rule (see TryDequeueNext) depends on exactly that.
+                lock (_bulk)
+                {
+                    _bulk.Add(new BulkStream(registered.Subscription, registered.InitialSet));
+                }
+
+                return registered.InitialSet;
             });
             ServerTelemetry.CompleteInitialSet(activity, initialSet.Rows.Count, initialSet.Bytes);
-            lock (_bulk)
-            {
-                _bulk.Add(new BulkStream(subscription, initialSet));
-            }
-
             _sendSignal.Release();
         }
         catch (SqlParseException parse)
@@ -721,19 +726,57 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
     /// <summary>
     /// Lane priority: control and call results first, then one committed delta, then one bulk
-    /// chunk — so a 30MB initial set never delays a reducer response by more than one chunk.
+    /// chunk — so a 30MB initial set never delays a reducer response by more than one chunk. One
+    /// exception outranks a delta: the first chunk of a not-yet-started initial set. Until that
+    /// chunk is on the wire the client may still be live on the subscription's previous anchor (a
+    /// gateway swap re-issues a subscription on the destination node under an id the client
+    /// already holds, and that anchor counts against another log), and a delta arriving ahead of
+    /// the chunk would be judged against the wrong log's anchor and silently dropped. The first
+    /// chunk is what flips the client to buffering; behind it, every delta replays against the
+    /// anchor the set actually names. Deltas for such a subscription exist only after it
+    /// registered, and registration lists the bulk stream under the same engine-lock hold, so a
+    /// successfully dequeued delta is proof the stream is already visible here.
     /// </summary>
     private bool TryDequeueNext(out byte[] bytes)
     {
         if (_priority.TryDequeue(out bytes!))
             return true;
-        if (_delta.TryDequeue(out bytes!))
+        var delta = _heldDelta;
+        if (delta is null && _delta.TryDequeue(out delta!))
+            Interlocked.Add(ref _bufferedDeltaBytes, -delta.Length);
+        if (delta is not null)
         {
-            Interlocked.Add(ref _bufferedDeltaBytes, -bytes.Length);
+            if (TryBuildFirstChunk(out bytes!))
+            {
+                _heldDelta = delta;
+                return true;
+            }
+
+            _heldDelta = null;
+            bytes = delta;
             return true;
         }
 
         return TryBuildBulkChunk(out bytes!);
+    }
+
+    /// <summary>Builds the first chunk of a stream that has not started, if any; see <see cref="TryDequeueNext"/>.</summary>
+    private bool TryBuildFirstChunk(out byte[]? bytes)
+    {
+        BulkStream? fresh;
+        lock (_bulk)
+        {
+            fresh = _bulk.Find(static stream => !stream.Started);
+        }
+
+        if (fresh is null)
+        {
+            bytes = null;
+            return false;
+        }
+
+        bytes = BuildChunk(fresh);
+        return true;
     }
 
     private bool TryBuildBulkChunk(out byte[]? bytes)
@@ -750,9 +793,15 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             return false;
         }
 
+        bytes = BuildChunk(stream);
+        return true;
+    }
+
+    private byte[] BuildChunk(BulkStream stream)
+    {
         var chunkBudget = _transport.Options.Transport.MaxInitialSetChunkBytes;
         var frame = stream.NextChunk(chunkBudget);
-        bytes = _serializer.Serialize(frame);
+        var bytes = _serializer.Serialize(frame);
         if (frame.IsLast)
         {
             lock (_bulk)
@@ -765,7 +814,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _sendSignal.Release();
         }
 
-        return true;
+        return bytes;
     }
 
     private void UnregisterAllSubscriptions() =>
@@ -789,6 +838,9 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         private uint _chunk;
 
         public ServerSubscription Subscription { get; } = subscription;
+
+        /// <summary>Whether the first chunk has been built — read and advanced by the sender loop only.</summary>
+        public bool Started => _chunk > 0;
 
         public SubscriptionAppliedFrame NextChunk(int chunkBudget)
         {

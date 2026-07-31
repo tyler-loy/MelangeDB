@@ -142,8 +142,11 @@ not an unreliable channel.
 - ~~**Head-of-line blocking.**~~ **Settled: chunk-and-interleave by priority on one socket, shipped.** The
   sender drains lanes in order — control/results, then one committed delta, then one bulk chunk of at most
   `Transport:MaxInitialSetChunkBytes` — so a reducer response waits at most one chunk behind a 30MB initial
-  set. Asserted by a wire-order test. The channel tag on every frame keeps multi-socket HTTP/2 and QUIC
-  streams open as substrates with no protocol change.
+  set. Asserted by a wire-order test. One exception, added with phase 10's swap in hand: the **first-chunk
+  rule** — the first chunk of a not-yet-started initial set outranks committed deltas, because until that
+  chunk is on the wire a subscription re-issued by a gateway swap is still judged by the client against the
+  previous log's anchor (the phase 10 soft-spot record has the full story). The channel tag on every frame
+  keeps multi-socket HTTP/2 and QUIC streams open as substrates with no protocol change.
 - ~~**How much log to retain for `Resume`.**~~ **Settled: a time window, `Resume:RetentionWindowSeconds`
   (default 300).** What matters is surviving a plausible network outage, which is measured in seconds, not
   transactions. A resume whose oldest missed record is older than the window answers full resync. Interaction
