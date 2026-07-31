@@ -120,11 +120,29 @@ public interface IShardStrategy
 ### Strategy A — spatial partitioning (Vibe Shaft)
 
 A contiguous 10km world of 157×157 chunks. Shard = a rectangular block of chunks; shard key derives from
-`ChunkId`. Interest = the eight neighbouring blocks, one chunk deep. Handoff is **continuous and
-implicit** — triggered by walking.
+`ChunkId`. Interest = the eight neighbouring blocks, narrowed per row to the border band
+(`Cluster:BorderBandChunks` deep). Handoff is **continuous and implicit** — triggered by walking.
+
+Shipped in phase 10 as `SpatialShardStrategy`: the developer supplies the geometry (`SpatialGeometry` —
+block dimensions in chunks and the chunk-id decoder, because the chunk encoding is the game's, not ours) and
+the strategy supplies block math, eight-neighbour interest, band membership, and boundary assessment. Three
+contracts worth knowing:
+
+- **The shard key packs two full 32-bit block coordinates**, so the world can grow in any direction without a
+  key migration. The chunk-id *column* must be at least 32 bits wide, enforced at registration: the reference
+  workload's `cx * 157 + cy` in a `ushort` tops out at 65,535, so a 20 km world overflows it — a trap that
+  must fail at startup, not surface as a migration under load.
+- **Ownership widens at the seam.** The strict rule — a shard commits only rows resolving to itself — would
+  freeze the world at every boundary line, because an entity mid-handoff stands *across* the line while its
+  origin still owns it. `MayCommit` therefore admits rows up to the band's depth inside a neighbouring block;
+  beyond the band the write fails loudly, because an entity that deep into foreign territory means handoffs
+  are not keeping up and the band was sized too shallow.
+- **Transferred rows re-home by content** (`RowRehoming.ByContent`): a spatial row's chunk id *is* its shard,
+  so the import asserts the row already resolves to the destination instead of rewriting anything —
+  instancing's column rewrite would corrupt a chunk id.
 
 Splitting a single crowded location makes no sense here: everyone in the town square interacts with
-everyone else, so they must share a writer. **This is the hard case.**
+everyone else, so they must share a writer. **This is the hard case** — see the hotspot ceiling below.
 
 ### Strategy B — instancing (WoW-style)
 

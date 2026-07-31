@@ -227,14 +227,24 @@ internal static class ShardSpan
         {
             if (!schema.TryGet(op.Table, out var table) || table.Placement != Placement.Partitioned)
                 continue;
-            if (RowBytesOf(store, op) is { } bytes)
-                (shards ??= []).Add(strategy.ShardForRow(op.Table, table.ToRowRef(bytes)).Value);
+            if (RowBytesOf(store, op) is not { } bytes)
+                continue;
+            var row = table.ToRowRef(bytes);
+
+            // On a shard the question is the strategy's MayCommit — which for a spatial strategy
+            // admits the seam (an owned entity standing a band's depth across the line,
+            // mid-handoff), while instancing keeps the strict same-shard contract. Single-node has
+            // no executing shard, so the strict contract applies unchanged.
+            if (executingShard is { } own && !strategy.MayCommit(own, op.Table, row))
+                (shards ??= []).Add(strategy.ShardForRow(op.Table, row).Value);
+            else if (executingShard is null)
+                (shards ??= []).Add(strategy.ShardForRow(op.Table, row).Value);
         }
 
         if (shards is null)
             return;
-        if (executingShard is { } own)
-            shards.Add(own.Value);
+        if (executingShard is { } executing)
+            shards.Add(executing.Value);
         if (shards.Count > 1)
         {
             throw new ShardSpanException(

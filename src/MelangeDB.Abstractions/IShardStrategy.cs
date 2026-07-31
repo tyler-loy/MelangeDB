@@ -50,6 +50,29 @@ public sealed class SessionContext
 }
 
 /// <summary>
+/// How handoff re-homes a transferred row on the destination shard. Instancing rewrites the
+/// explicit shard-id column; a spatial strategy's rows already carry their location, so the
+/// content <em>is</em> the shard and rewriting anything would corrupt it.
+/// </summary>
+public enum RowRehoming
+{
+    /// <summary>
+    /// The import rewrites the row's <c>ShardBy</c> column to the destination shard's key — the
+    /// instancing shape, where the shard id is an explicit column with no other meaning.
+    /// </summary>
+    RewriteShardBy,
+
+    /// <summary>
+    /// The row's content (a chunk id, a position) already resolves it to a shard, so the import
+    /// leaves the bytes untouched and instead <em>asserts</em> that
+    /// <see cref="IShardStrategy.ShardForRow"/> answers the destination — a transferred row that
+    /// still resolves elsewhere is a protocol error, and failing loudly beats silently re-homing
+    /// a row whose position contradicts its owner.
+    /// </summary>
+    ByContent,
+}
+
+/// <summary>
 /// The seam where the developer defines what a shard <em>means</em>. MelangeDB supplies the
 /// mechanism — one writer per shard, one commit log per shard, handoff, interest — and this
 /// interface supplies the meaning: how rows and sessions map onto shards, and which foreign
@@ -67,8 +90,28 @@ public interface IShardStrategy
 
     /// <summary>
     /// Which foreign shards must this shard hold read-only slices of? Empty for instancing —
-    /// instances are causally disjoint by definition. Spatial strategies (phase 10) return
-    /// neighbouring shards here.
+    /// instances are causally disjoint by definition. Spatial strategies return the neighbouring
+    /// blocks here, and <see cref="InterestedInRow"/> narrows each to its border band.
     /// </summary>
     IReadOnlyList<ShardKey> InterestOf(ShardKey shard);
+
+    /// <summary>
+    /// May <paramref name="shard"/>'s writer commit this row? The default is the strict contract —
+    /// only the row's own shard — which is exactly right for instancing. A spatial strategy widens
+    /// it at the seam: an entity the origin still owns may stand a border band's depth inside a
+    /// neighbouring block while its handoff is pending, and refusing the write there would freeze
+    /// the world at every boundary line.
+    /// </summary>
+    bool MayCommit(ShardKey shard, TableId table, in RowRef row) => ShardForRow(table, row) == shard;
+
+    /// <summary>How handoff re-homes this table's rows; see <see cref="RowRehoming"/>.</summary>
+    RowRehoming RehomingOf(TableId table) => RowRehoming.RewriteShardBy;
+
+    /// <summary>
+    /// Whether <paramref name="observer"/>'s read-only slice of <paramref name="owner"/> includes
+    /// this row. The default — everything — suits strategies whose interest is all-or-nothing; a
+    /// spatial strategy narrows it to the border band, which is the whole point of a band: the
+    /// observer holds the edge it can see across, not the neighbour's world.
+    /// </summary>
+    bool InterestedInRow(ShardKey owner, ShardKey observer, TableId table, in RowRef row) => true;
 }

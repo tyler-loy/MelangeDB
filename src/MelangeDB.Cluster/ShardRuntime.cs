@@ -46,6 +46,7 @@ internal sealed class ShardRuntime : IDisposable
     private readonly HashSet<string> _importedHandoffs = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (HandoffMarker Marker, ulong Lsn)> _unsettledImports = new(StringComparer.Ordinal);
     private readonly IHandoffSet? _handoffSet;
+    private readonly IShardStrategy? _strategy;
 
     public ShardRuntime(
         ShardKey shard,
@@ -68,6 +69,7 @@ internal sealed class ShardRuntime : IDisposable
         Directory = shardDirectory;
         _handoffSet = services.GetService<IHandoffSet>();
         var strategy = services.GetService<IShardStrategy>();
+        _strategy = strategy;
         var current = options.CurrentValue;
         Options = MelangeOptionsClone.DeepClone(current);
         Options.HotStore.Path = Path.Combine(shardDirectory, "hot");
@@ -293,7 +295,7 @@ internal sealed class ShardRuntime : IDisposable
         foreach (var wire in rows)
         {
             var table = Engine.Schema.Get(new TableId(wire.Table));
-            ops.Add(new RowOp(RowOpKind.Insert, table.Id, new RowKey(wire.Key), RewriteShardColumn(table, wire.Row!)));
+            ops.Add(new RowOp(RowOpKind.Insert, table.Id, new RowKey(wire.Key), RehomeRow(table, wire.Row!)));
         }
 
         var marker = new HandoffMarker(handoffId, playerHex, fromShard, Shard.Value, null);
@@ -434,6 +436,30 @@ internal sealed class ShardRuntime : IDisposable
 
     private static WireOp[] RowRefsOf(WireOp[] rows) =>
         [.. rows.Select(static r => new WireOp(r.Kind, r.Table, r.Key, null))];
+
+    /// <summary>
+    /// Re-homes a transferred row per the strategy's <see cref="IShardStrategy.RehomingOf"/>:
+    /// rewrite the ShardBy column (instancing), or assert the content already resolves here
+    /// (spatial) — a transferred row whose position contradicts its destination is a protocol
+    /// error, and rewriting a chunk id to a shard key would be silent corruption.
+    /// </summary>
+    private byte[] RehomeRow(TableSchema table, byte[] rowBytes)
+    {
+        if ((_strategy?.RehomingOf(table.Id) ?? RowRehoming.RewriteShardBy) == RowRehoming.RewriteShardBy)
+            return RewriteShardColumn(table, rowBytes);
+
+        var resolved = _strategy!.ShardForRow(table.Id, table.ToRowRef(rowBytes));
+        if (resolved != Shard)
+        {
+            throw new InvalidOperationException(
+                $"Handoff row of table '{table.Name}' resolves to {resolved}, not this destination {Shard}. A " +
+                "ByContent strategy transfers rows only once their content places them in the destination shard — " +
+                "the boundary monitor triggers past the crossing margin, so an import resolving elsewhere means the " +
+                "transfer was initiated for the wrong destination.");
+        }
+
+        return rowBytes;
+    }
 
     private byte[] RewriteShardColumn(TableSchema table, byte[] rowBytes)
     {
