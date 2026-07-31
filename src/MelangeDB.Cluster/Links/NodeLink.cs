@@ -18,26 +18,104 @@ public sealed class NodeLinkException(string message, bool isPeerError = false) 
 }
 
 /// <summary>
-/// Per-node counters over node-link traffic, by message type. The "zero cross-node traffic"
-/// acceptance test counts these — network calls, not code inspection — so every frame that
-/// crosses a link increments here, heartbeats included (tests exclude them by type name).
+/// Per-node counters over node-link traffic, by message type — counts and payload bytes. The
+/// "zero cross-node traffic" acceptance test counts these — network calls, not code inspection —
+/// so every frame that crosses a link increments here, heartbeats included (tests exclude them by
+/// type name). The byte counters are the border-band bandwidth measure: sum the
+/// <c>border-apply</c>/<c>border-reset-apply</c> types on a node to see what its neighbours'
+/// edges cost it.
 /// </summary>
 public sealed class ClusterMetrics
 {
     private readonly ConcurrentDictionary<string, long> _sent = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, long> _received = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _sentBytes = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _receivedBytes = new(StringComparer.Ordinal);
 
-    internal void RecordSent(string type) => _sent.AddOrUpdate(type, 1, static (_, count) => count + 1);
+    internal void RecordSent(string type, int bytes)
+    {
+        _sent.AddOrUpdate(type, 1, static (_, count) => count + 1);
+        _sentBytes.AddOrUpdate(type, bytes, (_, total) => total + bytes);
+    }
 
-    internal void RecordReceived(string type) => _received.AddOrUpdate(type, 1, static (_, count) => count + 1);
+    internal void RecordReceived(string type, int bytes)
+    {
+        _received.AddOrUpdate(type, 1, static (_, count) => count + 1);
+        _receivedBytes.AddOrUpdate(type, bytes, (_, total) => total + bytes);
+    }
 
     public IReadOnlyDictionary<string, long> SentByType => _sent;
 
     public IReadOnlyDictionary<string, long> ReceivedByType => _received;
 
+    /// <summary>Payload bytes sent per message type.</summary>
+    public IReadOnlyDictionary<string, long> SentBytesByType => _sentBytes;
+
+    /// <summary>Payload bytes received per message type.</summary>
+    public IReadOnlyDictionary<string, long> ReceivedBytesByType => _receivedBytes;
+
     /// <summary>Total messages sent, excluding the given types (typically the heartbeat pair).</summary>
     public long TotalSentExcept(params string[] exceptTypes) =>
         _sent.Where(pair => !exceptTypes.Contains(pair.Key, StringComparer.Ordinal)).Sum(static pair => pair.Value);
+
+    private long _handoffsStarted;
+    private long _handoffsCompleted;
+    private long _handoffsAborted;
+    private long _handoffsUnresolved;
+    private long _handoffsRateLimited;
+    private long _handoffsInFlight;
+
+    /// <summary>Transfer sagas this hub started (explicit and boundary-triggered alike).</summary>
+    public long HandoffsStarted => Interlocked.Read(ref _handoffsStarted);
+
+    /// <summary>Sagas whose destination became authoritative.</summary>
+    public long HandoffsCompleted => Interlocked.Read(ref _handoffsCompleted);
+
+    /// <summary>Sagas that aborted definitively: the entity stayed on its origin.</summary>
+    public long HandoffsAborted => Interlocked.Read(ref _handoffsAborted);
+
+    /// <summary>Sagas whose import fate was unknowable when the coordinator gave up; a reconciler resolves each later.</summary>
+    public long HandoffsUnresolved => Interlocked.Read(ref _handoffsUnresolved);
+
+    /// <summary>Boundary-triggered requests suppressed by Cluster:HandoffMinIntervalMs — hysteresis working.</summary>
+    public long HandoffsRateLimited => Interlocked.Read(ref _handoffsRateLimited);
+
+    /// <summary>Sagas currently in flight on this hub.</summary>
+    public long HandoffsInFlight => Interlocked.Read(ref _handoffsInFlight);
+
+    internal void HandoffStarted()
+    {
+        Interlocked.Increment(ref _handoffsStarted);
+        Interlocked.Increment(ref _handoffsInFlight);
+    }
+
+    internal void HandoffEnded(bool completed, bool aborted, bool unresolved)
+    {
+        Interlocked.Decrement(ref _handoffsInFlight);
+        if (completed)
+            Interlocked.Increment(ref _handoffsCompleted);
+        if (aborted)
+            Interlocked.Increment(ref _handoffsAborted);
+        if (unresolved)
+            Interlocked.Increment(ref _handoffsUnresolved);
+    }
+
+    internal void HandoffRateLimited() => Interlocked.Increment(ref _handoffsRateLimited);
+
+    private long _handoffRequestsReceived;
+
+    /// <summary>Boundary-triggered transfer requests the hub received, dropped or not.</summary>
+    public long HandoffRequestsReceived => Interlocked.Read(ref _handoffRequestsReceived);
+
+    internal void HandoffRequestReceived() => Interlocked.Increment(ref _handoffRequestsReceived);
+
+    internal void HandoffResolvedRemotely(bool released)
+    {
+        if (released)
+            Interlocked.Increment(ref _handoffsCompleted);
+        else
+            Interlocked.Increment(ref _handoffsAborted);
+    }
 }
 
 /// <summary>
@@ -126,7 +204,7 @@ internal sealed class NodeLink : IDisposable
             _sendLock.Release();
         }
 
-        _metrics.RecordSent(frame.Type);
+        _metrics.RecordSent(frame.Type, payload.Length);
     }
 
     private async Task ReadLoopAsync()
@@ -145,7 +223,7 @@ internal sealed class NodeLink : IDisposable
                 await _stream.ReadExactlyAsync(payload, ct).ConfigureAwait(false);
                 var frame = JsonSerializer.Deserialize<WireFrame>(payload)
                     ?? throw new InvalidDataException("Node-link frame deserialized to null.");
-                _metrics.RecordReceived(frame.Type);
+                _metrics.RecordReceived(frame.Type, payload.Length);
                 if (frame.Re != 0)
                 {
                     if (_pending.TryGetValue(frame.Re, out var tcs))

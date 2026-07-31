@@ -53,6 +53,34 @@ not hand-configured.
 
 The invariant to teach: **one writer per shard, many readers.**
 
+Shipped in phase 10 as the **border stream**: each shard node keeps one subscription per (owned shard,
+interesting neighbour) pair, and the owner ships its border-relevant ops — rows in the observer's band, plus
+its own entities strayed into the observer's block mid-handoff — through the hub, in LSN order, at least
+once. The copies land in the observer's engine as **borrowed rows**: ordinary rows to every read and
+subscription, refused at every commit (`BorderReadOnlyException`, always on — a copy silently diverging from
+its owner is the failure no test surfaces). Four properties worth knowing:
+
+- **Owner wins.** A border op never touches a row the observer holds authoritatively (a completed import
+  supersedes any stale copy in flight), and a trailing delete from a previous owner cannot erase the new
+  owner's fresh copy — during a transfer two neighbours briefly publish the same entity, and the rules make
+  that window harmless.
+- **Out-of-scope means retracted.** An update that moves a row out of the observer's band ships as a delete,
+  so the observer stops seeing what walked away rather than keeping a stale ghost.
+- **Nothing pins the owner's log.** A border cursor the log can no longer serve — truncation, epoch change, a
+  changed band depth — is answered with a full band reset (upserts plus deletion of absent borrowed rows,
+  EventId 1715), never silently resumed past. Staleness is tolerable for a read-only cache; a pinned log is
+  not.
+- **The borrowed registry survives restarts** via a sidecar beside the shard's log (state at an LSN plus log
+  tail replay — the engine's own snapshot pattern), because border records below a truncation base are gone
+  while their rows survive in the snapshot. A missing sidecar rebuilds from row content, loudly (EventId
+  1716).
+
+One honesty note: `MayCommit`'s seam (an owner writing its strayed entity inside a neighbour's band) is a
+*debug net*, not a security boundary — the strategy cannot distinguish "my entity strayed across" from "I
+invented a row in my neighbour's territory" by content alone. The borrowed-row guard catches mutation of
+every replicated copy; creating fresh rows in a neighbour's near-band is the one contract the application
+keeps by convention, the same way it keeps the same-shard transaction contract.
+
 ## Node roles: hub and shard
 
 The **hub** / **shard node** split (originally framed as master/daughter — see
@@ -120,11 +148,29 @@ public interface IShardStrategy
 ### Strategy A — spatial partitioning (Vibe Shaft)
 
 A contiguous 10km world of 157×157 chunks. Shard = a rectangular block of chunks; shard key derives from
-`ChunkId`. Interest = the eight neighbouring blocks, one chunk deep. Handoff is **continuous and
-implicit** — triggered by walking.
+`ChunkId`. Interest = the eight neighbouring blocks, narrowed per row to the border band
+(`Cluster:BorderBandChunks` deep). Handoff is **continuous and implicit** — triggered by walking.
+
+Shipped in phase 10 as `SpatialShardStrategy`: the developer supplies the geometry (`SpatialGeometry` —
+block dimensions in chunks and the chunk-id decoder, because the chunk encoding is the game's, not ours) and
+the strategy supplies block math, eight-neighbour interest, band membership, and boundary assessment. Three
+contracts worth knowing:
+
+- **The shard key packs two full 32-bit block coordinates**, so the world can grow in any direction without a
+  key migration. The chunk-id *column* must be at least 32 bits wide, enforced at registration: the reference
+  workload's `cx * 157 + cy` in a `ushort` tops out at 65,535, so a 20 km world overflows it — a trap that
+  must fail at startup, not surface as a migration under load.
+- **Ownership widens at the seam.** The strict rule — a shard commits only rows resolving to itself — would
+  freeze the world at every boundary line, because an entity mid-handoff stands *across* the line while its
+  origin still owns it. `MayCommit` therefore admits rows up to the band's depth inside a neighbouring block;
+  beyond the band the write fails loudly, because an entity that deep into foreign territory means handoffs
+  are not keeping up and the band was sized too shallow.
+- **Transferred rows re-home by content** (`RowRehoming.ByContent`): a spatial row's chunk id *is* its shard,
+  so the import asserts the row already resolves to the destination instead of rewriting anything —
+  instancing's column rewrite would corrupt a chunk id.
 
 Splitting a single crowded location makes no sense here: everyone in the town square interacts with
-everyone else, so they must share a writer. **This is the hard case.**
+everyone else, so they must share a writer. **This is the hard case** — see the hotspot ceiling below.
 
 ### Strategy B — instancing (WoW-style)
 
@@ -168,6 +214,40 @@ Two shapes, following from the strategy:
   arrives, the player's partitioned rows transfer, then the origin drops the band. Seamless, and the
   reason interest overlap exists.
 
+Continuous handoff shipped in phase 10 on top of phase 09's saga, and its moving parts are worth naming
+because each is the answer to a specific failure mode:
+
+- **The origin decides** (settled). Its committed rows are the only trusted position — the client's claimed
+  position never is, and the gateway cannot see positions at all. A boundary monitor per owned shard assesses
+  every committed write of an anchored entity (`IMigrationAnchors`): entering the band notifies an
+  *approach* (the gateway pre-opens the destination session on it); crossing past the margin requests a
+  transfer. A sweep re-signals standing strays, so an entity that stops just past the margin after a
+  rate-limited trigger is never stranded.
+- **Hysteresis is layered** (settled): the margin (`Cluster:HandoffMarginChunks` — after a transfer the
+  entity must walk back through the whole margin before the reverse can fire), the hub's per-entity rate
+  limit (`Cluster:HandoffMinIntervalMs`), and a local notify cooldown. Pacing across a boundary triggers a
+  bounded number of transfers, never one per step.
+- **The gateway swap is invisible** (settled: mid-handoff reducer calls are *queued*). From saga start the
+  gateway holds the client's shard-routed calls; at the destination-authoritative moment — after the import
+  is durable, before the release is requested — the saga synchronously lets the gateway mute the origin (so
+  the release's row deletions never reach the client), then the gateway re-issues the client's shard
+  subscriptions on the destination and flushes the held calls in order. Re-subscribing under an existing id
+  re-scopes it: the destination's initial set (border band included, which is why the terrain behind the
+  player is already there) atomically replaces the client's cache. No disconnect, no resync error, no gap.
+  The trade: those calls wait out the transfer window, and a wedged transfer caps the queue with a retryable
+  error.
+- **Stale origins cannot transfer** (defense in depth, each independently sufficient for its case): the hub
+  drops a request whose sender is not the entity's recorded owner (1722); a freeze refuses to collect
+  borrowed rows and aborts on an empty transfer set; the monitor never signals frozen or borrowed rows. A
+  saga built on a stale copy would re-import the past over the present — the one lesson of this phase's
+  hardest bug.
+- **Creatures transfer on crossing** (settled: ownership-transfer, not don't-chase). A creature chases by
+  reading its target's border copy — pathing toward a player in the next shard needs only the band — and
+  when it crosses, it migrates immediately (no margin: its AI only ticks rows resolving to its own block, so
+  a margin would leave it standing unticked at the line). Scheduled AI ticks the shard's own entities and
+  must skip rows resolving elsewhere — the read-only guard makes a violation loud, and one throwing row
+  would abort the whole tick.
+
 Either way, transfer is the one unavoidable distributed transaction: the player must not be writable on
 two nodes at once, and must not vanish if a node dies mid-transfer. It runs as a small saga — *freeze on
 origin → append on destination → confirm → release on origin* — recoverable because both logs record
@@ -193,6 +273,24 @@ the fix for a silent failure mode:
   to a dead node. Aborting blind could mint two owners, so the freeze stays (the player is writable
   *nowhere*) until the reconciler learns the truth from the destination's log. Unavailable beats duplicated.
   Only an error *reply* from the destination — a definitive "did not happen" — aborts immediately.
+
+### Cross-shard interaction, in priority order
+
+Settled in phase 10, and the order is the design:
+
+1. **Co-locate, then transact locally.** Interaction in a game is proximity-gated — you trade with someone
+   adjacent, you attack what's in range — so interacting entities already share a shard and the transaction
+   is one ordinary local commit with zero per-transaction cross-node messages (asserted by counting them).
+   This covers nearly everything and is why spatial sharding is tractable at all.
+2. **Ownership transfer** for an entity crossing a boundary — the handoff protocol with a different entity
+   class (a creature chasing, a vehicle driven across).
+3. **A saga over the event bus** for the rare genuine remote case. The initiating shard commits its half
+   locally and publishes the fact; a hub-side handler drives the remote steps with
+   `MelangeClusterCoordinator.ExecuteOnShardAsync` — each step one ordinary local transaction on the owning
+   shard, fencing-checked — and compensates on a definitive failure. **Eventually consistent, explicitly not
+   ACID**: between a debit and its remote credit (or compensating refund) the value is simply in flight, and
+   delivery is at-least-once, so steps must be idempotent-enough for the game's semantics. If a flow cannot
+   tolerate that, the answer is placement (put the tables together), not a distributed transaction.
 
 One structural rule falls out of how re-homing works: **`ShardBy` must not be the primary key** (compile
 error MELANGE0018, mirrored at schema registration). Handoff rewrites the row's `ShardBy` column while the
@@ -266,7 +364,21 @@ bigger term and needs no coordination layer at all.
   it — another reason it shipped first.
 - **The hotspot ceiling is strategy-dependent, and worth telling users plainly.** Spatial partitioning
   cannot split a single crowded location; instancing can. A developer choosing a strategy is choosing
-  which failure mode they get, and that should be documented at the point of choice.
+  which failure mode they get. **Measured in phase 10** (in-process, one crowded shard on a real shard node
+  — engine, guards, and durable log in the path; 100 players in one chunk, movement reducers issued
+  round-robin, sustained commits/second over a 2 s window; Windows 11 dev machine with NVMe, Release build;
+  the methodology and the live measurement are `HotspotMeasurementTests`):
+  - Under the default `CommitLog:FsyncPolicy = OnCommit`, one shard sustains **~1,100 commits/s** — the
+    disk's fsync rate is the ceiling. That is ~55 players in one square at a 20 Hz per-player update budget,
+    ~110 at 10 Hz.
+  - Under `FsyncPolicy = Interval` (50 ms), the same shard sustains **~52,000 commits/s** — the serialized
+    transaction loop's own ceiling. ~2,600 players at 20 Hz, ~5,200 at 10 Hz.
+
+  Run the measurement on your hardware; the shape holds even where the numbers move. The point of publishing
+  it: 200 players in one town square fits comfortably under interval fsync and does not fit under per-commit
+  fsync — and *no cluster size changes either number*, because a crowded location is one shard on one node
+  by construction. Choosing spatial partitioning is choosing this ceiling; instancing trades it for the
+  inability to have one shared world.
 - ~~**Cluster membership.**~~ **Settled in phase 09: Postgres-backed, not Raft.** The ownership registry —
   nodes, per-shard owner, fencing token, and originator id — lives in the hub's own Postgres
   (`AddPostgresClusterMembership()`; in-memory for tests), the hub is its sole writer, failure detection is

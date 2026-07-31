@@ -44,14 +44,19 @@ internal sealed class ClusterFixture : IAsyncDisposable
     private readonly string _root;
     private readonly int _heartbeatMs;
     private readonly int _failureTimeoutMs;
+    private readonly bool _spatial;
+    private readonly IReadOnlyDictionary<string, string?>? _extraSettings;
     private int _hubHttpPort;
     private int _nodeListenPort;
 
-    private ClusterFixture(string root, int heartbeatMs, int failureTimeoutMs)
+    private ClusterFixture(
+        string root, int heartbeatMs, int failureTimeoutMs, bool spatial, IReadOnlyDictionary<string, string?>? extraSettings)
     {
         _root = root;
         _heartbeatMs = heartbeatMs;
         _failureTimeoutMs = failureTimeoutMs;
+        _spatial = spatial;
+        _extraSettings = extraSettings;
     }
 
     public WebApplication HubApp { get; private set; } = null!;
@@ -75,10 +80,12 @@ internal sealed class ClusterFixture : IAsyncDisposable
     public static async Task<ClusterFixture> StartAsync(
         int shardNodes = 2,
         int heartbeatMs = 200,
-        int failureTimeoutMs = 10_000)
+        int failureTimeoutMs = 10_000,
+        bool spatial = false,
+        IReadOnlyDictionary<string, string?>? extraSettings = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-cluster-").FullName;
-        var fixture = new ClusterFixture(root, heartbeatMs, failureTimeoutMs);
+        var fixture = new ClusterFixture(root, heartbeatMs, failureTimeoutMs, spatial, extraSettings);
         fixture._hubHttpPort = FreePort();
         fixture._nodeListenPort = FreePort();
         fixture.HubApp = await fixture.StartAppAsync("hub", ClusterRole.Hub, fixture._hubHttpPort);
@@ -125,12 +132,32 @@ internal sealed class ClusterFixture : IAsyncDisposable
     public MelangeClient CreateClient(string? token = null) =>
         new(new MelangeClientOptions { Uri = GatewayUri, Token = token ?? TestTokens.Default });
 
+    /// <summary>
+    /// Kills a node. Graceful stop is attempted but not required — these tests kill nodes
+    /// mid-request on purpose, and a stop that trips over its own in-flight work must still
+    /// release the node's resources (above all its log file handles), or the "revive the node"
+    /// half of the test fails on a leaked lock instead of testing recovery.
+    /// </summary>
     public async Task StopNodeAsync(string name)
     {
         var node = Node(name);
-        await node.App!.StopAsync();
-        await node.App.DisposeAsync();
-        node.App = null;
+        try
+        {
+            // Two seconds of grace, then abort: phase 10's gateway holds live websockets into
+            // shard nodes, and a default graceful stop would wait the host's full shutdown
+            // timeout for connections that only close when the process dies.
+            using var abrupt = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await node.App!.StopAsync(abrupt.Token);
+        }
+        catch (Exception)
+        {
+            // A kill, not a shutdown; disposal below still releases everything.
+        }
+        finally
+        {
+            await node.App!.DisposeAsync();
+            node.App = null;
+        }
     }
 
     public async Task StartNodeAsync(string name)
@@ -201,6 +228,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
             // what lets a reassigned shard's new owner open the shard's log and recover it.
             ["MelangeDb:Cluster:ShardDataPath"] = Path.Combine(_root, "shards"),
         };
+        foreach (var (key, value) in _extraSettings ?? new Dictionary<string, string?>())
+            settings[key] = value;
         if (role == ClusterRole.Hub)
         {
             settings["MelangeDb:Cluster:NodeListenPort"] = _nodeListenPort.ToString();
@@ -214,6 +243,11 @@ internal sealed class ClusterFixture : IAsyncDisposable
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        if (Environment.GetEnvironmentVariable("MELANGE_TEST_LOG") is { Length: > 0 } path)
+        {
+            builder.Logging.AddProvider(new FileLoggerProvider(path, nodeName));
+            builder.Logging.AddFilter("MelangeDB.Cluster", LogLevel.Debug);
+        }
         builder.WebHost.ConfigureKestrel(kestrel =>
             kestrel.Listen(IPAddress.Loopback, httpPort, static listen => listen.Protocols = HttpProtocols.Http1));
         builder.Configuration.AddInMemoryCollection(settings);
@@ -231,11 +265,35 @@ internal sealed class ClusterFixture : IAsyncDisposable
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Mob).Assembly)
             .AddReducersFrom(typeof(ClusterReducers).Assembly)
-            .AddEventHandler<MobDiedHandler>());
-        builder.Services.AddSingleton<IShardStrategy>(static provider => new InstancingShardStrategy(
-            provider.GetRequiredService<SchemaRegistry>(),
-            static session => new ShardKey(session.HubDb.Find<PlayerLocation>(session.Identity)?.InstanceId ?? 1)));
-        builder.Services.AddSingleton<IHandoffSet, PlayerStateHandoffSet>();
+            .AddEventHandler<MobDiedHandler>()
+            .AddEventHandler<GiftSagaHandler>());
+        if (_spatial)
+        {
+            builder.Services.AddSingleton<IShardStrategy>(static provider => new SpatialShardStrategy(
+                provider.GetRequiredService<SchemaRegistry>(),
+                new SpatialGeometry
+                {
+                    BlockWidthChunks = SpatialReducers.BlockW,
+                    BlockHeightChunks = SpatialReducers.BlockH,
+                    DecodeChunk = Chunks.At,
+                },
+                static session => new ShardKey(
+                    session.HubDb.Find<PlayerShardMap>(session.Identity)?.Shard
+                    ?? SpatialShardStrategy.ShardOfBlock(0, 0).Value),
+                provider.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<MelangeDbOptions>>()));
+            builder.Services.AddSingleton<IHandoffSet, SpatialHandoffSet>();
+            builder.Services.AddSingleton<IMigrationAnchors, SpatialAnchors>();
+            builder.Services.AddSingleton<IShardTransferListener>(
+                static provider => new SpatialTransferListener(provider));
+        }
+        else
+        {
+            builder.Services.AddSingleton<IShardStrategy>(static provider => new InstancingShardStrategy(
+                provider.GetRequiredService<SchemaRegistry>(),
+                static session => new ShardKey(session.HubDb.Find<PlayerLocation>(session.Identity)?.InstanceId ?? 1)));
+            builder.Services.AddSingleton<IHandoffSet, PlayerStateHandoffSet>();
+        }
+
         builder.Services.AddMelangeCluster();
 
         var app = builder.Build();
@@ -252,6 +310,36 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
         await app.StartAsync();
         return app;
+    }
+
+    /// <summary>Diagnostics only: MELANGE_TEST_LOG routes cluster-layer logs to one shared file.</summary>
+    private sealed class FileLoggerProvider(string path, string node) : ILoggerProvider
+    {
+        private static readonly Lock Sync = new();
+
+        public ILogger CreateLogger(string categoryName) => new FileLogger(path, node, categoryName);
+
+        public void Dispose()
+        {
+        }
+
+        private sealed class FileLogger(string path, string node, string category) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state)
+                where TState : notnull => null;
+
+            public bool IsEnabled(LogLevel logLevel) => true;
+
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            {
+                lock (Sync)
+                {
+                    File.AppendAllText(
+                        path,
+                        $"{DateTime.UtcNow:HH:mm:ss.fff} [{node}] {category} {eventId.Name}: {formatter(state, exception)}\n");
+                }
+            }
+        }
     }
 
     public static async Task WaitUntilAsync(Func<bool> condition, string what, int timeoutSeconds = 20)

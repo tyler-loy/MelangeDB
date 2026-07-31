@@ -111,6 +111,19 @@ same clock — which is exactly what stops a wrongly-suspected-dead node from wr
 owns. It is `restart`, not the planned `live`: the two sides must agree on the value, and nodes learn it at
 registration.
 
+**Shipped as of phase 10** (defaults verified against `ClusterOptions`): `Cluster:BorderBandChunks`,
+`Cluster:HandoffMarginChunks`, and `Cluster:HandoffMinIntervalMs`. The register's planned rows were reshaped
+when they met the implementation: (1) the planned `Cluster:HandoffHysteresisMeters` is spelled in **chunks**,
+not meters — MelangeDB never learns the world's metric scale (chunk decoding is the developer's
+`SpatialGeometry`), so a meters knob would have been a unit the library cannot interpret — and it split into
+the margin (`HandoffMarginChunks`, the crossing depth that triggers) and the rate limit
+(`HandoffMinIntervalMs`, the floor between an entity's transfers), because hysteresis needs both a distance
+and a time to bound pacing. (2) `Cluster:BorderBandChunks` shipped at its planned default of 2 with the
+derivation documented rather than guessed (margin + one handoff window of travel; docs/plan-phase-10.md
+shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> HandoffMarginChunks`, `≤` the
+block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
+next border re-subscribe, when the owner sends a full band reset.
+
 ## Conventions
 
 - **Everything lives under the `MelangeDb:` configuration section**, so a host can bind it from
@@ -266,8 +279,9 @@ that were reshaped or removed when this shipped.
 | `Cluster:FailureTimeoutMs` | int | `10000` | restart | 09 | One number, both sides: silence after which the hub suspects a node dead and reassigns its shards (bumping fencing tokens), and after which the node itself considers its lease expired and fences its own writes. The self-fencing half is what stops a wrongly-suspected-dead node from writing players it no longer owns. |
 | `Cluster:ShardSpanCheck` | enum | `DebugOnly` | live | 09 | `DebugOnly` \| `Always` \| `Off`. Catches the one contract MelangeDB cannot verify statically: rows mutated in one transaction must resolve to one shard. `DebugOnly` probes whether the entry assembly is a Debug build; a violation throws `ShardSpanException` and aborts with zero trace. Also armed on single-node deployments that register an `IShardStrategy` and call `AddMelangeCluster()`. |
 | `Cluster:ShardDataPath` | string | `./data/shards` | restart | 09 | Shard only: the root under which per-shard engines keep their commit logs and hot stores (`{ShardDataPath}/shard-{key}`). Must be storage every shard node can reach — reassignment means the new owner opens the shard's directory and recovers it from the shard's own log (phase 09 assumes shared or re-attachable volumes; log shipping is a later phase). |
-| `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Deeper is smoother and costs bandwidth plus memory on every node. Default should be derived from movement speed and tick rate, not guessed. |
-| `Cluster:HandoffHysteresisMeters` | float | `16` | live | 10 | Stops a player pacing across a boundary from triggering a handoff per step. |
+| `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Spatial strategy only: how deep each shard's read-only border band reaches into its neighbours, in chunks. Deeper is smoother and costs bandwidth plus memory on every node. The default is derived (docs/CLUSTERING.md shows the derivation): margin + the distance an entity covers during one handoff window — for the reference workload `1 + ceil(8 m/s x ~1 s / 64 m) = 2`. Must be ≥ 1 and > `HandoffMarginChunks` and ≤ the block dimension — validated loudly at strategy construction; live reads clamp instead of crashing a running node. `careful` because deepening it live only fully materializes on the next border re-subscribe (the owner then sends a full band reset). |
+| `Cluster:HandoffMarginChunks` | int | `1` | live | 10 | Spatial strategy only: the hysteresis margin. An automatic handoff triggers only once an entity is *strictly more* than this many chunks past a block boundary, so after a transfer the entity must walk back through the whole margin before the reverse transfer can fire — pacing on the line triggers nothing. `0` disables the margin (creatures transfer on first crossing regardless of this setting). Must be ≥ 0 and < `BorderBandChunks`. |
+| `Cluster:HandoffMinIntervalMs` | int | `2000` | live | 10 | Rate limit on automatic (boundary-triggered) handoffs: the hub will not start a new transfer for the same entity within this window. The second half of hysteresis — even an entity oscillating deeper than the margin triggers a bounded number of transfers per unit time. Must be ≥ 0. |
 
 ## Diagnostics
 

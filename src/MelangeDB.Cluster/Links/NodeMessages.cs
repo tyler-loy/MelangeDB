@@ -54,6 +54,38 @@ internal sealed record ReplicaReset(ulong Lsn, ReplicaTableSnapshot[] Tables);
 
 internal sealed record EventsForward(ulong UpToLsn, ulong ShardValue, WireEvent[] Events, long[] TimestampsMicros, ulong[] Lsns);
 
+/// <summary>
+/// An observer shard's request to receive an owner shard's border slice, carrying the observer's
+/// durable cursor (epoch-qualified — a cursor against another log incarnation means reset) and
+/// its current band depth, so the owner can detect a widened band and answer with a full reset.
+/// Sent observer node → hub, routed hub → owner node as <c>border-subscribe-owner</c>.
+/// </summary>
+internal sealed record BorderSubscribe(
+    ulong OwnerShard, ulong ObserverShard, string Epoch, ulong FromLsn, int BandChunks, bool ForceReset);
+
+/// <summary>False when the owner shard does not exist yet (empty world region) — benign, retry later.</summary>
+internal sealed record BorderSubscribeReply(bool Exists);
+
+/// <summary>
+/// One batch of an owner shard's border-relevant row ops for one observer, in LSN order up to
+/// <see cref="UpToLsn"/>. Sent owner node → hub as <c>border-batch</c>, routed hub → observer node
+/// as <c>border-apply</c>; the ack chain is the flow control, and the observer persists its cursor
+/// before acking, so delivery is at-least-once and re-application reconciles.
+/// </summary>
+internal sealed record BorderBatch(ulong OwnerShard, ulong ObserverShard, string Epoch, ulong UpToLsn, WireOp[] Ops);
+
+/// <summary>
+/// A full border-band reset: every row of the owner's slice for this observer, captured at one
+/// LSN. Sent when the observer's cursor cannot be served from the owner's log — truncated past, a
+/// different epoch, or a widened band — because silently resuming past a gap is the bug class the
+/// replica stream's bootstrap already kills; the observer applies upserts <em>plus deletion of
+/// rows previously borrowed from this owner that the snapshot lacks</em>.
+/// </summary>
+internal sealed record BorderReset(ulong OwnerShard, ulong ObserverShard, string Epoch, ulong Lsn, ReplicaTableSnapshot[] Tables);
+
+/// <summary>The log-arguments payload of a <c>melange/border</c> record: which shard owns the copied rows.</summary>
+internal sealed record BorderMarker(ulong Owner);
+
 internal sealed record HandoffFreeze(string HandoffId, ulong FromShard, ulong ToShard, long FencingToken, string PlayerHex);
 
 internal sealed record HandoffFrozenRows(WireOp[] Rows);
@@ -62,6 +94,33 @@ internal sealed record HandoffImport(
     string HandoffId, ulong FromShard, ulong ToShard, long FencingToken, string PlayerHex, WireOp[] Rows);
 
 internal sealed record HandoffRelease(string HandoffId, ulong FromShard, long FencingToken);
+
+/// <summary>
+/// A shard node telling the hub an anchored entity crossed its boundary past the margin — the
+/// origin-decides trigger of a seamless handoff. A notification, not a request: the hub owns the
+/// decision (in-flight dedupe, rate limit) and the origin keeps serving the entity meanwhile.
+/// </summary>
+internal sealed record HandoffRequest(string PlayerHex, ulong FromShard, ulong ToShard, long FencingToken);
+
+/// <summary>An anchored entity entered the border band: the gateway pre-opens destination sessions on it.</summary>
+internal sealed record HandoffApproach(string PlayerHex, ulong FromShard, ulong[] ToShards);
+
+/// <summary>
+/// A node's reconciler resolved a stranded handoff (the coordinator died or lost its link
+/// mid-saga): released means the destination owns the entity now, so the hub must run its
+/// transfer listeners and gateway notifications late — better late than a stale session map.
+/// </summary>
+internal sealed record HandoffResolved(string HandoffId, string PlayerHex, ulong FromShard, ulong ToShard, bool Released);
+
+/// <summary>
+/// A hub-initiated reducer execution on the shard owning <see cref="Shard"/> — the primitive a
+/// cross-shard saga's steps are made of. Arguments travel pre-encoded (the hub validates and
+/// encodes with the same registry the node decodes with); the fencing token makes a step against
+/// a stale owner fail loudly instead of executing on the wrong term.
+/// </summary>
+internal sealed record ShardExecute(ulong Shard, long FencingToken, string Reducer, string CallerHex, string ArgsB64);
+
+internal sealed record ShardExecuteReply(ulong Lsn);
 
 internal sealed record HandoffQuery(string HandoffId, ulong ToShard);
 

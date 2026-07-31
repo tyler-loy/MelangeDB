@@ -94,14 +94,50 @@ it may lag independently and resume where it stopped.
 connection; a clustered client (phase 09) holds several — hub plus shard. The resume cursor (log epoch + acked
 LSN) is per attachment, never per subscription and never global.
 
+**Approach** — The boundary monitor's early signal: an anchored entity entered the border band toward a
+neighbouring shard. The gateway pre-opens a session to the (possibly just-created) destination on it, so the
+eventual swap is instant. Not a commitment — most approaches never become crossings.
+
 **AutoInc** — A column whose value is assigned from a durable per-table sequence, allocated into the write set
 *before* the log append so replay never reassigns different ids. The contract is **unique, not dense** — gaps
 are normal, which is what lets each shard allocate from an originator-prefixed range with no coordination.
 Ids are 64-bit but allocated within 63 (sign bit clear: 16-bit originator, 47-bit sequence), so a value
 round-trips through Postgres `bigint` and signed-only client languages unchanged.
 
-**Border band** — In the spatial strategy, the ring of chunks a shard node holds read-only copies of so it can
-serve entities just beyond its own boundary. Derived from `InterestOf`.
+**Block** — Under the spatial strategy, the rectangular group of chunks that is one shard: the shard key packs
+the block's two 32-bit coordinates, so a world can grow in any direction without ever migrating key encodings.
+Block dimensions are the developer's geometry (`SpatialGeometry`), not MelangeDB's.
+
+**Border band** — In the spatial strategy, the ring of chunks (depth `Cluster:BorderBandChunks`) a shard node
+holds read-only copies of so it can serve entities just beyond its own boundary. Derived from `InterestOf`,
+narrowed per row by `InterestedInRow`. The band is also the ownership *seam*: an entity its origin still owns
+may stand up to the band's depth inside a neighbouring block while its handoff is pending — beyond it, writes
+fail loudly, because that means handoffs are not keeping up.
+
+**Border stream** — The at-least-once replication of one owner shard's border slice to one observer shard:
+owner node → hub → observer node, log-driven on the owner with the observer's durable cursor as the truth.
+Nothing pins the owner's log for it — a cursor the log can no longer serve is answered by a full band reset
+(EventId 1715), never silently resumed past. An update that moves a row out of the observer's scope ships as
+a retraction, so the observer stops seeing what walked away.
+
+**Borrowed row** — A border-band copy: a row present in a shard engine's store that a *neighbouring* shard
+owns. Visible to reads and subscriptions, refused at every commit (`BorderReadOnlyException`) — always
+enforced, never debug-only, because a copy silently diverging from its owner is the failure no test surfaces.
+The registry of borrowed rows persists as a sidecar beside the shard's log (snapshot-plus-tail, like the
+engine's own recovery), since border records below a truncation base are gone while their rows survive in the
+snapshot.
+
+**Chunk** — The developer's unit of world space (Vibe Shaft: 64 m squares). MelangeDB never interprets chunk
+ids; the spatial strategy is handed a decoder (`SpatialGeometry.DecodeChunk`) and requires the chunk-id column
+to be at least 32 bits wide, because a `ushort` encoding (`cx * 157 + cy`) tops out at 65,535 and overflows
+when the world grows — a migration trap closed at registration, not discovered in production.
+
+**Boundary monitor** — The origin-decides half of seamless handoff: a commit observer per owned shard that
+assesses every committed Partitioned write of an anchored entity against the shard's boundary, notifies the
+hub of approaches (the gateway pre-opens on them) and requests a transfer once the entity crosses past the
+hysteresis margin. The origin decides because its committed rows are the only trusted position — the client's
+claimed position never is. On shard open it re-assesses existing rows once, so an entity that crossed in the
+instant before a crash still migrates.
 
 **Buffer pool** — The capped in-memory portion of the paging store's hybrid logs, bounded by
 `HotStore:MemoryBudgetBytes`. **Excludes** resident tables, which are pinned and accounted separately — the
@@ -248,6 +284,12 @@ the node dead. An expired lease means **self-fencing**: the node's shard engines
 
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
 
+**Migration anchor (`IMigrationAnchors`)** — The application's declaration of which rows anchor automatic
+migration: a player's position row (with hysteresis — pacing on the line must not thrash) or a creature
+(immediate — its AI only ticks it on the shard its position resolves to, so a margin would leave it standing
+unticked at the boundary). Companion rows follow their anchor via the `IHandoffSet`; terrain anchors nothing
+and never migrates.
+
 **Membership store (`IMembershipStore`)** — The cluster's ownership registry: which nodes exist, which node
 owns each shard under which fencing token, and each shard's originator id. Owned and written exclusively by
 the hub; shard nodes learn assignments over their node links, never by reading the store. Postgres-backed in
@@ -327,6 +369,11 @@ projection that serves SQL tooling and aggregates.
 reaches the LSN — the narrow primitive for the rare flow that genuinely needs cross-tier read-after-write.
 An honest wait: it can take as long as Postgres is down. Most code should not use it; the lag is the design,
 and the hot store already serves read-your-writes.
+
+**Re-homing** — What handoff does to a transferred row on the destination: instancing rewrites the explicit
+`ShardBy` column (`RowRehoming.RewriteShardBy`); the spatial strategy's rows already carry their location, so
+the import leaves the bytes untouched and *asserts* they resolve to the destination
+(`RowRehoming.ByContent`) — rewriting a chunk id to a shard key would be silent corruption.
 
 **Replicated** — Placement: a full copy on every node, written only by the hub. Small bounded reference data.
 

@@ -18,10 +18,24 @@ internal sealed record HandoffMarker(string HandoffId, string PlayerHex, ulong F
     public const ulong NoOrigin = ulong.MaxValue;
 }
 
+/// <summary>
+/// The durable form of the borrowed-row registry: the registry's full state, consistent at
+/// <see cref="Lsn"/> of log epoch <see cref="Epoch"/>. Border records below a snapshot's
+/// truncation base are gone while their rows survive in the snapshot, so the registry cannot be
+/// rebuilt from the log alone — this sidecar is its snapshot, and recovery is sidecar plus log
+/// tail, exactly the engine's own snapshot-plus-replay pattern.
+/// </summary>
+internal sealed record BorrowedSidecar(Guid Epoch, ulong Lsn, BorrowedSidecar.Entry[] Rows)
+{
+    public sealed record Entry(uint Table, byte[] Key, ulong Owner);
+}
+
 /// <summary>Reserved reducer names for cluster-internal log records.</summary>
 internal static class ClusterRecordNames
 {
     public const string Replica = "melange/replica";
+    public const string Border = "melange/border";
+    public const string BorderReset = "melange/border-reset";
     public const string HandoffFreeze = "melange/handoff-freeze";
     public const string HandoffImport = "melange/handoff-import";
     public const string HandoffRelease = "melange/handoff-release";
@@ -36,7 +50,7 @@ internal static class ClusterRecordNames
 /// and the origin/destination halves of the handoff saga, recoverable because every step appended
 /// a marker to this log before it was acknowledged.
 /// </summary>
-internal sealed class ShardRuntime : IDisposable
+internal sealed partial class ShardRuntime : IDisposable
 {
     private static readonly Identity ClusterCaller = Identity.Hash("melange/cluster");
 
@@ -46,6 +60,23 @@ internal sealed class ShardRuntime : IDisposable
     private readonly HashSet<string> _importedHandoffs = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (HandoffMarker Marker, ulong Lsn)> _unsettledImports = new(StringComparer.Ordinal);
     private readonly IHandoffSet? _handoffSet;
+    private readonly IShardStrategy? _strategy;
+
+    /// <summary>
+    /// Serializes ownership <em>decisions</em> — border applies versus handoff imports — so a
+    /// border op can never judge a row "not owned here" concurrently with the import that makes it
+    /// owned. Never taken by the commit guard (which runs under the engine's write lock), so the
+    /// lock order is always ownership lock then engine lock, never the reverse.
+    /// </summary>
+    private readonly Lock _ownershipLock = new();
+
+    /// <summary>
+    /// The read-only border copies this shard holds, keyed to the owning shard. Concurrent because
+    /// the commit guard reads it under the engine's write lock while appliers mutate it under
+    /// <see cref="_ownershipLock"/>.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(TableId Table, RowKey Key), ulong> _borrowedRows = new();
+    private readonly ILogger _logger;
 
     public ShardRuntime(
         ShardKey shard,
@@ -66,8 +97,10 @@ internal sealed class ShardRuntime : IDisposable
         Shard = shard;
         FencingToken = fencingToken;
         Directory = shardDirectory;
+        _logger = loggerFactory.CreateLogger("MelangeDB.Cluster.Shard");
         _handoffSet = services.GetService<IHandoffSet>();
         var strategy = services.GetService<IShardStrategy>();
+        _strategy = strategy;
         var current = options.CurrentValue;
         Options = MelangeOptionsClone.DeepClone(current);
         Options.HotStore.Path = Path.Combine(shardDirectory, "hot");
@@ -89,7 +122,8 @@ internal sealed class ShardRuntime : IDisposable
             strategy,
             () => ShardSpanCheck.IsEnabled(options.CurrentValue.Cluster.ShardSpanCheck),
             leaseValid,
-            FrozenSnapshot));
+            FrozenSnapshot,
+            BorrowedOwnerOf));
 
         RecoverHandoffState();
 
@@ -100,6 +134,18 @@ internal sealed class ShardRuntime : IDisposable
         // owners — the exact silent-gap bug class phase 08 fixed for the Postgres checkpoint.
         Engine.AddTruncationFloor(() => MarkerFloor(_pendingFreezes));
         Engine.AddTruncationFloor(() => MarkerFloor(_unsettledImports));
+
+        // Not a pin — a refresh point. Truncation may erase border records whose effects only the
+        // borrowed sidecar remembers, so the sidecar is rewritten at the head the moment
+        // truncation is being decided (this runs under the engine's write lock, like the snapshot
+        // itself): after the write, everything at or below the head is reconstructible from
+        // sidecar plus tail, and nothing needs pinning. The stale-sidecar check in recovery stays
+        // as the loud safety net.
+        Engine.AddTruncationFloor(() =>
+        {
+            WriteBorrowedSidecar();
+            return null;
+        });
 
         ReducerHost = new MelangeReducerHost(
             Engine, reducers, services.GetRequiredService<IServiceScopeFactory>(), options, time);
@@ -198,6 +244,157 @@ internal sealed class ShardRuntime : IDisposable
 
     private static readonly IReadOnlySet<(TableId, RowKey)> EmptyFrozen = new HashSet<(TableId, RowKey)>();
 
+    /// <summary>Which shard owns this row's border copy, or null when the row is not borrowed.</summary>
+    public ulong? BorrowedOwnerOf(TableId table, RowKey key) =>
+        _borrowedRows.TryGetValue((table, key), out var owner) ? owner : null;
+
+    /// <summary>Whether the row is frozen mid-handoff — a transfer for it is already in flight.</summary>
+    public bool IsFrozen(TableId table, RowKey key)
+    {
+        lock (_handoffLock)
+        {
+            return _frozenRows.Contains((table, key));
+        }
+    }
+
+    /// <summary>How many read-only border copies this shard currently holds — the band's footprint in rows.</summary>
+    public int BorrowedRowCount => _borrowedRows.Count;
+
+    /// <summary>
+    /// Applies one border batch from a neighbouring owner shard, judged per op under the
+    /// ownership lock. The rules, in blast-radius order: a row this shard holds unmarked and
+    /// unfrozen is <em>authoritative</em> — including an owned entity strayed across the line
+    /// awaiting its handoff — and no border op may touch it. A frozen unmarked row is the zombie
+    /// of a transfer whose import is durable elsewhere; the new owner's publication <em>adopts</em>
+    /// it as a marked copy, because a silent skip would desync the publisher's sent-set (it
+    /// believes the observer holds what the observer dropped) and the stale unmarked copy would
+    /// later masquerade as an owned entity. Deletes touch only marked copies, and only when sent
+    /// by the copy's recorded owner — during a transfer two neighbours briefly publish the same
+    /// entity, and the previous owner's trailing retraction must not erase the new owner's fresh
+    /// copy. The cursor is persisted before the caller acks, so delivery is at-least-once and
+    /// re-application reconciles.
+    /// </summary>
+    public void ApplyBorder(BorderBatch batch)
+    {
+        lock (_ownershipLock)
+        {
+            var frozen = FrozenSnapshot();
+            var ops = new List<RowOp>(batch.Ops.Length);
+            foreach (var wire in batch.Ops)
+            {
+                if (!Engine.Schema.TryGet(new TableId(wire.Table), out var table) || table.Placement != Placement.Partitioned)
+                    continue;
+                var key = (table.Id, new RowKey(wire.Key));
+                var borrowed = _borrowedRows.TryGetValue(key, out var owner);
+                var exists = Engine.HotStore.TryGetRow(key.Item1, key.Item2, out _);
+                if (exists && !borrowed && !frozen.Contains(key))
+                    continue; // Authoritative here (owned, possibly strayed): no border op may touch it.
+                if (wire.Kind == (byte)RowOpKind.Delete)
+                {
+                    if (!borrowed || owner != batch.OwnerShard)
+                        continue;
+                    ops.Add(wire.ToRowOp());
+                    _borrowedRows.TryRemove(key, out _);
+                }
+                else
+                {
+                    ops.Add(wire.ToRowOp());
+                    _borrowedRows[key] = batch.OwnerShard;
+                }
+            }
+
+            if (ops.Count > 0)
+            {
+                Engine.ApplyInternal(
+                    ClusterRecordNames.Border, ClusterCaller, ops,
+                    arguments: JsonSerializer.SerializeToUtf8Bytes(new BorderMarker(batch.OwnerShard)), reconcile: true);
+                WriteBorrowedSidecar();
+            }
+
+            WriteBorderCursor(batch.OwnerShard, batch.Epoch, batch.UpToLsn);
+        }
+    }
+
+    /// <summary>
+    /// Applies a full band reset from one owner: upsert every snapshot row, delete every copy
+    /// previously borrowed from <em>that owner</em> the snapshot lacks — the owner deleted it
+    /// during the gap its truncated log can no longer serve, and a pure upsert would resurrect it.
+    /// The same rigor as the replica stream's bootstrap.
+    /// </summary>
+    public void ApplyBorderReset(BorderReset reset)
+    {
+        lock (_ownershipLock)
+        {
+            var frozen = FrozenSnapshot();
+            var ops = new List<RowOp>();
+            var seen = new HashSet<(TableId, RowKey)>();
+            foreach (var table in reset.Tables)
+            {
+                if (!Engine.Schema.TryGet(new TableId(table.Table), out var schema) || schema.Placement != Placement.Partitioned)
+                    continue;
+                foreach (var wire in table.Rows)
+                {
+                    var key = (schema.Id, new RowKey(wire.Key));
+                    seen.Add(key);
+                    var borrowed = _borrowedRows.ContainsKey(key);
+                    if (!borrowed && !frozen.Contains(key) && Engine.HotStore.TryGetRow(key.Item1, key.Item2, out _))
+                        continue; // Authoritative here (owned, possibly strayed); the snapshot's copy is the stale one.
+                    ops.Add(wire.ToRowOp());
+                    _borrowedRows[key] = reset.OwnerShard;
+                }
+            }
+
+            foreach (var (key, owner) in _borrowedRows)
+            {
+                if (owner == reset.OwnerShard && !seen.Contains(key))
+                {
+                    ops.Add(new RowOp(RowOpKind.Delete, key.Table, key.Key));
+                    _borrowedRows.TryRemove(key, out _);
+                }
+            }
+
+            if (ops.Count > 0)
+            {
+                Engine.ApplyInternal(
+                    ClusterRecordNames.BorderReset, ClusterCaller, ops,
+                    arguments: JsonSerializer.SerializeToUtf8Bytes(new BorderMarker(reset.OwnerShard)), reconcile: true);
+                WriteBorrowedSidecar();
+            }
+
+            WriteBorderCursor(reset.OwnerShard, reset.Epoch, reset.Lsn);
+        }
+    }
+
+    /// <summary>The observer's durable cursor into one owner's log: epoch, LSN, and the band depth it was taken at.</summary>
+    public (string Epoch, ulong Lsn, int BandChunks) ReadBorderCursor(ulong ownerShard, int currentBand)
+    {
+        var path = BorderCursorPath(ownerShard);
+        try
+        {
+            if (File.Exists(path))
+            {
+                var parts = File.ReadAllText(path).Split('|');
+                if (parts.Length == 3 && ulong.TryParse(parts[1], out var lsn) && int.TryParse(parts[2], out var band))
+                    return (parts[0], lsn, band);
+            }
+        }
+        catch (IOException)
+        {
+        }
+
+        return (string.Empty, 0, currentBand);
+    }
+
+    private int _borderCursorBand;
+
+    /// <summary>The band depth the next persisted cursor records; set by the subscribe sweep.</summary>
+    public void SetBorderCursorBand(int bandChunks) => _borderCursorBand = bandChunks;
+
+    private void WriteBorderCursor(ulong ownerShard, string epoch, ulong lsn) =>
+        File.WriteAllText(BorderCursorPath(ownerShard), $"{epoch}|{lsn}|{_borderCursorBand}");
+
+    private string BorderCursorPath(ulong ownerShard) => Path.Combine(Directory, $"border-from-{ownerShard}.cursor");
+
     /// <summary>
     /// The origin half, step one: freeze the player's rows, then collect them — both under one
     /// write-lock hold, so no write can interleave between "still writable" and "collected" —
@@ -222,6 +419,32 @@ internal sealed class ShardRuntime : IDisposable
         Engine.ReadConsistent(_ =>
         {
             _handoffSet.Collect(player, Shard, Engine.CommittedView, collector);
+
+            // Defense in depth against a confused trigger: a freeze may only cover rows this
+            // shard owns. A border copy in the transfer set means someone asked the wrong origin
+            // to move an entity — exporting the stale copy would overwrite the true owner's row.
+            foreach (var (table, key, _) in collector.Rows)
+            {
+                if (_borrowedRows.TryGetValue((table.Id, key), out var owner))
+                {
+                    throw new InvalidOperationException(
+                        $"Handoff {handoffId}: the transfer set for {player} includes a row of '{table.Name}' that is " +
+                        $"a read-only border copy owned by shard:{owner} — this shard does not own the entity and " +
+                        "cannot be its transfer origin.");
+                }
+            }
+
+            // An empty transfer set means this shard does not actually hold the entity — a stale
+            // or duplicate trigger racing a transfer that already happened. Importing nothing
+            // would "succeed", flip session maps, and teach everyone a lie; failing loudly makes
+            // the confused trigger visible and costs nothing real.
+            if (collector.Rows.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Handoff {handoffId}: the transfer set for {player} out of {Shard} is empty — this shard holds " +
+                    "no rows for the entity, so it cannot be the transfer origin. A stale trigger; nothing was frozen.");
+            }
+
             lock (_handoffLock)
             {
                 foreach (var (table, key, _) in collector.Rows)
@@ -293,7 +516,7 @@ internal sealed class ShardRuntime : IDisposable
         foreach (var wire in rows)
         {
             var table = Engine.Schema.Get(new TableId(wire.Table));
-            ops.Add(new RowOp(RowOpKind.Insert, table.Id, new RowKey(wire.Key), RewriteShardColumn(table, wire.Row!)));
+            ops.Add(new RowOp(RowOpKind.Insert, table.Id, new RowKey(wire.Key), RehomeRow(table, wire.Row!)));
         }
 
         var marker = new HandoffMarker(handoffId, playerHex, fromShard, Shard.Value, null);
@@ -303,9 +526,20 @@ internal sealed class ShardRuntime : IDisposable
             _unsettledImports[handoffId] = (marker, Engine.Log.HeadLsn + 1);
         }
 
-        var record = Engine.ApplyInternal(
-            ClusterRecordNames.HandoffImport, ClusterCaller, ops,
-            arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
+        // Under the ownership lock: the import is what turns a borrowed border copy into an
+        // authoritative row, and a border op racing this decision must observe either the copy or
+        // the ownership, never a half of each.
+        CommitRecord? record;
+        lock (_ownershipLock)
+        {
+            record = Engine.ApplyInternal(
+                ClusterRecordNames.HandoffImport, ClusterCaller, ops,
+                arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
+            foreach (var op in ops)
+                _borrowedRows.TryRemove((op.Table, op.Key), out _);
+            WriteBorrowedSidecar();
+        }
+
         lock (_handoffLock)
         {
             _importedHandoffs.Add(handoffId);
@@ -342,7 +576,10 @@ internal sealed class ShardRuntime : IDisposable
     /// <summary>
     /// The origin half, last step: delete the transferred rows and unfreeze. Only called once the
     /// destination confirmed its import is durable — between import and release the player exists
-    /// on both logs but is writable on neither, which is the invariant.
+    /// on both logs but is writable on neither, which is the invariant. A row the new owner's
+    /// border stream already <em>adopted</em> as a marked copy is kept, not deleted: it is the
+    /// border copy this shard is entitled to (the entity stands just across the line), and
+    /// deleting it would silently desync the owner's publisher, which believes we hold it.
     /// </summary>
     public void Release(string handoffId)
     {
@@ -354,12 +591,17 @@ internal sealed class ShardRuntime : IDisposable
             marker = pending.Marker;
         }
 
-        var ops = (marker.Rows ?? [])
-            .Select(static r => new RowOp(RowOpKind.Delete, new TableId(r.Table), new RowKey(r.Key)))
-            .ToList();
-        Engine.ApplyInternal(
-            ClusterRecordNames.HandoffRelease, ClusterCaller, ops,
-            arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
+        lock (_ownershipLock)
+        {
+            var ops = (marker.Rows ?? [])
+                .Where(r => !_borrowedRows.ContainsKey((new TableId(r.Table), new RowKey(r.Key))))
+                .Select(static r => new RowOp(RowOpKind.Delete, new TableId(r.Table), new RowKey(r.Key)))
+                .ToList();
+            Engine.ApplyInternal(
+                ClusterRecordNames.HandoffRelease, ClusterCaller, ops,
+                arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
+        }
+
         Unfreeze(handoffId, marker);
     }
 
@@ -391,16 +633,41 @@ internal sealed class ShardRuntime : IDisposable
     }
 
     /// <summary>
-    /// Rebuilds the handoff saga state from this shard's own log: a freeze with no release or
-    /// abort re-freezes its rows (the node's reconciler then asks the hub whether the destination
-    /// imported, and completes or aborts); an import record marks its handoff id done — and stays
-    /// unsettled, pinning truncation, until a settled record follows it. The truncation floors
-    /// registered over these sets are what guarantee this scan can never miss a live marker.
+    /// Rebuilds the handoff saga state and the borrowed-row registry from this shard's own log: a
+    /// freeze with no release or abort re-freezes its rows (the node's reconciler then asks the
+    /// hub whether the destination imported, and completes or aborts); an import record marks its
+    /// handoff id done — and stays unsettled, pinning truncation, until a settled record follows
+    /// it — and un-borrows the rows it made authoritative; border records add and remove borrowed
+    /// copies in the order they were applied. The truncation floors registered over the saga sets
+    /// are what guarantee this scan can never miss a live marker, and the borrowed registry needs
+    /// no floor at all — border records survive exactly as long as their rows, because both live
+    /// in the same log the snapshot captures.
     /// </summary>
     private void RecoverHandoffState()
     {
+        var (sidecarLsn, sidecarUsable) = LoadBorrowedSidecar();
         foreach (var record in Engine.Log.ReadFrom(Engine.Log.BaseLsn + 1))
         {
+            if (record.ReducerName is ClusterRecordNames.Border or ClusterRecordNames.BorderReset)
+            {
+                // Only records past the sidecar's LSN: an older add replayed over a newer sidecar
+                // would resurrect an entry a later import already retired.
+                if (record.Lsn <= sidecarLsn)
+                    continue;
+                var border = JsonSerializer.Deserialize<BorderMarker>(record.Arguments.Span);
+                if (border is null)
+                    continue;
+                foreach (var op in record.WriteSet)
+                {
+                    if (op.Kind == RowOpKind.Delete)
+                        _borrowedRows.TryRemove((op.Table, op.Key), out _);
+                    else
+                        _borrowedRows[(op.Table, op.Key)] = border.Owner;
+                }
+
+                continue;
+            }
+
             if (!record.ReducerName.StartsWith("melange/handoff", StringComparison.Ordinal))
                 continue;
             var marker = JsonSerializer.Deserialize<HandoffMarker>(record.Arguments.Span);
@@ -418,6 +685,12 @@ internal sealed class ShardRuntime : IDisposable
                 case ClusterRecordNames.HandoffImport:
                     _importedHandoffs.Add(marker.HandoffId);
                     _unsettledImports[marker.HandoffId] = (marker, record.Lsn);
+                    if (record.Lsn > sidecarLsn)
+                    {
+                        foreach (var op in record.WriteSet)
+                            _borrowedRows.TryRemove((op.Table, op.Key), out _);
+                    }
+
                     break;
                 case ClusterRecordNames.HandoffSettled:
                     _unsettledImports.Remove(marker.HandoffId);
@@ -430,10 +703,121 @@ internal sealed class ShardRuntime : IDisposable
             foreach (var reference in pending.Rows ?? [])
                 _frozenRows.Add((new TableId(reference.Table), new RowKey(reference.Key)));
         }
+
+        if (!sidecarUsable)
+            RebuildBorrowedFromStore();
+        WriteBorrowedSidecar();
     }
+
+    /// <summary>
+    /// Seeds the borrowed registry from its sidecar. Returns the LSN the sidecar is consistent at
+    /// and whether it was usable — an unusable one (missing while the log is truncated, another
+    /// epoch, older than the truncation base, or unreadable) means the log tail alone cannot
+    /// reconstruct the registry, and the store-scan fallback must run instead.
+    /// </summary>
+    private (ulong Lsn, bool Usable) LoadBorrowedSidecar()
+    {
+        var path = BorrowedSidecarPath;
+        try
+        {
+            if (!File.Exists(path))
+                return (0, Engine.Log.BaseLsn == 0); // A fresh (or pre-sidecar) shard: the full log is the registry.
+            var sidecar = JsonSerializer.Deserialize<BorrowedSidecar>(File.ReadAllBytes(path));
+            if (sidecar is null || sidecar.Epoch != Engine.Log.EpochId || sidecar.Lsn < Engine.Log.BaseLsn)
+                return (0, Engine.Log.BaseLsn == 0);
+            foreach (var entry in sidecar.Rows)
+                _borrowedRows[(new TableId(entry.Table), new RowKey(entry.Key))] = entry.Owner;
+            return (sidecar.Lsn, true);
+        }
+        catch (Exception exception) when (exception is IOException or JsonException)
+        {
+            return (0, Engine.Log.BaseLsn == 0);
+        }
+    }
+
+    /// <summary>
+    /// The loud fallback: rebuilds the registry from row content — a Partitioned row resolving to
+    /// a foreign shard is a border copy owned by that shard, unless a pending freeze names it (an
+    /// entity this shard still owns, frozen mid-transfer across the line). Correct by the
+    /// strategy's own definition, and a full scan, which is why the sidecar exists to make it the
+    /// exception. Also the upgrade path for shard directories that predate the sidecar.
+    /// </summary>
+    private void RebuildBorrowedFromStore()
+    {
+        if (_strategy is null)
+            return;
+        _borrowedRows.Clear();
+        var frozen = FrozenSnapshot();
+        var rebuilt = 0;
+        foreach (var table in Engine.Schema.Tables)
+        {
+            if (table.Placement != Placement.Partitioned)
+                continue;
+            foreach (var (key, bytes) in Engine.HotStore.Scan(table.Id))
+            {
+                if (frozen.Contains((table.Id, key)))
+                    continue;
+                var owner = _strategy.ShardForRow(table.Id, table.ToRowRef(bytes));
+                if (owner != Shard)
+                {
+                    _borrowedRows[(table.Id, key)] = owner.Value;
+                    rebuilt++;
+                }
+            }
+        }
+
+        LogBorrowedRebuilt(_logger, Shard.Value, rebuilt);
+    }
+
+    /// <summary>Only file-write serialization: holders never take the engine or ownership lock inside it.</summary>
+    private readonly Lock _sidecarLock = new();
+
+    private void WriteBorrowedSidecar()
+    {
+        var entries = _borrowedRows
+            .Select(static pair => new BorrowedSidecar.Entry(pair.Key.Table.Value, pair.Key.Key.ToArray(), pair.Value))
+            .ToArray();
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(new BorrowedSidecar(Engine.Log.EpochId, Engine.Log.HeadLsn, entries));
+        lock (_sidecarLock)
+        {
+            File.WriteAllBytes(BorrowedSidecarPath, bytes);
+        }
+    }
+
+    private string BorrowedSidecarPath => Path.Combine(Directory, "borrowed.sidecar");
+
+    [LoggerMessage(EventId = 1716, EventName = "BorrowedRegistryRebuilt", Level = LogLevel.Warning,
+        Message = "Shard {Shard}'s borrowed-row sidecar was missing or unusable while its log is truncated; the registry was " +
+            "rebuilt from row content ({Rows} border copies) — correct, but a full scan. Expected once when upgrading a " +
+            "pre-phase-10 shard directory; recurring, it means the sidecar is not surviving restarts.")]
+    private static partial void LogBorrowedRebuilt(ILogger logger, ulong shard, int rows);
 
     private static WireOp[] RowRefsOf(WireOp[] rows) =>
         [.. rows.Select(static r => new WireOp(r.Kind, r.Table, r.Key, null))];
+
+    /// <summary>
+    /// Re-homes a transferred row per the strategy's <see cref="IShardStrategy.RehomingOf"/>:
+    /// rewrite the ShardBy column (instancing), or assert the content already resolves here
+    /// (spatial) — a transferred row whose position contradicts its destination is a protocol
+    /// error, and rewriting a chunk id to a shard key would be silent corruption.
+    /// </summary>
+    private byte[] RehomeRow(TableSchema table, byte[] rowBytes)
+    {
+        if ((_strategy?.RehomingOf(table.Id) ?? RowRehoming.RewriteShardBy) == RowRehoming.RewriteShardBy)
+            return RewriteShardColumn(table, rowBytes);
+
+        var resolved = _strategy!.ShardForRow(table.Id, table.ToRowRef(rowBytes));
+        if (resolved != Shard)
+        {
+            throw new InvalidOperationException(
+                $"Handoff row of table '{table.Name}' resolves to {resolved}, not this destination {Shard}. A " +
+                "ByContent strategy transfers rows only once their content places them in the destination shard — " +
+                "the boundary monitor triggers past the crossing margin, so an import resolving elsewhere means the " +
+                "transfer was initiated for the wrong destination.");
+        }
+
+        return rowBytes;
+    }
 
     private byte[] RewriteShardColumn(TableSchema table, byte[] rowBytes)
     {

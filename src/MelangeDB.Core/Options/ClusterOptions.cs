@@ -115,4 +115,32 @@ public sealed class ClusterOptions
     /// assumes shared or re-attachable volumes; log shipping is a later phase).
     /// </summary>
     public string ShardDataPath { get; set; } = "./data/shards";
+
+    /// <summary>
+    /// Spatial strategy only: how deep (in chunks) each shard's read-only border band reaches into
+    /// its neighbours. Deeper is smoother and costs bandwidth plus memory on every node. The
+    /// default is derived, not guessed: the band must cover
+    /// <c>HandoffMarginChunks</c> plus the distance an entity travels during one handoff window
+    /// (crossing detection + saga), which for the reference workload is
+    /// 1 + ceil(8 m/s x ~1 s / 64 m per chunk) = 2 (docs/CLUSTERING.md shows the derivation).
+    /// Must exceed <see cref="HandoffMarginChunks"/>; values below 1 are clamped to 1.
+    /// </summary>
+    public int BorderBandChunks { get; set; } = 2;
+
+    /// <summary>
+    /// Spatial strategy only: the hysteresis margin, in chunks. A handoff triggers only once an
+    /// entity is strictly more than this many chunks past a block boundary, so pacing across the
+    /// line never triggers one per step — after a transfer the entity must travel back through
+    /// the full margin before the reverse transfer can fire. 0 disables the margin (entities
+    /// transfer on first crossing, which is what creatures use regardless).
+    /// </summary>
+    public int HandoffMarginChunks { get; set; } = 1;
+
+    /// <summary>
+    /// The rate limit on automatic (boundary-triggered) handoffs: the hub will not start a new
+    /// transfer for an entity within this many milliseconds of its previous one. The second half
+    /// of hysteresis — even an entity oscillating deeper than the margin triggers a bounded
+    /// number of transfers per unit time, never one per step.
+    /// </summary>
+    public int HandoffMinIntervalMs { get; set; } = 2_000;
 }
