@@ -1,3 +1,5 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Xunit;
 
 namespace MelangeDB.Cluster.Tests;
@@ -67,6 +69,11 @@ public class FailoverTests
         Assert.Contains("lease", fenced.Message);
         Assert.Contains("fenc", fenced.Message);
 
+        // The melange-shard health check reports the contested ownership.
+        var health = owner.App!.Services.GetRequiredService<MelangeShardHealthCheck>();
+        var whileFenced = await health.CheckHealthAsync(new HealthCheckContext(), TestContext.Current.CancellationToken);
+        Assert.Equal(HealthStatus.Unhealthy, whileFenced.Status);
+
         // The hub, on the same clock, suspects the node dead and orphans the shard (there is no
         // other node to take it) under a bumped fencing token.
         await ClusterFixture.WaitUntilAsync(
@@ -87,5 +94,8 @@ public class FailoverTests
 
         reopened!.ReducerHost.Call("SpawnMob", ClusterFixture.Caller, 1u, 7);
         Assert.Equal(2, reopened.Engine.CommittedView.Count<Mob>());
+
+        var afterHeal = await health.CheckHealthAsync(new HealthCheckContext(), TestContext.Current.CancellationToken);
+        Assert.Equal(HealthStatus.Healthy, afterHeal.Status);
     }
 }

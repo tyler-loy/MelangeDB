@@ -86,27 +86,75 @@ the hub.
 
 ## Decisions to settle
 
-- **Cluster membership.** Ownership registry, failure detection, and reassigning a dead node's shards. Could
-  be Postgres-backed (the hub already needs it) rather than a new consensus dependency — worth taking, since
-  it avoids introducing Raft one phase early.
-- **How do shard nodes trust an identity?** A client authenticates once at the gateway; re-validating its JWT on
-  every shard node is wasteful and doesn't work at all for hub-issued guest identities, which no external
-  issuer can vouch for. The likely answer is a signed internal identity assertion minted by the hub and
-  verified by shard nodes, plus mutual auth between nodes so a client cannot talk to a shard node directly and
-  claim to be anyone. Note the trust boundary this creates: a compromised shard node can impersonate any player
-  in its shards. That may be acceptable — nodes are your infrastructure — but it should be a stated assumption
-  rather than an accident.
-- **Client protocol during dual attachment.** A client holds a hub session and a shard session; the gateway
-  must present that as one endpoint, including which node answers which subscription.
-- **Does `Replicated` need write support from shards?** Say no as long as possible.
-- **Where do policies evaluate, and what can they read there?** Subscription fan-out for `Partitioned` tables
-  runs on shard nodes, but the flagship phase 04 policy reads `AdminIdentity` — a `Global` hub table that
-  isn't present there. Options: tables read by policies must be `Replicated`; policy evaluation moves to the
-  gateway; or the hub pushes policy-relevant state to shard nodes with the identity assertion. Undecided, and
-  must be settled before row policies work in a cluster — "policies may freely read private tables" needs a
-  placement qualifier or it's overclaimed.
-- **How do reducers that touch only `Global` tables get routed** — hub-executed, or shard-executed with a
-  remote call? Hub-executed is simpler.
+Each settled when the phase shipped; the subsections are the record.
+
+### Settled: cluster membership is Postgres-backed, not Raft
+
+The ownership registry (`IMembershipStore`) — registered nodes, per-shard owner, fencing token, and
+originator id — is owned and written exclusively by the hub, and persists in the hub's own Postgres
+(`PostgresMembershipStore`, opted in with `AddPostgresClusterMembership()`; an in-memory store serves tests
+and single-process clusters). Rationale: the hub already has Postgres for its Global tier, membership
+mutations are rare (register, heartbeat, create-shard, reassign-on-death) so an exclusive table lock is
+plenty, and what actually must survive a hub restart is small and relational-shaped — fencing tokens (a
+restarted hub must never re-mint an old one) and originator ranges. Introducing Raft one phase early would
+have bought availability of the *hub* — a non-goal until "does the hub shard?" is answered — at the price of
+a consensus dependency in every deployment. Failure detection is heartbeat silence past
+`Cluster:FailureTimeoutMs`; reassignment bumps fencing tokens; shard nodes learn assignments over their node
+links, never by reading the store.
+
+### Settled: inter-node identity is a hub-minted signed assertion over a shared cluster secret
+
+Exactly as the plan sketched. The gateway validates a client's IdP JWT once; every upstream node session
+authenticates with an `InternalIdentityAssertion` — HMAC-SHA256 over `Cluster:Secret`, carrying identity,
+guest/owner claims, expiry (capped by `Cluster:AssertionTtlSeconds`, never outliving the client token), and
+whether the session fires lifecycle reducers (only the hub attachment does — one real session start per
+client). Node links mutually authenticate with the same secret over exchanged nonces, so neither a rogue
+dialer nor a fake hub passes the handshake, and assertions are refused at the gateway itself so a client can
+never present one. The trust boundary is stated in docs/SECURITY.md rather than left as an accident: any
+holder of the cluster secret can assert any identity — a compromised shard node impersonates every player in
+its shards — accepted because nodes are your infrastructure, with the operational consequences (internal
+network for node endpoints, secret rotation invalidates all assertions) written down.
+
+### Settled: the dual attachment is server-internal; the client protocol does not change
+
+The client speaks the ordinary one-socket protocol to one endpoint (the gateway, on the hub). The gateway
+holds the hub session and the moving shard session, routes `CallReducer` by the descriptor's execution site
+and `Subscribe` by the named table's placement, tracks which upstream owns each subscription id, and forwards
+node frames verbatim — the client cannot tell how many nodes exist, which is the acceptance test. Three
+protocol consequences, chosen deliberately: the client's `Welcome` carries the hub log's epoch; `Resume`
+through the gateway always answers full resync (a resume cursor counts against one log, and a gateway session
+spans several — the client converges through the same path a rejected resume always used); and when a shard
+attachment is re-established under the client (handoff, node death), the gateway sends the existing
+`overflow_resync` error, telling the client to re-establish subscriptions — under instancing that moment is a
+portal with a loading screen, which is the whole reason instancing shipped first.
+
+### Settled: `Replicated` takes no writes from shards
+
+No, as the plan hoped, and enforced rather than assumed: a shard engine refuses a `Replicated` write at the
+point of access ("written only by the hub — route the write through a hub-executed reducer"), and the
+commit-point guard backstops the bulk path. Replication is strictly hub log → node, applied per shard engine
+with a persisted cursor that travels with the shard's directory.
+
+### Settled: policies evaluate where the subscription fans out, and may read only tables present there
+
+Row and column policies for a `Partitioned` table's subscription evaluate on the owning shard node, against
+that shard engine's committed view — so they may read `Replicated`, `Partitioned`, and `Local` tables, and a
+read of a hub-only `Global` table throws at the point of access with the fix in the message (make the table
+`Replicated`, or hub-execute the reducer). The other options lost on their merits: evaluating at the gateway
+would re-serialize every candidate row across a node boundary to apply a predicate, and pushing policy state
+with the assertion turns a token into a cache with invalidation problems. The flagship `AdminIdentity` case
+is precisely `Replicated`-shaped data — small, bounded, read-mostly. DESIGN.md §7's "policies may freely read
+private tables" now carries the qualifier: private is not the constraint; placement is.
+
+### Settled: reducers touching only `Global`/`Replicated` tables are hub-executed
+
+Hub-executed, resolved at **compile time**: the generator analyzes each reducer body's table touches through
+`ctx.Db` and emits the execution site into the descriptor — `Hub` when every touch is `Global` or
+`Replicated` (and for lifecycle reducers, which are session events on the hub attachment), `Shard` otherwise.
+A body the analysis cannot see through (passes `ctx` to a helper, inferred-generic `IDbView` calls) resolves
+to `Shard`, where a genuinely hub-shaped reducer fails loudly with the stated fix:
+`[Reducer(Site = ReducerSite.Hub)]`, which always wins. Conservative-plus-loud beats clever-and-wrong here —
+a misrouted reducer is a clear error message, never silent empty reads.
 
 ## Done when
 
@@ -121,6 +169,30 @@ the hub.
 - Scheduled reducers fire once per shard on the owning node — never twice, never zero times.
 - Killing a shard node reassigns its shards; the fencing token prevents the revived node from writing.
 - A single-node deployment ignores placement entirely and behaves exactly as in M1.
+
+## Shipped notes
+
+Boundaries drawn while shipping, recorded so they read as decisions rather than surprises:
+
+- **A shard is an engine.** "One commit log per shard" is implemented literally: each shard is a full engine
+  instance (own log, own hot store, own scheduler, own reducer host, own subscription fan-out) opened by
+  whichever node the membership store names. Per-shard order, single writer, and timers-follow-their-shard
+  all fall out of that one identity instead of being separately engineered.
+- **Reassignment assumes shared or re-attachable storage** (`Cluster:ShardDataPath`): the shard's directory
+  *is* the shard, and the new owner opens it and recovers from the shard's own log. Log shipping for
+  non-shared storage is a later phase.
+- **Cluster events are handled on the hub.** Shard-published events forward from each shard's log
+  (at-least-once, acked cursor) and dispatch to the hub's handlers; handler code is unchanged, but foreign
+  events have no per-subscriber durable checkpoint and no dead-letter file — a handler that exhausts retries
+  is a loud log (EventId 1704), and the source log still holds the event. Shard-side handler execution
+  (interest-scoped delivery) is phase 10 territory alongside interest itself.
+- **The freeze covers the collected row set.** Handoff freezes exactly the rows the `IHandoffSet` selector
+  named, atomically with collecting them; rows created *for that player* by a concurrent reducer during the
+  (short, explicit) transfer window are not retroactively frozen. Instancing's discrete transitions make the
+  window a loading screen; the spatial strategy will need more.
+- **The gateway forwards frames sequentially per client** — no lane prioritization at the gateway hop (each
+  node's own transport still interleaves bulk and interactive traffic on its leg). Revisit when the phase 10
+  measurement says the gateway is the bottleneck, which the risk register already predicts.
 
 ## Risks
 

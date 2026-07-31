@@ -63,6 +63,18 @@ public static class MelangeClusterServiceCollectionExtensions
         services.TryAddSingleton(static provider => new MelangeClusterCoordinator(
             provider, provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>()));
         services.AddHostedService<ClusterRuntimeHost>();
+        services.TryAddSingleton<MelangeShardHealthCheck>();
+        services.Configure<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckServiceOptions>(static options =>
+        {
+            if (options.Registrations.All(static r => r.Name != "melange-shard"))
+            {
+                options.Registrations.Add(new Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckRegistration(
+                    "melange-shard",
+                    static provider => provider.GetRequiredService<MelangeShardHealthCheck>(),
+                    failureStatus: null,
+                    tags: null));
+            }
+        });
         return services;
     }
 }
