@@ -51,10 +51,21 @@ public static class LoadTestTool
     private static async Task<int> ServeAsync(LoadTestOptions options, TextWriter output, CancellationToken ct)
     {
         await using var server = await LoadTestServer.StartAsync(options, output, ct).ConfigureAwait(false);
-        var until = options.ServeSeconds > 0 ? TimeSpan.FromSeconds(options.ServeSeconds) : Timeout.InfiniteTimeSpan;
+        var clock = Stopwatch.StartNew();
         try
         {
-            await Task.Delay(until, ct).ConfigureAwait(false);
+            // Idle until told to stop, printing the same counters the stats endpoint serves —
+            // a remote driver cannot see this console, but an operator watching serve can.
+            while (options.ServeSeconds == 0 || clock.Elapsed < TimeSpan.FromSeconds(options.ServeSeconds))
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+                var stats = server.Stats();
+                output.WriteLine(
+                    $"[serve {clock.Elapsed.TotalSeconds,5:F0}s] handoffs {stats.HandoffsCompleted} completed " +
+                    $"{stats.HandoffsAborted} aborted {stats.HandoffsInFlight} in flight; working set " +
+                    $"{stats.WorkingSetBytes / (1024 * 1024)} MiB, GC heap {stats.GcHeapBytes / (1024 * 1024)} MiB, " +
+                    $"gen2 {stats.Gen2Collections}");
+            }
         }
         catch (OperationCanceledException)
         {

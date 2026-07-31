@@ -147,6 +147,11 @@ out-of-line blobs, so blob churn cannot evict hot main records.
 **Bulk ingestion** — A path appending one large write set instead of one transaction per row, for world
 generation and similar mass loads.
 
+**Call-to-delta latency** — The load-testing tool's headline number: the time from issuing a reducer call to
+the matching row change arriving back on the *caller's own subscription*. Measures the full path — gateway
+routing, the shard's serialized commit, and subscription fan-out — where call-to-ack would stop at the
+commit. See [LOAD-TESTING.md](LOAD-TESTING.md).
+
 **Cold world** — The overwhelming majority of a world's data that no player is near, whose size grows with area
 (the N² term). Addressed by paging, not sharding.
 
@@ -426,6 +431,10 @@ startup and maintained through the commit-observer seam, dispatching from a sing
 `TimeProvider` timer. A tick that outruns its interval follows `Scheduler:OverrunPolicy`; downtime follows
 `Scheduler:CatchUpAfterDowntime`. Fires run as `MelangeScheduler.Caller`, exempt from rate limits and
 reducer policies — internal dispatch is not a client call.
+
+**Seam walker** — In the load-testing tool's workload, a simulated player that oscillates across one shard
+boundary, one chunk past the hysteresis margin each way, so handoff and border traffic is continuously
+exercised rather than left to chance. See [LOAD-TESTING.md](LOAD-TESTING.md).
 
 **`[ServerOnly]`** — A column attribute: never sent to any client, admin included, in any mode — ad-hoc SQL's
 owner mode included, because "never leaves the process" has no modes. Enforced on the wire since phase 04:

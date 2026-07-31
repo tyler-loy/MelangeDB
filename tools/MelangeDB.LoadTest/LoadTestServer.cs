@@ -110,6 +110,9 @@ internal sealed class LoadTestServer : IAsyncDisposable
         _nodeApps.Select(app => app.Services.GetRequiredService<ShardNodeRuntime>().TryGetShard(shard))
             .FirstOrDefault(static r => r is not null);
 
+    /// <summary>The same counters the stats endpoint serves, for the serve console's periodic line.</summary>
+    public ServerStats Stats() => CollectStats();
+
     private ServerStats CollectStats()
     {
         using var process = Process.GetCurrentProcess();

@@ -379,6 +379,12 @@ bigger term and needs no coordination layer at all.
   fsync — and *no cluster size changes either number*, because a crowded location is one shard on one node
   by construction. Choosing spatial partitioning is choosing this ceiling; instancing trades it for the
   inability to have one shared world.
+
+  These are the *commit loop's* ceilings, measured in-process on purpose. The full path — real clients,
+  real sockets, subscriptions fanning every commit out to every subscriber on the shard — hits a different
+  and lower wall first: delta fan-out, which grows with the *square* of players per shard. That path is
+  measured by the standalone load-testing tool, with numbers and methodology in
+  [LOAD-TESTING.md](LOAD-TESTING.md).
 - ~~**Cluster membership.**~~ **Settled in phase 09: Postgres-backed, not Raft.** The ownership registry —
   nodes, per-shard owner, fencing token, and originator id — lives in the hub's own Postgres
   (`AddPostgresClusterMembership()`; in-memory for tests), the hub is its sole writer, failure detection is
