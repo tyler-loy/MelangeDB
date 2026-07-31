@@ -7,8 +7,16 @@ using Microsoft.Extensions.Options;
 
 namespace MelangeDB.Cluster;
 
-/// <summary>The durable saga record a handoff marker carries in its log arguments.</summary>
-internal sealed record HandoffMarker(string HandoffId, string PlayerHex, ulong FromShard, ulong ToShard, WireOp[]? Rows);
+/// <summary>
+/// The durable saga record a handoff marker carries in its log arguments. On an import marker,
+/// <see cref="FromShard"/> is <see cref="NoOrigin"/> for a first-entry transfer (the player had
+/// no rows anywhere yet), which is what tells the destination's reconciler there is no origin to
+/// wait on before settling.
+/// </summary>
+internal sealed record HandoffMarker(string HandoffId, string PlayerHex, ulong FromShard, ulong ToShard, WireOp[]? Rows)
+{
+    public const ulong NoOrigin = ulong.MaxValue;
+}
 
 /// <summary>Reserved reducer names for cluster-internal log records.</summary>
 internal static class ClusterRecordNames
@@ -18,6 +26,7 @@ internal static class ClusterRecordNames
     public const string HandoffImport = "melange/handoff-import";
     public const string HandoffRelease = "melange/handoff-release";
     public const string HandoffAbort = "melange/handoff-abort";
+    public const string HandoffSettled = "melange/handoff-settled";
 }
 
 /// <summary>
@@ -33,8 +42,9 @@ internal sealed class ShardRuntime : IDisposable
 
     private readonly Lock _handoffLock = new();
     private readonly HashSet<(TableId Table, RowKey Key)> _frozenRows = [];
-    private readonly Dictionary<string, HandoffMarker> _pendingFreezes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (HandoffMarker Marker, ulong Lsn)> _pendingFreezes = new(StringComparer.Ordinal);
     private readonly HashSet<string> _importedHandoffs = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, (HandoffMarker Marker, ulong Lsn)> _unsettledImports = new(StringComparer.Ordinal);
     private readonly IHandoffSet? _handoffSet;
 
     public ShardRuntime(
@@ -83,6 +93,14 @@ internal sealed class ShardRuntime : IDisposable
 
         RecoverHandoffState();
 
+        // Handoff markers must survive log truncation for as long as their saga is unresolved —
+        // the origin's freeze until it releases or aborts, the destination's import until the
+        // origin is known settled. Truncating one away would silently unfreeze a mid-transfer
+        // player (origin) or make WasImported answer a wrong "no" (destination): either way, two
+        // owners — the exact silent-gap bug class phase 08 fixed for the Postgres checkpoint.
+        Engine.AddTruncationFloor(() => MarkerFloor(_pendingFreezes));
+        Engine.AddTruncationFloor(() => MarkerFloor(_unsettledImports));
+
         ReducerHost = new MelangeReducerHost(
             Engine, reducers, services.GetRequiredService<IServiceScopeFactory>(), options, time);
         Scheduler = new MelangeScheduler(Engine, ReducerHost, options, loggerFactory, time);
@@ -116,7 +134,32 @@ internal sealed class ShardRuntime : IDisposable
         {
             lock (_handoffLock)
             {
-                return [.. _pendingFreezes.Values];
+                return [.. _pendingFreezes.Values.Select(static p => p.Marker)];
+            }
+        }
+    }
+
+    /// <summary>Whether the given handoff's freeze is still unresolved on this shard (as origin).</summary>
+    public bool IsFreezePending(string handoffId)
+    {
+        lock (_handoffLock)
+        {
+            return _pendingFreezes.ContainsKey(handoffId);
+        }
+    }
+
+    /// <summary>
+    /// Imports (as destination) whose origin is not yet known settled. Their markers pin log
+    /// truncation, so a restarted destination can never answer <see cref="WasImported"/> with a
+    /// silently wrong "no" — the marker is guaranteed to still be in the log it recovers from.
+    /// </summary>
+    public IReadOnlyList<HandoffMarker> UnsettledImports
+    {
+        get
+        {
+            lock (_handoffLock)
+            {
+                return [.. _unsettledImports.Values.Select(static p => p.Marker)];
             }
         }
     }
@@ -127,6 +170,21 @@ internal sealed class ShardRuntime : IDisposable
         lock (_handoffLock)
         {
             return _importedHandoffs.Contains(handoffId);
+        }
+    }
+
+    /// <summary>
+    /// The truncation floor a marker set pins: everything from the oldest live marker onward must
+    /// stay in the log (the floor is the highest removable LSN). Null pins nothing — sagas
+    /// resolve, so the pin is bounded by the slowest in-flight handoff, not by history.
+    /// </summary>
+    private ulong? MarkerFloor(Dictionary<string, (HandoffMarker Marker, ulong Lsn)> markers)
+    {
+        lock (_handoffLock)
+        {
+            if (markers.Count == 0)
+                return null;
+            return markers.Values.Min(static p => p.Lsn) - 1;
         }
     }
 
@@ -175,14 +233,24 @@ internal sealed class ShardRuntime : IDisposable
             .Select(static r => new WireOp((byte)RowOpKind.Insert, r.Table.Id.Value, r.Key.ToArray(), r.Bytes))
             .ToArray();
         var marker = new HandoffMarker(handoffId, player.ToString(), Shard.Value, toShard.Value, RowRefsOf(rows));
+
+        // Registered under a conservative placeholder LSN *before* the append: the append itself
+        // can trigger an automatic snapshot, and the truncation floor must already cover the
+        // marker about to land. The real LSN replaces the placeholder right after.
         lock (_handoffLock)
         {
-            _pendingFreezes[handoffId] = marker;
+            _pendingFreezes[handoffId] = (marker, Engine.Log.HeadLsn + 1);
         }
 
-        Engine.ApplyInternal(
+        var record = Engine.ApplyInternal(
             ClusterRecordNames.HandoffFreeze, ClusterCaller, [],
             arguments: JsonSerializer.SerializeToUtf8Bytes(marker), alwaysAppend: true);
+        lock (_handoffLock)
+        {
+            if (_pendingFreezes.ContainsKey(handoffId))
+                _pendingFreezes[handoffId] = (marker, record!.Lsn);
+        }
+
         return rows;
     }
 
@@ -191,7 +259,7 @@ internal sealed class ShardRuntime : IDisposable
         HandoffMarker marker;
         lock (_handoffLock)
         {
-            marker = _pendingFreezes[handoffId];
+            marker = _pendingFreezes[handoffId].Marker;
         }
 
         var rows = new List<WireOp>();
@@ -208,8 +276,10 @@ internal sealed class ShardRuntime : IDisposable
 
     /// <summary>
     /// The destination half: rewrite each row's shard column to this shard and append them as one
-    /// internal commit whose marker carries the handoff id. Idempotent — a re-delivered import
-    /// reconciles into updates and the id was already recorded.
+    /// internal commit whose marker carries the handoff id and the real origin shard
+    /// (<see cref="HandoffMarker.NoOrigin"/> for a first-entry transfer). Idempotent — a
+    /// re-delivered import reconciles into updates and the id was already recorded. The marker
+    /// stays truncation-pinned until <see cref="Settle"/>.
     /// </summary>
     public void Import(string handoffId, string playerHex, ulong fromShard, WireOp[] rows)
     {
@@ -227,12 +297,45 @@ internal sealed class ShardRuntime : IDisposable
         }
 
         var marker = new HandoffMarker(handoffId, playerHex, fromShard, Shard.Value, null);
-        Engine.ApplyInternal(
+        lock (_handoffLock)
+        {
+            // Placeholder-then-real LSN, same reason as the freeze: the append below may snapshot.
+            _unsettledImports[handoffId] = (marker, Engine.Log.HeadLsn + 1);
+        }
+
+        var record = Engine.ApplyInternal(
             ClusterRecordNames.HandoffImport, ClusterCaller, ops,
             arguments: JsonSerializer.SerializeToUtf8Bytes(marker), reconcile: true, alwaysAppend: true);
         lock (_handoffLock)
         {
             _importedHandoffs.Add(handoffId);
+            if (_unsettledImports.ContainsKey(handoffId))
+                _unsettledImports[handoffId] = (marker, record!.Lsn);
+        }
+    }
+
+    /// <summary>
+    /// The destination's last word: the origin is known resolved (released or aborted, or there
+    /// never was one), so the import marker stops pinning log truncation. The settled marker is
+    /// appended first, so a restart between append and truncation recovers the same conclusion.
+    /// Idempotent.
+    /// </summary>
+    public void Settle(string handoffId)
+    {
+        HandoffMarker? marker;
+        lock (_handoffLock)
+        {
+            if (!_unsettledImports.TryGetValue(handoffId, out var pending))
+                return;
+            marker = pending.Marker;
+        }
+
+        Engine.ApplyInternal(
+            ClusterRecordNames.HandoffSettled, ClusterCaller, [],
+            arguments: JsonSerializer.SerializeToUtf8Bytes(marker), alwaysAppend: true);
+        lock (_handoffLock)
+        {
+            _unsettledImports.Remove(handoffId);
         }
     }
 
@@ -243,11 +346,12 @@ internal sealed class ShardRuntime : IDisposable
     /// </summary>
     public void Release(string handoffId)
     {
-        HandoffMarker? marker;
+        HandoffMarker marker;
         lock (_handoffLock)
         {
-            if (!_pendingFreezes.TryGetValue(handoffId, out marker))
+            if (!_pendingFreezes.TryGetValue(handoffId, out var pending))
                 return; // Already released or aborted.
+            marker = pending.Marker;
         }
 
         var ops = (marker.Rows ?? [])
@@ -262,11 +366,12 @@ internal sealed class ShardRuntime : IDisposable
     /// <summary>The origin half's failure exit: the destination never imported, so the player stays here.</summary>
     public void Abort(string handoffId)
     {
-        HandoffMarker? marker;
+        HandoffMarker marker;
         lock (_handoffLock)
         {
-            if (!_pendingFreezes.TryGetValue(handoffId, out marker))
+            if (!_pendingFreezes.TryGetValue(handoffId, out var pending))
                 return;
+            marker = pending.Marker;
         }
 
         Engine.ApplyInternal(
@@ -287,9 +392,10 @@ internal sealed class ShardRuntime : IDisposable
 
     /// <summary>
     /// Rebuilds the handoff saga state from this shard's own log: a freeze with no release or
-    /// abort re-freezes its rows (the node runtime then asks the hub whether the destination
-    /// imported, and completes or aborts); an import record marks its handoff id done, which is
-    /// how a re-delivered import stays idempotent across a crash.
+    /// abort re-freezes its rows (the node's reconciler then asks the hub whether the destination
+    /// imported, and completes or aborts); an import record marks its handoff id done — and stays
+    /// unsettled, pinning truncation, until a settled record follows it. The truncation floors
+    /// registered over these sets are what guarantee this scan can never miss a live marker.
     /// </summary>
     private void RecoverHandoffState()
     {
@@ -303,7 +409,7 @@ internal sealed class ShardRuntime : IDisposable
             switch (record.ReducerName)
             {
                 case ClusterRecordNames.HandoffFreeze:
-                    _pendingFreezes[marker.HandoffId] = marker;
+                    _pendingFreezes[marker.HandoffId] = (marker, record.Lsn);
                     break;
                 case ClusterRecordNames.HandoffRelease:
                 case ClusterRecordNames.HandoffAbort:
@@ -311,11 +417,15 @@ internal sealed class ShardRuntime : IDisposable
                     break;
                 case ClusterRecordNames.HandoffImport:
                     _importedHandoffs.Add(marker.HandoffId);
+                    _unsettledImports[marker.HandoffId] = (marker, record.Lsn);
+                    break;
+                case ClusterRecordNames.HandoffSettled:
+                    _unsettledImports.Remove(marker.HandoffId);
                     break;
             }
         }
 
-        foreach (var pending in _pendingFreezes.Values)
+        foreach (var (pending, _) in _pendingFreezes.Values)
         {
             foreach (var reference in pending.Rows ?? [])
                 _frozenRows.Add((new TableId(reference.Table), new RowKey(reference.Key)));

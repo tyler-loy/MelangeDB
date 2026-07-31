@@ -145,6 +145,16 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor ShardByIsPrimaryKey = new(
+        "MELANGE0018",
+        "ShardBy must not be the primary key",
+        "Table '{0}': ShardBy = \"{1}\" names the [PrimaryKey] column. Handoff re-homes a row by rewriting its ShardBy " +
+        "column while the stored row key — the encoded primary key — stays fixed, so a primary-key shard column would " +
+        "silently diverge from its key on the first transfer. Give the shard id its own column.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(
         "MELANGE0017",
         "Full scan over a table that is not Resident",

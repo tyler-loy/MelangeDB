@@ -22,3 +22,4 @@ MELANGE0014 | MelangeDB | Error | Scheduled table names a reducer that does not 
 MELANGE0015 | MelangeDB | Error | Scheduled reducer signature is invalid
 MELANGE0016 | MelangeDB | Error | ScheduleAt column placement is invalid
 MELANGE0017 | MelangeDB | Warning | Full scan over a table that is not Resident
+MELANGE0018 | MelangeDB | Error | ShardBy must not be the primary key

@@ -32,6 +32,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private volatile NodeLink? _link;
     private long _leaseValidUntilTicks;
     private Task? _connectLoop;
+    private Task? _reconcileLoop;
     private ulong _replicaSubscribedFrom = ulong.MaxValue;
 
     public ShardNodeRuntime(IServiceProvider services)
@@ -102,6 +103,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         engine.SetTableAccessGuard(PlacementGuards.NodeLocalAccess(cluster.NodeName));
 
         _connectLoop = Task.Run(RunAsync);
+        _reconcileLoop = Task.Run(ReconcileHandoffsAsync);
     }
 
     private async Task RunAsync()
@@ -256,7 +258,6 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 forwarder.Start();
                 shardSetChanged = true;
                 LogShardOpened(_logger, assignment.Shard.Value, NodeName, runtime.Engine.Log.HeadLsn);
-                ResolvePendingHandoffs(runtime);
             }
 
             // A shard-set change moves the replication low-water mark; force a re-subscribe.
@@ -326,6 +327,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             case "replica-batch":
                 ApplyReplicaBatch(body!.Value.Deserialize<ReplicaBatch>()!);
                 return Task.FromResult<object?>(null);
+            case "replica-reset":
+                ApplyReplicaReset(body!.Value.Deserialize<ReplicaReset>()!);
+                return Task.FromResult<object?>(null);
             case "handoff-freeze":
             {
                 var freeze = body!.Value.Deserialize<HandoffFreeze>()!;
@@ -339,7 +343,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             {
                 var import = body!.Value.Deserialize<HandoffImport>()!;
                 var runtime = RequireShard(new ShardKey(import.ToShard), import.FencingToken);
-                runtime.Import(import.HandoffId, import.PlayerHex, 0, import.Rows);
+                runtime.Import(import.HandoffId, import.PlayerHex, import.FromShard, import.Rows);
                 return Task.FromResult<object?>(null);
             }
 
@@ -363,6 +367,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 var runtime = TryGetShard(new ShardKey(query.ToShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {query.ToShard}.");
                 return Task.FromResult<object?>(new HandoffQueryReply(runtime.WasImported(query.HandoffId)));
+            }
+
+            case "handoff-freeze-query-owner":
+            {
+                var query = body!.Value.Deserialize<HandoffFreezeQuery>()!;
+                var runtime = TryGetShard(new ShardKey(query.FromShard))
+                    ?? throw new InvalidOperationException($"This node does not own shard {query.FromShard}.");
+                return Task.FromResult<object?>(new HandoffFreezeQueryReply(runtime.IsFreezePending(query.HandoffId)));
             }
 
             default:
@@ -417,55 +429,127 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// Applies a full-state replication reset (see <see cref="ReplicaReset"/>): upsert every
+    /// snapshot row, delete every local Replicated row the snapshot lacks — the hub deleted it
+    /// during the gap the truncated log can no longer serve — then jump the shard's cursor to the
+    /// snapshot LSN and resume streaming from there.
+    /// </summary>
+    private void ApplyReplicaReset(ReplicaReset reset)
+    {
+        List<(ShardRuntime Runtime, ulong Cursor)> shards;
+        lock (_shardsLock)
+        {
+            shards = [.. _shards.Values.Select(r => (r, ReadReplicaCursor(r.Directory)))];
+        }
+
+        foreach (var (runtime, cursor) in shards)
+        {
+            if (cursor >= reset.Lsn)
+                continue;
+            var ops = new List<RowOp>();
+            foreach (var table in reset.Tables)
+            {
+                var tableId = new TableId(table.Table);
+                var snapshotKeys = new HashSet<RowKey>();
+                foreach (var row in table.Rows)
+                {
+                    snapshotKeys.Add(new RowKey(row.Key));
+                    ops.Add(row.ToRowOp());
+                }
+
+                foreach (var (key, _) in runtime.Engine.HotStore.Scan(tableId).ToList())
+                {
+                    if (!snapshotKeys.Contains(key))
+                        ops.Add(new RowOp(RowOpKind.Delete, tableId, key));
+                }
+            }
+
+            runtime.Engine.ApplyInternal(ClusterRecordNames.Replica, ReplicaCaller, ops, reconcile: true);
+            WriteReplicaCursor(runtime.Directory, reset.Lsn);
+        }
+    }
+
     private static readonly Identity ReplicaCaller = Identity.Hash("melange/replica");
 
     /// <summary>
-    /// Handoff recovery, origin side: every freeze in this shard's log with no release or abort
-    /// re-froze its rows at open; this resolves each by asking the hub whether the destination's
-    /// import became durable — release if it did, abort if it did not, retry while the answer is
-    /// "in flight". Exactly one owner, whichever way it lands.
+    /// The handoff reconciler: a periodic sweep resolving every saga this node holds a live half
+    /// of, whether it got there by crash recovery or by a coordinator that died (or lost the
+    /// link) mid-saga. Origin side: a pending freeze asks the hub whether the destination's
+    /// import became durable — release if it did, abort if it definitively did not, wait while
+    /// the saga is still in flight or the destination is unreachable. Destination side: an
+    /// unsettled import asks whether the origin's freeze is still pending — once it is not (or
+    /// there never was an origin), the import settles and its marker stops pinning log
+    /// truncation. Every step is idempotent, so the sweep needs no state of its own — which is
+    /// what makes it correct across any combination of crashes.
     /// </summary>
-    private void ResolvePendingHandoffs(ShardRuntime runtime)
+    private async Task ReconcileHandoffsAsync()
     {
-        foreach (var pending in runtime.PendingFreezes)
+        var ct = _stopped.Token;
+        while (!ct.IsCancellationRequested)
         {
-            var marker = pending;
-            _ = Task.Run(async () =>
+            try
             {
-                var ct = _stopped.Token;
-                while (!ct.IsCancellationRequested)
+                await Task.Delay(HandoffReconcileIntervalMs, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (_link is not { } link)
+                continue;
+            List<ShardRuntime> runtimes;
+            lock (_shardsLock)
+            {
+                runtimes = [.. _shards.Values];
+            }
+
+            foreach (var runtime in runtimes)
+            {
+                foreach (var pending in runtime.PendingFreezes)
                 {
                     try
                     {
-                        if (_link is not { } link)
-                            throw new InvalidOperationException("No hub link yet.");
                         var reply = await link.RequestAsync(
-                            "handoff-query", new HandoffQuery(marker.HandoffId, marker.ToShard), ct).ConfigureAwait(false);
+                            "handoff-query", new HandoffQuery(pending.HandoffId, pending.ToShard), ct).ConfigureAwait(false);
                         if (reply!.Value.Deserialize<HandoffQueryReply>()!.Imported)
-                            runtime.Release(marker.HandoffId);
+                            runtime.Release(pending.HandoffId);
                         else
-                            runtime.Abort(marker.HandoffId);
-                        return;
+                            runtime.Abort(pending.HandoffId);
                     }
-                    catch (OperationCanceledException)
+                    catch (Exception) when (!ct.IsCancellationRequested)
                     {
-                        return;
-                    }
-                    catch (Exception)
-                    {
-                        try
-                        {
-                            await Task.Delay(300, ct).ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            return;
-                        }
+                        // Still in flight, or the destination is unreachable: the freeze stays,
+                        // the player stays unwritable everywhere, and the next sweep retries.
                     }
                 }
-            });
+
+                foreach (var import in runtime.UnsettledImports)
+                {
+                    try
+                    {
+                        if (import.FromShard == HandoffMarker.NoOrigin)
+                        {
+                            runtime.Settle(import.HandoffId); // First entry: no origin to wait on.
+                            continue;
+                        }
+
+                        var reply = await link.RequestAsync(
+                            "handoff-freeze-query", new HandoffFreezeQuery(import.HandoffId, import.FromShard), ct).ConfigureAwait(false);
+                        if (!reply!.Value.Deserialize<HandoffFreezeQueryReply>()!.Pending)
+                            runtime.Settle(import.HandoffId);
+                    }
+                    catch (Exception) when (!ct.IsCancellationRequested)
+                    {
+                        // Origin unreachable: the marker keeps pinning truncation, honestly.
+                    }
+                }
+            }
         }
     }
+
+    private const int HandoffReconcileIntervalMs = 1_000;
 
     public void Dispose()
     {

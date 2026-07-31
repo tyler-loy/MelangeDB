@@ -5,8 +5,17 @@ using System.Text.Json;
 
 namespace MelangeDB.Cluster;
 
-/// <summary>A node-link request answered with an error by the peer.</summary>
-public sealed class NodeLinkException(string message) : InvalidOperationException(message);
+/// <summary>
+/// A node-link request that failed. <see cref="IsPeerError"/> distinguishes the two failure
+/// shapes a saga must treat differently: the peer <em>replied</em> with an error (it definitively
+/// did not perform the request) versus a timeout or link death (the peer may or may not have —
+/// the request's effect is unknown, and only reconciliation can say).
+/// </summary>
+public sealed class NodeLinkException(string message, bool isPeerError = false) : InvalidOperationException(message)
+{
+    /// <summary>True when the peer answered with an error reply — the request definitively did not happen.</summary>
+    public bool IsPeerError { get; } = isPeerError;
+}
 
 /// <summary>
 /// Per-node counters over node-link traffic, by message type. The "zero cross-node traffic"
@@ -142,9 +151,14 @@ internal sealed class NodeLink : IDisposable
                     if (_pending.TryGetValue(frame.Re, out var tcs))
                     {
                         if (frame.Type == "error")
-                            tcs.TrySetException(new NodeLinkException(frame.Body?.GetProperty("Message").GetString() ?? "error"));
+                        {
+                            tcs.TrySetException(new NodeLinkException(
+                                frame.Body?.GetProperty("Message").GetString() ?? "error", isPeerError: true));
+                        }
                         else
+                        {
                             tcs.TrySetResult(frame.Body);
+                        }
                     }
 
                     continue;

@@ -126,6 +126,9 @@ public sealed class ClusterReducers
     }
 
     [Reducer]
+    public void DeleteItemDef(ReducerContext ctx, long id) => ctx.Db.ItemDef.Id.Delete(id);
+
+    [Reducer]
     public void SpawnMob(ReducerContext ctx, uint instanceId, int hp) =>
         ctx.Db.Mob.Insert(new Mob { InstanceId = instanceId, Hp = hp });
 

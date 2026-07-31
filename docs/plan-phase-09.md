@@ -190,6 +190,17 @@ Boundaries drawn while shipping, recorded so they read as decisions rather than 
   named, atomically with collecting them; rows created *for that player* by a concurrent reducer during the
   (short, explicit) transfer window are not retroactively frozen. Instancing's discrete transitions make the
   window a loading screen; the spatial strategy will need more.
+- **Log truncation respects live cluster state** (hardened in the review round; details in
+  docs/CLUSTERING.md). Pending handoff markers pin their shard's log until the saga resolves — an unresolved
+  freeze or unsettled import can never be snapshotted away — and each node's reconciler resolves stranded
+  saga halves idempotently, including the unknowable-import case, where the player deliberately stays frozen
+  (unavailable beats duplicated). Event forwarders floor truncation at their forwarded cursor. A replica
+  cursor below the hub log's truncation base triggers a full-state bootstrap (upserts plus
+  absent-row deletes, EventId 1711) instead of silently skipping the gap — the phase 08 silent-gap bug
+  class, killed in its phase 09 habitats.
+- **`ShardBy` must not be the primary key** (MELANGE0018, mirrored at schema registration): handoff rewrites
+  the shard column while the stored row key stays fixed, so a primary-key shard column would silently
+  diverge from its key on the first transfer.
 - **The gateway forwards frames sequentially per client** — no lane prioritization at the gateway hop (each
   node's own transport still interleaves bulk and interactive traffic on its leg). Revisit when the phase 10
   measurement says the gateway is the bottleneck, which the risk register already predicts.

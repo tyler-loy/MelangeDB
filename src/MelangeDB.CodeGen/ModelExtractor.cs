@@ -83,6 +83,14 @@ internal static class ModelExtractor
                 new EquatableArray<string>([tableName, primaryKeys.ToString()])));
         }
 
+        if (shardBy is not null && columns.Any(c => c.IsPrimaryKey && c.Name == shardBy))
+        {
+            diagnostics.Add(new DiagnosticInfo(
+                "MELANGE0018",
+                typeLocation,
+                new EquatableArray<string>([tableName, shardBy])));
+        }
+
         var scheduleAtColumns = columns.Count(static c => c.Kind == WireKind.ScheduleAt);
         if (scheduled is not null && scheduleAtColumns != 1)
         {

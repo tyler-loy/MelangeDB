@@ -64,11 +64,19 @@ public sealed class ClusterOptions
     public string Secret { get; set; } = "";
 
     /// <summary>
-    /// Hub only: the TCP port the node-link listener binds on the loopback-or-internal interface.
-    /// 0 binds an ephemeral port (useful for tests; the bound port is logged and exposed to the
-    /// process).
+    /// Hub only: the TCP port the node-link listener binds. 0 binds an ephemeral port (useful for
+    /// tests; the bound port is logged and exposed to the process).
     /// </summary>
     public int NodeListenPort { get; set; }
+
+    /// <summary>
+    /// Hub only: the interface address the node-link listener binds. The default,
+    /// <c>127.0.0.1</c>, only admits same-machine nodes — safe by construction. A multi-machine
+    /// cluster sets <c>0.0.0.0</c> or a specific internal interface; every connection still has
+    /// to prove the cluster secret, but widening the bind should be paired with network-level
+    /// controls (see docs/SECURITY.md).
+    /// </summary>
+    public string NodeListenAddress { get; set; } = "127.0.0.1";
 
     /// <summary>Shard only: the hub's node-link address, as <c>host:port</c>.</summary>
     public string HubAddress { get; set; } = "";

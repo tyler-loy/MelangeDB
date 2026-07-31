@@ -238,6 +238,28 @@ public class ClusterSeamTests
     }
 
     [Fact]
+    public void A_table_whose_shard_by_names_the_primary_key_is_refused_at_schema_construction()
+    {
+        // The runtime half of MELANGE0018 — covers the non-codegen registration path.
+        var column = new ColumnSchema
+        {
+            Name = "InstanceId",
+            ClrType = typeof(uint),
+            Kind = ColumnKind.UInt32,
+            IsPrimaryKey = true,
+            GetValue = static row => 0u,
+            SetValue = static (_, _) => { },
+        };
+        var failure = Assert.Throws<NotSupportedException>(() => new TableSchema(
+            typeof(TerrainChunk), "BadShardBy", [column], placement: Placement.Partitioned, shardBy: "InstanceId"));
+        Assert.Contains("its own column", failure.Message);
+
+        var unknown = Assert.Throws<NotSupportedException>(() => new TableSchema(
+            typeof(TerrainChunk), "BadShardBy", [column], placement: Placement.Partitioned, shardBy: "Nope"));
+        Assert.Contains("no column", unknown.Message);
+    }
+
+    [Fact]
     public void Descriptor_auto_site_resolves_to_shard_at_runtime()
     {
         var descriptor = new ReducerDescriptor(

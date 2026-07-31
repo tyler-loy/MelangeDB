@@ -208,7 +208,11 @@ exactly like the host process that already runs reducers with full authority (se
 it operationally: treat `Cluster:Secret` like a database password; keep node links and per-shard websocket
 endpoints (`Cluster:PublicAddress`, `{path}/shard/{key}`) on an internal network — the gateway is the only
 client-facing endpoint; and rotate the secret by restarting the cluster with a new one, which invalidates
-every outstanding assertion at once.
+every outstanding assertion at once. The node-link listener binds `127.0.0.1` by default
+(`Cluster:NodeListenAddress`), so a single-machine cluster exposes nothing off-box by accident; widening the
+bind for a multi-machine cluster relies on the cluster-secret mutual authentication above and should be
+paired with network-level controls (an internal interface, firewall rules, or both) — defense in depth, not a
+substitute for it.
 
 Fencing tokens and leases are a *correctness* mechanism, not a security one: they stop a wrongly-suspected-dead
 node from split-brain writes, but a node that ignores them is already inside the trust boundary above.

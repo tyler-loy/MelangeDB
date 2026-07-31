@@ -186,6 +186,10 @@ internal sealed class ClusterFixture : IAsyncDisposable
             ["MelangeDb:CommitLog:Path"] = Path.Combine(nodeRoot, "log"),
             ["MelangeDb:HotStore:Path"] = Path.Combine(nodeRoot, "hot"),
             ["MelangeDb:Events:DeadLetterPath"] = Path.Combine(nodeRoot, "deadletter"),
+
+            // Truncation tests take snapshots on demand; a retention window would floor every
+            // truncation at "now minus five minutes", which in a test is the whole log.
+            ["MelangeDb:Resume:RetentionWindowSeconds"] = "0",
             ["MelangeDb:Cluster:Role"] = role.ToString(),
             ["MelangeDb:Cluster:NodeName"] = nodeName,
             ["MelangeDb:Cluster:Secret"] = Secret,

@@ -197,7 +197,10 @@ linking rather than anything MelangeDB does. Preserve the issuer and subject and
 instancing; continuous and implicit under spatial partitioning. The one unavoidable distributed transaction,
 run as a saga — freeze on origin, import on destination, confirm, release on origin — with each half appended
 as a marker to its own commit log before it is acknowledged, so a crash at any step recovers to exactly one
-owner. Between freeze and release the player is writable nowhere.
+owner. Between freeze and release the player is writable nowhere — including when an import's fate is
+unknowable (a timed-out request), which deliberately leaves the player frozen rather than risk two owners.
+Live markers pin log truncation until their saga resolves, and each node's periodic reconciler resolves
+stranded halves idempotently; see docs/CLUSTERING.md.
 
 **Handoff set (`IHandoffSet`)** — The developer-supplied selector naming which rows follow a player between
 shards — the "player-owned tables share the player's shard key" convention made concrete, on the same

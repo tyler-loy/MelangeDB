@@ -50,11 +50,8 @@ internal sealed partial class HubRuntime : IDisposable
         }
     }
 
-    /// <summary>An in-flight handoff saga on the coordinator.</summary>
-    private sealed record Saga(string HandoffId, Identity Player, ShardKey From, ShardKey To)
-    {
-        public bool Imported { get; set; }
-    }
+    /// <summary>An in-flight handoff saga on the coordinator; its presence alone means "still driving".</summary>
+    private sealed record Saga(string HandoffId, Identity Player, ShardKey From, ShardKey To);
 
     private readonly IServiceProvider _services;
     private readonly MelangeEngine _engine;
@@ -110,7 +107,15 @@ internal sealed partial class HubRuntime : IDisposable
         _engine.AddCommitGuard(new HubCommitGuard(_engine.Schema));
         _engine.AddCommitObserver(new ReplicaSignaller(this));
 
-        _listener = new TcpListener(IPAddress.Loopback, cluster.NodeListenPort);
+        if (!IPAddress.TryParse(cluster.NodeListenAddress, out var listenAddress))
+        {
+            throw new InvalidOperationException(
+                $"Cluster:NodeListenAddress '{cluster.NodeListenAddress}' is not an IP address. Use 127.0.0.1 " +
+                "(the default), 0.0.0.0 to accept nodes from other machines, or a specific interface address — " +
+                "and read the docs/SECURITY.md note before widening it.");
+        }
+
+        _listener = new TcpListener(listenAddress, cluster.NodeListenPort);
         _listener.Start();
         NodeListenPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _acceptLoop = Task.Run(AcceptLoopAsync);
@@ -160,12 +165,15 @@ internal sealed partial class HubRuntime : IDisposable
         if (from == to)
             return;
         var handoffId = Guid.NewGuid().ToString("n");
-        var saga = new Saga(handoffId, player, from, to);
-        _sagas[handoffId] = saga;
+        _sagas[handoffId] = new Saga(handoffId, player, from, to);
         try
         {
             var origin = _membership.GetAssignment(from);
-            var originLink = origin?.NodeName is { } originNode ? LinkOf(originNode) : null;
+            var originLink = origin?.NodeName is { } originNode
+                ? LinkOf(originNode)
+                    ?? throw new InvalidOperationException(
+                        $"No live link to '{originNode}', the owner of {from}; the player cannot be frozen, so the transfer cannot start.")
+                : null;
             WireOp[] rows = [];
             if (origin is not null && originLink is not null)
             {
@@ -186,12 +194,19 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 await destinationLink.RequestAsync(
                     "handoff-import",
-                    new HandoffImport(handoffId, to.Value, destination.FencingToken, player.ToString(), rows),
+                    new HandoffImport(
+                        handoffId,
+                        origin is null ? HandoffMarker.NoOrigin : from.Value,
+                        to.Value,
+                        destination.FencingToken,
+                        player.ToString(),
+                        rows),
                     ct).ConfigureAwait(false);
             }
-            catch (Exception)
+            catch (NodeLinkException failure) when (failure.IsPeerError)
             {
-                // The import never became durable; the player stays on the origin.
+                // The destination *replied* with an error: the import definitively did not
+                // persist, so aborting the origin's freeze is safe and the player stays put.
                 if (originLink is not null && origin is not null)
                 {
                     await originLink.RequestAsync(
@@ -201,8 +216,17 @@ internal sealed partial class HubRuntime : IDisposable
                 LogHandoffAborted(_logger, handoffId, player.ToString(), from.Value, to.Value);
                 throw;
             }
+            catch (Exception)
+            {
+                // A timeout or link death: the destination may or may not have durably imported —
+                // an ack lost in transit looks exactly like a dead node. Aborting here could make
+                // two owners, so the origin's freeze deliberately STAYS: the player is writable
+                // nowhere until the origin's reconciler learns the truth from the destination's
+                // log and releases or aborts. Unavailable beats duplicated.
+                LogHandoffUnresolved(_logger, handoffId, player.ToString(), from.Value, to.Value);
+                throw;
+            }
 
-            saga.Imported = true;
             if (originLink is not null && origin is not null)
             {
                 if (HandoffStepHook is { } beforeRelease)
@@ -280,6 +304,8 @@ internal sealed partial class HubRuntime : IDisposable
                 return null;
             case "handoff-query":
                 return await HandleHandoffQueryAsync(body!.Value.Deserialize<HandoffQuery>()!).ConfigureAwait(false);
+            case "handoff-freeze-query":
+                return await HandleFreezeQueryAsync(body!.Value.Deserialize<HandoffFreezeQuery>()!).ConfigureAwait(false);
             default:
                 throw new InvalidOperationException($"Unknown node-link message '{type}'.");
         }
@@ -307,19 +333,35 @@ internal sealed partial class HubRuntime : IDisposable
 
     private async Task<HandoffQueryReply> HandleHandoffQueryAsync(HandoffQuery query)
     {
-        // An in-flight saga answers "wait": the coordinator still intends to import, so the
-        // recovering origin must not abort yet — aborting while the import lands would duplicate
-        // the player.
-        if (_sagas.TryGetValue(query.HandoffId, out var saga) && !saga.Imported)
+        // An in-flight saga always answers "wait": the coordinator is still driving — the origin's
+        // reconciler must neither abort (the import may be about to land) nor release (racing the
+        // coordinator's own release step). It takes over only once the saga object is gone, which
+        // the coordinator guarantees on every exit path.
+        if (_sagas.ContainsKey(query.HandoffId))
             throw new InvalidOperationException("The handoff is still in flight; retry.");
-        if (saga is { Imported: true })
-            return new HandoffQueryReply(true);
 
         var destination = _membership.GetAssignment(new ShardKey(query.ToShard));
         if (destination?.NodeName is not { } owner || LinkOf(owner) is not { } link)
             throw new InvalidOperationException($"The destination shard's owner is unreachable; retry.");
         var reply = await link.RequestAsync("handoff-query-owner", query, _stopped.Token).ConfigureAwait(false);
         return reply!.Value.Deserialize<HandoffQueryReply>()!;
+    }
+
+    /// <summary>
+    /// Routes a destination reconciler's "is the origin's freeze still pending?" to the origin
+    /// shard's current owner. An in-flight saga answers "pending" without asking — the freeze
+    /// exists by construction while its saga runs.
+    /// </summary>
+    private async Task<HandoffFreezeQueryReply> HandleFreezeQueryAsync(HandoffFreezeQuery query)
+    {
+        if (_sagas.ContainsKey(query.HandoffId))
+            return new HandoffFreezeQueryReply(true);
+
+        var origin = _membership.GetAssignment(new ShardKey(query.FromShard));
+        if (origin?.NodeName is not { } owner || LinkOf(owner) is not { } link)
+            throw new InvalidOperationException("The origin shard's owner is unreachable; retry.");
+        var reply = await link.RequestAsync("handoff-freeze-query-owner", query, _stopped.Token).ConfigureAwait(false);
+        return reply!.Value.Deserialize<HandoffFreezeQueryReply>()!;
     }
 
     private ShardAssignmentDto[] AssignmentsDto(string nodeName) =>
@@ -342,6 +384,17 @@ internal sealed partial class HubRuntime : IDisposable
                 try
                 {
                     var cursor = (ulong)Math.Max(0, session.ReplicaCursor);
+
+                    // A cursor below the truncation base cannot be served from the log — the
+                    // gap's records are gone, and streaming from BaseLsn+1 would silently lose
+                    // every Replicated update in between (the phase 08 silent-gap bug class).
+                    // Bootstrap instead: full current Replicated state at one LSN.
+                    if (cursor < _engine.Log.BaseLsn)
+                    {
+                        await BootstrapReplicaAsync(link, session, cursor, ct).ConfigureAwait(false);
+                        continue;
+                    }
+
                     var head = _engine.Log.HeadLsn;
                     if (cursor < head)
                     {
@@ -396,6 +449,42 @@ internal sealed partial class HubRuntime : IDisposable
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// Sends the full current Replicated table set, captured under the write lock at one LSN, as
+    /// a reset the node applies with upsert-plus-absent-delete semantics — matching phase 08's
+    /// Postgres bootstrap rigor, where a pure upsert would resurrect rows deleted during the gap.
+    /// The stream then resumes from the snapshot LSN.
+    /// </summary>
+    private async Task BootstrapReplicaAsync(NodeLink link, NodeSession session, ulong staleCursor, CancellationToken ct)
+    {
+        ulong resetLsn = 0;
+        var tables = new List<ReplicaTableSnapshot>();
+        _engine.ReadConsistent(head =>
+        {
+            resetLsn = head;
+            foreach (var table in _engine.Schema.Tables)
+            {
+                if (table.Placement != Placement.Replicated)
+                    continue;
+                var rows = _engine.HotStore.Scan(table.Id)
+                    .Select(pair => new WireOp((byte)RowOpKind.Insert, table.Id.Value, pair.Key.ToArray(), pair.Value.ToArray()))
+                    .ToArray();
+                tables.Add(new ReplicaTableSnapshot(table.Id.Value, rows));
+            }
+        });
+
+        await link.RequestAsync("replica-reset", new ReplicaReset(resetLsn, [.. tables]), ct).ConfigureAwait(false);
+        LogReplicaBootstrapped(
+            _logger,
+            (link.Tag as NodeSession)?.NodeName ?? "?",
+            staleCursor,
+            _engine.Log.BaseLsn,
+            resetLsn,
+            tables.Sum(static t => t.Rows.Length));
+        if (session.ReplicaCursor == (long)staleCursor)
+            session.ReplicaCursor = (long)resetLsn;
     }
 
     private WireOp[] ReplicatedOps(CommitRecord record)
@@ -475,4 +564,17 @@ internal sealed partial class HubRuntime : IDisposable
     [LoggerMessage(EventId = 1706, EventName = "HandoffAborted", Level = LogLevel.Warning,
         Message = "Handoff {HandoffId}: import failed; player {Player} stays on shard {FromShard} (destination was {ToShard}).")]
     private static partial void LogHandoffAborted(ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1710, EventName = "HandoffUnresolved", Level = LogLevel.Warning,
+        Message = "Handoff {HandoffId}: the import request to shard {ToShard}'s owner timed out or the link died — the " +
+            "destination may or may not hold the import. Player {Player} stays frozen on shard {FromShard} until the " +
+            "origin's reconciler learns the truth from the destination's log; unavailable beats duplicated.")]
+    private static partial void LogHandoffUnresolved(ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1711, EventName = "ReplicaStreamBootstrapped", Level = LogLevel.Warning,
+        Message = "Node '{NodeName}' subscribed replication from LSN {StaleCursor}, below the hub log's truncation base " +
+            "{BaseLsn}; the gap cannot be served from the log, so the full Replicated state ({Rows} row(s)) was sent as a " +
+            "reset at LSN {ResetLsn} and the stream resumes from there.")]
+    private static partial void LogReplicaBootstrapped(
+        ILogger logger, string nodeName, ulong staleCursor, ulong baseLsn, ulong resetLsn, int rows);
 }

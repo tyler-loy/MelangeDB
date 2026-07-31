@@ -41,19 +41,36 @@ internal sealed record ReplicaSubscribe(ulong FromLsn);
 
 internal sealed record ReplicaBatch(ulong[] Lsns, WireOp[][] Records);
 
+internal sealed record ReplicaTableSnapshot(uint Table, WireOp[] Rows);
+
+/// <summary>
+/// A full-state replication reset: the hub's entire Replicated table set at one LSN, sent when a
+/// node's cursor fell below the hub log's truncation base — the gap's records are gone, so the
+/// stream cannot serve it and only a bootstrap can. The node applies it as upserts <em>plus
+/// deletions of local rows absent from the snapshot</em>, because a pure upsert bootstrap would
+/// resurrect rows the hub deleted during the gap.
+/// </summary>
+internal sealed record ReplicaReset(ulong Lsn, ReplicaTableSnapshot[] Tables);
+
 internal sealed record EventsForward(ulong UpToLsn, ulong ShardValue, WireEvent[] Events, long[] TimestampsMicros, ulong[] Lsns);
 
 internal sealed record HandoffFreeze(string HandoffId, ulong FromShard, ulong ToShard, long FencingToken, string PlayerHex);
 
 internal sealed record HandoffFrozenRows(WireOp[] Rows);
 
-internal sealed record HandoffImport(string HandoffId, ulong ToShard, long FencingToken, string PlayerHex, WireOp[] Rows);
+internal sealed record HandoffImport(
+    string HandoffId, ulong FromShard, ulong ToShard, long FencingToken, string PlayerHex, WireOp[] Rows);
 
 internal sealed record HandoffRelease(string HandoffId, ulong FromShard, long FencingToken);
 
 internal sealed record HandoffQuery(string HandoffId, ulong ToShard);
 
 internal sealed record HandoffQueryReply(bool Imported);
+
+/// <summary>The destination's reconciler asking whether the origin's freeze is still unresolved.</summary>
+internal sealed record HandoffFreezeQuery(string HandoffId, ulong FromShard);
+
+internal sealed record HandoffFreezeQueryReply(bool Pending);
 
 /// <summary>
 /// The mutual-authentication proofs both ends of a node link exchange at connect: each side

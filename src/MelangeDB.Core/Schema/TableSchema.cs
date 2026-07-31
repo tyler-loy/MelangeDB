@@ -43,6 +43,22 @@ public sealed class TableSchema
         if (primaryKeys.Count != 1)
             throw new NotSupportedException($"Table '{name}' must declare exactly one [PrimaryKey] column; found {primaryKeys.Count}.");
 
+        // Handoff re-homes a row by rewriting its ShardBy column while the stored row key — the
+        // encoded primary key — stays fixed. A primary-key shard column would silently diverge
+        // from its key on the first transfer, so it is refused here and at compile time
+        // (MELANGE0018).
+        if (shardBy is not null)
+        {
+            var shardColumn = columns.FirstOrDefault(c => c.Name == shardBy)
+                ?? throw new NotSupportedException($"Table '{name}': ShardBy names no column '{shardBy}'.");
+            if (shardColumn.IsPrimaryKey)
+            {
+                throw new NotSupportedException(
+                    $"Table '{name}': ShardBy = \"{shardBy}\" names the [PrimaryKey] column. The shard id must be its " +
+                    "own column — handoff rewrites it while the row's key stays fixed.");
+            }
+        }
+
         PrimaryKey = primaryKeys[0];
         if (!KeyCodec.IsKeyEncodable(PrimaryKey.Kind))
             throw new NotSupportedException($"Table '{name}': column '{PrimaryKey.Name}' of kind {PrimaryKey.Kind} cannot be a primary key.");

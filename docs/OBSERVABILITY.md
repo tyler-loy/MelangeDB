@@ -206,8 +206,13 @@ misconfigured node, either way worth an alert), `1704 ForeignEventHandlerFailed`
 its retries for a shard-forwarded event; foreign events have no dead-letter file, and the log says so
 plainly — `1705 HandoffCompleted` and `1706 HandoffAborted` (the two ends every transfer saga reaches),
 `1707 ShardOpened` (which node, recovered to which LSN — reassignment is recovery, and this is its receipt),
-`1708 ShardReleased`, and `1709 HubLinkLost` — the node's own view of a partition, ending in self-fencing if
-`Cluster:FailureTimeoutMs` passes first (09).
+`1708 ShardReleased`, `1709 HubLinkLost` — the node's own view of a partition, ending in self-fencing if
+`Cluster:FailureTimeoutMs` passes first — `1710 HandoffUnresolved` — an import request that timed out or lost
+its link: the destination may or may not hold the import, so the player deliberately stays frozen until the
+origin's reconciler learns the truth from the destination's log; unavailable beats duplicated — and
+`1711 ReplicaStreamBootstrapped`: a node subscribed replication from below the hub log's truncation base, so
+the gap could not be served from the log and the full Replicated state was sent as a reset instead of the
+stream silently resuming past it (09).
 
 ## Health checks
 

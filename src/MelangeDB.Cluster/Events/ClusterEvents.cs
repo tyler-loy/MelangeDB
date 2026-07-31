@@ -152,6 +152,11 @@ internal sealed class EventForwarder : ICommitObserver, IDisposable
     public void Start()
     {
         _engine.AddCommitObserver(this);
+
+        // Records not yet forwarded to the hub must survive log truncation — the log is this
+        // forwarder's buffer, exactly as it is for the local bus's subscribers, and the cursor
+        // (everything at or below it is delivered) is the highest removable LSN.
+        _engine.AddTruncationFloor(() => ReadCursor());
         _loop = Task.Run(LoopAsync);
     }
 

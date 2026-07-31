@@ -30,17 +30,23 @@ public class HandoffRecoveryTests
             player, new ShardKey(1), new ShardKey(2), TestContext.Current.CancellationToken));
         cluster.Hub.HandoffStepHook = null;
 
-        // The origin aborted: the player is unfrozen, intact, and writable exactly where it was.
+        // The coordinator saw a dead link, not an error reply — the destination MAY hold the
+        // import (an ack lost in transit looks identical), so aborting blind could mint two
+        // owners. The freeze deliberately stays: writable nowhere until the truth is known.
+        var frozen = Assert.ThrowsAny<Exception>(() => origin.ReducerHost.Call("GrantGold", player, 1u, 1));
+        Assert.Contains("frozen mid-handoff", frozen.Message);
+
+        // The revived destination's log has no import; the origin's reconciler learns that and
+        // aborts — the player is unfrozen, intact, and writable exactly where it was.
+        await cluster.StartNodeAsync(destinationOwner.Name);
+        await ClusterFixture.WaitUntilAsync(
+            () => origin.PendingFreezes.Count == 0,
+            "the origin's reconciler resolved the unknowable failure to an abort");
         var kept = origin.Engine.CommittedView.Find<PlayerState>(player);
         Assert.NotNull(kept);
         Assert.Equal(500, kept!.Value.Gold);
         origin.ReducerHost.Call("GrantGold", player, 1u, 1);
 
-        // The revived destination recovered its shard from its log: no import ever landed there.
-        await cluster.StartNodeAsync(destinationOwner.Name);
-        await ClusterFixture.WaitUntilAsync(
-            () => cluster.Node(destinationOwner.Name).Runtime.TryGetShard(new ShardKey(2)) is not null,
-            "the destination reopened its shard");
         var destination = cluster.Node(destinationOwner.Name).Runtime.TryGetShard(new ShardKey(2))!;
         Assert.Null(destination.Engine.CommittedView.Find<PlayerState>(player));
     }
