@@ -68,9 +68,13 @@ public class HotspotMeasurementTests(ITestOutputHelper output)
         output.WriteLine($"Degradation point at a 10 Hz per-player budget: ~{perSecond / 10:F0} players.");
 
         // Sanity floors only: the point of this test is that the number exists and is honest,
-        // not that this machine is fast.
+        // not that this machine is fast. The floor shrinks with MELANGE_TEST_TIME_SCALE the same
+        // way deadlines stretch with it — a saturated CI runner fsyncing a shared disk sustains
+        // a fraction of dev-hardware throughput without anything being structurally wrong.
         Assert.True(commits > 0);
-        Assert.True(perSecond > 100, $"a shard sustaining {perSecond:F0} commits/s indicates something structurally wrong");
+        Assert.True(
+            perSecond > 100.0 / TestTime.Scale,
+            $"a shard sustaining {perSecond:F0} commits/s indicates something structurally wrong");
     }
 
     private static long RunWindow(ShardRuntime shard, Identity[] players, uint square, TimeSpan window)
