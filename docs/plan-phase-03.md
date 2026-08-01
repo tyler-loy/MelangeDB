@@ -37,7 +37,12 @@ demonstrable, so it should be reached before anything in 04–08 is started.
 - **Compression** via `permessage-deflate`, configurable. Terrain blobs are already RLE-compressed, but delta
   frames carrying many small rows compress well.
 - **Heartbeat.** `Ping`/`Pong` with a timeout, because phase 05's `ClientDisconnected` must fire on ungraceful
-  drops and a closed socket is not the only way a client goes away.
+  drops and a closed socket is not the only way a client goes away. Settled later, when a CI wedge exposed the
+  seam (issue #23): silence convicts only if this server actually sent a ping since it last heard from the
+  peer. A heartbeat tick that fires late — a starved timer thread, a long GC pause, a frozen VM — measures the
+  server's own absence, not the client's, and a pure subscriber's only unprompted upstream traffic is
+  answering pings; convicting unsolicited silence would drop every quiet-but-healthy connection in one sweep
+  on resume. Probe first, judge one interval later; a dead client still dies within timeout plus one interval.
 
 **HTTP endpoints.** WebSocket is the wrong shape for two of the three client types in the reference project: the
 admin console runs **one-shot SQL over HTTP**, and terrain-gen **bulk-loads ~24.6k chunk rows**. Neither wants a

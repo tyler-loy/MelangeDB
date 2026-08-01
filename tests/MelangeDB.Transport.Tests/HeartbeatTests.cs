@@ -51,6 +51,40 @@ public class HeartbeatTests
         await reader;
     }
 
+    /// <summary>
+    /// The paused-server schedule: the whole timeout elapses in one jump before any tick runs —
+    /// a starved timer thread on an overloaded host, a long GC pause, a frozen VM. The first
+    /// tick afterwards sees silence beyond the timeout, but that silence measures the server's
+    /// own absence: no ping was ever sent in the window, so nothing solicited the quiet client
+    /// to speak (after its handshake this client, like any pure subscriber, has nothing to say
+    /// unprompted). The detector must probe before it convicts — ping now, judge one interval
+    /// later — or every quiet-but-healthy connection dies in one sweep the moment the process
+    /// resumes. Deterministically red on the unsolicited conviction, green on probe-first.
+    /// </summary>
+    [Fact]
+    public async Task A_stalled_servers_first_tick_pings_before_it_convicts()
+    {
+        await using var host = await TransportTestHost.StartAsync(manualTime: true);
+        await using var client = host.CreateClient();
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        var disconnected = false;
+        client.OnDisconnected += () => disconnected = true;
+
+        // The stall: past the full 45s timeout with zero intervening ticks — Jump moves the
+        // clock without firing timers, and the zero Advance then runs the overdue first tick at
+        // the jumped-to now, exactly as a resumed process would. That tick must not abort — the
+        // reducer call proves the connection end to end (and is itself fresh inbound traffic,
+        // so the following on-schedule tick sees a short silence).
+        host.Time!.Jump(TimeSpan.FromSeconds(46));
+        host.Time.Advance(TimeSpan.Zero);
+        await client.CallReducerAsync("Noop", null, TestContext.Current.CancellationToken);
+
+        host.Time.Advance(TimeSpan.FromSeconds(15));
+        await client.CallReducerAsync("Noop", null, TestContext.Current.CancellationToken);
+        Assert.True(client.IsConnected, "a healthy client must survive the server's own stall");
+        Assert.False(disconnected);
+    }
+
     [Fact]
     public async Task A_responsive_client_is_never_dropped()
     {
