@@ -89,7 +89,12 @@ This is a denial-of-service surface, so it belongs in the phase that ships subsc
 - Connect, authenticate (stubbed until 04), call reducers, await results.
 - Locally maintained row cache per subscription with `OnInsert` / `OnUpdate` / `OnDelete` events.
 - Reconnect with `Resume` from the last acked LSN, falling back to full re-establishment when the server says
-  the gap can't be served.
+  the gap can't be served. Settled later, when a suite flake exposed the seam: connection teardown is scoped
+  to the socket's own era — a stale receive loop dying after a reconnect already installed a fresh socket
+  must neither fail the new dial's pending state nor fire `OnDisconnected` for an outage that is over. And
+  `ReconnectAsync` deliberately does **not** retry a failed dial: the one observed "transient" dial failure
+  was this very race, not the network, and an internal retry would have masked it — genuine failures surface
+  to the caller, who owns backoff policy.
 
 ## Out of scope
 

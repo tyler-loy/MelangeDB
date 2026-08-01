@@ -94,6 +94,45 @@ public class ResumeTests
         Assert.Equal(2, subscription.Count);
     }
 
+    /// <summary>
+    /// The stale-teardown schedule, era-scoped away: an Abort()'s receive loop can lose the
+    /// scheduling race to ReconnectAsync and die only after the new dial installed its own
+    /// pending state. That late death used to run the full teardown against the fresh era —
+    /// failing the new dial's pending handshake mid-flight ("the connection dropped during the
+    /// handshake" out of a healthy reconnect, the suite flake this pins) and announcing a
+    /// disconnect whose outage was already over. The gate forces the schedule exactly: the old
+    /// loop is held at the top of its teardown across the entire reconnect, then released; a
+    /// teardown scoped to its own era must do nothing at all.
+    /// </summary>
+    [Fact]
+    public async Task A_stale_receive_loops_late_death_cannot_touch_a_fresh_reconnects_era()
+    {
+        await using var host = await TransportTestHost.StartAsync();
+        host.Call("SetChunk", 1L, 1L, new byte[] { 1 });
+        await using var client = host.CreateClient();
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        var subscription = await client.SubscribeAsync("SELECT * FROM Chunk", cancellationToken: TestContext.Current.CancellationToken);
+
+        var disconnects = 0;
+        client.OnDisconnected += () => Interlocked.Increment(ref disconnects);
+
+        // Hold the aborted loop at its teardown while the reconnect completes underneath it.
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.ReceiveTeardownGate = () => release.Task;
+        client.Abort();
+        var resumed = await client.ReconnectAsync(TestContext.Current.CancellationToken);
+        Assert.True(resumed);
+
+        // The stale loop dies now, strictly after the fresh era took over. It must neither fail
+        // the new era's pending state nor announce the already-healed disconnect.
+        release.SetResult();
+        var head = host.Call("SetChunk", 2L, 2L, new byte[] { 2 });
+        await TransportTestHost.WaitUntilAsync(() => client.LastAckedLsn >= head, "the live delta to arrive on the fresh era");
+        Assert.Equal(0, disconnects);
+        Assert.Equal(2, subscription.Count);
+        Assert.True(client.IsConnected);
+    }
+
     [Fact]
     public async Task A_stale_or_unknown_log_epoch_fails_cleanly_into_full_resync()
     {
