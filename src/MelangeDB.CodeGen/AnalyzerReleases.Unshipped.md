@@ -24,3 +24,5 @@ MELANGE0016 | MelangeDB | Error | ScheduleAt column placement is invalid
 MELANGE0017 | MelangeDB | Warning | Full scan over a table that is not Resident
 MELANGE0018 | MelangeDB | Error | ShardBy must not be the primary key
 MELANGE0019 | MelangeDB | Error | Client-visible enums must have unique names
+MELANGE0020 | MelangeDB | Error | Schema manifest is invalid
+MELANGE0021 | MelangeDB | Error | One project generates from one schema manifest

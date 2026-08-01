@@ -76,6 +76,48 @@ The manifest is embedded in the module assembly as the generated
 the schema endpoint, and the committed file are all that constant verbatim — one writer, several
 transports, byte-identical everywhere.
 
+## The generated API
+
+Bindings land in the `MelangeDB.Types` namespace — deliberately the shape of `spacetime generate`'s
+`SpacetimeDB.Types`, because issue #20's consumer is porting 459 call sites and renames are the
+budget. Per public table `Creature`:
+
+```csharp
+var conn = new MelangeConnection(client);          // wraps a connected MelangeClient
+
+conn.Db.Creature.OnInsert += c => ...;             // typed events off the merged cache
+conn.Db.Creature.OnUpdate += (old, now) => ...;
+conn.Db.Creature.OnDelete += c => ...;
+conn.Db.Creature.Count;                            // locally cached rows
+conn.Db.Creature.Iter();                           // snapshot of the cache
+conn.Db.Creature.Id.Find(creatureId);              // PK lookup, O(1) by encoded key
+conn.Db.Creature.ChunkId.Filter(5, 15);            // index lookup, scans the local cache
+
+await conn.Db.Creature.SubscribeAllAsync();                        // SELECT * FROM Creature
+var sub = await conn.Db.Creature.ChunkId.SubscribeRangeAsync(0, 10);  // ... WHERE ChunkId BETWEEN :lo AND :hi
+await conn.Db.Creature.ChunkId.RescopeRangeAsync(sub, 5, 15);      // the terrain pattern: a diff, not a flush
+await sub.UnsubscribeAsync();                                      // removes only rows nothing else covers
+
+var lsn = await conn.Reducers.SpawnAsync(chunkId, "wolf", stats);  // typed stub per reducer
+conn.SchemaHash;                                                   // the drift detector
+```
+
+Rows are `partial struct`s with the server's field names; enums are re-declared from the manifest.
+The caches are **merged per table and refcounted per key** across every subscription — a row
+matching two subscriptions is one cached row and one event, and the server deliberately sends it
+once per subscription (the engine deduplicates nothing across subscriptions on a connection; the
+client merge is where that collapses). Subscription helpers cover three of the four SQL shapes —
+full table, equality, range — on primary-key, `[Unique]`, and `[Index]` columns, which is exactly
+the set the server accepts predicates on. The fourth shape (an explicit column list) stays on the
+untyped `MelangeClient` API: a projected row bound to a full struct would read as zeros, the
+precise trap typed bindings exist to close.
+
+Deliberate divergences from the SpacetimeDB C# SDK, for porting hands: reducer stubs are
+`Task<ulong>`-returning `<Name>Async(...)` (the LSN, house async style) rather than fire-and-forget
+`void`; the connection wrapper is `MelangeConnection`, not `DbConnection`; non-PK lookups scan the
+local cache instead of maintaining client-side index dictionaries — client caches are
+subscription-sized, and an index that earns its keep should show up in a profile first.
+
 ## Staleness
 
 The manifest can go stale against the module it was exported from. The defenses, in order: the

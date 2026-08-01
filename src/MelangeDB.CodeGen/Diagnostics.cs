@@ -164,6 +164,22 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor InvalidManifest = new(
+        "MELANGE0020",
+        "Schema manifest is invalid",
+        "The schema manifest at '{0}' cannot be read: {1}. Re-export it with tools/MelangeDB.SchemaExport from the module build (or its dev server); no bindings were generated.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor MultipleManifests = new(
+        "MELANGE0021",
+        "One project generates from one schema manifest",
+        "This compilation carries several melange-schema.json AdditionalFiles ({0}). The bindings share one MelangeDB.Types namespace and one connection wrapper, so one project binds one module; split consumers of different modules into separate projects.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(
         "MELANGE0017",
         "Full scan over a table that is not Resident",

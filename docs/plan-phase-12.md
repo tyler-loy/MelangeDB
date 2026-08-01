@@ -154,6 +154,25 @@ The decisions the plan left to the implementer, as they were actually taken.
   never a default. A mismatch surfacing in an initial set fails that `SubscribeAsync` with the message;
   one surfacing mid-stream (a schema change under a live connection) is allowed to kill the receive loop
   loudly rather than be swallowed.
+- **Bindings emit into `MelangeDB.Types`** — the `SpacetimeDB.Types` shape, because renames are the
+  porting budget. Divergences from the SpacetimeDB C# SDK, chosen for house style and noted in
+  CLIENT-BINDINGS.md: stubs are `Task<ulong>`-returning `<Name>Async` rather than fire-and-forget `void`;
+  the wrapper is `MelangeConnection`, not `DbConnection`; non-PK lookups scan the local cache rather than
+  maintaining client-side index dictionaries (caches are subscription-sized; an index should earn its
+  place in a profile first). Range and equality filters compare by encoded `RowKey`, so client-side
+  comparison semantics are byte-for-byte the server's — including UTF-8 string ordering.
+- **Typed subscription helpers cover three of the four shapes** — full table, equality, range, on
+  exactly the predicate-legal columns (PK, `[Unique]`, `[Index]`). The column-list shape stays untyped by
+  the projection decision above. Typed rescope lives on the column accessor
+  (`RescopeAsync`/`RescopeRangeAsync`), because the parameter names (`p` / `lo`,`hi`) are part of the
+  emitted query and only the accessor knows them; `TypedSubscription.RescopeAsync(dictionary)` remains
+  for hand-built parameter maps.
+- **Client generator diagnostics:** MELANGE0020 (manifest missing fields, malformed JSON, or an unknown
+  format version — one id, the message says which) and MELANGE0021 (two manifests in one compilation:
+  one project binds one module, split consumers into separate projects).
+- **The client generator's tests eat the server generator's output.** `GeneratorTestHost.ExportManifest`
+  runs the server generator and pulls the JSON back out of the generated constant, so the reader is
+  always tested against the writer of record, never a hand-maintained fixture.
 
 ## Risks
 

@@ -3,6 +3,8 @@ using MelangeDB.CodeGen;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
+using Microsoft.CodeAnalysis.Text;
+using Xunit;
 
 namespace MelangeDB.CodeGen.Tests;
 
@@ -38,6 +40,77 @@ internal static class GeneratorTestHost
             .Select(s => (s.HintName, s.SourceText.ToString()))
             .ToList();
         return new RunResult(output, diagnostics, sources);
+    }
+
+    /// <summary>
+    /// Runs the client generator over manifest AdditionalFiles, the way a consuming client
+    /// project triggers it. The compilation references MelangeDB.Client, so generated bindings
+    /// compile for real, not just as text.
+    /// </summary>
+    public static RunResult RunClientGenerator(string manifestJson, string source = "") =>
+        RunClientGenerator([("melange-schema.json", manifestJson)], source);
+
+    public static RunResult RunClientGenerator(IReadOnlyList<(string Path, string Content)> manifests, string source = "")
+    {
+        var compilation = Compile(source);
+        var additionalTexts = manifests
+            .Select(AdditionalText (m) => new InMemoryAdditionalText(m.Path, m.Content))
+            .ToArray();
+        var driver = CSharpGeneratorDriver
+            .Create([new MelangeClientGenerator().AsSourceGenerator()], additionalTexts, ParseOptions)
+            .RunGeneratorsAndUpdateCompilation(compilation, out var output, out var diagnostics);
+        var run = driver.GetRunResult();
+        var sources = run.Results
+            .SelectMany(r => r.GeneratedSources)
+            .Select(s => (s.HintName, s.SourceText.ToString()))
+            .ToList();
+        return new RunResult(output, diagnostics, sources);
+    }
+
+    /// <summary>
+    /// The manifest the server generator embedded for <paramref name="source"/> — the JSON pulled
+    /// back out of the generated constant, so client-generator tests consume the real writer's
+    /// output rather than a hand-maintained copy.
+    /// </summary>
+    public static string ExportManifest(string source)
+    {
+        var run = RunGenerator(source);
+        var (_, holder) = Assert.Single(run.GeneratedSources, s => s.HintName == "MelangeSchemaManifest.g.cs");
+        const string marker = "public const string Json = @\"";
+        var start = holder.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
+        var end = holder.LastIndexOf("\";", StringComparison.Ordinal);
+        return holder[start..end].Replace("\"\"", "\"");
+    }
+
+    /// <summary>
+    /// Compares generated output against a checked-in snapshot; on drift a .actual lands next to
+    /// the build output for diffing.
+    /// </summary>
+    public static void AssertSnapshot(RunResult result, string hintName, string expectedFile)
+    {
+        var (_, actual) = Assert.Single(result.GeneratedSources, s => s.HintName == hintName);
+        actual = actual.Replace("\r\n", "\n");
+
+        var expectedPath = Path.Combine(AppContext.BaseDirectory, "Snapshots", expectedFile);
+        Directory.CreateDirectory(Path.GetDirectoryName(expectedPath)!);
+        if (!File.Exists(expectedPath))
+        {
+            File.WriteAllText(expectedPath + ".actual", actual);
+            Assert.Fail($"Missing snapshot {expectedFile}; review and check in the .actual file written next to it.");
+        }
+
+        var expected = File.ReadAllText(expectedPath).Replace("\r\n", "\n");
+        if (expected != actual)
+            File.WriteAllText(expectedPath + ".actual", actual);
+        Assert.Equal(expected, actual);
+    }
+
+    private sealed class InMemoryAdditionalText(string path, string content) : AdditionalText
+    {
+        public override string Path { get; } = path;
+
+        public override SourceText GetText(CancellationToken cancellationToken = default) =>
+            SourceText.From(content, System.Text.Encoding.UTF8);
     }
 
     public static async Task<ImmutableArray<Diagnostic>> RunAnalyzerAsync(string source)
@@ -78,6 +151,8 @@ internal static class GeneratorTestHost
             paths.Add(path);
         paths.Add(typeof(MelangeDB.TableAttribute).Assembly.Location);
         paths.Add(typeof(MelangeDB.Core.MelangeEngine).Assembly.Location);
+        paths.Add(typeof(MelangeDB.Protocol.Frame).Assembly.Location);
+        paths.Add(typeof(MelangeDB.Client.MelangeClient).Assembly.Location);
         return paths.Select(MetadataReference (p) => MetadataReference.CreateFromFile(p)).ToList();
     }
 }

@@ -10,6 +10,7 @@
     <!-- Referenced only to hand their assemblies to test compilations as metadata references. -->
     <ProjectReference Include="..\..\src\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
   </ItemGroup>
 
   <ItemGroup>
