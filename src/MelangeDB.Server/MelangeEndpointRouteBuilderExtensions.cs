@@ -100,7 +100,7 @@ public static class MelangeEndpointRouteBuilderExtensions
         {
             context.Response.StatusCode = StatusCodes.Status404NotFound;
             await context.Response.WriteAsync(manifests is { All.Count: > 1 }
-                ? "This host registered several module assemblies with schema manifests; serving one of many would misstate the schema. Export per module with tools/MelangeDB.SchemaExport instead."
+                ? "This host registered several module assemblies with schema manifests; serving one of many would misstate the schema. Export per module with `melange schema` instead."
                 : "No registered module assembly carries a generated schema manifest. Reference the MelangeDB.CodeGen analyzer and declare a public table or a reducer.").ConfigureAwait(false);
             return;
         }

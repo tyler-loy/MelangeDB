@@ -167,7 +167,7 @@ public static class Diagnostics
     public static readonly DiagnosticDescriptor InvalidManifest = new(
         "MELANGE0020",
         "Schema manifest is invalid",
-        "The schema manifest at '{0}' cannot be read: {1}. Re-export it with tools/MelangeDB.SchemaExport from the module build (or its dev server); no bindings were generated.",
+        "The schema manifest at '{0}' cannot be read: {1}. Re-export it with `melange schema` (the MelangeDB.Cli tool) from the module build (or its dev server); no bindings were generated.",
         Category,
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);

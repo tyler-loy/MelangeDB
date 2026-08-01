@@ -297,6 +297,13 @@ the node dead. An expired lease means **self-fencing**: the node's shard engines
 
 **LSN** — Log sequence number. Monotonic within a shard's log. There is **no** cluster-wide ordering.
 
+**`melange` CLI** — The MelangeDB command-line tool (`src/MelangeDB.Cli`, package `MelangeDB.Cli`, installed
+with `dotnet tool install`). `melange` is the umbrella command; its one subcommand today is `schema`, which
+writes a module's schema manifest to `melange-schema.json` from a built module DLL or from a running dev
+server's schema endpoint — the feed-consumer form of the export workflow in
+[CLIENT-BINDINGS.md](CLIENT-BINDINGS.md). The name is deliberately the umbrella so future verbs (schema
+diff, storage inspection, cluster ops) arrive as subcommands, not as a breaking tool rename.
+
 **Migration anchor (`IMigrationAnchors`)** — The application's declaration of which rows anchor automatic
 migration: a player's position row (with hysteresis — pacing on the line must not thrash) or a creature
 (immediate — its AI only ticks it on the shard its position resolves to, so a margin would leave it standing
@@ -443,7 +450,7 @@ reducer policies — internal dispatch is not a client call.
 **Schema endpoint** — The development HTTP endpoint (`{path}/schema`) serving the module's schema manifest,
 gated the way Swagger gates its document: on in Development, `Transport:SchemaEndpointEnabled` overrides in
 either direction, anonymous while on because the manifest carries only what every client already receives.
-The exporter tool fetches from it — generate bindings against the running local dev server, no DLL path.
+`melange schema` fetches from it — generate bindings against the running local dev server, no DLL path.
 
 **Schema hash** — SHA-256 over a manifest's JSON rendered with an empty `schemaHash` field. The generator
 stamps it into the manifest and into the client bindings built from it, so a connection wrapper can surface

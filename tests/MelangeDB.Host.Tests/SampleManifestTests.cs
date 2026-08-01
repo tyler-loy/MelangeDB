@@ -36,7 +36,7 @@ public class SampleManifestTests : IDisposable
         // The manifest the sample client generates from is committed next to the worker; if the
         // worker's tables or reducers change, this fails until it is re-exported — schema drift
         // becomes a build break, never a runtime null. Re-export with:
-        //   dotnet run --project tools/MelangeDB.SchemaExport -- samples/MelangeDB.Sample.Worker/bin/Debug/net10.0/MelangeDB.Sample.Worker.dll -o samples/MelangeDB.Sample.Worker/melange-schema.json
+        //   dotnet run --project src/MelangeDB.Cli -- schema samples/MelangeDB.Sample.Worker/bin/Debug/net10.0/MelangeDB.Sample.Worker.dll -o samples/MelangeDB.Sample.Worker/melange-schema.json
         var committed = File.ReadAllText(Path.Combine(RepoRoot(), "samples", "MelangeDB.Sample.Worker", "melange-schema.json"));
         var embedded = (string)typeof(MelangeDB.Sample.Visitor).Assembly
             .GetType("MelangeDB.Generated.MelangeSchemaManifest")!

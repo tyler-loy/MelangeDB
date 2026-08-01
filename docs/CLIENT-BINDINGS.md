@@ -16,7 +16,7 @@ reducers anyway, whose bodies exist only in the server compilation.
 ```
 server module (.dll, built with MelangeDB.CodeGen)
         │
-        │  tools/MelangeDB.SchemaExport  (from the DLL, or from the running dev server)
+        │  melange schema  (from the DLL, or from the running dev server)
         ▼
 melange-schema.json          ← committed next to the consumer(s)
         │
@@ -25,12 +25,18 @@ melange-schema.json          ← committed next to the consumer(s)
 typed client bindings        ← one tree per consuming project; N consumers, one schema
 ```
 
-Export the manifest either way — the two paths produce byte-identical files:
+The exporter ships as the `melange` CLI (package `MelangeDB.Cli` on the repo feed, a dotnet
+tool). Install it once, then export the manifest either way — the two paths produce
+byte-identical files:
 
 ```
-dotnet run --project tools/MelangeDB.SchemaExport -- path/to/Module.dll -o melange-schema.json
-dotnet run --project tools/MelangeDB.SchemaExport -- http://localhost:5310 -o melange-schema.json
+dotnet tool install --global MelangeDB.Cli
+melange schema path/to/Module.dll -o melange-schema.json
+melange schema http://localhost:5310 -o melange-schema.json
 ```
+
+(Working from a checkout of this repo, `dotnet run --project src/MelangeDB.Cli -- schema …`
+does the same without installing anything.)
 
 The URL form fetches `GET {path}/schema` from a running server (a bare base URL gets
 `/melange/schema` appended). That endpoint follows the Swagger pattern: **on in Development, off

@@ -86,7 +86,7 @@ jobs:
       FEED: https://nuget.pkg.github.com/tyler-loy/index.json
       PACKABLE: >-
         Abstractions Core Protocol Client Server CodeGen
-        Storage.Faster Storage.Postgres Cluster OpenTelemetry
+        Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli
     steps:
       - uses: actions/checkout@v7
 

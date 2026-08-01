@@ -1,5 +1,5 @@
 using System.Net;
-using MelangeDB.SchemaExport;
+using MelangeDB.Cli;
 using Xunit;
 
 namespace MelangeDB.Transport.Tests;

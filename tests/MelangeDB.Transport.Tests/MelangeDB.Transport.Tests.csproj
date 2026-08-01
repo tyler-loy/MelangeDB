@@ -16,9 +16,9 @@
     <ProjectReference Include="..\..\src\MelangeDB.Server\MelangeDB.Server.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
-    <!-- The exporter tool, referenced as a library so the byte-identity test can drive both of
+    <!-- The CLI's exporter, referenced as a library so the byte-identity test can drive both of
          its sources — the built assembly and the running dev server — through the same writer. -->
-    <ProjectReference Include="..\..\tools\MelangeDB.SchemaExport\MelangeDB.SchemaExport.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.Cli\MelangeDB.Cli.csproj" />
   </ItemGroup>
 
   <ItemGroup>

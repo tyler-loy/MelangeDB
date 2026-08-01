@@ -1,4 +1,4 @@
-using MelangeDB.SchemaExport;
+using MelangeDB.Cli;
 using MelangeDB.Types;
 using Xunit;
 
