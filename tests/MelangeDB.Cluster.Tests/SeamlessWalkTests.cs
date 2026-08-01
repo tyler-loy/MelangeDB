@@ -331,17 +331,20 @@ public class SeamlessWalkTests
         Assert.Equal(66, destination.Engine.CommittedView.Find<Pack>(player)!.Value.Gold);
 
         // The revived origin replays its freeze, learns the import happened, and releases: no
-        // duplicate — exactly one authoritative copy in the world. StartNodeAsync returns at
-        // Kestrel start; everything that resolves the freeze happens after it, each step bounded
-        // and retried, and the honest sum exceeds the default deadline on a loaded machine: the
-        // hub link reconnects (10s challenge timeout per attempt, 0.5s retry), assignments reopen
-        // and recover the shard log, the reconciler sweeps at its 1s cadence, and each of its two
-        // link round-trips rides a 15s request timeout — one query lost to contention costs a
-        // full timeout plus a sweep. Sixty seconds covers one bad cycle at every stage.
+        // duplicate — exactly one authoritative copy in the world. Two allowances make this wait
+        // honest. Deadline: StartNodeAsync returns at Kestrel start, and the resolution then
+        // needs the hub-link reconnect (10s challenge timeout per attempt, 0.5s retry), the
+        // assignment-driven shard reopen and log recovery, the reconciler's 1s sweep, and two
+        // link round-trips each under a 15s request timeout — sixty seconds covers one bad cycle
+        // of every stage. Condition: the release deliberately keeps a row the border stream
+        // already adopted as a marked copy (the player stands inside A's observer band during
+        // the transfer), so "released" means absent or borrowed — never a second authority.
         await cluster.StartNodeAsync(originOwner);
+        var posTable = destination.Engine.Schema.Get(typeof(PlayerPos));
         await ClusterFixture.WaitUntilAsync(
             () => cluster.Node(originOwner).Runtime.TryGetShard(new ShardKey(BlockA)) is { } reopened
-                && reopened.Engine.CommittedView.Find<PlayerPos>(player) is null,
+                && (reopened.Engine.CommittedView.Find<PlayerPos>(player) is null
+                    || reopened.BorrowedOwnerOf(posTable.Id, KeyCodec.Encode(posTable.PrimaryKey, player)) is not null),
             "the recovered origin released the transferred player",
             timeoutSeconds: 60);
     }
