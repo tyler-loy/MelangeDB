@@ -257,9 +257,14 @@ public class SeamlessWalkTests
             () => cluster.Node(destinationOwner).App is null, "the destination node finished stopping");
         cluster.Hub.HandoffStepHook = null;
         await cluster.StartNodeAsync(destinationOwner);
+
+        // Same envelope as the origin-revival wait in the test below: the revived destination's
+        // link reconnect, the reconciler's 1s cadence, and 15s per link round-trip all sit
+        // between the restart and this resolution — sixty seconds covers one bad cycle of each.
         await ClusterFixture.WaitUntilAsync(
             () => origin.PendingFreezes.Count == 0,
-            "the origin's reconciler resolved the unknowable import to an abort");
+            "the origin's reconciler resolved the unknowable import to an abort",
+            timeoutSeconds: 60);
 
         // Owned by the origin, alive, and playable — through the same client, no reconnect. The
         // destination may hold a read-only border copy (the player stands in its band — that is
@@ -326,11 +331,18 @@ public class SeamlessWalkTests
         Assert.Equal(66, destination.Engine.CommittedView.Find<Pack>(player)!.Value.Gold);
 
         // The revived origin replays its freeze, learns the import happened, and releases: no
-        // duplicate — exactly one authoritative copy in the world.
+        // duplicate — exactly one authoritative copy in the world. StartNodeAsync returns at
+        // Kestrel start; everything that resolves the freeze happens after it, each step bounded
+        // and retried, and the honest sum exceeds the default deadline on a loaded machine: the
+        // hub link reconnects (10s challenge timeout per attempt, 0.5s retry), assignments reopen
+        // and recover the shard log, the reconciler sweeps at its 1s cadence, and each of its two
+        // link round-trips rides a 15s request timeout — one query lost to contention costs a
+        // full timeout plus a sweep. Sixty seconds covers one bad cycle at every stage.
         await cluster.StartNodeAsync(originOwner);
         await ClusterFixture.WaitUntilAsync(
             () => cluster.Node(originOwner).Runtime.TryGetShard(new ShardKey(BlockA)) is { } reopened
                 && reopened.Engine.CommittedView.Find<PlayerPos>(player) is null,
-            "the recovered origin released the transferred player");
+            "the recovered origin released the transferred player",
+            timeoutSeconds: 60);
     }
 }
