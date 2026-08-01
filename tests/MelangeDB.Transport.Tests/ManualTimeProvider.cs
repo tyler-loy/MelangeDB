@@ -54,12 +54,30 @@ internal sealed class ManualTimeProvider : TimeProvider
                         next = timer;
                 }
 
-                _now = next?.DueAt ?? target;
+                // Never rewind: a timer left overdue by Jump fires at the jumped-to now, exactly
+                // as a stalled callback runs late against a clock that kept moving.
+                var advanceTo = next?.DueAt ?? target;
+                if (advanceTo > _now)
+                    _now = advanceTo;
             }
 
             if (next is null)
                 return;
             next.Fire();
+        }
+    }
+
+    /// <summary>
+    /// Moves the clock without firing due timers — a stalled timer thread, a long GC pause, a
+    /// frozen VM: time passed, but nothing scheduled got to run. The next <see cref="Advance"/>
+    /// (even by zero) fires the overdue timers at the jumped-to now, exactly as a resumed
+    /// process would.
+    /// </summary>
+    public void Jump(TimeSpan by)
+    {
+        lock (_lock)
+        {
+            _now += by;
         }
     }
 

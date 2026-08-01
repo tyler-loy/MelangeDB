@@ -43,15 +43,24 @@ public class InitialSetConsistencyTests
         await using var client = host.CreateClient();
         await client.ConnectAsync(TestContext.Current.CancellationToken);
 
+        // Subscribe-first, then consult the writer: the old `while (!writer.IsCompleted)` shape
+        // could run its body zero times — on a starved two-core host a scheduler burst lets the
+        // writer's 400 in-process commits finish before this thread's first loop check, leaving
+        // ZERO subscriptions. No subscription means no frame ever carries an LSN, LastAckedLsn
+        // stays 0, and the drain wait below is unsatisfiable at any deadline — the full-deadline
+        // "wedge" of issue #23 (CI runs 30690081070/30690573307, reproduced locally 1-in-1 with
+        // the suite pinned to two cores under bursty burners; the connection was healthy the
+        // whole time: acked=0, head=359, subs=0). The do-while guarantees at least one
+        // subscription; when the writer is genuinely fast, that subscription's initial set
+        // anchors at the final head and the boundary assertion still holds.
         var subscriptions = new List<Client.MelangeSubscription>();
-        while (!writer.IsCompleted)
+        do
         {
             subscriptions.Add(await client.SubscribeAsync(
                 "SELECT * FROM Chunk",
                 cancellationToken: TestContext.Current.CancellationToken));
-            if (subscriptions.Count >= 8)
-                break;
         }
+        while (!writer.IsCompleted && subscriptions.Count < 8);
 
         await writer;
         var head = host.Engine.Log.HeadLsn;

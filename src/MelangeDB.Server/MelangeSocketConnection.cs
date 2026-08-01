@@ -42,6 +42,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private byte[]? _heldDelta; // Sender-loop only: a delta held back behind a fresh stream's first chunk.
     private long _lastReceivedTicks;
     private uint _nextPingId;
+    private volatile bool _pingSolicited; // A ping went out after the last inbound frame; only then may silence convict.
     private ITimer? _heartbeat;
     private bool _handshaken;
     private bool _lifecycleConnected;
@@ -280,6 +281,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             }
 
             _lastReceivedTicks = _time.GetUtcNow().UtcTicks;
+            _pingSolicited = false;
             var frame = _serializer.Deserialize(message.GetBuffer().AsSpan(0, (int)message.Length));
             await HandleFrameAsync(frame).ConfigureAwait(false);
         }
@@ -682,16 +684,24 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             }
 
             var silence = _time.GetUtcNow() - new DateTimeOffset(Interlocked.Read(ref _lastReceivedTicks), TimeSpan.Zero);
-            if (silence > TimeSpan.FromMilliseconds(options.Transport.HeartbeatTimeoutMs))
+            if (silence > TimeSpan.FromMilliseconds(options.Transport.HeartbeatTimeoutMs) && _pingSolicited)
             {
-                // No close frame arrived and nothing else did either: an ungraceful drop. Abort so
-                // the read loop observes the death instead of waiting forever.
+                // No close frame arrived and nothing answered a ping this connection actually
+                // sent since it last heard from the peer: an ungraceful drop. Abort so the read
+                // loop observes the death instead of waiting forever. The solicited check is what
+                // makes the detector honest: a tick that fires late — the timer thread starved on
+                // an overloaded host, a long GC pause, a frozen VM — sees a silence that measures
+                // this server's own absence, not the client's. Convicting on it would drop every
+                // quiet-but-healthy client in one sweep the moment the process resumes (a
+                // subscriber that only reads is a legitimate profile; its only upstream traffic
+                // is answering our pings). Probe first; judge one interval later.
                 LogMessages.HeartbeatTimeout(_logger, ConnectionId.ToString(), options.Transport.HeartbeatTimeoutMs);
                 _socket.Abort();
                 return;
             }
 
             EnqueuePriority(new PingFrame(_nextPingId++));
+            _pingSolicited = true;
             _heartbeat?.Change(TimeSpan.FromMilliseconds(options.Transport.HeartbeatIntervalMs), Timeout.InfiniteTimeSpan);
         }
         catch (ObjectDisposedException)
