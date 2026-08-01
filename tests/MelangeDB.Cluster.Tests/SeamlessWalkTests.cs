@@ -145,7 +145,12 @@ public class SeamlessWalkTests
 
             await Task.Delay(150, TestContext.Current.CancellationToken);
         }
-        Assert.True(cluster.Hub.Metrics.HandoffsCompleted >= 2);
+
+        // The hub map (what the loop above watches) flips before the release round-trip, and
+        // HandoffEnded counts the completion only after it — wait for the count, don't race it.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HandoffsCompleted >= 2,
+            "both boundary crossings closed their sagas and counted");
         Assert.True(client.IsConnected, "the client must never observe a disconnect");
         Assert.False(disconnected);
         Assert.Empty(resyncErrors);

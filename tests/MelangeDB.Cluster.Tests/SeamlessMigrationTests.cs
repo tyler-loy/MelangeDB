@@ -100,6 +100,13 @@ public class SeamlessMigrationTests
         await ClusterFixture.WaitUntilAsync(
             () => cluster.HubEngine.CommittedView.Find<PlayerShardMap>(player)?.Shard == BlockB,
             "the transfer listener flipped the hub's session-to-shard map");
+
+        // The map flips before the release round-trip by design (deletions must never reach an
+        // attached client), and HandoffEnded runs in the saga's finally after that round-trip —
+        // so the counter trails the map by a full network exchange. Wait, then assert.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HandoffsCompleted == 1,
+            "the saga closed and counted the completed handoff");
         Assert.Equal(1, cluster.Hub.Metrics.HandoffsCompleted);
     }
 
@@ -182,7 +189,12 @@ public class SeamlessMigrationTests
         await ClusterFixture.WaitUntilAsync(
             () => shardB.Engine.CommittedView.Find<Critter>(critterId)!.Value.Ticks > ticksAtArrival,
             "the critter keeps ticking on its new owner");
-        Assert.True(cluster.Hub.Metrics.HandoffsCompleted >= 1);
+
+        // Ticking on the destination begins at destination-authoritative; HandoffEnded runs only
+        // after the release round-trip. Wait for the count rather than asserting it raw.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HandoffsCompleted >= 1,
+            "the saga closed and counted the completed handoff");
     }
 
     private static RowKey KeyOf(ShardRuntime shard, Identity id)
