@@ -106,7 +106,7 @@ public class ClusterSeamTests
         using var harness = new EngineHarness();
         var schema = harness.Engine.Schema.Get(typeof(TerrainChunk));
         var row = RowSerializer.Serialize(schema, new TerrainChunk { ChunkId = 9, Data = [1, 2], Kind = ChunkKind.Ore });
-        var key = KeyCodec.Encode(schema.PrimaryKey, 9L);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, 9L);
 
         var record = harness.Engine.ApplyInternal(
             "melange/replica", EngineHarness.Caller, [new RowOp(RowOpKind.Insert, schema.Id, key, row)]);
@@ -123,8 +123,8 @@ public class ClusterSeamTests
         using var harness = new EngineHarness();
         var schema = harness.Engine.Schema.Get(typeof(TerrainChunk));
         var row = RowSerializer.Serialize(schema, new TerrainChunk { ChunkId = 9, Data = [1], Kind = ChunkKind.Rock });
-        var key = KeyCodec.Encode(schema.PrimaryKey, 9L);
-        var missingKey = KeyCodec.Encode(schema.PrimaryKey, 404L);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, 9L);
+        var missingKey = SchemaKeyCodec.Encode(schema.PrimaryKey, 404L);
         var ops = new[]
         {
             new RowOp(RowOpKind.Insert, schema.Id, key, row),

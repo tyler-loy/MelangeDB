@@ -386,7 +386,7 @@ internal sealed class ServerSubscription
             ?? throw new SubscriptionRejectedException(
                 MelangeErrorCodes.ParseError,
                 $"A predicate value for '{Schema.Name}.{column.Name}' cannot be null.");
-        return KeyCodec.Encode(column, coerced);
+        return SchemaKeyCodec.Encode(column, coerced);
     }
 
     private static long ToInt64(object? value) => Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture);

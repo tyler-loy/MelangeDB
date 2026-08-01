@@ -218,7 +218,7 @@ public class ResumeTests
 
     private static byte[] RowKeyOf(long id)
     {
-        var key = Core.KeyCodec.EncodeInt64(id);
+        var key = KeyCodec.EncodeInt64(id);
         return key.ToArray();
     }
 }

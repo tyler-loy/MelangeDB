@@ -852,7 +852,7 @@ internal sealed partial class ShardRuntime : IDisposable
             if (table.Placement != Placement.Partitioned)
                 throw new InvalidOperationException($"Handoff moves Partitioned rows; table '{table.Name}' is {table.Placement}.");
             object boxed = row;
-            var key = KeyCodec.Encode(table.PrimaryKey, table.PrimaryKey.GetValue(boxed)!);
+            var key = SchemaKeyCodec.Encode(table.PrimaryKey, table.PrimaryKey.GetValue(boxed)!);
             Rows.Add((table, key, RowSerializer.Serialize(table, boxed)));
         }
     }

@@ -88,7 +88,7 @@ public class ZeroReflectionTests
             Path.Combine("Store", "InMemoryHotStore.cs"),
             Path.Combine("Serialization", "RowCodec.cs"),
             Path.Combine("Serialization", "RowWriter.cs"),
-            Path.Combine("Serialization", "KeyCodec.cs"),
+            Path.Combine("Serialization", "SchemaKeyCodec.cs"),
             Path.Combine("Serialization", "ReducerArgsReader.cs"),
             Path.Combine("Dispatch", "ReducerDescriptor.cs"),
             Path.Combine("Hosting", "MelangeReducerHost.cs"),

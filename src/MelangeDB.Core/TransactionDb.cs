@@ -63,7 +63,7 @@ internal sealed class TransactionDb : IDbView
             }
         }
 
-        var boxedKey = KeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
+        var boxedKey = SchemaKeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
         if (Exists(schema.Id, boxedKey))
             throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {boxedKey} already exists.");
         CheckUniqueConstraints(schema, boxedKey, boxed);
@@ -86,7 +86,7 @@ internal sealed class TransactionDb : IDbView
         }
 
         object boxed = row;
-        var boxedKey = KeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
+        var boxedKey = SchemaKeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
         if (!Exists(schema.Id, boxedKey))
             throw new InvalidOperationException($"Table '{schema.Name}': no row with primary key {boxedKey} to update.");
         CheckUniqueConstraints(schema, boxedKey, boxed);
@@ -98,7 +98,7 @@ internal sealed class TransactionDb : IDbView
     {
         ArgumentNullException.ThrowIfNull(primaryKey);
         var schema = Resolve<TRow>(TableAccess.Write);
-        var key = KeyCodec.Encode(schema.PrimaryKey, primaryKey);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, primaryKey);
         if (!Exists(schema.Id, key))
             return false;
         _writeSet.Stage(new RowOp(RowOpKind.Delete, schema.Id, key));
@@ -110,7 +110,7 @@ internal sealed class TransactionDb : IDbView
     {
         ArgumentNullException.ThrowIfNull(primaryKey);
         var schema = Resolve<TRow>(TableAccess.Read);
-        var key = KeyCodec.Encode(schema.PrimaryKey, primaryKey);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, primaryKey);
         if (_writeSet.TryGetPending(schema.Id, key, out var pending))
         {
             return pending.Kind == RowOpKind.Delete
@@ -138,7 +138,7 @@ internal sealed class TransactionDb : IDbView
         ArgumentNullException.ThrowIfNull(value);
         var schema = Resolve<TRow>(TableAccess.Read);
         var columnSchema = RequireIndexed(schema, column);
-        var encoded = KeyCodec.Encode(columnSchema, value);
+        var encoded = SchemaKeyCodec.Encode(columnSchema, value);
 
         if (columnSchema.IsPrimaryKey)
         {
@@ -159,8 +159,8 @@ internal sealed class TransactionDb : IDbView
         ArgumentNullException.ThrowIfNull(high);
         var schema = Resolve<TRow>(TableAccess.Read);
         var columnSchema = RequireIndexed(schema, column);
-        var lowKey = KeyCodec.Encode(columnSchema, low);
-        var highKey = KeyCodec.Encode(columnSchema, high);
+        var lowKey = SchemaKeyCodec.Encode(columnSchema, low);
+        var highKey = SchemaKeyCodec.Encode(columnSchema, high);
 
         if (columnSchema.IsPrimaryKey)
         {
@@ -293,7 +293,7 @@ internal sealed class TransactionDb : IDbView
             return codec.EncodeColumnFromBytes(column.Name, rowBytes.Span);
         var row = RowSerializer.Deserialize(schema, rowBytes);
         var value = column.GetValue(row);
-        return value is null ? null : KeyCodec.Encode(column, value);
+        return value is null ? null : SchemaKeyCodec.Encode(column, value);
     }
 
     private TRow? FindByEncodedKey<TRow>(TableSchema schema, RowKey key)
@@ -334,7 +334,7 @@ internal sealed class TransactionDb : IDbView
             var value = column.GetValue(row);
             if (value is null)
                 continue;
-            CheckUniqueValue(schema, column, selfKey, KeyCodec.Encode(column, value));
+            CheckUniqueValue(schema, column, selfKey, SchemaKeyCodec.Encode(column, value));
         }
     }
 

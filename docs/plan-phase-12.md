@@ -91,6 +91,18 @@ and **no schema** — MessagePack decoding is lossy (integers surface as `long`,
 - Generated output is snapshot-tested in the house style, and the full suite passes Debug and Release
   with zero skips.
 
+## Shipped notes
+
+The decisions the plan left to the implementer, as they were actually taken.
+
+- **KeyCodec split, not a whole-class move.** The typed, allocation-honest encoders
+  (`EncodeBool` … `EncodeTimestamp`) moved to Abstractions as `MelangeDB.KeyCodec` — they are
+  dependency-free and both generators emit calls to them. The boxed overloads could not follow:
+  `Encode(ColumnSchema, object)` and `Decode(ColumnSchema, in RowKey)` interpret a column schema,
+  and `ColumnSchema`/`ColumnKind` are Core types with no business in Abstractions. They stay in
+  Core as `SchemaKeyCodec`, delegating every byte decision to the Abstractions class so the two
+  cannot drift. Call sites were fixed directly — no type-forward, no re-export, pre-1.0.
+
 ## Risks
 
 - **The manifest can go stale against the module.** Mitigation: the manifest records the generator

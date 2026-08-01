@@ -719,7 +719,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
             var row = RowSerializer.Deserialize(Schema, rowBytes.ToArray());
             var columnSchema = Schema.Column(column);
             var value = columnSchema.GetValue(row);
-            return value is null ? null : KeyCodec.Encode(columnSchema, value);
+            return value is null ? null : SchemaKeyCodec.Encode(columnSchema, value);
         }
 
         private static long EntryOverhead(DirectoryEntry entry)

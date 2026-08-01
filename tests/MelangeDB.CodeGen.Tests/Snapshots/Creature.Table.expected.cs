@@ -150,14 +150,14 @@ namespace MelangeDB.Generated
         }
 
         public override global::MelangeDB.RowKey EncodePrimaryKey(in global::Snapshot.Creature row) =>
-            global::MelangeDB.Core.KeyCodec.EncodeUInt64(row.Id);
+            global::MelangeDB.KeyCodec.EncodeUInt64(row.Id);
 
         public override global::MelangeDB.RowKey? EncodeColumn(string column, in global::Snapshot.Creature row)
         {
             switch (column)
             {
-                case "Id": return global::MelangeDB.Core.KeyCodec.EncodeUInt64(row.Id);
-                case "ChunkId": return global::MelangeDB.Core.KeyCodec.EncodeUInt16(row.ChunkId);
+                case "Id": return global::MelangeDB.KeyCodec.EncodeUInt64(row.Id);
+                case "ChunkId": return global::MelangeDB.KeyCodec.EncodeUInt16(row.ChunkId);
                 default: throw new global::System.ArgumentException($"Table 'Creature' has no key-encodable column '{column}'.", nameof(column));
             }
         }

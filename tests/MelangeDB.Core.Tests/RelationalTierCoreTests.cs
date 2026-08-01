@@ -100,8 +100,8 @@ public class RelationalTierCoreTests : IDisposable
         })
         {
             var columnSchema = schema.Column(column);
-            var encoded = KeyCodec.Encode(columnSchema, value);
-            Assert.Equal(value, KeyCodec.Decode(columnSchema, encoded));
+            var encoded = SchemaKeyCodec.Encode(columnSchema, value);
+            Assert.Equal(value, SchemaKeyCodec.Decode(columnSchema, encoded));
         }
     }
 

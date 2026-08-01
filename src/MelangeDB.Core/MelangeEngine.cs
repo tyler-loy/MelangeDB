@@ -663,7 +663,7 @@ public sealed class MelangeEngine : IDisposable
         if (pkValue is null)
             throw new ArgumentException($"Table '{schema.Name}': bulk row is missing primary key column '{schema.PrimaryKey.Name}'.");
 
-        var key = KeyCodec.Encode(schema.PrimaryKey, pkValue);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, pkValue);
         var exists = writeSet.TryGetPending(schema.Id, key, out var pending)
             ? pending.Kind != RowOpKind.Delete
             : HotStore.TryGetRow(schema.Id, key, out _);

@@ -107,7 +107,7 @@ public class SeamlessWalkTests
                                     .Select(m =>
                                     {
                                         var pos = m.Runtime!.Engine.CommittedView.Find<PlayerPos>(player)!.Value;
-                                        return $"{m.Name}/{SpatialShardStrategy.BlockOf(m.Shard)}: chunk={Chunks.At(pos.ChunkId)} steps={pos.Steps} borrowed={m.Runtime.BorrowedOwnerOf(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).Id, KeyCodec.Encode(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).PrimaryKey, player))}";
+                                        return $"{m.Name}/{SpatialShardStrategy.BlockOf(m.Shard)}: chunk={Chunks.At(pos.ChunkId)} steps={pos.Steps} borrowed={m.Runtime.BorrowedOwnerOf(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).Id, SchemaKeyCodec.Encode(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).PrimaryKey, player))}";
                                     })));
                             var monitors = string.Join("; ", cluster.Nodes.Where(n => n.App is not null).SelectMany(
                                 n => n.Runtime.OwnedShards.Select(s => (n.Name, Shard: s, Monitor: n.Runtime.TryGetMonitor(s)))
@@ -277,7 +277,7 @@ public class SeamlessWalkTests
         {
             var posTable = destinationShard.Engine.Schema.Get(typeof(PlayerPos));
             Assert.NotNull(destinationShard.BorrowedOwnerOf(
-                posTable.Id, KeyCodec.Encode(posTable.PrimaryKey, player)));
+                posTable.Id, SchemaKeyCodec.Encode(posTable.PrimaryKey, player)));
         }
         Assert.True(client.IsConnected);
         await client.CallReducerAsync("Move", [Chunks.Id(2, 2)], TestContext.Current.CancellationToken)
@@ -344,7 +344,7 @@ public class SeamlessWalkTests
         await ClusterFixture.WaitUntilAsync(
             () => cluster.Node(originOwner).Runtime.TryGetShard(new ShardKey(BlockA)) is { } reopened
                 && (reopened.Engine.CommittedView.Find<PlayerPos>(player) is null
-                    || reopened.BorrowedOwnerOf(posTable.Id, KeyCodec.Encode(posTable.PrimaryKey, player)) is not null),
+                    || reopened.BorrowedOwnerOf(posTable.Id, SchemaKeyCodec.Encode(posTable.PrimaryKey, player)) is not null),
             "the recovered origin released the transferred player",
             timeoutSeconds: 60);
     }

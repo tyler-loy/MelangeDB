@@ -37,7 +37,7 @@ public class SeamlessMigrationTests
                 if (runtime is null || runtime.Engine.CommittedView.Find<PlayerPos>(player) is null)
                     continue;
                 var table = runtime.Engine.Schema.Get(typeof(PlayerPos));
-                var key = KeyCodec.Encode(table.PrimaryKey, player);
+                var key = SchemaKeyCodec.Encode(table.PrimaryKey, player);
                 if (runtime.BorrowedOwnerOf(table.Id, key) is null)
                     return runtime;
             }
@@ -205,6 +205,6 @@ public class SeamlessMigrationTests
     private static RowKey KeyOf(ShardRuntime shard, Identity id)
     {
         var table = shard.Engine.Schema.Get(typeof(Critter));
-        return KeyCodec.Encode(table.PrimaryKey, id);
+        return SchemaKeyCodec.Encode(table.PrimaryKey, id);
     }
 }
