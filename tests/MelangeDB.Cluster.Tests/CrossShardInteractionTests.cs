@@ -42,10 +42,27 @@ public class CrossShardInteractionTests
         long Sum(string type) => cluster.Hub.Metrics.SentByType.GetValueOrDefault(type)
             + cluster.Nodes.Where(static n => n.App is not null).Sum(n => n.Metrics.SentByType.GetValueOrDefault(type));
 
-        var before = ControlFree();
+        // One ControlFree() reading spans many counters across three runtimes; a background
+        // border-subscribe sweep landing mid-read skews a single sample (observed once as a
+        // negative "before"). The counters are cumulative, so two consecutive agreeing reads
+        // mean nothing was in flight — sample until stable, on both sides of the trade.
+        async Task<long> StableControlFreeAsync()
+        {
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (true)
+            {
+                var first = ControlFree();
+                await Task.Delay(50, TestContext.Current.CancellationToken);
+                if (ControlFree() == first)
+                    return first;
+                Assert.True(deadline.Elapsed < TestTime.Dilated(TimeSpan.FromSeconds(15)), "link counters never went quiet");
+            }
+        }
+
+        var before = await StableControlFreeAsync();
         shard.ReducerHost.Call("TradeGold", alice, bob.ToString(), 40);
         await Task.Delay(500, TestContext.Current.CancellationToken);
-        Assert.Equal(before, ControlFree());
+        Assert.Equal(before, await StableControlFreeAsync());
         Assert.Equal(60, shard.Engine.CommittedView.Find<Pack>(alice)!.Value.Gold);
         Assert.Equal(40, shard.Engine.CommittedView.Find<Pack>(bob)!.Value.Gold);
     }
