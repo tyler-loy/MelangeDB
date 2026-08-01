@@ -308,6 +308,14 @@ public class SeamlessWalkTests
         await ClusterFixture.WaitUntilAsync(
             () => destination.Engine.CommittedView.Find<Pack>(player) is not null,
             "the destination holds the imported player");
+
+        // The Pack is visible the instant the destination's import handler commits — while the
+        // hub is still finishing the import round-trip. Clearing the hook on that evidence raced
+        // the saga's release-step check (a hub-side window of a few milliseconds, stretched by a
+        // loaded machine) and silently skipped the kill, leaving the origin alive and the wait
+        // below eternal. The hook stays armed until its kill demonstrably ran.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Node(originOwner).App is null, "the hook's kill of the origin finished");
         cluster.Hub.HandoffStepHook = null;
 
         // Playable on the destination immediately, through the same connection.
@@ -318,10 +326,7 @@ public class SeamlessWalkTests
         Assert.Equal(66, destination.Engine.CommittedView.Find<Pack>(player)!.Value.Gold);
 
         // The revived origin replays its freeze, learns the import happened, and releases: no
-        // duplicate — exactly one authoritative copy in the world. (Wait out the hook's kill
-        // first; the saga that ran it is fire-and-forget.)
-        await ClusterFixture.WaitUntilAsync(
-            () => cluster.Node(originOwner).App is null, "the origin node finished stopping");
+        // duplicate — exactly one authoritative copy in the world.
         await cluster.StartNodeAsync(originOwner);
         await ClusterFixture.WaitUntilAsync(
             () => cluster.Node(originOwner).Runtime.TryGetShard(new ShardKey(BlockA)) is { } reopened
