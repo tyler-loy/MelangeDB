@@ -10,7 +10,10 @@ namespace MelangeDB.Client;
 /// awaits their results, and maintains per-subscription row caches advanced by live deltas. On
 /// reconnect it resumes from its last acknowledged LSN — naming the log epoch, so a cursor can
 /// never be applied against the wrong log — and falls back to full re-establishment when the
-/// server says the gap cannot be served.
+/// server says the gap cannot be served. Under <see cref="DispatchMode.Immediate"/> (the
+/// default) frames apply and events fire on the receive loop as they arrive; under
+/// <see cref="DispatchMode.Manual"/> whole data frames queue in arrival order and
+/// <see cref="FrameTick"/> applies them on the caller's own thread — the game-loop mode.
 /// </summary>
 public sealed class MelangeClient : IAsyncDisposable
 {
@@ -32,6 +35,20 @@ public sealed class MelangeClient : IAsyncDisposable
     private long _bytesReceived;
     private ulong _lastAckedLsn;
 
+    // The Manual-dispatch pump. Entries are whole frames (or queued lifecycle events) in
+    // arrival order, each tagged with the era (dial generation) it arrived on; a full resync
+    // raises the floor so entries from the dead era can never apply against the reset caches.
+    // The lock serializes entry application against the resync clear — never held while the
+    // receive loop enqueues, so the socket is never blocked by a slow tick.
+    private readonly Lock _dispatchLock = new();
+    private readonly ConcurrentQueue<DispatchEntry> _dispatchQueue = new();
+    private int _dispatchCount;
+    private ErrorFrame? _overflowError;
+    private int _overflowEra;
+    private int _era;
+    private int _eraFloor;
+    private int _ticking;
+
     public MelangeClient(MelangeClientOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -50,7 +67,12 @@ public sealed class MelangeClient : IAsyncDisposable
     /// <summary>The commit log epoch this client's resume cursor counts against.</summary>
     public Guid LogEpochId { get; private set; }
 
-    /// <summary>The last LSN this client fully applied — the resume cursor.</summary>
+    /// <summary>
+    /// The last LSN this client applied or retained — the resume cursor. Under Manual dispatch
+    /// it advances at receive time: a queued frame is retained in-process, the same precedent
+    /// as the rescope buffer one layer down, so the cursor may run ahead of what handlers have
+    /// been told.
+    /// </summary>
     public ulong LastAckedLsn => Interlocked.Read(ref _lastAckedLsn);
 
     /// <summary>Total websocket payload bytes received. The resume-versus-refetch saving is measured here.</summary>
@@ -58,12 +80,20 @@ public sealed class MelangeClient : IAsyncDisposable
 
     public bool IsConnected => _socket is { State: WebSocketState.Open };
 
-    /// <summary>Connection-scoped errors, including the server's demand for an overflow resync.</summary>
+    /// <summary>
+    /// Connection-scoped errors, including the server's demand for an overflow resync. Under
+    /// Manual dispatch the invocation joins the frame queue and fires from <see cref="FrameTick"/>
+    /// after every frame received before it — except the client's own dispatch-overflow error,
+    /// which jumps to the head of the queue so the next tick learns the connection died before
+    /// spending its budget on the retained backlog.
+    /// </summary>
     public event Action<ErrorFrame>? OnError;
 
     /// <summary>
     /// Fires when the current socket dies, gracefully or not. A socket a reconnect has already
     /// replaced tears down silently — its outage is over, and announcing it would be a lie.
+    /// Under Manual dispatch the invocation joins the frame queue and fires from
+    /// <see cref="FrameTick"/> after every frame received before it.
     /// </summary>
     public event Action? OnDisconnected;
 
@@ -113,7 +143,9 @@ public sealed class MelangeClient : IAsyncDisposable
 
     /// <summary>
     /// Subscribes to a query and awaits the full initial set. The returned subscription's cache
-    /// then stays current as deltas arrive.
+    /// then stays current as deltas arrive. Under Manual dispatch the initial set applies only
+    /// inside <see cref="FrameTick"/>, so this completes only while something ticks — await it,
+    /// never block the ticking thread on it.
     /// </summary>
     public Task<MelangeSubscription> SubscribeAsync(
         string query,
@@ -178,7 +210,12 @@ public sealed class MelangeClient : IAsyncDisposable
     /// <summary>
     /// Reconnects after a drop. Attempts <c>Resume</c> from the last acked LSN against the known
     /// log epoch; returns true when the server served the gap (no initial sets were refetched),
-    /// false when it demanded — and this method performed — a full re-establishment.
+    /// false when it demanded — and this method performed — a full re-establishment. Under
+    /// Manual dispatch, re-established initial sets apply only inside <see cref="FrameTick"/>,
+    /// so this completes only while something ticks — await it, never block the ticking thread
+    /// on it. The resume-accepted path keeps the frame queue (frames buffered before the drop
+    /// apply before the resumed gap, in order); the full-resync path clears it, because a frame
+    /// from the dead era must never apply against the reset caches.
     /// </summary>
     public async Task<bool> ReconnectAsync(CancellationToken cancellationToken = default)
     {
@@ -203,8 +240,11 @@ public sealed class MelangeClient : IAsyncDisposable
         }
 
         // Full resync: the server said the gap cannot be served (or this is a different log
-        // incarnation entirely). Every cache reloads from a fresh initial set.
+        // incarnation entirely). Every cache reloads from a fresh initial set, so anything the
+        // pump still holds from the dead era is invalid against them — clear it, and raise the
+        // era floor so a straggler a dying receive loop enqueues late can never apply either.
         Interlocked.Exchange(ref _lastAckedLsn, 0);
+        ClearDispatchQueue();
         foreach (var subscription in _subscriptions.Values)
             subscription.ResetForResync();
         await ReestablishAsync(_subscriptions.Values, cancellationToken).ConfigureAwait(false);
@@ -273,7 +313,8 @@ public sealed class MelangeClient : IAsyncDisposable
         _socket = socket;
         var welcomePending = new TaskCompletionSource<WelcomeFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingWelcome = welcomePending;
-        _receiveLoop = Task.Run(() => ReceiveLoopAsync(socket), CancellationToken.None);
+        var era = Interlocked.Increment(ref _era);
+        _receiveLoop = Task.Run(() => ReceiveLoopAsync(socket, era), CancellationToken.None);
         await SendAsync(new HelloFrame(
             MessagePackFrameSerializer.ProtocolVersion,
             MessagePackFrameSerializer.ProtocolVersion,
@@ -357,7 +398,7 @@ public sealed class MelangeClient : IAsyncDisposable
         }
     }
 
-    private async Task ReceiveLoopAsync(ClientWebSocket socket)
+    private async Task ReceiveLoopAsync(ClientWebSocket socket, int era)
     {
         var buffer = new byte[64 * 1024];
         using var message = new MemoryStream();
@@ -379,7 +420,7 @@ public sealed class MelangeClient : IAsyncDisposable
                 Interlocked.Add(ref _bytesReceived, message.Length);
                 var frame = _serializer.Deserialize(message.GetBuffer().AsSpan(0, (int)message.Length));
                 _options.FrameInspector?.Invoke(frame, (int)message.Length);
-                HandleFrame(frame);
+                HandleFrame(frame, socket, era);
             }
         }
         catch (Exception exception) when (exception is WebSocketException or OperationCanceledException or ObjectDisposedException)
@@ -398,12 +439,20 @@ public sealed class MelangeClient : IAsyncDisposable
             if (ReferenceEquals(_socket, socket))
             {
                 FailPending();
-                OnDisconnected?.Invoke();
+
+                // The event half of the teardown defers with the frames it trails: under Manual
+                // dispatch it joins the queue, so handlers hear about the drop only after every
+                // frame that arrived before it. Failing the pendings above stays immediate —
+                // those complete awaited Tasks and must never wait for a tick.
+                if (_options.Dispatch == DispatchMode.Manual)
+                    EnqueueEvent(new DispatchEntry(era, EntryKind.Disconnected, null));
+                else
+                    OnDisconnected?.Invoke();
             }
         }
     }
 
-    private void HandleFrame(Frame frame)
+    private void HandleFrame(Frame frame, ClientWebSocket socket, int era)
     {
         switch (frame)
         {
@@ -414,6 +463,146 @@ public sealed class MelangeClient : IAsyncDisposable
                 if (_pendingCalls.TryRemove(result.RequestId, out var call))
                     call.TrySetResult(result);
                 break;
+
+            // The frame-tick seam. These two cases are the data channel — everything that
+            // mutates a cache or raises a row event flows through them — so Manual dispatch
+            // defers exactly here, whole frames in arrival order, and FrameTick runs the same
+            // apply machinery on the caller's thread. Control-plane frames (every other case)
+            // stay immediate: they complete awaited Tasks and answer heartbeats.
+            case SubscriptionAppliedFrame or TransactionUpdateFrame:
+                if (_options.Dispatch == DispatchMode.Manual)
+                    EnqueueDataFrame(frame, socket, era);
+                else
+                    ApplyDataFrame(frame);
+                break;
+            case UnsubscribedFrame unsubscribed:
+                if (_pendingUnsubscribes.TryRemove(unsubscribed.SubscriptionId, out var pendingUnsubscribe))
+                    pendingUnsubscribe.TrySetResult();
+                break;
+            case ResumeResultFrame resumeResult:
+                _pendingResume?.TrySetResult(resumeResult);
+                break;
+            case PingFrame ping:
+                _ = SendPongAsync(ping.Id);
+                break;
+            case PongFrame:
+                break;
+            case ReauthenticateResultFrame reauthenticated:
+                _pendingReauthenticate?.TrySetResult(reauthenticated);
+                break;
+            case ErrorFrame error:
+                HandleError(error, era);
+                break;
+        }
+    }
+
+    private void HandleError(ErrorFrame error, int era)
+    {
+        if (error.SubscriptionId != 0 && _subscriptions.TryGetValue(error.SubscriptionId, out var subscription))
+        {
+            subscription.FailSubscribe(error.Code, error.Message);
+            return;
+        }
+
+        if (error.RequestId != 0 && _pendingCalls.TryRemove(error.RequestId, out var call))
+        {
+            call.TrySetException(new MelangeCallException(error.Code, error.Message));
+            return;
+        }
+
+        _pendingWelcome?.TrySetException(new MelangeCallException(error.Code, error.Message));
+
+        // The event invocation defers with the frames it arrived among; failing the pending
+        // handshake above stays immediate, because it completes an awaited Task.
+        if (_options.Dispatch == DispatchMode.Manual)
+            EnqueueEvent(new DispatchEntry(era, EntryKind.Error, error));
+        else
+            OnError?.Invoke(error);
+    }
+
+    /// <summary>
+    /// Manual dispatch only: applies queued whole frames and fires queued lifecycle events on
+    /// the calling thread, in arrival order, and returns how many were applied. A frame is one
+    /// whole commit (or one initial-set chunk), so a budgeted tick never observes half a
+    /// transaction — the flip side is that a completed rescope's reconcile is one indivisible
+    /// frame and can be big. The pump is single-consumer by contract: a concurrent call throws,
+    /// and calling this at all under <see cref="DispatchMode.Immediate"/> throws — a
+    /// misconfiguration should be loud, not silently idle.
+    /// </summary>
+    /// <param name="maxFrames">The most entries this tick may apply; must be positive.</param>
+    public int FrameTick(int maxFrames = int.MaxValue)
+    {
+        if (_options.Dispatch != DispatchMode.Manual)
+            throw new InvalidOperationException("FrameTick requires DispatchMode.Manual — under Immediate dispatch frames apply on the receive loop as they arrive.");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFrames);
+        if (Interlocked.CompareExchange(ref _ticking, 1, 0) != 0)
+            throw new InvalidOperationException("A FrameTick is already draining — the pump is single-consumer by contract.");
+        try
+        {
+            var applied = 0;
+            while (applied < maxFrames && TickOne())
+                applied++;
+            return applied;
+        }
+        finally
+        {
+            Volatile.Write(ref _ticking, 0);
+        }
+    }
+
+    /// <summary>
+    /// Applies the next live entry, skipping entries a full resync marked dead, and reports
+    /// whether anything applied. Application holds the dispatch lock so a concurrent resync's
+    /// clear-and-reset can never interleave with half an entry.
+    /// </summary>
+    private bool TickOne()
+    {
+        while (true)
+        {
+            lock (_dispatchLock)
+            {
+                // The synthesized overflow error outranks the backlog: the app must learn its
+                // connection died before it spends tick budget chewing through retained frames.
+                if (_overflowError is { } overflow)
+                {
+                    _overflowError = null;
+                    if (_overflowEra < _eraFloor)
+                        continue;
+                    OnError?.Invoke(overflow);
+                    return true;
+                }
+
+                if (!_dispatchQueue.TryDequeue(out var entry))
+                    return false;
+                Interlocked.Decrement(ref _dispatchCount);
+
+                // An entry from before a full resync must never touch the reset caches.
+                if (entry.Era < _eraFloor)
+                    continue;
+
+                switch (entry.Kind)
+                {
+                    case EntryKind.Data:
+                        ApplyDataFrame(entry.Frame!);
+                        break;
+                    case EntryKind.Error:
+                        OnError?.Invoke((ErrorFrame)entry.Frame!);
+                        break;
+                    case EntryKind.Disconnected:
+                        OnDisconnected?.Invoke();
+                        break;
+                }
+
+                return true;
+            }
+        }
+    }
+
+    /// <summary>The one apply path both dispatch modes share — the pump moves where it runs, never what it does.</summary>
+    private void ApplyDataFrame(Frame frame)
+    {
+        switch (frame)
+        {
             case SubscriptionAppliedFrame chunk:
                 if (_subscriptions.TryGetValue(chunk.SubscriptionId, out var applied))
                 {
@@ -437,43 +626,76 @@ public sealed class MelangeClient : IAsyncDisposable
                 // The whole frame is applied or retained; the cursor may advance.
                 InterlockedMax(ref _lastAckedLsn, update.Lsn);
                 break;
-            case UnsubscribedFrame unsubscribed:
-                if (_pendingUnsubscribes.TryRemove(unsubscribed.SubscriptionId, out var pendingUnsubscribe))
-                    pendingUnsubscribe.TrySetResult();
+        }
+    }
+
+    private void EnqueueDataFrame(Frame frame, ClientWebSocket socket, int era)
+    {
+        if (Volatile.Read(ref _dispatchCount) >= _options.DispatchQueueLimit)
+        {
+            // Overflow: never drop silently (the cache would diverge without a trace), never
+            // block the receive loop (a blocked loop stops answering pings and the server
+            // convicts the client illegibly). Fail the connection loudly instead — the error
+            // takes the head of the queue, the socket is aborted, and because the cursor never
+            // advanced past the dropped frame, the ordinary reconnect's resume replays it.
+            lock (_dispatchLock)
+            {
+                if (_overflowError is null)
+                {
+                    _overflowError = new ErrorFrame(
+                        MelangeErrorCodes.DispatchOverflow,
+                        $"The dispatch queue reached DispatchQueueLimit ({_options.DispatchQueueLimit}) without a FrameTick; the connection was aborted. Reconnect to recover — the resume cursor stopped at the last retained frame.");
+                    _overflowEra = era;
+                }
+            }
+
+            socket.Abort();
+            return;
+        }
+
+        Interlocked.Increment(ref _dispatchCount);
+        _dispatchQueue.Enqueue(new DispatchEntry(era, EntryKind.Data, frame));
+
+        // The cursor advances at receive time: a queued frame is retained in-process, the same
+        // "applied or retained" contract the rescope buffer relies on one layer down. The same
+        // conditions as the apply path — an initial set acks only when its last chunk names an
+        // anchor for a subscription this client still holds.
+        switch (frame)
+        {
+            case SubscriptionAppliedFrame { IsLast: true } chunk when _subscriptions.ContainsKey(chunk.SubscriptionId):
+                InterlockedMax(ref _lastAckedLsn, chunk.AnchorLsn);
                 break;
-            case ResumeResultFrame resumeResult:
-                _pendingResume?.TrySetResult(resumeResult);
-                break;
-            case PingFrame ping:
-                _ = SendPongAsync(ping.Id);
-                break;
-            case PongFrame:
-                break;
-            case ReauthenticateResultFrame reauthenticated:
-                _pendingReauthenticate?.TrySetResult(reauthenticated);
-                break;
-            case ErrorFrame error:
-                HandleError(error);
+            case TransactionUpdateFrame update:
+                InterlockedMax(ref _lastAckedLsn, update.Lsn);
                 break;
         }
     }
 
-    private void HandleError(ErrorFrame error)
+    /// <summary>
+    /// Queues a lifecycle event behind every frame received before it. Exempt from the queue
+    /// limit: these arrive once per connection death, not as a stream, and the disconnect that
+    /// trails an overflow abort must itself be deliverable.
+    /// </summary>
+    private void EnqueueEvent(DispatchEntry entry)
     {
-        if (error.SubscriptionId != 0 && _subscriptions.TryGetValue(error.SubscriptionId, out var subscription))
-        {
-            subscription.FailSubscribe(error.Code, error.Message);
-            return;
-        }
+        Interlocked.Increment(ref _dispatchCount);
+        _dispatchQueue.Enqueue(entry);
+    }
 
-        if (error.RequestId != 0 && _pendingCalls.TryRemove(error.RequestId, out var call))
+    /// <summary>
+    /// The full-resync half of the cursor reset: drops everything queued and raises the era
+    /// floor to the just-dialed socket's era, so even an entry a dying receive loop enqueues
+    /// after this point can never apply against the caches the resync is about to rebuild.
+    /// </summary>
+    private void ClearDispatchQueue()
+    {
+        lock (_dispatchLock)
         {
-            call.TrySetException(new MelangeCallException(error.Code, error.Message));
-            return;
+            _eraFloor = Volatile.Read(ref _era);
+            _overflowError = null;
+            while (_dispatchQueue.TryDequeue(out _))
+                Interlocked.Decrement(ref _dispatchCount);
         }
-
-        _pendingWelcome?.TrySetException(new MelangeCallException(error.Code, error.Message));
-        OnError?.Invoke(error);
     }
 
     private async Task SendPongAsync(uint id)
@@ -513,4 +735,18 @@ public sealed class MelangeClient : IAsyncDisposable
             current = previous;
         }
     }
+
+    private enum EntryKind
+    {
+        Data,
+        Error,
+        Disconnected,
+    }
+
+    /// <summary>
+    /// One queued dispatch: a whole data frame, a connection-scoped error, or a disconnect —
+    /// tagged with the era (dial generation) it arrived on, which is what lets a full resync
+    /// declare everything before it dead without racing the queue.
+    /// </summary>
+    private readonly record struct DispatchEntry(int Era, EntryKind Kind, Frame? Frame);
 }

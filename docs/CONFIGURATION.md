@@ -221,6 +221,17 @@ to fix it without a code change and a redeploy.
 | `Subscriptions:MaxRangeSpan` | long | `1024` | live | 03 | Maximum width of a `BETWEEN` predicate. Lets a client stream a ring around itself but not the whole map. |
 | `Subscriptions:RequirePredicateOn` | string[] | — | live | 03 | Tables where an unbounded subscription is rejected. An entry is a table name (any predicate satisfies) or `Table.Column` (the predicate must constrain that column). Terrain and blob tables belong here. |
 
+## Client dispatch (`MelangeClientOptions`)
+
+The client's knobs live on `MelangeClientOptions` — a client is constructed in code, not bound from the
+`MelangeDb:` configuration section — but they follow the same rule as every server key: named here in the
+change that adds them. Added by the frame-tick pump, issue #26.
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `Dispatch` | `DispatchMode` | `Immediate` | `Immediate` \| `Manual`. `Immediate` applies data frames and raises events on the receive loop as they arrive — the pre-pump behaviour, unchanged for every existing consumer. `Manual` queues whole frames and applies them only inside `MelangeClient.FrameTick()`, on the caller's thread — the game-loop mode, for hosts (Godot, Unity) whose scene graph may only be touched from their own thread. A `Manual` client that is never ticked applies nothing and completes no subscribe/reconnect; `FrameTick` on an `Immediate` client throws, so the misconfiguration is loud either way. See [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md), threading. |
+| `DispatchQueueLimit` | int | `65536` | Manual dispatch only: the ceiling on entries (whole frames) queued between ticks. On overflow the client synthesizes a `dispatch_overflow` error at the **head** of the queue and aborts its own socket — never dropping a delta silently (the cache would diverge without a trace) and never blocking the receive loop (a blocked loop stops answering pings, and the server convicts the client as dead illegibly). The default is deliberately in the tens of thousands: at a sustained 1,000 commits/second it is over a minute of not ticking — far past any loading screen or alt-tab — while still bounding worst-case memory. Recovery is the ordinary `ReconnectAsync` resume path once the app ticks again: the cursor never advanced past the dropped frame, so the replay picks up exactly there. |
+
 ## Identity and policies
 
 | Key | Type | Default | Reload | Phase | Notes |

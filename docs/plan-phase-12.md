@@ -149,7 +149,21 @@ The decisions the plan left to the implementer, as they were actually taken.
   unsubscribe acknowledgement.
 - **All typed events dispatch through one seam** — `ClientCacheRegistry.DispatchTypedEvent`, invoked on the
   receive loop. The frame-tick pump the Godot client wants (issue #20 "Adjacent") replaces that method and
-  nothing else.
+  nothing else. *Superseded when the pump landed (issue #26)* — the settled seam moved one level up, and the
+  decision record is: the pump defers **both** cache mutation and events, at `MelangeClient.HandleFrame`'s
+  two data-channel cases (`SubscriptionApplied`, `TransactionUpdate`), not at `DispatchTypedEvent` — deferring
+  only events would let a handler's cross-table lookup see a newer world than the event it is handling, the
+  skew game clients hit hardest, so "what the cache says" and "what handlers have been told" advance on one
+  clock and `DispatchTypedEvent` stays a plain synchronous call. `FrameTick` drains **whole frames** — one
+  `TransactionUpdate` frame is one whole commit, so transaction atomicity falls out of the drain unit and a
+  budget counted in frames can never tear a commit (a completed rescope's reconcile is one indivisible,
+  possibly large, frame — accepted). Backpressure is a **bounded queue that fails loud**
+  (`DispatchQueueLimit`): overflow synthesizes a client-side `dispatch_overflow` error at the head of the
+  queue and aborts the socket, because dropping deltas silently diverges the cache and blocking the receive
+  loop stops the pings that keep the server from convicting the client. The resume cursor **keeps advancing
+  at receive time** — queued frames are retained in-process, the same "applied or retained" precedent as the
+  rescope `_pending` buffer — so an overflow's dropped frame (never acked) is exactly where the reconnect's
+  resume replay picks up.
 - **Schema drift fails loud, typed.** The coercion table (`ClientWireValues`) throws
   `MelangeSchemaMismatchException` on a missing column, a wrong wire kind, or an out-of-range integer —
   never a default. A mismatch surfacing in an initial set fails that `SubscribeAsync` with the message;

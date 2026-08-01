@@ -7,9 +7,11 @@ public sealed record MelangeRow(byte[] Key, IReadOnlyDictionary<string, object?>
 
 /// <summary>
 /// A live subscription and its locally maintained row cache — a projection of the server's state,
-/// loaded from the initial set and advanced by deltas. Events fire on the client's receive loop.
-/// Deltas that arrive while the initial set is still streaming are buffered and applied once the
-/// set completes, keeping the anchor-LSN boundary gap-free and duplicate-free on this side too.
+/// loaded from the initial set and advanced by deltas. Events fire on the thread that applies
+/// frames: the client's receive loop under Immediate dispatch, the <c>FrameTick</c> caller under
+/// Manual. Deltas that arrive while the initial set is still streaming are buffered and applied
+/// once the set completes, keeping the anchor-LSN boundary gap-free and duplicate-free on this
+/// side too.
 /// </summary>
 public sealed class MelangeSubscription
 {

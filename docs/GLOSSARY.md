@@ -185,6 +185,13 @@ subscription projects columns or a policy masks them.
 through the overlay, append at the commit point, notify the appliers. In phase 01 it is a method on the
 engine; phase 02 hides it behind host integration.
 
+**Dispatch mode (`Immediate` / `Manual`)** — How a `MelangeClient` runs its data frames and connection
+events. `Immediate` (the default) applies frames and fires events on the receive loop as they arrive.
+`Manual` queues whole frames in arrival order and the frame-tick pump applies them on the host's own
+thread — cache mutation and events together, deliberately, so a handler's world always matches its event.
+Configured by `MelangeClientOptions.Dispatch`; see [CONFIGURATION.md](CONFIGURATION.md) and the threading
+section of [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
+
 **Domain event** — An application-level fact published from a reducer via `ctx.Publish`, delivered to
 DI-resolved handlers *after* the commit point.
 
@@ -225,6 +232,14 @@ anchor remains the deferred protocol-level hardening.
 
 **Frame** — One protocol message on the wire: one MessagePack-encoded unit carrying its type, its channel tag,
 and its fields. Ordering is guaranteed only within a frame's channel.
+
+**Frame-tick pump** — The Manual dispatch mode's drain: `MelangeClient.FrameTick(maxFrames)` applies queued
+whole frames — one `TransactionUpdate` frame is one whole commit, so a budgeted tick never observes half a
+transaction — and fires queued lifecycle events, on the calling thread, returning how many were applied.
+Single-consumer by contract; calling it under Immediate dispatch throws. What lets a Godot client mutate the
+scene tree from typed handlers with no `CallDeferred` anywhere (issue #26). Backpressure is a bounded queue
+(`DispatchQueueLimit`) that fails the connection loudly on overflow rather than dropping deltas or blocking
+the receive loop.
 
 **Gateway** — The one endpoint clients connect to in a cluster. It terminates the client socket on the hub,
 validates the IdP token once, and holds the client's dual attachment — a permanent hub session and a moving

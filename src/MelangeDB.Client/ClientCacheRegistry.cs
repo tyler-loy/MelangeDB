@@ -56,9 +56,11 @@ public sealed class ClientCacheRegistry
     }
 
     /// <summary>
-    /// The one seam every typed event passes through, on the receive loop. A frame-tick pump —
-    /// the Godot client wants handlers raised on its own thread — replaces this dispatch, and
-    /// nothing else, when that lands as its own issue.
+    /// The one seam every typed event passes through. The frame-tick pump landed a level above
+    /// this (issue #26): <see cref="MelangeClient"/> defers whole data frames in
+    /// <see cref="DispatchMode.Manual"/>, so this stays a plain synchronous call and typed
+    /// events simply fire on whichever thread applies the frame — the receive loop under
+    /// Immediate dispatch, the <see cref="MelangeClient.FrameTick"/> caller under Manual.
     /// </summary>
     internal void DispatchTypedEvent(Action fire) => fire();
 }
