@@ -5,6 +5,13 @@ namespace MelangeDB;
 /// whole commit records through <see cref="Apply"/> and owns its secondary index maintenance, so a
 /// storage engine swap never touches the applier pipeline. Rows are held and served in their
 /// serialized form; the serialized bytes are the identity of a row's state.
+/// <para>
+/// <b>Thread safety:</b> reads are safe only while no <see cref="Apply"/> runs — which is what the
+/// engine's write lock guarantees. Point reads and enumerations alike (<see cref="Scan"/> and
+/// friends are lazy) must run inside <c>MelangeEngine.ReadConsistent</c>, or on a code path the
+/// engine already serializes (reducers, policies, fan-out, appliers). A raw scan racing an apply
+/// throws "collection was modified" at best and yields a half-applied batch at worst.
+/// </para>
 /// </summary>
 public interface IHotStore
 {

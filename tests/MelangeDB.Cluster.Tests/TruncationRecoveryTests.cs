@@ -192,6 +192,9 @@ public class TruncationRecoveryTests
             "the stream must have been bootstrapped, not silently resumed past the gap");
     }
 
+    // Scan is safe only under the engine lock: the replica stream applies concurrently, and a
+    // raw scan mid-apply throws "collection was modified" (or worse, sees a half-applied batch).
     private static List<string> Rows(Core.MelangeEngine engine, TableId table) =>
-        [.. engine.HotStore.Scan(table).Select(static pair => $"{pair.Key}|{Convert.ToHexStringLower(pair.Value.Span)}")];
+        engine.ReadConsistent(_ =>
+            engine.HotStore.Scan(table).Select(static pair => $"{pair.Key}|{Convert.ToHexStringLower(pair.Value.Span)}").ToList());
 }
