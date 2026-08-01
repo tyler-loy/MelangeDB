@@ -48,7 +48,15 @@ public class InitialSetConsistencyTests
 
         await writer;
         var head = host.Engine.Log.HeadLsn;
-        await TransportTestHost.WaitUntilAsync(() => client.LastAckedLsn >= head, "the client to drain the delta stream");
+
+        // The drain condition is sound — every appended record fans a frame to these full-table
+        // subscriptions, so LastAckedLsn must reach head once the stream is through — but the
+        // whole wait can overlap the rest of the suite running in parallel: on a two-vCPU CI
+        // runner in Debug, the backpressure floods and their fsync'd writers can starve this
+        // client's receive continuations for most of a minute. The stock 15s (dilated) deadline
+        // measured that contention, not this test's invariant; give the drain the suite's length.
+        await TransportTestHost.WaitUntilAsync(
+            () => client.LastAckedLsn >= head, "the client to drain the delta stream", timeoutSeconds: 60);
 
         // Authoritative state, read consistently server-side.
         var authoritative = host.Engine.ReadConsistent(_ =>
@@ -94,7 +102,10 @@ public class InitialSetConsistencyTests
 
         await writer;
         var head = host.Engine.Log.HeadLsn;
-        await TransportTestHost.WaitUntilAsync(() => client.LastAckedLsn >= head, "the client to drain the delta stream");
+
+        // Same suite-contention allowance as the test above.
+        await TransportTestHost.WaitUntilAsync(
+            () => client.LastAckedLsn >= head, "the client to drain the delta stream", timeoutSeconds: 60);
 
         Assert.Equal(0, subscription.Inconsistencies);
         var schema = host.Engine.Schema.Get(typeof(Chunk));
