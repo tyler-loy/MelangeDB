@@ -25,6 +25,11 @@ and **no schema** — MessagePack decoding is lossy (integers surface as `long`,
   their client-visible columns (kinds, PK/unique/index flags), enum definitions (name, underlying kind,
   members), and reducer signatures (parameter names, kinds, arrays). A small exporter
   (`tools/MelangeDB.SchemaExport`) writes it from a built module assembly as `melange-schema.json`.
+
+  *Settled after the phase (issue #24):* the exporter ships from the feed as a dotnet tool,
+  `src/MelangeDB.Cli`, and the installed command is the umbrella `melange` with `schema` as its first
+  subcommand — the umbrella name is reserved now so future verbs (schema diff, storage inspection,
+  cluster ops) arrive as subcommands rather than as a breaking tool rename.
 - **The manifest served from the running server** — added during the phase: `GET {path}/schema`, gated the
   way Swagger gates its document (on in Development, `Transport:SchemaEndpointEnabled` overrides), and the
   exporter accepts a URL as well as a DLL path, so the workflow is "generate from the running local dev

@@ -6,7 +6,7 @@
 namespace MelangeDB.Generated
 {
     /// <summary>
-    /// The client-visible schema this module exports: what tools/MelangeDB.SchemaExport
+    /// The client-visible schema this module exports: what `melange schema`
     /// writes to melange-schema.json and the development schema endpoint serves.
     /// </summary>
     internal static class MelangeSchemaManifest

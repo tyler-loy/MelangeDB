@@ -53,7 +53,7 @@ internal static class ManifestEmitter
         builder.AppendLine("namespace MelangeDB.Generated");
         builder.AppendLine("{");
         builder.AppendLine("    /// <summary>");
-        builder.AppendLine("    /// The client-visible schema this module exports: what tools/MelangeDB.SchemaExport");
+        builder.AppendLine("    /// The client-visible schema this module exports: what `melange schema`");
         builder.AppendLine("    /// writes to melange-schema.json and the development schema endpoint serves.");
         builder.AppendLine("    /// </summary>");
         builder.AppendLine("    internal static class MelangeSchemaManifest");

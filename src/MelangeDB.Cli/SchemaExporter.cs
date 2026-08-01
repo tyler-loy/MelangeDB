@@ -1,6 +1,6 @@
 using System.Reflection;
 
-namespace MelangeDB.SchemaExport;
+namespace MelangeDB.Cli;
 
 /// <summary>
 /// The two ways to obtain a module's schema manifest, one writer: read the generated

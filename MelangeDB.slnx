@@ -1,6 +1,7 @@
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/MelangeDB.Abstractions/MelangeDB.Abstractions.csproj" />
+    <Project Path="src/MelangeDB.Cli/MelangeDB.Cli.csproj" />
     <Project Path="src/MelangeDB.Client/MelangeDB.Client.csproj" />
     <Project Path="src/MelangeDB.Cluster/MelangeDB.Cluster.csproj" />
     <Project Path="src/MelangeDB.CodeGen/MelangeDB.CodeGen.csproj" />
@@ -23,7 +24,6 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/MelangeDB.LoadTest/MelangeDB.LoadTest.csproj" />
-    <Project Path="tools/MelangeDB.SchemaExport/MelangeDB.SchemaExport.csproj" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/MelangeDB.Sample.Client/MelangeDB.Sample.Client.csproj" />
