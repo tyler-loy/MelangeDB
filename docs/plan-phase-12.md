@@ -173,6 +173,17 @@ The decisions the plan left to the implementer, as they were actually taken.
 - **The client generator's tests eat the server generator's output.** `GeneratorTestHost.ExportManifest`
   runs the server generator and pulls the JSON back out of the generated constant, so the reader is
   always tested against the writer of record, never a hand-maintained fixture.
+- **Manifest bytes are LF-only and git never touches them.** The first Windows build surfaced it: the
+  JSON writer used `AppendLine`, so the manifest — and the schema hash covering it — depended on which
+  operating system ran the compiler. The writer now emits hard `\n`, and `.gitattributes` marks
+  `melange-schema.json -text` so autocrlf checkouts cannot rewrite the committed artifact the staleness
+  tests hold byte-identical to the build.
+- **Two staleness guards, two consumers under test.** `MelangeDB.Transport.Tests` is both the server
+  module and a typed consumer of its own exported manifest — the end-to-end proof runs real generated
+  bindings against the real transport, and a test holds the committed manifest byte-identical to the
+  build. The sample pair gets the same treatment in `MelangeDB.Host.Tests`, which drives the sample
+  client's actual generated bindings against the real worker in-process. Drift in either module breaks
+  the build with a message naming the re-export command, never a client at runtime.
 
 ## Risks
 

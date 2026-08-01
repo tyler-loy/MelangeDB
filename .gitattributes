@@ -1,0 +1,4 @@
+# Schema manifests are wire artifacts, not documents: the schema hash covers their exact bytes,
+# and the staleness tests hold the committed file byte-identical to the generated constant. Git
+# must never convert their line endings on checkout or checkin.
+melange-schema.json -text

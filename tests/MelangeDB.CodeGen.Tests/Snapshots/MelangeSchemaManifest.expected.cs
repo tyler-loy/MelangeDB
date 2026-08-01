@@ -12,13 +12,13 @@ namespace MelangeDB.Generated
     internal static class MelangeSchemaManifest
     {
         /// <summary>SHA-256 over the manifest JSON rendered with an empty schemaHash field.</summary>
-        public const string Hash = "f2ddf9d5ab4751cc36a722acaf3d5f5e7f27275615f1e9d54c09c9b20a6c2041";
+        public const string Hash = "35d1eb7e116b591528e66c4e365ca888a5de9ee998f3ded4718b6d309d3e579c";
 
         /// <summary>The manifest JSON, verbatim.</summary>
         public const string Json = @"{
   ""format"": 1,
   ""generator"": ""0.1.0.0"",
-  ""schemaHash"": ""f2ddf9d5ab4751cc36a722acaf3d5f5e7f27275615f1e9d54c09c9b20a6c2041"",
+  ""schemaHash"": ""35d1eb7e116b591528e66c4e365ca888a5de9ee998f3ded4718b6d309d3e579c"",
   ""module"": ""MelangeGeneratorTests"",
   ""enums"": [
     {

@@ -231,8 +231,10 @@ internal static class ManifestEmitter
 
     /// <summary>
     /// A deliberately small JSON writer: two-space indentation, ordinal ordering left to the
-    /// caller, strings escaped per RFC 8259. Hand-rolled because the generator targets
-    /// netstandard2.0 and ships no dependencies.
+    /// caller, strings escaped per RFC 8259, and hard <c>\n</c> newlines — never
+    /// <see cref="Environment.NewLine"/>, because the schema hash covers these bytes and must
+    /// not depend on which operating system ran the build. Hand-rolled because the generator
+    /// targets netstandard2.0 and ships no dependencies.
     /// </summary>
     private sealed class JsonBuilder
     {
@@ -277,7 +279,7 @@ internal static class ManifestEmitter
             else if (_depth > 0)
             {
                 Separate();
-                _text.AppendLine();
+                _text.Append('\n');
                 Indent();
             }
 
@@ -293,7 +295,7 @@ internal static class ManifestEmitter
             _depth--;
             if (hadItems)
             {
-                _text.AppendLine();
+                _text.Append('\n');
                 Indent();
             }
 
@@ -303,7 +305,7 @@ internal static class ManifestEmitter
         private void Prefix(string name)
         {
             Separate();
-            _text.AppendLine();
+            _text.Append('\n');
             Indent();
             WriteString(name);
             _text.Append(": ");

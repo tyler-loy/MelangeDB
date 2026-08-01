@@ -1,0 +1,444 @@
+{
+  "format": 1,
+  "generator": "0.1.0.0",
+  "schemaHash": "1cf61e7336d9033f93c599887b189451c71ec87c1c6716f19af3f9032438ba1f",
+  "module": "MelangeDB.Transport.Tests",
+  "enums": [
+    {
+      "name": "ContainerKind",
+      "underlying": "Int32",
+      "members": [
+        {
+          "name": "PlayerPack",
+          "value": "0"
+        },
+        {
+          "name": "WorldContainer",
+          "value": "1"
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "name": "Chunk",
+      "type": "Chunk",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "Int64",
+          "primaryKey": true,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "X",
+          "kind": "Int64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "Data",
+          "kind": "Bytes",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "name": "Creature",
+      "type": "Creature",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "UInt64",
+          "primaryKey": true,
+          "autoInc": true,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "X",
+          "kind": "Float32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "name": "InventoryItem",
+      "type": "InventoryItem",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "UInt64",
+          "primaryKey": true,
+          "autoInc": true,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "OwnerId",
+          "kind": "Identity",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "Container",
+          "kind": "Int32",
+          "enum": "ContainerKind",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "ItemName",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "name": "PlayerState",
+      "type": "PlayerState",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "Identity",
+          "primaryKey": true,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "RoomId",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "Name",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "X",
+          "kind": "Float32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "name": "Skill",
+      "type": "Skill",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "UInt64",
+          "primaryKey": true,
+          "autoInc": true,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "PlayerNum",
+          "kind": "Int64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "Name",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "TotalXp",
+          "kind": "Int64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Level",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    }
+  ],
+  "reducers": [
+    {
+      "name": "AddAdmin",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Identity",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "AddSecret",
+      "params": [
+        {
+          "name": "id",
+          "kind": "UInt64",
+          "isArray": false
+        },
+        {
+          "name": "data",
+          "kind": "String",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "AddSkill",
+      "params": [
+        {
+          "name": "playerNum",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "name",
+          "kind": "String",
+          "isArray": false
+        },
+        {
+          "name": "xp",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "level",
+          "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "ClearCreatures",
+      "params": []
+    },
+    {
+      "name": "DeleteChunk",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "GiveItem",
+      "params": [
+        {
+          "name": "owner",
+          "kind": "Identity",
+          "isArray": false
+        },
+        {
+          "name": "container",
+          "kind": "Int32",
+          "isArray": false
+        },
+        {
+          "name": "itemName",
+          "kind": "String",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "Move",
+      "params": [
+        {
+          "name": "x",
+          "kind": "Float32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "MoveCreature",
+      "params": [
+        {
+          "name": "id",
+          "kind": "UInt64",
+          "isArray": false
+        },
+        {
+          "name": "x",
+          "kind": "Float32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "MoveItem",
+      "params": [
+        {
+          "name": "id",
+          "kind": "UInt64",
+          "isArray": false
+        },
+        {
+          "name": "newOwner",
+          "kind": "Identity",
+          "isArray": false
+        },
+        {
+          "name": "container",
+          "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "Noop",
+      "params": []
+    },
+    {
+      "name": "NudgeCreatureThink",
+      "params": [
+        {
+          "name": "id",
+          "kind": "UInt64",
+          "isArray": false
+        },
+        {
+          "name": "nextThinkAt",
+          "kind": "UInt64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "RecordStat",
+      "params": [
+        {
+          "name": "metric",
+          "kind": "String",
+          "isArray": false
+        },
+        {
+          "name": "value",
+          "kind": "Int64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "SetChunk",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "x",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "data",
+          "kind": "Bytes",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "SetSkillLevel",
+      "params": [
+        {
+          "name": "id",
+          "kind": "UInt64",
+          "isArray": false
+        },
+        {
+          "name": "level",
+          "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "SetSkillXp",
+      "params": [
+        {
+          "name": "id",
+          "kind": "UInt64",
+          "isArray": false
+        },
+        {
+          "name": "xp",
+          "kind": "Int64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "Spawn",
+      "params": [
+        {
+          "name": "name",
+          "kind": "String",
+          "isArray": false
+        },
+        {
+          "name": "roomId",
+          "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "SpawnCreature",
+      "params": [
+        {
+          "name": "x",
+          "kind": "Float32",
+          "isArray": false
+        },
+        {
+          "name": "nextThinkAt",
+          "kind": "UInt64",
+          "isArray": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "generator": "0.1.0.0",
+  "schemaHash": "d740de2cac1eb169604391640d40834efb184247141f4c2dbfc4265ea2662537",
+  "module": "MelangeDB.Sample.Worker",
+  "enums": [],
+  "tables": [
+    {
+      "name": "Visitor",
+      "type": "Visitor",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "UInt64",
+          "primaryKey": true,
+          "autoInc": true,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Name",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "VisitedAt",
+          "kind": "Timestamp",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "GreetedExcitedly",
+          "kind": "Bool",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    }
+  ],
+  "reducers": [
+    {
+      "name": "Greet",
+      "params": [
+        {
+          "name": "name",
+          "kind": "String",
+          "isArray": false
+        }
+      ]
+    }
+  ]
+}
