@@ -19,7 +19,7 @@ internal sealed class ClusterNode
 {
     public required string Name { get; init; }
 
-    public required int HttpPort { get; init; }
+    public required int HttpPort { get; set; }
 
     public WebApplication? App { get; set; }
 
@@ -176,8 +176,18 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
     public async Task StartNodeAsync(string name)
     {
+        // A revived node need not keep its old port: it announces Cluster:PublicAddress on every
+        // auth, RegisterNode replaces the membership record wholesale, and the gateway re-resolves
+        // the address on every connection attempt — a fresh port is legal by the product's own
+        // design. Keeping the old port raced every concurrent fixture's FreePort over a number
+        // another process may have won during the stop-to-restart gap (observed as "address
+        // already in use" on a truncation-recovery revival under the full suite).
         var node = Node(name);
-        node.App = await StartAppAsync(node.Name, ClusterRole.Shard, node.HttpPort);
+        node.App = await WithFreshPortsRetryAsync(() =>
+        {
+            node.HttpPort = FreePort();
+            return StartAppAsync(node.Name, ClusterRole.Shard, node.HttpPort);
+        });
     }
 
     /// <summary>Total non-heartbeat node-link messages across the whole cluster — the network-call count.</summary>
@@ -391,9 +401,10 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
     /// <summary>
     /// <see cref="FreePort"/> is allocate-close-rebind, so another process can win the port in
-    /// the gap and the app's real bind then fails. Initial allocation retries with fresh ports;
-    /// restarts of an existing node deliberately do not — tests rely on stable ports across a
-    /// kill-and-revive, so a stolen port there should fail loudly.
+    /// the gap and the app's real bind then fails; every start — initial and revival alike —
+    /// retries with fresh ports. Revivals may move ports because the product lets them: a node
+    /// announces its address on every auth and the hub replaces the record (see
+    /// <see cref="StartNodeAsync"/>).
     /// </summary>
     private static async Task<WebApplication> WithFreshPortsRetryAsync(Func<Task<WebApplication>> start)
     {
