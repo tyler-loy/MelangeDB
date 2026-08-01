@@ -17,15 +17,17 @@ public sealed class MelangeSubscription
     private readonly Dictionary<ByteKey, MelangeRow> _rows = [];
     private readonly List<WireRow> _initialRows = [];
     private readonly List<(ulong Lsn, IReadOnlyList<WireRowOp> Ops)> _pending = [];
+    private readonly ISubscriptionSink? _sink;
     private TaskCompletionSource _applied = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private ulong _anchorLsn;
     private bool _live;
 
-    internal MelangeSubscription(uint id, string query, IReadOnlyDictionary<string, object?>? parameters)
+    internal MelangeSubscription(uint id, string query, IReadOnlyDictionary<string, object?>? parameters, ISubscriptionSink? sink = null)
     {
         Id = id;
         Query = query;
         Parameters = parameters;
+        _sink = sink;
     }
 
     public uint Id { get; }
@@ -92,6 +94,7 @@ public sealed class MelangeSubscription
     internal void AcceptInitialChunk(SubscriptionAppliedFrame chunk)
     {
         List<(ulong, IReadOnlyList<WireRowOp>)>? replay = null;
+        List<MelangeRow>? snapshot = null;
         lock (_lock)
         {
             // An initial set arriving for a live subscription is a server-driven re-scope — the
@@ -113,6 +116,25 @@ public sealed class MelangeSubscription
             _live = true;
             replay = [.. _pending];
             _pending.Clear();
+            if (_sink is not null)
+                snapshot = [.. _rows.Values];
+        }
+
+        // The typed cache sees the completed set before the buffered deltas replay through
+        // OnRowOp, so its reconciliation order matches the untyped cache's exactly. A decode
+        // failure here is schema drift caught at its earliest observable moment — fail the
+        // subscribe if it is still failable, else let the receive loop die loudly.
+        if (snapshot is not null)
+        {
+            try
+            {
+                _sink!.OnSnapshot(snapshot);
+            }
+            catch (MelangeSchemaMismatchException exception)
+            {
+                if (!FailSubscribe(MelangeErrorCodes.Protocol, exception.Message))
+                    throw;
+            }
         }
 
         if (replay is not null)
@@ -155,9 +177,11 @@ public sealed class MelangeSubscription
             if (_applied.Task.IsCompleted)
                 _applied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         }
+
+        _sink?.OnReset();
     }
 
-    internal void FailSubscribe(string code, string message) =>
+    internal bool FailSubscribe(string code, string message) =>
         _applied.TrySetException(new MelangeSubscriptionException(code, message));
 
     internal bool IsLive
@@ -213,6 +237,11 @@ public sealed class MelangeSubscription
             }
         }
 
+        // The typed cache hears the resolved op first: its consistency must not depend on what a
+        // user's untyped handler does with the same event.
+        if (kind is RowOpKind.Insert or RowOpKind.Update ? current is not null : previous is not null)
+            _sink?.OnRowOp(kind, previous, current);
+
         switch (kind)
         {
             case RowOpKind.Insert when current is not null:
@@ -224,22 +253,6 @@ public sealed class MelangeSubscription
             case RowOpKind.Delete when previous is not null:
                 OnDelete?.Invoke(previous);
                 break;
-        }
-    }
-
-    private readonly struct ByteKey(byte[] bytes) : IEquatable<ByteKey>
-    {
-        private readonly byte[] _bytes = bytes;
-
-        public bool Equals(ByteKey other) => _bytes.AsSpan().SequenceEqual(other._bytes);
-
-        public override bool Equals(object? obj) => obj is ByteKey other && Equals(other);
-
-        public override int GetHashCode()
-        {
-            var hash = new HashCode();
-            hash.AddBytes(_bytes);
-            return hash.ToHashCode();
         }
     }
 }

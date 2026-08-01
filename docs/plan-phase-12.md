@@ -130,6 +130,30 @@ The decisions the plan left to the implementer, as they were actually taken.
 - **The endpoint gate is evaluated per request.** `Transport:SchemaEndpointEnabled` is live-reloadable, so
   the route maps unconditionally and answers 404 while disabled, rather than existing only when enabled at
   startup.
+- **The server dedup question, answered by reading `SubscriptionEngine.Fanout`:** there is none. Deltas are
+  computed per registered subscription and grouped per sink as one `SubscriptionUpdate` per subscription id
+  — a row matching two subscriptions on one connection arrives twice, in initial sets and in deltas alike.
+  The client merge therefore refcounts covering subscriptions per key and derives typed events from
+  transitions, with value-equality on the wire column maps as the duplicate detector (an overlapping
+  subscription's identical copy of an update compares equal and stays silent). Wire op kinds are input, not
+  truth — the same posture as `MelangeSubscription`'s insert↔update self-healing one layer down.
+- **The typed cache rides an internal sink, attached before the Subscribe frame leaves.** Public
+  subscription events carry no LSN and never fire for initial sets, so the typed layer hooks
+  `MelangeSubscription` internals instead: `OnSnapshot` (completed initial set, before buffered deltas
+  replay), `OnRowOp` (each applied op, resolved kind), `OnReset`. Attaching at construction closes the
+  window where a row could slip past between subscribe and attach. The sink hears each op before the
+  public events do — the cache's consistency must not depend on what a user's untyped handler throws.
+- **Unsubscribe fires `OnDelete` for orphaned rows.** A consumer watching the cache must see every row
+  leave it; rows another subscription still covers stay, silently. Detach happens after the server's
+  unsubscribe acknowledgement.
+- **All typed events dispatch through one seam** — `ClientCacheRegistry.DispatchTypedEvent`, invoked on the
+  receive loop. The frame-tick pump the Godot client wants (issue #20 "Adjacent") replaces that method and
+  nothing else.
+- **Schema drift fails loud, typed.** The coercion table (`ClientWireValues`) throws
+  `MelangeSchemaMismatchException` on a missing column, a wrong wire kind, or an out-of-range integer —
+  never a default. A mismatch surfacing in an initial set fails that `SubscribeAsync` with the message;
+  one surfacing mid-stream (a schema change under a live connection) is allowed to kill the receive loop
+  loudly rather than be swallowed.
 
 ## Risks
 

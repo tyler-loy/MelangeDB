@@ -529,6 +529,18 @@ silently regress.
 `ctx.Db.Player.Id.Find(id)`, `ctx.Db.Creature.ChunkId.Filter(lo, hi)` — emitted as readonly structs over
 `IDbView`, so the ergonomic path and the fast path are the same path.
 
+**Typed cache** — The client's merged per-table row cache (`ClientCache<TRow>`): rows from every subscription
+over one table, keyed by encoded primary key, refcounted per key. The server sends a row once *per
+subscription* — the engine deduplicates nothing across subscriptions on a connection — so the merge derives
+typed events from coverage transitions, never from wire op kinds: first coverage fires `OnInsert`, a value
+change fires `OnUpdate` once (an overlapping subscription's identical copy compares equal and stays silent),
+and only the last uncovering fires `OnDelete` — whether by delete, scope exit, or unsubscribe.
+
+**Typed subscription** — A live subscription feeding a typed cache (`TypedSubscription<TRow>`): owns rescope
+and unsubscribe, while rows and events live on the shared cache. A completed initial set — first subscribe,
+re-establishment after resync, or a server-driven rescope — reconciles against that subscription's covered
+keys as a diff: deletes for departures, inserts for arrivals, updates for changed survivors. No flush.
+
 **Write set** — The ordered row operations a transaction produced, keyed by table and primary key. **The
 authoritative payload of a log record** — logging the write set rather than the reducer invocation is what lets
 projections rebuild without re-executing user code.
