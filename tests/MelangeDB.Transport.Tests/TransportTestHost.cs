@@ -140,7 +140,31 @@ internal sealed class TransportTestHost : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// A restart must rebind the SAME ports — resuming clients dial the address they recorded —
+    /// so unlike the cluster fixture it cannot sidestep a stolen port by moving. The thief is
+    /// almost always another test's short-lived outbound socket that drew this number from the
+    /// ephemeral range; a bounded same-port retry outwaits that churn, and a durably bound port
+    /// still fails loudly when the window closes.
+    /// </summary>
     private async Task StartAppAsync()
+    {
+        var deadline = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                await StartAppOnceAsync();
+                return;
+            }
+            catch (IOException) when (_http1Port != 0 && deadline.Elapsed < TestTime.Dilated(TimeSpan.FromSeconds(10)))
+            {
+                await Task.Delay(250);
+            }
+        }
+    }
+
+    private async Task StartAppOnceAsync()
     {
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -187,7 +211,17 @@ internal sealed class TransportTestHost : IAsyncDisposable
         var app = builder.Build();
         app.UseWebSockets();
         app.MapMelangeSocket();
-        await app.StartAsync();
+        try
+        {
+            await app.StartAsync();
+        }
+        catch
+        {
+            // A failed bind must release everything the host already opened — the engine holds
+            // this incarnation's log files, and the same-port retry reuses the same directories.
+            await app.DisposeAsync();
+            throw;
+        }
 
         var addresses = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.ToList();
         _http1Port = new Uri(addresses[0]).Port;
