@@ -77,8 +77,9 @@ and **no schema** — MessagePack decoding is lossy (integers surface as `long`,
   When a rescope's new initial set completes, the typed cache diffs it against the merged state — deletes
   for rows that left scope, inserts for arrivals, updates for survivors whose bytes changed. No flush,
   no event storm, and server-driven rescopes (a gateway shard swap) take the same path.
-- **`KeyCodec` lives in Core but the client needs primary-key encoding.** Lean: move it to Abstractions
-  (it is dependency-free and pre-1.0); the implementer verifies nothing in Core's packaging story objects.
+- ~~**`KeyCodec` lives in Core but the client needs primary-key encoding.**~~ **Settled: the typed half
+  moved to Abstractions** — see Shipped notes; the schema-boxed overloads stayed in Core as
+  `SchemaKeyCodec` because `ColumnSchema` could not follow.
 
 ## Done when
 
