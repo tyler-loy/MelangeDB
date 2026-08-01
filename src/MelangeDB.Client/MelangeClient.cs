@@ -61,8 +61,18 @@ public sealed class MelangeClient : IAsyncDisposable
     /// <summary>Connection-scoped errors, including the server's demand for an overflow resync.</summary>
     public event Action<ErrorFrame>? OnError;
 
-    /// <summary>Fires when the socket dies, gracefully or not.</summary>
+    /// <summary>
+    /// Fires when the current socket dies, gracefully or not. A socket a reconnect has already
+    /// replaced tears down silently — its outage is over, and announcing it would be a lie.
+    /// </summary>
     public event Action? OnDisconnected;
+
+    /// <summary>
+    /// Test seam, consumed once by the next receive loop to die: awaited at the top of that
+    /// loop's teardown, before any teardown effect. Lets a test hold a dying loop across a
+    /// reconnect to pin the era-scoping schedule.
+    /// </summary>
+    internal Func<Task>? ReceiveTeardownGate;
 
     /// <summary>Dials, performs the versioned handshake, and starts the receive loop.</summary>
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -244,6 +254,10 @@ public sealed class MelangeClient : IAsyncDisposable
             socket.Options.DangerousDeflateOptions = new WebSocketDeflateOptions();
         await socket.ConnectAsync(uri, SharedInvoker, cancellationToken).ConfigureAwait(false);
 
+        // Anything still pending belongs to the era this dial replaces and can never complete
+        // now; fail it here, deterministically, because the old receive loop's own teardown is
+        // era-scoped and will decline to touch state that no longer belongs to it.
+        FailPending();
         _socket = socket;
         var welcomePending = new TaskCompletionSource<WelcomeFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pendingWelcome = welcomePending;
@@ -361,8 +375,19 @@ public sealed class MelangeClient : IAsyncDisposable
         }
         finally
         {
-            FailPending();
-            OnDisconnected?.Invoke();
+            if (Interlocked.Exchange(ref ReceiveTeardownGate, null) is { } gate)
+                await gate().ConfigureAwait(false);
+
+            // Teardown is scoped to this socket's era. A reconnect may already have installed a
+            // fresh socket and a fresh pending handshake; a stale loop dying late (an Abort whose
+            // death processing lost the scheduling race to ReconnectAsync) must fail neither —
+            // its own era's pendings were already failed by the dial that replaced it, and firing
+            // OnDisconnected after a successful reconnect would announce an outage that is over.
+            if (ReferenceEquals(_socket, socket))
+            {
+                FailPending();
+                OnDisconnected?.Invoke();
+            }
         }
     }
 

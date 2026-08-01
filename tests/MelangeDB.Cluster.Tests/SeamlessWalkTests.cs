@@ -145,7 +145,12 @@ public class SeamlessWalkTests
 
             await Task.Delay(150, TestContext.Current.CancellationToken);
         }
-        Assert.True(cluster.Hub.Metrics.HandoffsCompleted >= 2);
+
+        // The hub map (what the loop above watches) flips before the release round-trip, and
+        // HandoffEnded counts the completion only after it — wait for the count, don't race it.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HandoffsCompleted >= 2,
+            "both boundary crossings closed their sagas and counted");
         Assert.True(client.IsConnected, "the client must never observe a disconnect");
         Assert.False(disconnected);
         Assert.Empty(resyncErrors);
@@ -252,9 +257,14 @@ public class SeamlessWalkTests
             () => cluster.Node(destinationOwner).App is null, "the destination node finished stopping");
         cluster.Hub.HandoffStepHook = null;
         await cluster.StartNodeAsync(destinationOwner);
+
+        // Same envelope as the origin-revival wait in the test below: the revived destination's
+        // link reconnect, the reconciler's 1s cadence, and 15s per link round-trip all sit
+        // between the restart and this resolution — sixty seconds covers one bad cycle of each.
         await ClusterFixture.WaitUntilAsync(
             () => origin.PendingFreezes.Count == 0,
-            "the origin's reconciler resolved the unknowable import to an abort");
+            "the origin's reconciler resolved the unknowable import to an abort",
+            timeoutSeconds: 60);
 
         // Owned by the origin, alive, and playable — through the same client, no reconnect. The
         // destination may hold a read-only border copy (the player stands in its band — that is
@@ -303,6 +313,14 @@ public class SeamlessWalkTests
         await ClusterFixture.WaitUntilAsync(
             () => destination.Engine.CommittedView.Find<Pack>(player) is not null,
             "the destination holds the imported player");
+
+        // The Pack is visible the instant the destination's import handler commits — while the
+        // hub is still finishing the import round-trip. Clearing the hook on that evidence raced
+        // the saga's release-step check (a hub-side window of a few milliseconds, stretched by a
+        // loaded machine) and silently skipped the kill, leaving the origin alive and the wait
+        // below eternal. The hook stays armed until its kill demonstrably ran.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Node(originOwner).App is null, "the hook's kill of the origin finished");
         cluster.Hub.HandoffStepHook = null;
 
         // Playable on the destination immediately, through the same connection.
@@ -313,14 +331,21 @@ public class SeamlessWalkTests
         Assert.Equal(66, destination.Engine.CommittedView.Find<Pack>(player)!.Value.Gold);
 
         // The revived origin replays its freeze, learns the import happened, and releases: no
-        // duplicate — exactly one authoritative copy in the world. (Wait out the hook's kill
-        // first; the saga that ran it is fire-and-forget.)
-        await ClusterFixture.WaitUntilAsync(
-            () => cluster.Node(originOwner).App is null, "the origin node finished stopping");
+        // duplicate — exactly one authoritative copy in the world. Two allowances make this wait
+        // honest. Deadline: StartNodeAsync returns at Kestrel start, and the resolution then
+        // needs the hub-link reconnect (10s challenge timeout per attempt, 0.5s retry), the
+        // assignment-driven shard reopen and log recovery, the reconciler's 1s sweep, and two
+        // link round-trips each under a 15s request timeout — sixty seconds covers one bad cycle
+        // of every stage. Condition: the release deliberately keeps a row the border stream
+        // already adopted as a marked copy (the player stands inside A's observer band during
+        // the transfer), so "released" means absent or borrowed — never a second authority.
         await cluster.StartNodeAsync(originOwner);
+        var posTable = destination.Engine.Schema.Get(typeof(PlayerPos));
         await ClusterFixture.WaitUntilAsync(
             () => cluster.Node(originOwner).Runtime.TryGetShard(new ShardKey(BlockA)) is { } reopened
-                && reopened.Engine.CommittedView.Find<PlayerPos>(player) is null,
-            "the recovered origin released the transferred player");
+                && (reopened.Engine.CommittedView.Find<PlayerPos>(player) is null
+                    || reopened.BorrowedOwnerOf(posTable.Id, KeyCodec.Encode(posTable.PrimaryKey, player)) is not null),
+            "the recovered origin released the transferred player",
+            timeoutSeconds: 60);
     }
 }

@@ -101,8 +101,11 @@ public class ClusterAcceptanceTests
         }
     }
 
+    // Scan is safe only under the engine lock: replication applies to these engines
+    // concurrently, and a raw scan mid-apply throws "collection was modified".
     private static List<string> Rows(MelangeEngine engine, TableId table) =>
-        [.. engine.HotStore.Scan(table).Select(static pair => $"{pair.Key}|{Convert.ToHexStringLower(pair.Value.Span)}")];
+        engine.ReadConsistent(_ =>
+            engine.HotStore.Scan(table).Select(static pair => $"{pair.Key}|{Convert.ToHexStringLower(pair.Value.Span)}").ToList());
 
     [Fact]
     public async Task A_global_write_from_a_shard_attached_client_reaches_the_hub_and_is_visible_cluster_wide()

@@ -65,15 +65,28 @@ internal sealed class LoadTestServer : IAsyncDisposable
 
     private async Task StartCoreAsync(TextWriter output, CancellationToken ct)
     {
-        _hubHttpPort = _options.Port != 0 ? _options.Port : FreePort();
-        _nodeListenPort = FreePort();
         output.WriteLine(
             $"Serve: hub + {_options.Nodes} shard node(s), world {_options.World} " +
             $"({_options.WorldChunksX}x{_options.WorldChunksY} chunks), band {_options.BandChunks}, " +
             $"fsync {_options.Fsync}{(_options.Fsync == "interval" ? $" ({_options.FsyncIntervalMs} ms)" : string.Empty)}.");
-        _hubApp = await StartAppAsync("hub", ClusterRole.Hub, _hubHttpPort).ConfigureAwait(false);
+
+        // FreePort is allocate-close-rebind, so another process can win a port in the gap and the
+        // real bind then fails — one stolen port out of the dozens churning on a busy CI machine
+        // must not fail a whole run. Ephemeral allocations retry with fresh ports (the fixture in
+        // the cluster tests does the same); an explicitly requested --port is never moved — it is
+        // the caller's scripted address — so if that port itself is taken, the retries exhaust
+        // and the failure stays loud.
+        _hubApp = await WithFreshPortsRetryAsync(() =>
+        {
+            _hubHttpPort = _options.Port != 0 ? _options.Port : FreePort();
+            _nodeListenPort = FreePort();
+            return StartAppAsync("hub", ClusterRole.Hub, _hubHttpPort);
+        }).ConfigureAwait(false);
         for (var i = 0; i < _options.Nodes; i++)
-            _nodeApps.Add(await StartAppAsync($"node-{i}", ClusterRole.Shard, FreePort()).ConfigureAwait(false));
+        {
+            var name = $"node-{i}";
+            _nodeApps.Add(await WithFreshPortsRetryAsync(() => StartAppAsync(name, ClusterRole.Shard, FreePort())).ConfigureAwait(false));
+        }
 
         var hub = Hub;
         await WaitUntilAsync(
@@ -229,8 +242,38 @@ internal sealed class LoadTestServer : IAsyncDisposable
             app.MapMelangeShardSockets();
         }
 
-        await app.StartAsync().ConfigureAwait(false);
+        try
+        {
+            await app.StartAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // A failed start (stolen port above all) must release everything the host already
+            // opened — the engines hold this node's log files, and the fresh-port retry reuses
+            // the same data directories.
+            await app.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+
         return app;
+    }
+
+    /// <summary>Retries an app start whose ephemeral port was stolen between allocation and bind.</summary>
+    private static async Task<WebApplication> WithFreshPortsRetryAsync(Func<Task<WebApplication>> start)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await start().ConfigureAwait(false);
+            }
+            catch (IOException) when (attempt < 5)
+            {
+            }
+            catch (SocketException) when (attempt < 5)
+            {
+            }
+        }
     }
 
     private IPAddress ListenAddress() =>

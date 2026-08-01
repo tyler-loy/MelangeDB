@@ -320,7 +320,12 @@ public class EventBusTests : IDisposable
             await EventProbe.WaitUntilAsync(
                 () => second.Bus().MinimumLiveCheckpointLsn is null,
                 "the idle checkpoints were never evicted");
-            Assert.True(_logs.Has(1403), "no SubscriberCheckpointEvicted (1403) log entry");
+
+            // The sweep flips the checkpoint state first and logs one statement later, on its
+            // own timer thread — polling the state can win that race by a preemption, so the log
+            // entry gets the same wait the state did.
+            await EventProbe.WaitUntilAsync(
+                () => _logs.Has(1403), "no SubscriberCheckpointEvicted (1403) log entry");
 
             // Committed while nobody subscribed — and after eviction, gone for good.
             second.Reducers().Call("PublishNote", TestApp.Caller, "missed");

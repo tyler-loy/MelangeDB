@@ -100,6 +100,13 @@ public class SeamlessMigrationTests
         await ClusterFixture.WaitUntilAsync(
             () => cluster.HubEngine.CommittedView.Find<PlayerShardMap>(player)?.Shard == BlockB,
             "the transfer listener flipped the hub's session-to-shard map");
+
+        // The map flips before the release round-trip by design (deletions must never reach an
+        // attached client), and HandoffEnded runs in the saga's finally after that round-trip —
+        // so the counter trails the map by a full network exchange. Wait, then assert.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HandoffsCompleted == 1,
+            "the saga closed and counted the completed handoff");
         Assert.Equal(1, cluster.Hub.Metrics.HandoffsCompleted);
     }
 
@@ -172,17 +179,27 @@ public class SeamlessMigrationTests
                 && shardB.BorrowedOwnerOf(shardB.Engine.Schema.Get(typeof(Critter)).Id, KeyOf(shardB, critterId)) is null,
             "the critter chased across the boundary and reached its target as B's own row");
 
-        // Exactly one authoritative copy, ever after: A holds at most a read-only border shadow.
-        var onA = shardA.Engine.CommittedView.Find<Critter>(critterId);
-        if (onA is not null)
-            Assert.NotNull(shardA.BorrowedOwnerOf(shardA.Engine.Schema.Get(typeof(Critter)).Id, KeyOf(shardA, critterId)));
+        // Exactly one authoritative copy: A holds at most a read-only border shadow. B owning the
+        // row (the wait above) is the destination-authoritative moment; A's own row is deleted by
+        // the release, a full round-trip later — sampling A raw in that window sees the frozen
+        // authoritative row with no borrowed mark and fails a true invariant. Wait for A's copy
+        // to resolve, then hold the invariant: absent, or a shadow, never a second authority.
+        await ClusterFixture.WaitUntilAsync(
+            () => shardA.Engine.CommittedView.Find<Critter>(critterId) is null
+                || shardA.BorrowedOwnerOf(shardA.Engine.Schema.Get(typeof(Critter)).Id, KeyOf(shardA, critterId)) is not null,
+            "A's copy resolved to absent or a read-only border shadow");
 
         // And it never stops ticking: the destination's scheduler owns it now.
         var ticksAtArrival = shardB.Engine.CommittedView.Find<Critter>(critterId)!.Value.Ticks;
         await ClusterFixture.WaitUntilAsync(
             () => shardB.Engine.CommittedView.Find<Critter>(critterId)!.Value.Ticks > ticksAtArrival,
             "the critter keeps ticking on its new owner");
-        Assert.True(cluster.Hub.Metrics.HandoffsCompleted >= 1);
+
+        // Ticking on the destination begins at destination-authoritative; HandoffEnded runs only
+        // after the release round-trip. Wait for the count rather than asserting it raw.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HandoffsCompleted >= 1,
+            "the saga closed and counted the completed handoff");
     }
 
     private static RowKey KeyOf(ShardRuntime shard, Identity id)
