@@ -111,9 +111,11 @@ public class TypedBindingsTests
         var window = await conn.Db.Chunk.X.SubscribeRangeAsync(0, 10, TestContext.Current.CancellationToken);
         Assert.Equal(1, conn.Db.Chunk.Count);
         await conn.Db.Chunk.X.RescopeRangeAsync(window, 5, 15, TestContext.Current.CancellationToken);
+        // Wait for convergence, not arrival: the diff's insert and delete are separate ops, and
+        // under contention the arrival can land a poll-tick before the departure applies.
         await TransportTestHost.WaitUntilAsync(
-            () => conn.Db.Chunk.Id.Find(2L) is not null,
-            "the rescope diff to arrive");
+            () => conn.Db.Chunk.Id.Find(2L) is not null && conn.Db.Chunk.Id.Find(1L) is null,
+            "the rescope diff to converge");
         Assert.Null(conn.Db.Chunk.Id.Find(1L));
 
         var byPlayer = await conn.Db.Skill.PlayerNum.SubscribeAsync(7L, TestContext.Current.CancellationToken);
