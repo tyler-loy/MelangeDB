@@ -124,6 +124,38 @@ Deliberate divergences from the SpacetimeDB C# SDK, for porting hands: reducer s
 local cache instead of maintaining client-side index dictionaries — client caches are
 subscription-sized, and an index that earns its keep should show up in a profile first.
 
+## Threading
+
+Which thread events fire on is a mode, `MelangeClientOptions.Dispatch` (issue #26 — see
+[CONFIGURATION.md](CONFIGURATION.md)):
+
+- **`DispatchMode.Immediate`** (the default): every event — typed cache events, untyped subscription
+  events, `OnError`, `OnDisconnected` — fires on the client's **receive loop** as frames arrive. Right for
+  servers, tools, and tests that want data the moment it exists; wrong for a game client whose engine
+  allows scene mutation only from its own main thread.
+- **`DispatchMode.Manual`**: whole data frames queue in arrival order and apply only inside
+  `client.FrameTick(maxFrames)` — so every one of those events fires on **the thread that calls
+  `FrameTick`**. Call it from Godot's `_Process` (or any host loop) and handlers may touch the scene tree
+  directly, no `CallDeferred` anywhere. The pump defers cache mutation *and* events together: an
+  `OnInsert` handler that looks up a related row sees a world consistent with its event, never a newer
+  one, because "what the cache says" and "what handlers have been told" advance on the same clock. A tick
+  drains whole frames — one `TransactionUpdate` frame is one whole commit, so a budget never tears a
+  transaction; note a completed rescope's reconcile is one indivisible (possibly large) frame.
+
+**The Manual-mode rule: await, never block.** In Manual mode, `SubscribeAsync`, `ReconnectAsync`, and
+`UnsubscribeAsync` complete only as ticks apply their frames. `await` them from the ticking thread and
+they finish across later ticks; **block** the ticking thread on one (`.Result`, `.Wait()`) and the
+application deadlocks — the completion is waiting for the very tick the block is preventing. The same
+applies inside handlers: a handler that synchronously waits on anything frame-driven wedges the pump.
+
+**Reducer continuations.** `await conn.Reducers.<Name>Async(…)` resumes via the caller's
+`SynchronizationContext`. Godot installs a main-thread one, so awaiting a reducer in `_Process`-adjacent
+code resumes on the main thread and may touch nodes safely. The footgun is user code that discards that
+context: inside `Task.Run(...)` or after `ConfigureAwait(false)` there is no context to return to, the
+continuation runs on a thread-pool thread, and node access from it is the intermittent renderer-thread
+crash the pump exists to prevent. The same applies to code after `await sub.UnsubscribeAsync()`: the
+cache-eviction `OnDelete` events it triggers fire on the resuming thread.
+
 ## Staleness
 
 The manifest can go stale against the module it was exported from. The defenses, in order: the

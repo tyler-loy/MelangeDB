@@ -243,6 +243,14 @@ public sealed class TransportReducers
     public void AddSkill(ReducerContext ctx, long playerNum, string name, long xp, int level) =>
         ctx.Db.Skill.Insert(new Skill { PlayerNum = playerNum, Name = name, TotalXp = xp, Level = level });
 
+    /// <summary>Writes two tables in one transaction — the frame-tick pump's atomicity subject.</summary>
+    [Reducer]
+    public void SpawnWithSkill(ReducerContext ctx, string name, int roomId, long playerNum, string skillName)
+    {
+        ctx.Db.PlayerState.Insert(new PlayerState { Id = ctx.Caller, RoomId = roomId, Name = name, X = 0 });
+        ctx.Db.Skill.Insert(new Skill { PlayerNum = playerNum, Name = skillName, TotalXp = 0, Level = 1 });
+    }
+
     [Reducer]
     public void SetSkillXp(ReducerContext ctx, ulong id, long xp)
     {

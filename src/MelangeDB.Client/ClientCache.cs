@@ -5,8 +5,9 @@ namespace MelangeDB.Client;
 /// <summary>
 /// The internal seam a subscription reports through so a typed cache can mirror it: the completed
 /// initial set (first subscribe, re-establishment, and server-driven rescope all land here), each
-/// applied row op with its self-healed kind, and resync resets. Invoked on the receive loop, in
-/// apply order, before the subscription's public events fire.
+/// applied row op with its self-healed kind, and resync resets. Invoked on the thread applying
+/// the frame — the receive loop under Immediate dispatch, the <c>FrameTick</c> caller under
+/// Manual — in apply order, before the subscription's public events fire.
 /// </summary>
 internal interface ISubscriptionSink
 {

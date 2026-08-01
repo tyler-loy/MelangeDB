@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "0.1.0.0",
-  "schemaHash": "1cf61e7336d9033f93c599887b189451c71ec87c1c6716f19af3f9032438ba1f",
+  "schemaHash": "597928711c31ff66adeb172e3fabd3b2111beb94f282a4f8def995626d37904e",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -436,6 +436,31 @@
         {
           "name": "nextThinkAt",
           "kind": "UInt64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "SpawnWithSkill",
+      "params": [
+        {
+          "name": "name",
+          "kind": "String",
+          "isArray": false
+        },
+        {
+          "name": "roomId",
+          "kind": "Int32",
+          "isArray": false
+        },
+        {
+          "name": "playerNum",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "skillName",
+          "kind": "String",
           "isArray": false
         }
       ]

@@ -77,6 +77,12 @@ public static class MelangeErrorCodes
     public const string NotRelationalTier = "not_relational";
     public const string NoRelationalTier = "no_relational_tier";
     public const string RelationalUnavailable = "relational_unavailable";
+
+    /// <summary>
+    /// Client-synthesized, never sent by a server: a Manual-dispatch client's frame queue hit
+    /// its configured limit without a tick, and the client aborted its own socket.
+    /// </summary>
+    public const string DispatchOverflow = "dispatch_overflow";
 }
 
 /// <summary>One frame on the wire. Every frame carries its channel tag.</summary>

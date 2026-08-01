@@ -48,6 +48,43 @@ public sealed class MelangeClientOptions
     /// Useful for asserting wire-level behaviour; keep it fast.
     /// </summary>
     public Action<Frame, int>? FrameInspector { get; set; }
+
+    /// <summary>
+    /// How data-channel frames — initial sets, deltas — and the connection lifecycle events
+    /// around them are dispatched. <see cref="DispatchMode.Immediate"/> (the default) applies
+    /// frames and raises events on the receive loop as they arrive.
+    /// <see cref="DispatchMode.Manual"/> queues whole frames and applies them only inside
+    /// <see cref="MelangeClient.FrameTick"/>, on the caller's thread — the game-loop mode, for
+    /// hosts (Godot, Unity) whose handlers may only run on the host's own thread.
+    /// </summary>
+    public DispatchMode Dispatch { get; set; } = DispatchMode.Immediate;
+
+    /// <summary>
+    /// Manual dispatch only: the ceiling on entries queued between ticks. On overflow the client
+    /// synthesizes a <see cref="MelangeErrorCodes.DispatchOverflow"/> error at the head of the
+    /// queue and aborts the socket — never dropping a delta silently (the cache would diverge),
+    /// never blocking the receive loop (a blocked loop stops answering pings and the server
+    /// convicts the client illegibly). The default is over a minute of not ticking at a
+    /// sustained 1,000 commits per second — far longer than any loading screen — while keeping
+    /// worst-case memory bounded. Recovery is the ordinary
+    /// <see cref="MelangeClient.ReconnectAsync"/> resume path once the app ticks again.
+    /// </summary>
+    public int DispatchQueueLimit { get; set; } = 65536;
+}
+
+/// <summary>How a <see cref="MelangeClient"/> dispatches data frames and connection events.</summary>
+public enum DispatchMode
+{
+    /// <summary>Frames apply and events fire on the receive loop as they arrive. The default.</summary>
+    Immediate,
+
+    /// <summary>
+    /// Whole frames queue in arrival order; <see cref="MelangeClient.FrameTick"/> applies them
+    /// and fires their events on the calling thread. A Manual client that is never ticked
+    /// applies nothing — subscriptions and reconnects await their frames, so tick from the
+    /// host's own loop.
+    /// </summary>
+    Manual,
 }
 
 /// <summary>Thrown when a reducer call fails; <see cref="Code"/> is a <see cref="MelangeErrorCodes"/> value.</summary>
