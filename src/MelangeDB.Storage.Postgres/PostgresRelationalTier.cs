@@ -518,7 +518,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         private NpgsqlBatchCommand Delete(in RowKey key)
         {
             var command = new NpgsqlBatchCommand(_deleteSql);
-            command.Parameters.Add(PostgresTypeMap.Parameter(_table.PrimaryKey, KeyCodec.Decode(_table.PrimaryKey, key)));
+            command.Parameters.Add(PostgresTypeMap.Parameter(_table.PrimaryKey, SchemaKeyCodec.Decode(_table.PrimaryKey, key)));
             return command;
         }
     }

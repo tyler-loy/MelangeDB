@@ -440,6 +440,21 @@ startup and maintained through the commit-observer seam, dispatching from a sing
 `Scheduler:CatchUpAfterDowntime`. Fires run as `MelangeScheduler.Caller`, exempt from rate limits and
 reducer policies — internal dispatch is not a client call.
 
+**Schema endpoint** — The development HTTP endpoint (`{path}/schema`) serving the module's schema manifest,
+gated the way Swagger gates its document: on in Development, `Transport:SchemaEndpointEnabled` overrides in
+either direction, anonymous while on because the manifest carries only what every client already receives.
+The exporter tool fetches from it — generate bindings against the running local dev server, no DLL path.
+
+**Schema hash** — SHA-256 over a manifest's JSON rendered with an empty `schemaHash` field. The generator
+stamps it into the manifest and into the client bindings built from it, so a connection wrapper can surface
+"these bindings were generated from a different schema" instead of leaving drift to fail as wrong columns.
+
+**Schema manifest** — The client-visible schema a module exports as `melange-schema.json`: public tables
+minus `[ServerOnly]` columns, the enum definitions that surface references, and client-callable reducer
+signatures. The contract the client binding generator consumes — deliberately JSON, not a shared assembly,
+because the wire shares no types and non-C# clients must stay possible. Format documented in
+[CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
+
 **Seam walker** — In the load-testing tool's workload, a simulated player that oscillates across one shard
 boundary, one chunk past the hysteresis margin each way, so handoff and border traffic is continuously
 exercised rather than left to chance. See [LOAD-TESTING.md](LOAD-TESTING.md).
@@ -513,6 +528,18 @@ silently regress.
 **Typed accessor** — The generated, strongly typed view onto a table through `ctx.Db` —
 `ctx.Db.Player.Id.Find(id)`, `ctx.Db.Creature.ChunkId.Filter(lo, hi)` — emitted as readonly structs over
 `IDbView`, so the ergonomic path and the fast path are the same path.
+
+**Typed cache** — The client's merged per-table row cache (`ClientCache<TRow>`): rows from every subscription
+over one table, keyed by encoded primary key, refcounted per key. The server sends a row once *per
+subscription* — the engine deduplicates nothing across subscriptions on a connection — so the merge derives
+typed events from coverage transitions, never from wire op kinds: first coverage fires `OnInsert`, a value
+change fires `OnUpdate` once (an overlapping subscription's identical copy compares equal and stays silent),
+and only the last uncovering fires `OnDelete` — whether by delete, scope exit, or unsubscribe.
+
+**Typed subscription** — A live subscription feeding a typed cache (`TypedSubscription<TRow>`): owns rescope
+and unsubscribe, while rows and events live on the shared cache. A completed initial set — first subscribe,
+re-establishment after resync, or a server-driven rescope — reconciles against that subscription's covered
+keys as a diff: deletes for departures, inserts for arrivals, updates for changed survivors. No flush.
 
 **Write set** — The ordered row operations a transaction produced, keyed by table and primary key. **The
 authoritative payload of a log record** — logging the write set rather than the reducer invocation is what lets

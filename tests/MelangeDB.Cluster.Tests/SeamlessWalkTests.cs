@@ -45,6 +45,31 @@ public class SeamlessWalkTests
     private static bool HasTerrain(MelangeSubscription terrain, int cx, int cy) =>
         terrain.Rows.Any(row => Convert.ToUInt32(row.Columns["ChunkId"]) == Chunks.Id(cx, cy));
 
+    /// <summary>
+    /// One walk step, retried the way a real client ticks. Mid-handoff the player is writable
+    /// nowhere (the frozen-row guard), and just after the map flips a stale route can land on a
+    /// border copy — transient rejections the load driver's tick loop absorbs by design
+    /// (PlayerDriver.CallAsync), so the walk absorbs them too. Bounded by a dilated deadline: a
+    /// persistent failure still rethrows and fails the test with the real error.
+    /// </summary>
+    private static async Task MoveAsync(MelangeClient client, uint chunkId)
+    {
+        var deadline = TestTime.Dilated(TimeSpan.FromSeconds(15));
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                await client.CallReducerAsync("Move", [chunkId], TestContext.Current.CancellationToken);
+                return;
+            }
+            catch (MelangeCallException) when (stopwatch.Elapsed < deadline)
+            {
+                await Task.Delay(25, TestContext.Current.CancellationToken);
+            }
+        }
+    }
+
     [Fact]
     public async Task A_client_walks_across_three_shard_nodes_with_no_disconnect_no_resync_and_no_missing_terrain()
     {
@@ -79,7 +104,7 @@ public class SeamlessWalkTests
         // line) and, after the invisible swap, by the destination.
         for (var cx = 2; cx <= 10; cx++)
         {
-            await client.CallReducerAsync("Move", [Chunks.Id(cx, 2)], TestContext.Current.CancellationToken);
+            await MoveAsync(client, Chunks.Id(cx, 2));
             var expectedX = cx;
             await ClusterFixture.WaitUntilAsync(
                 () => positions.Rows.Any(row => Convert.ToUInt32(row.Columns["ChunkId"]) == Chunks.Id(expectedX, 2)),
@@ -107,7 +132,7 @@ public class SeamlessWalkTests
                                     .Select(m =>
                                     {
                                         var pos = m.Runtime!.Engine.CommittedView.Find<PlayerPos>(player)!.Value;
-                                        return $"{m.Name}/{SpatialShardStrategy.BlockOf(m.Shard)}: chunk={Chunks.At(pos.ChunkId)} steps={pos.Steps} borrowed={m.Runtime.BorrowedOwnerOf(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).Id, KeyCodec.Encode(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).PrimaryKey, player))}";
+                                        return $"{m.Name}/{SpatialShardStrategy.BlockOf(m.Shard)}: chunk={Chunks.At(pos.ChunkId)} steps={pos.Steps} borrowed={m.Runtime.BorrowedOwnerOf(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).Id, SchemaKeyCodec.Encode(m.Runtime.Engine.Schema.Get(typeof(PlayerPos)).PrimaryKey, player))}";
                                     })));
                             var monitors = string.Join("; ", cluster.Nodes.Where(n => n.App is not null).SelectMany(
                                 n => n.Runtime.OwnedShards.Select(s => (n.Name, Shard: s, Monitor: n.Runtime.TryGetMonitor(s)))
@@ -277,7 +302,7 @@ public class SeamlessWalkTests
         {
             var posTable = destinationShard.Engine.Schema.Get(typeof(PlayerPos));
             Assert.NotNull(destinationShard.BorrowedOwnerOf(
-                posTable.Id, KeyCodec.Encode(posTable.PrimaryKey, player)));
+                posTable.Id, SchemaKeyCodec.Encode(posTable.PrimaryKey, player)));
         }
         Assert.True(client.IsConnected);
         await client.CallReducerAsync("Move", [Chunks.Id(2, 2)], TestContext.Current.CancellationToken)
@@ -344,7 +369,7 @@ public class SeamlessWalkTests
         await ClusterFixture.WaitUntilAsync(
             () => cluster.Node(originOwner).Runtime.TryGetShard(new ShardKey(BlockA)) is { } reopened
                 && (reopened.Engine.CommittedView.Find<PlayerPos>(player) is null
-                    || reopened.BorrowedOwnerOf(posTable.Id, KeyCodec.Encode(posTable.PrimaryKey, player)) is not null),
+                    || reopened.BorrowedOwnerOf(posTable.Id, SchemaKeyCodec.Encode(posTable.PrimaryKey, player)) is not null),
             "the recovered origin released the transferred player",
             timeoutSeconds: 60);
     }

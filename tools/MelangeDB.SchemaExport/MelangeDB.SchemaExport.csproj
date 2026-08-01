@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <Description>Writes a module's client-visible schema manifest to melange-schema.json — from a built module assembly, or fetched from a running development server's schema endpoint. The manifest is what the client binding generator consumes. See docs/CLIENT-BINDINGS.md.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+  </ItemGroup>
+
+</Project>

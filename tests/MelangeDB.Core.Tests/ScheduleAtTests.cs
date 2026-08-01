@@ -107,7 +107,7 @@ public class ScheduleAtTests
         Assert.Equal(Placement.Local, forced.Placement);
 
         // And a ScheduleAt column can never key or index anything.
-        Assert.False(KeyCodec.IsKeyEncodable(ColumnKind.ScheduleAt));
+        Assert.False(SchemaKeyCodec.IsKeyEncodable(ColumnKind.ScheduleAt));
     }
 
     private static ColumnSchema Column(string name, ColumnKind kind, Type clrType, bool primaryKey = false) => new()

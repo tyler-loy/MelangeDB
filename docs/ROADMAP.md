@@ -59,11 +59,15 @@ commit log in phase 01.
 | [09](plan-phase-09.md) | Clustering I — placement, hub/shard roles, instancing |
 | [10](plan-phase-10.md) | Clustering II — spatial strategy and seamless handoff |
 
-### M3 — Proven (phase 11)
+### M3 — Proven (phases 11–12)
 
 | Phase | Title |
 | --- | --- |
+| [12](plan-phase-12.md) | Typed client bindings |
 | [11](plan-phase-11.md) | Vibe Shaft port and validation |
+
+Phase 12 is numbered after 11 but lands first: the port's scoping pass ([#20](https://github.com/tyler-loy/MelangeDB/issues/20))
+measured 459 client call sites that are mechanical against typed bindings and a rewrite without them.
 
 Phase 11 is written as one phase for planning purposes, but in practice porting will start much earlier —
 a subset of Vibe Shaft's tables and reducers is the most honest integration test available from phase 03

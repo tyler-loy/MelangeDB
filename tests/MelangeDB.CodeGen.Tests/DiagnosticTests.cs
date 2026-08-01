@@ -571,4 +571,52 @@ public class DiagnosticTests
         var analyzerDiagnostics = await GeneratorTestHost.RunAnalyzerAsync(source);
         Assert.DoesNotContain(analyzerDiagnostics, d => d.Id.StartsWith("MELANGE", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public void Melange0019_fires_when_two_client_visible_enums_share_a_name()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            namespace Alpha { public enum Kind { A } }
+            namespace Beta { public enum Kind { B } }
+
+            [Table(Public = true)]
+            public partial struct Split
+            {
+                [PrimaryKey] public long Id;
+                public Alpha.Kind First;
+                public Beta.Kind Second;
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0019");
+    }
+
+    [Fact]
+    public void Melange0019_stays_quiet_when_the_collision_never_leaves_the_server()
+    {
+        // The same collision on a private table is fine — the manifest never carries it.
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            namespace Alpha { public enum Kind { A } }
+            namespace Beta { public enum Kind { B } }
+
+            [Table]
+            public partial struct Split
+            {
+                [PrimaryKey] public long Id;
+                public Alpha.Kind First;
+                public Beta.Kind Second;
+            }
+
+            [Table(Public = true)]
+            public partial struct Visible
+            {
+                [PrimaryKey] public long Id;
+            }
+            """);
+        Assert.DoesNotContain(result.MelangeDiagnostics, d => d.Id == "MELANGE0019");
+        Assert.Contains(result.GeneratedSources, s => s.HintName == "MelangeSchemaManifest.g.cs");
+    }
 }

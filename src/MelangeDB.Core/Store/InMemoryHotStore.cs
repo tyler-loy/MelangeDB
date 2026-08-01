@@ -247,7 +247,7 @@ public sealed class InMemoryHotStore : IHotStore
                 var column = _schema.Column(index.Column);
                 var value = column.GetValue(row);
                 if (value is not null)
-                    yield return (index.Column, KeyCodec.Encode(column, value));
+                    yield return (index.Column, SchemaKeyCodec.Encode(column, value));
             }
         }
     }

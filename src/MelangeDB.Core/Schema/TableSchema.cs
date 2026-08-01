@@ -60,14 +60,14 @@ public sealed class TableSchema
         }
 
         PrimaryKey = primaryKeys[0];
-        if (!KeyCodec.IsKeyEncodable(PrimaryKey.Kind))
+        if (!SchemaKeyCodec.IsKeyEncodable(PrimaryKey.Kind))
             throw new NotSupportedException($"Table '{name}': column '{PrimaryKey.Name}' of kind {PrimaryKey.Kind} cannot be a primary key.");
 
         foreach (var column in columns)
         {
             if (column.IsAutoInc && column.Kind is not (ColumnKind.Int64 or ColumnKind.UInt64))
                 throw new NotSupportedException($"Table '{name}': [AutoInc] column '{column.Name}' must be long or ulong.");
-            if ((column.IsIndexed || column.IsUnique) && !KeyCodec.IsKeyEncodable(column.Kind))
+            if ((column.IsIndexed || column.IsUnique) && !SchemaKeyCodec.IsKeyEncodable(column.Kind))
                 throw new NotSupportedException($"Table '{name}': column '{column.Name}' of kind {column.Kind} cannot be indexed.");
         }
 

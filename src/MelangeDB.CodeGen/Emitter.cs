@@ -371,7 +371,7 @@ internal static class Emitter
         column.IsEnum ? $"({column.ClrFqn}){readExpression}" : readExpression;
 
     private static string KeyEncode(ColumnModel column, string access) =>
-        $"global::MelangeDB.Core.KeyCodec.Encode{column.Kind}({CastToWire(column, access)})";
+        $"global::MelangeDB.KeyCodec.Encode{column.Kind}({CastToWire(column, access)})";
 
     private static string UnderlyingFqn(WireKind kind) => kind switch
     {

@@ -16,12 +16,24 @@
     <ProjectReference Include="..\..\src\MelangeDB.Server\MelangeDB.Server.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <!-- The exporter tool, referenced as a library so the byte-identity test can drive both of
+         its sources — the built assembly and the running dev server — through the same writer. -->
+    <ProjectReference Include="..\..\tools\MelangeDB.SchemaExport\MelangeDB.SchemaExport.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit.v3" Version="3.0.0" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- This assembly is both the server module (TestTables) and a typed-bindings consumer of
+         its own exported manifest — the end-to-end proof that generated code speaks to the real
+         transport. SchemaManifestTests holds the committed file byte-identical to the build. -->
+    <AdditionalFiles Include="melange-schema.json" />
+    <!-- Copied verbatim so the staleness guard can compare the committed file to the build. -->
+    <None Include="melange-schema.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

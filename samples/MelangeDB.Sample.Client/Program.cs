@@ -2,12 +2,16 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using MelangeDB.Client;
+using MelangeDB.Types;
 
 // Connects to the sample worker (dotnet run in samples/MelangeDB.Sample.Worker first), subscribes
-// to the Visitor table, calls the Greet reducer, and watches its own row arrive as a live delta.
-// The token is minted against the worker's dev issuer — a stand-in for your IdP; MelangeDB itself
-// mints no identities. The FileTokenStore persists it across runs, the same mechanism that keeps
-// a guest identity from being lost with the process.
+// to the Visitor table through the generated typed bindings, calls the generated Greet stub, and
+// watches its own row arrive as a typed live delta — no column-name strings, no reducer-name
+// strings; a renamed column is a build error here, not a runtime null. The bindings come from
+// ../MelangeDB.Sample.Worker/melange-schema.json (see docs/CLIENT-BINDINGS.md); the token is
+// minted against the worker's dev issuer — a stand-in for your IdP; MelangeDB itself mints no
+// identities. The FileTokenStore persists it across runs, the same mechanism that keeps a guest
+// identity from being lost with the process.
 var uri = new Uri(args.Length > 0 ? args[0] : "ws://localhost:5310/melange");
 await using var client = new MelangeClient(new MelangeClientOptions
 {
@@ -16,15 +20,16 @@ await using var client = new MelangeClient(new MelangeClientOptions
     TokenStore = new FileTokenStore(Path.Combine(AppContext.BaseDirectory, "melange-token.txt")),
 });
 await client.ConnectAsync();
-Console.WriteLine($"Connected over {client.NegotiatedHttpProtocol}; log epoch {client.LogEpochId:N}.");
+var conn = new MelangeConnection(client);
+Console.WriteLine($"Connected over {client.NegotiatedHttpProtocol}; log epoch {client.LogEpochId:N}; schema {conn.SchemaHash[..12]}….");
 
-var visitors = await client.SubscribeAsync("SELECT * FROM Visitor");
-Console.WriteLine($"Subscribed: {visitors.Count} visitor(s) in the initial set (anchor LSN {visitors.AnchorLsn}).");
-visitors.OnInsert += row => Console.WriteLine($"  + visitor #{row.Columns["Id"]}: {row.Columns["Name"]}");
-visitors.OnUpdate += (_, row) => Console.WriteLine($"  ~ visitor #{row.Columns["Id"]}: {row.Columns["Name"]}");
-visitors.OnDelete += row => Console.WriteLine($"  - visitor #{row.Columns["Id"]}");
+conn.Db.Visitor.OnInsert += v => Console.WriteLine($"  + visitor #{v.Id}: {v.Name} at {v.VisitedAt}{(v.GreetedExcitedly ? "!!!" : "")}");
+conn.Db.Visitor.OnUpdate += (_, v) => Console.WriteLine($"  ~ visitor #{v.Id}: {v.Name}");
+conn.Db.Visitor.OnDelete += v => Console.WriteLine($"  - visitor #{v.Id}");
+await conn.Db.Visitor.SubscribeAllAsync();
+Console.WriteLine($"Subscribed: {conn.Db.Visitor.Count} visitor(s) in the initial set.");
 
-var lsn = await client.CallReducerAsync("Greet", ["ConsoleVisitor"]);
+var lsn = await conn.Reducers.GreetAsync("ConsoleVisitor");
 Console.WriteLine($"Greet committed at LSN {lsn}; watching live deltas. Press Enter to exit.");
 Console.ReadLine();
 

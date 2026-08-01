@@ -39,15 +39,18 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
                 production.AddSource($"{table.SafeName}.Table.g.cs", Emitter.EmitTable(table));
         });
 
+        var moduleName = context.CompilationProvider.Select(static (compilation, _) => compilation.AssemblyName ?? "module");
+
         context.RegisterSourceOutput(
-            tables.Collect().Combine(reducers.Collect()),
-            static (production, source) => EmitModel(production, source.Left, source.Right));
+            tables.Collect().Combine(reducers.Collect()).Combine(moduleName),
+            static (production, source) => EmitModel(production, source.Left.Left, source.Left.Right, source.Right));
     }
 
     private static void EmitModel(
         SourceProductionContext production,
         ImmutableArray<TableModel> tables,
-        ImmutableArray<ReducerModel> reducers)
+        ImmutableArray<ReducerModel> reducers,
+        string moduleName)
     {
         foreach (var reducer in reducers)
         {
@@ -69,6 +72,34 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         if (validTables.Length == 0 && validReducers.Length == 0)
             return;
         production.AddSource("MelangeModel.g.cs", Emitter.EmitModel(validTables, validReducers));
+        EmitManifest(production, validTables, validReducers, moduleName);
+    }
+
+    /// <summary>
+    /// Emits the client-visible schema manifest when the module has a client-visible surface.
+    /// Enum name collisions abort the manifest with MELANGE0019 rather than shipping a contract
+    /// whose enum names are ambiguous — the manifest keys enums by the simple name the client
+    /// bindings will declare.
+    /// </summary>
+    private static void EmitManifest(
+        SourceProductionContext production,
+        TableModel[] validTables,
+        ReducerModel[] validReducers,
+        string moduleName)
+    {
+        if (!ManifestEmitter.HasClientSurface(validTables, validReducers))
+            return;
+
+        var collisions = ManifestEmitter.EnumNameCollisions(validTables, validReducers);
+        if (collisions.Length > 0)
+        {
+            foreach (var collision in collisions)
+                production.ReportDiagnostic(Diagnostic.Create(Diagnostics.AmbiguousClientEnumName, Location.None, collision));
+            return;
+        }
+
+        var (json, hash) = ManifestEmitter.Build(moduleName, validTables, validReducers);
+        production.AddSource("MelangeSchemaManifest.g.cs", ManifestEmitter.EmitHolder(json, hash));
     }
 
     /// <summary>

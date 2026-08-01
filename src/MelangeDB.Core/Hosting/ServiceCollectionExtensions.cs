@@ -60,6 +60,8 @@ public static class ServiceCollectionExtensions
             provider.GetService<ILoggerFactory>(),
             provider.GetService<TimeProvider>()));
 
+        services.TryAddSingleton(builder.Manifests);
+
         var tables = builder.Tables;
         services.TryAddSingleton(_ => new SchemaRegistry(tables));
         services.TryAddSingleton(provider => new MelangeEngine(

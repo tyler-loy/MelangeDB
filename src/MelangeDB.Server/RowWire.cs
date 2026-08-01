@@ -66,7 +66,7 @@ internal static class RowWire
         var boxed = RowSerializer.Deserialize(schema, row.ToArray());
         var columnSchema = schema.Column(column);
         var value = columnSchema.GetValue(boxed);
-        return value is null ? null : KeyCodec.Encode(columnSchema, value);
+        return value is null ? null : SchemaKeyCodec.Encode(columnSchema, value);
     }
 
     private static object? ReadValue(ref RowReader reader, ColumnKind kind) => kind switch

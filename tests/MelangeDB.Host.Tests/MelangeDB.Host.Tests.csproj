@@ -10,6 +10,9 @@
     <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\..\samples\MelangeDB.Sample.Worker\MelangeDB.Sample.Worker.csproj" />
+    <!-- The sample client carries the generated typed bindings for the worker's manifest; the
+         end-to-end sample test drives those real bindings against the real worker in-process. -->
+    <ProjectReference Include="..\..\samples\MelangeDB.Sample.Client\MelangeDB.Sample.Client.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Storage.Faster\MelangeDB.Storage.Faster.csproj" />
   </ItemGroup>

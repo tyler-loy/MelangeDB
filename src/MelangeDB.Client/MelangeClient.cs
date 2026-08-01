@@ -115,13 +115,25 @@ public sealed class MelangeClient : IAsyncDisposable
     /// Subscribes to a query and awaits the full initial set. The returned subscription's cache
     /// then stays current as deltas arrive.
     /// </summary>
-    public async Task<MelangeSubscription> SubscribeAsync(
+    public Task<MelangeSubscription> SubscribeAsync(
         string query,
         IReadOnlyDictionary<string, object?>? parameters = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        SubscribeAsync(query, parameters, sink: null, cancellationToken);
+
+    /// <summary>
+    /// The typed-cache entry point: the sink is attached before the Subscribe frame leaves, so
+    /// the initial set, every delta, and every future rescope reach the typed cache with no
+    /// window where a row could slip past unobserved.
+    /// </summary>
+    internal async Task<MelangeSubscription> SubscribeAsync(
+        string query,
+        IReadOnlyDictionary<string, object?>? parameters,
+        ISubscriptionSink? sink,
+        CancellationToken cancellationToken)
     {
         var id = Interlocked.Increment(ref _nextSubscriptionId);
-        var subscription = new MelangeSubscription(id, query, parameters);
+        var subscription = new MelangeSubscription(id, query, parameters, sink);
         _subscriptions[id] = subscription;
         await SendAsync(new SubscribeFrame(id, query, parameters) { Channel = MelangeChannels.Data }, cancellationToken).ConfigureAwait(false);
         try
