@@ -16,6 +16,7 @@ public sealed class MelangeDbBuilder
     private readonly List<TableSchema> _tables = [];
     private readonly List<ReducerDescriptor> _reducers = [];
     private readonly List<Type> _eventHandlers = [];
+    private readonly SchemaManifests _manifests = new();
 
     internal MelangeDbBuilder(IServiceCollection services) => Services = services;
 
@@ -27,6 +28,8 @@ public sealed class MelangeDbBuilder
     internal IReadOnlyList<ReducerDescriptor> Reducers => _reducers;
 
     internal IReadOnlyList<Type> EventHandlers => _eventHandlers;
+
+    internal SchemaManifests Manifests => _manifests;
 
     /// <summary>Configures the hot store. Runs after configuration binding, so code wins.</summary>
     public MelangeDbBuilder UseHotStore(Action<HotStoreOptions> configure)
@@ -52,7 +55,11 @@ public sealed class MelangeDbBuilder
     {
         ArgumentNullException.ThrowIfNull(assembly);
         if (_tableAssemblies.Add(assembly))
+        {
             _tables.AddRange(ModelOf(assembly).Tables());
+            _manifests.AddFrom(assembly);
+        }
+
         return this;
     }
 
@@ -64,7 +71,11 @@ public sealed class MelangeDbBuilder
     {
         ArgumentNullException.ThrowIfNull(assembly);
         if (_reducerAssemblies.Add(assembly))
+        {
             _reducers.AddRange(ModelOf(assembly).Reducers());
+            _manifests.AddFrom(assembly);
+        }
+
         return this;
     }
 

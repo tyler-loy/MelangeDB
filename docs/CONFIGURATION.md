@@ -210,6 +210,7 @@ to fix it without a code change and a redeploy.
 | `Transport:HeartbeatIntervalMs` | int | `15000` | live | 03 | |
 | `Transport:HeartbeatTimeoutMs` | int | `45000` | live | 03 | A closed socket is not the only way a client goes away; this is what makes `ClientDisconnected` fire on ungraceful drops. |
 | `Transport:HttpEndpointsEnabled` | bool | `true` | restart | 03 | One-shot reducer calls, bulk ingestion, tickets. WebSocket is the wrong shape for CLI tools and admin consoles. |
+| `Transport:SchemaEndpointEnabled` | bool? | *(unset)* | live | 12 | Serves the module's [schema manifest](CLIENT-BINDINGS.md) at `{path}/schema` — the Swagger pattern. Unset follows the host environment (on in Development, off elsewhere); `true`/`false` overrides in either direction. Anonymous while on, by design: the manifest carries only what every client already receives. Off means a plain 404. |
 | `Transport:MaxInitialSetChunkBytes` | int | `262144` | live | 03 | Large initial sets are chunked and interleaved so a 30MB terrain subscription can't block a movement reducer response. |
 | `Resume:RetentionWindowSeconds` | int | `300` | live | 03 | How far back a reconnecting client can resume. Too small and every blip becomes a full resync; too large and it fights log compaction. |
 | `Subscriptions:MaxPerConnection` | int | `64` | live | 03 | |

@@ -60,6 +60,95 @@ public class GeneratedOutputTests
         AssertSnapshot("MelangeModel.g.cs", "MelangeModel.expected.cs");
 
     [Fact]
+    public void Schema_manifest_matches_snapshot() =>
+        AssertSnapshot("MelangeSchemaManifest.g.cs", "MelangeSchemaManifest.expected.cs");
+
+    [Fact]
+    public void Schema_manifest_is_deterministic_across_runs()
+    {
+        var first = GeneratorTestHost.RunGenerator(SnapshotSource);
+        var second = GeneratorTestHost.RunGenerator(SnapshotSource);
+        var (_, firstManifest) = Assert.Single(first.GeneratedSources, s => s.HintName == "MelangeSchemaManifest.g.cs");
+        var (_, secondManifest) = Assert.Single(second.GeneratedSources, s => s.HintName == "MelangeSchemaManifest.g.cs");
+        Assert.Equal(firstManifest, secondManifest);
+    }
+
+    [Fact]
+    public void Schema_manifest_carries_only_the_client_visible_surface()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            public enum Rarity { Common, Epic }
+            public enum HiddenReason { Banned }
+
+            [Table(Public = true)]
+            public partial struct Item
+            {
+                [PrimaryKey] public ulong Id;
+                public Rarity Tier;
+                [ServerOnly] public HiddenReason Reason;
+            }
+
+            [Table]
+            public partial struct Audit
+            {
+                [PrimaryKey] public long Id;
+            }
+
+            [Table(Scheduled = nameof(Reducers.Tick))]
+            public partial struct TickTimer
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt At;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Grant(ReducerContext ctx, Rarity tier) { }
+
+                [Reducer]
+                public void Tick(ReducerContext ctx, TickTimer timer) { }
+
+                [Reducer(ReducerKind.ClientConnected)]
+                public void Connected(ReducerContext ctx) { }
+            }
+            """);
+        Assert.Empty(result.Errors);
+        var (_, manifest) = Assert.Single(result.GeneratedSources, s => s.HintName == "MelangeSchemaManifest.g.cs");
+
+        // Public table and its client-visible surface ship; everything server-side stays home:
+        // the private table, the [ServerOnly] column and the enum only it references, the timer
+        // table, the scheduled reducer, and the lifecycle reducer.
+        Assert.Contains("\"\"Item\"\"", manifest);
+        Assert.Contains("\"\"Rarity\"\"", manifest);
+        Assert.Contains("\"\"Grant\"\"", manifest);
+        Assert.DoesNotContain("Audit", manifest);
+        Assert.DoesNotContain("Reason", manifest);
+        Assert.DoesNotContain("HiddenReason", manifest);
+        Assert.DoesNotContain("TickTimer", manifest);
+        Assert.DoesNotContain("\"\"Tick\"\"", manifest);
+        Assert.DoesNotContain("Connected", manifest);
+    }
+
+    [Fact]
+    public void Modules_with_no_client_surface_emit_no_manifest()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table]
+            public partial struct Audit
+            {
+                [PrimaryKey] public long Id;
+            }
+            """);
+        Assert.Empty(result.Errors);
+        Assert.DoesNotContain(result.GeneratedSources, s => s.HintName == "MelangeSchemaManifest.g.cs");
+    }
+
+    [Fact]
     public void Generated_output_compiles_without_errors()
     {
         var result = GeneratorTestHost.RunGenerator(SnapshotSource);

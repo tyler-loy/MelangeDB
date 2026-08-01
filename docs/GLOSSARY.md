@@ -440,6 +440,21 @@ startup and maintained through the commit-observer seam, dispatching from a sing
 `Scheduler:CatchUpAfterDowntime`. Fires run as `MelangeScheduler.Caller`, exempt from rate limits and
 reducer policies — internal dispatch is not a client call.
 
+**Schema endpoint** — The development HTTP endpoint (`{path}/schema`) serving the module's schema manifest,
+gated the way Swagger gates its document: on in Development, `Transport:SchemaEndpointEnabled` overrides in
+either direction, anonymous while on because the manifest carries only what every client already receives.
+The exporter tool fetches from it — generate bindings against the running local dev server, no DLL path.
+
+**Schema hash** — SHA-256 over a manifest's JSON rendered with an empty `schemaHash` field. The generator
+stamps it into the manifest and into the client bindings built from it, so a connection wrapper can surface
+"these bindings were generated from a different schema" instead of leaving drift to fail as wrong columns.
+
+**Schema manifest** — The client-visible schema a module exports as `melange-schema.json`: public tables
+minus `[ServerOnly]` columns, the enum definitions that surface references, and client-callable reducer
+signatures. The contract the client binding generator consumes — deliberately JSON, not a shared assembly,
+because the wire shares no types and non-C# clients must stay possible. Format documented in
+[CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
+
 **Seam walker** — In the load-testing tool's workload, a simulated player that oscillates across one shard
 boundary, one chunk past the hysteresis margin each way, so handoff and border traffic is continuously
 exercised rather than left to chance. See [LOAD-TESTING.md](LOAD-TESTING.md).

@@ -155,6 +155,15 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor AmbiguousClientEnumName = new(
+        "MELANGE0019",
+        "Client-visible enums must have unique names",
+        "Enum name '{0}' is used by more than one enum on the client-visible surface. The schema manifest carries enums " +
+        "by simple name — that is the name the generated client bindings declare — so two public-facing enums cannot share one. Rename one of them.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(
         "MELANGE0017",
         "Full scan over a table that is not Resident",

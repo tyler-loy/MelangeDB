@@ -25,6 +25,11 @@ and **no schema** — MessagePack decoding is lossy (integers surface as `long`,
   their client-visible columns (kinds, PK/unique/index flags), enum definitions (name, underlying kind,
   members), and reducer signatures (parameter names, kinds, arrays). A small exporter
   (`tools/MelangeDB.SchemaExport`) writes it from a built module assembly as `melange-schema.json`.
+- **The manifest served from the running server** — added during the phase: `GET {path}/schema`, gated the
+  way Swagger gates its document (on in Development, `Transport:SchemaEndpointEnabled` overrides), and the
+  exporter accepts a URL as well as a DLL path, so the workflow is "generate from the running local dev
+  server". One writer, two sources, byte-identical output; the Roslyn generator itself stays file-only —
+  no network in a compiler.
 - **`MelangeClientGenerator`** in the existing `MelangeDB.CodeGen` package, triggered by a
   `melange-schema.json` AdditionalFile. Emits: row structs and enums, a typed connection wrapper over
   `MelangeClient` with `.Db.<Table>` cache handles and `.Reducers.<Name>(…)` stubs, and subscription
@@ -102,6 +107,29 @@ The decisions the plan left to the implementer, as they were actually taken.
   and `ColumnSchema`/`ColumnKind` are Core types with no business in Abstractions. They stay in
   Core as `SchemaKeyCodec`, delegating every byte decision to the Abstractions class so the two
   cannot drift. Call sites were fixed directly — no type-forward, no re-export, pre-1.0.
+- **Manifest discovery is a well-known generated type, not an attribute.** The generator embeds the JSON
+  as `MelangeDB.Generated.MelangeSchemaManifest` (`Json` + `Hash` constants); the exporter and the host
+  builder read it by type name. An assembly-level attribute would have added public API surface to
+  Abstractions for no gain — the type name is as much a contract as an attribute name, and reading a
+  constant runs no module code.
+- **What the manifest excludes, and why.** Lifecycle reducers (the transport fires them; a client call is
+  meaningless) and timer-row reducers (their argument is the server codec's own row bytes for a private
+  table — a stub would invite constructing it). Enums referenced only by `[ServerOnly]` columns or private
+  tables stay home. Enum member values ride as invariant decimal *strings* so `ulong`-backed enums survive
+  JSON readers that parse numbers as doubles.
+- **Enum identity is the simple name.** The manifest keys enums by the name the client bindings will
+  declare; two client-visible enums sharing a simple name across namespaces is refused at the server build
+  with MELANGE0019 rather than shipped as an ambiguous contract.
+- **The schema endpoint rides `MapMelangeSocket`, anonymous while on.** It is part of the same client
+  surface the socket serves, so it maps with it rather than as a separate opt-in call. The transport
+  authenticates per endpoint (there is no blanket auth middleware to fight), so anonymity is a local
+  choice: the manifest carries only what every authenticated client already receives, and the dev-default
+  gate is posture, not secrecy. Off means a plain 404 — a probe learns nothing. Multi-module hosts get a
+  404 with an explanation rather than one-of-several: serving a single module's manifest as "the schema"
+  would misstate it; per-module export via the tool covers that case.
+- **The endpoint gate is evaluated per request.** `Transport:SchemaEndpointEnabled` is live-reloadable, so
+  the route maps unconditionally and answers 404 while disabled, rather than existing only when enabled at
+  startup.
 
 ## Risks
 

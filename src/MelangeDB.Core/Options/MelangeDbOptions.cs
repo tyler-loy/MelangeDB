@@ -434,6 +434,16 @@ public sealed class TransportOptions
     public bool HttpEndpointsEnabled { get; set; } = true;
 
     /// <summary>
+    /// Serves the module's client-visible schema manifest at <c>{path}/schema</c> — the Swagger
+    /// pattern: on in Development, off elsewhere, and this key overrides in either direction.
+    /// Null (the default) means "follow the host environment". The manifest carries only what
+    /// every client already receives — public tables, non-<c>[ServerOnly]</c> columns, reducer
+    /// signatures — and the endpoint is anonymous while it is enabled; keeping it dev-default
+    /// is posture, not secrecy.
+    /// </summary>
+    public bool? SchemaEndpointEnabled { get; set; }
+
+    /// <summary>
     /// Initial result sets are chunked at this size and interleaved with interactive frames, so a
     /// large terrain subscription cannot head-of-line block a reducer response.
     /// </summary>

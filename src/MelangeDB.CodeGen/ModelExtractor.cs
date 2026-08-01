@@ -59,19 +59,20 @@ internal static class ModelExtractor
             (context.TargetNode as StructDeclarationSyntax)?.Identifier.GetLocation() ?? context.TargetNode.GetLocation());
         var diagnostics = new List<DiagnosticInfo>();
         var columns = new List<ColumnModel>();
+        var enums = new List<EnumModel>();
 
         // Fields first, then read-write properties — matching the reflection path's
         // MetadataToken ordering, so both serializers agree on column order.
         foreach (var member in type.GetMembers())
         {
             if (member is IFieldSymbol { IsStatic: false, IsConst: false, DeclaredAccessibility: Accessibility.Public, IsImplicitlyDeclared: false } field)
-                AddColumn(columns, diagnostics, tableName, isPublic, placement, field, field.Type, isProperty: false);
+                AddColumn(columns, diagnostics, enums, tableName, isPublic, placement, field, field.Type, isProperty: false);
         }
 
         foreach (var member in type.GetMembers())
         {
             if (member is IPropertySymbol { IsStatic: false, DeclaredAccessibility: Accessibility.Public, GetMethod: not null, SetMethod: not null, IsIndexer: false } property)
-                AddColumn(columns, diagnostics, tableName, isPublic, placement, property, property.Type, isProperty: true);
+                AddColumn(columns, diagnostics, enums, tableName, isPublic, placement, property, property.Type, isProperty: true);
         }
 
         var primaryKeys = columns.Count(static c => c.IsPrimaryKey);
@@ -120,7 +121,8 @@ internal static class ModelExtractor
             ShardBy: shardBy,
             Scheduled: scheduled,
             Columns: new EquatableArray<ColumnModel>([.. columns]),
-            Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]));
+            Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]),
+            Enums: new EquatableArray<EnumModel>([.. enums]));
     }
 
     public static ReducerModel? ExtractReducer(GeneratorAttributeSyntaxContext context)
@@ -164,6 +166,7 @@ internal static class ModelExtractor
             AddSignature(diagnostics, location, reducerName, "must be declared on a non-generic, public-or-internal class");
 
         var parameters = new List<ParameterModel>();
+        var enums = new List<EnumModel>();
         if (method.Parameters.Length == 0 || method.Parameters[0].Type.ToDisplayString() != "MelangeDB.ReducerContext")
         {
             AddSignature(diagnostics, location, reducerName, "must take ReducerContext as its first parameter");
@@ -209,6 +212,10 @@ internal static class ModelExtractor
                     continue;
                 }
 
+                if (model.IsEnum)
+                    AddEnum(enums, parameter.Type);
+                else if (model.ElementIsEnum && parameter.Type is IArrayTypeSymbol enumArray)
+                    AddEnum(enums, enumArray.ElementType);
                 parameters.Add(model);
             }
         }
@@ -228,7 +235,8 @@ internal static class ModelExtractor
             Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]),
             DeclaredSite: declaredSite,
             TouchedTables: touched,
-            OpaqueBody: opaque);
+            OpaqueBody: opaque,
+            Enums: new EquatableArray<EnumModel>([.. enums]));
     }
 
     /// <summary>
@@ -348,6 +356,7 @@ internal static class ModelExtractor
     private static void AddColumn(
         List<ColumnModel> columns,
         List<DiagnosticInfo> diagnostics,
+        List<EnumModel> enums,
         string tableName,
         bool isPublic,
         string placement,
@@ -357,6 +366,8 @@ internal static class ModelExtractor
     {
         var location = LocationInfo.From(member.Locations.FirstOrDefault() ?? Location.None);
         var (kind, isEnum, _) = Classify(memberType);
+        if (isEnum)
+            AddEnum(enums, memberType);
         var isPrimaryKey = HasAttribute(member, "PrimaryKeyAttribute");
         var isAutoInc = HasAttribute(member, "AutoIncAttribute");
         var isUnique = HasAttribute(member, "UniqueAttribute");
@@ -432,6 +443,33 @@ internal static class ModelExtractor
             ElementClrFqn: string.Empty,
             ElementIsEnum: false,
             ElementEnumUnderlyingFqn: string.Empty);
+    }
+
+    /// <summary>
+    /// Captures an enum's full definition — name, underlying kind, members — so the schema
+    /// manifest can carry it to client compilations that never see the declaring assembly.
+    /// Deduplicated by fully qualified name within one table or reducer.
+    /// </summary>
+    private static void AddEnum(List<EnumModel> enums, ITypeSymbol type)
+    {
+        var fqn = Fqn(type);
+        if (enums.Any(e => e.Fqn == fqn))
+            return;
+        var (underlying, _, _) = type is INamedTypeSymbol { EnumUnderlyingType: { } underlyingType }
+            ? Classify(underlyingType)
+            : (WireKind.Int32, false, string.Empty);
+        var members = new List<EnumMemberModel>();
+        foreach (var member in type.GetMembers())
+        {
+            if (member is IFieldSymbol { HasConstantValue: true } field)
+            {
+                members.Add(new EnumMemberModel(
+                    field.Name,
+                    string.Format(System.Globalization.CultureInfo.InvariantCulture, "{0}", field.ConstantValue)));
+            }
+        }
+
+        enums.Add(new EnumModel(type.Name, fqn, underlying, new EquatableArray<EnumMemberModel>([.. members])));
     }
 
     private static void AddSignature(List<DiagnosticInfo> diagnostics, LocationInfo location, string reducerName, string reason) =>

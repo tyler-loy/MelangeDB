@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -68,7 +69,45 @@ public static class MelangeEndpointRouteBuilderExtensions
             endpoints.MapPost(basePath + "/ticket", context => MelangeHttpEndpoints.TicketAsync(context, transport));
         }
 
+        // The schema manifest, served the way Swagger serves its document: on in Development,
+        // overridable by Transport:SchemaEndpointEnabled, anonymous while on (the manifest is
+        // the client-visible surface — nothing in it isn't already on every client's wire), and
+        // a plain 404 while off, so a probe learns nothing. Mapped unconditionally and gated per
+        // request, because the option is live-reloadable and the environment is not.
+        var environment = services.GetService<IHostEnvironment>();
+        var manifests = services.GetService<SchemaManifests>();
+        endpoints.MapGet(basePath + "/schema", context => ServeSchemaAsync(context, options, environment, manifests));
+
         return socket;
+    }
+
+    private static async Task ServeSchemaAsync(
+        HttpContext context,
+        IOptionsMonitor<MelangeDbOptions> options,
+        IHostEnvironment? environment,
+        SchemaManifests? manifests)
+    {
+        var enabled = options.CurrentValue.Transport.SchemaEndpointEnabled
+            ?? environment?.IsDevelopment()
+            ?? false;
+        if (!enabled)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        if (manifests?.Single is not { } manifest)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            await context.Response.WriteAsync(manifests is { All.Count: > 1 }
+                ? "This host registered several module assemblies with schema manifests; serving one of many would misstate the schema. Export per module with tools/MelangeDB.SchemaExport instead."
+                : "No registered module assembly carries a generated schema manifest. Reference the MelangeDB.CodeGen analyzer and declare a public table or a reducer.").ConfigureAwait(false);
+            return;
+        }
+
+        context.Response.ContentType = "application/json; charset=utf-8";
+        context.Response.Headers.ETag = $"\"{manifest.Hash}\"";
+        await context.Response.WriteAsync(manifest.Json).ConfigureAwait(false);
     }
 
     private static async Task HandleSocketAsync(HttpContext context, MelangeTransport transport)

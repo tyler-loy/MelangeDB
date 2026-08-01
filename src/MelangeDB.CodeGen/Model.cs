@@ -103,6 +103,19 @@ internal enum WireKind
     ScheduleAt,
 }
 
+/// <summary>One member of a client-visible enum; the value rides as invariant decimal text.</summary>
+internal sealed record EnumMemberModel(string Name, string Value);
+
+/// <summary>
+/// An enum referenced by a column or reducer parameter, captured whole so the schema manifest can
+/// carry the definition to clients that never see the server compilation.
+/// </summary>
+internal sealed record EnumModel(
+    string Name,
+    string Fqn,
+    WireKind Underlying,
+    EquatableArray<EnumMemberModel> Members);
+
 internal sealed record ColumnModel(
     string Name,
     WireKind Kind,
@@ -133,7 +146,8 @@ internal sealed record TableModel(
     string? ShardBy,
     string? Scheduled,
     EquatableArray<ColumnModel> Columns,
-    EquatableArray<DiagnosticInfo> Diagnostics)
+    EquatableArray<DiagnosticInfo> Diagnostics,
+    EquatableArray<EnumModel> Enums = default)
 {
     public bool IsValid => Diagnostics.Items.All(d => d.DescriptorId is "MELANGE0003" or "MELANGE0007");
 }
@@ -162,7 +176,8 @@ internal sealed record ReducerModel(
     EquatableArray<DiagnosticInfo> Diagnostics,
     string DeclaredSite = "Auto",
     EquatableArray<string> TouchedTables = default,
-    bool OpaqueBody = false)
+    bool OpaqueBody = false,
+    EquatableArray<EnumModel> Enums = default)
 {
     public bool IsValid => Diagnostics.Length == 0;
 
