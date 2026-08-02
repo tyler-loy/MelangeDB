@@ -124,6 +124,11 @@ shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> Ha
 block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
 next border re-subscribe, when the owner sends a full band reset.
 
+**Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
+the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid
+bearer token: bulk writes bypass every reducer and its policies, so the endpoint now follows the `Sql:*`
+posture — off unless opted into, and owner-role-gated when on. See the Bulk ingestion section below.
+
 ## Conventions
 
 - **Everything lives under the `MelangeDb:` configuration section**, so a host can bind it from
@@ -195,6 +200,19 @@ to fix it without a code change and a redeploy.
 | `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Since 08, `Owner` additionally requires the caller's `Sql:OwnerRole` claim, may name private *relational-tier* tables, and is the only mode that runs aggregates. |
 | `Sql:OwnerRole` | string | `melange-owner` | live | 08 | The role claim that authorizes a caller when `AdHocMode` is `Owner` — the per-caller half of the two-mode contract, per the `Auth:GuestRole` precedent (the IdP is the gate). A caller without it is refused (`403 owner_required`), never silently downgraded to policy-enforced. Empty makes owner mode unusable by everyone. |
 
+## Bulk ingestion
+
+| Key | Type | Default | Reload | Phase | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `Bulk:Enabled` | bool | `false` | live | #31 | Gates the whole `/melange/bulk` endpoint; off answers `403 bulk_disabled`. Off by default because bulk ingestion is a trusted-pipeline surface: rows land with **no reducer policy, no argument validation, and no reducer-body invariants** — a deployment that never opted in should not be exposing one. |
+| `Bulk:OwnerRole` | string | `melange-bulk-owner` | live | #31 | The role claim that authorizes a caller on `/melange/bulk`, per the `Sql:OwnerRole` precedent (the IdP is the gate). Deliberately a **distinct key from `Sql:OwnerRole`** — read-everything and write-anything are different capabilities; an operator who wants one god-role sets both keys to the same value. A caller without it is refused (`403 owner_required`), never silently downgraded. Empty makes bulk ingestion unusable by everyone. |
+
+**Why this exists** (issue #31): `/melange/bulk` is the one write path where "the reducer is the
+authorization boundary" does not hold — it bypasses all reducers at once, so a syntactically valid bearer
+token (which, in a game, every player holds) must not be enough. `Transport:HttpEndpointsEnabled` still
+turns off all plain-HTTP endpoints together; these keys gate bulk independently, so a host can serve `/sql`
+to its admin console without also serving unauthenticated-in-effect bulk writes to its players.
+
 ## Transport and subscriptions
 
 | Key | Type | Default | Reload | Phase | Notes |
@@ -209,7 +227,7 @@ to fix it without a code change and a redeploy.
 | `Transport:CompressionEnabled` | bool | `true` | restart | 03 | `permessage-deflate`. Terrain blobs are already RLE-compressed; delta frames of many small rows are what benefit. |
 | `Transport:HeartbeatIntervalMs` | int | `15000` | live | 03 | |
 | `Transport:HeartbeatTimeoutMs` | int | `45000` | live | 03 | A closed socket is not the only way a client goes away; this is what makes `ClientDisconnected` fire on ungraceful drops. |
-| `Transport:HttpEndpointsEnabled` | bool | `true` | restart | 03 | One-shot reducer calls, bulk ingestion, tickets. WebSocket is the wrong shape for CLI tools and admin consoles. |
+| `Transport:HttpEndpointsEnabled` | bool | `true` | restart | 03 | One-shot reducer calls, bulk ingestion, tickets. WebSocket is the wrong shape for CLI tools and admin consoles. Bulk ingestion additionally requires its own opt-in — see the Bulk ingestion section. |
 | `Transport:SchemaEndpointEnabled` | bool? | *(unset)* | live | 12 | Serves the module's [schema manifest](CLIENT-BINDINGS.md) at `{path}/schema` — the Swagger pattern. Unset follows the host environment (on in Development, off elsewhere); `true`/`false` overrides in either direction. Anonymous while on, by design: the manifest carries only what every client already receives. Off means a plain 404. |
 | `Transport:MaxInitialSetChunkBytes` | int | `262144` | live | 03 | Large initial sets are chunked and interleaved so a 30MB terrain subscription can't block a movement reducer response. |
 | `Resume:RetentionWindowSeconds` | int | `300` | live | 03 | How far back a reconnecting client can resume. Too small and every blip becomes a full resync; too large and it fights log compaction. |

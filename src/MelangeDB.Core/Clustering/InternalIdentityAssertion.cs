@@ -17,7 +17,9 @@ public static class InternalIdentityAssertion
     /// <summary>The token prefix marking an assertion; anything else is an ordinary bearer JWT.</summary>
     public const string Prefix = "mliassert1.";
 
-    private sealed record Payload(string I, bool G, long E, bool O, bool L);
+    // B (bulk owner) is additive and fail-closed: an assertion minted before the field existed
+    // deserializes it to false, so an old token can never confer the new capability.
+    private sealed record Payload(string I, bool G, long E, bool O, bool L, bool B);
 
     /// <summary>
     /// Mints an assertion for one identity, valid until <paramref name="expiresAt"/>.
@@ -30,12 +32,13 @@ public static class InternalIdentityAssertion
         Identity identity,
         bool isGuest,
         bool isSqlOwner,
+        bool isBulkOwner,
         DateTimeOffset expiresAt,
         bool firesLifecycle = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(secret);
         var payload = JsonSerializer.SerializeToUtf8Bytes(
-            new Payload(identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle));
+            new Payload(identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle, isBulkOwner));
         var signature = HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), payload);
         return Prefix + Convert.ToBase64String(payload) + "." + Convert.ToBase64String(signature);
     }
@@ -49,7 +52,7 @@ public static class InternalIdentityAssertion
     /// a reason on any failure — a tampered or expired assertion must read as "not authenticated",
     /// never as a different identity.
     /// </summary>
-    public static (Identity Identity, bool IsGuest, bool IsSqlOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle)? Validate(
+    public static (Identity Identity, bool IsGuest, bool IsSqlOwner, bool IsBulkOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle)? Validate(
         string secret,
         string token,
         DateTimeOffset now,
@@ -114,6 +117,6 @@ public static class InternalIdentityAssertion
             return null;
         }
 
-        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, expiresAt, parsed.L);
+        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, expiresAt, parsed.L);
     }
 }

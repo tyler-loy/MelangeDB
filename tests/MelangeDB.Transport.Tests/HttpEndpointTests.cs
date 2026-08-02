@@ -56,8 +56,13 @@ public class HttpEndpointTests
     [Fact]
     public async Task Bulk_ingestion_appends_one_write_set_not_one_transaction_per_row()
     {
-        await using var host = await TransportTestHost.StartAsync();
-        using var http = host.CreateHttp();
+        // Bulk is off by default and owner-gated since issue #31; this test is about the write
+        // path, so it opts in and presents the owner claim.
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
+        {
+            ["MelangeDb:Bulk:Enabled"] = "true",
+        });
+        using var http = host.CreateHttp(TestTokens.For(TestTokens.DefaultSubject, role: "melange-bulk-owner"));
         var headBefore = host.Engine.Log.HeadLsn;
 
         var rows = string.Join(',', Enumerable.Range(0, 1000).Select(i =>

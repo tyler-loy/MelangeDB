@@ -78,12 +78,31 @@ internal static class MelangeHttpEndpoints
 
     /// <summary>
     /// POST {path}/bulk — bulk ingestion: <c>{"tables": {"TableName": [{...row}, ...]}}</c>,
-    /// appended as one write set, one log record, not one transaction per row.
+    /// appended as one write set, one log record, not one transaction per row. Off until
+    /// <c>Bulk:Enabled</c> opts in, and requires the caller's <c>Bulk:OwnerRole</c> claim —
+    /// bulk writes bypass every reducer and its policies, so any valid token is not enough.
     /// </summary>
     public static async Task BulkAsync(HttpContext context, MelangeTransport transport)
     {
         if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
             return;
+        var bulkOptions = transport.Options.Bulk;
+        if (!bulkOptions.Enabled)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.BulkDisabled,
+                "Bulk ingestion is disabled; set Bulk:Enabled to true to opt in.").ConfigureAwait(false);
+            return;
+        }
+
+        if (!session.IsBulkOwner)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.OwnerRequired,
+                "This caller's token carries no Bulk:OwnerRole claim; bulk owner capability is never granted implicitly.").ConfigureAwait(false);
+            return;
+        }
+
         List<BulkRow> rows = [];
         try
         {

@@ -42,6 +42,7 @@ public static class MelangeEndpointRouteBuilderExtensions
             services,
             () => options.CurrentValue.Auth,
             () => options.CurrentValue.Sql,
+            () => options.CurrentValue.Bulk,
             () => options.CurrentValue.Cluster,
             services.GetService<TimeProvider>());
         authenticator.EnsureSchemeConfigured();

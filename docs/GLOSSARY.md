@@ -145,7 +145,15 @@ store's total declared footprint is the pool cap plus the residency report. Spli
 out-of-line blobs, so blob churn cannot evict hot main records.
 
 **Bulk ingestion** — A path appending one large write set instead of one transaction per row, for world
-generation and similar mass loads.
+generation and similar mass loads. The one write path where the reducer is not the authorization boundary —
+no reducer policy, argument validation, or reducer-body invariant runs — so on the wire it is off by default
+(`Bulk:Enabled`) and requires the bulk owner role when on (issue #31); `MelangeEngine.BulkInsert` itself
+stays ungated because direct engine callers are the host's own code.
+
+**Bulk owner role** — The role claim (`Bulk:OwnerRole`, default `melange-bulk-owner`) that authorizes a
+caller on `/melange/bulk`. The IdP is the gate: bulk-write capability is a claim it issues, refused outright
+when absent, never silently downgraded. Deliberately distinct from `Sql:OwnerRole` — read-everything and
+write-anything are different capabilities; set both keys to the same value for one god-role.
 
 **Call-to-delta latency** — The load-testing tool's headline number: the time from issuing a reducer call to
 the matching row change arriving back on the *caller's own subscription*. Measures the full path — gateway

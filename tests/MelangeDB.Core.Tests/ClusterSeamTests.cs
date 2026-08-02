@@ -280,7 +280,8 @@ public class InternalIdentityAssertionTests
     public void A_minted_assertion_validates_and_round_trips_its_claims()
     {
         var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);
-        var token = InternalIdentityAssertion.Mint("secret", Player, isGuest: true, isSqlOwner: false, expires, firesLifecycle: true);
+        var token = InternalIdentityAssertion.Mint(
+            "secret", Player, isGuest: true, isSqlOwner: false, isBulkOwner: true, expires, firesLifecycle: true);
 
         var result = InternalIdentityAssertion.Validate("secret", token, expires.AddMinutes(-1), out var failure);
 
@@ -289,14 +290,51 @@ public class InternalIdentityAssertionTests
         Assert.Equal(Player, result!.Value.Identity);
         Assert.True(result.Value.IsGuest);
         Assert.False(result.Value.IsSqlOwner);
+        Assert.True(result.Value.IsBulkOwner);
         Assert.True(result.Value.FiresLifecycle);
+    }
+
+    [Fact]
+    public void An_assertion_minted_without_bulk_owner_validates_without_it()
+    {
+        var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);
+        var token = InternalIdentityAssertion.Mint(
+            "secret", Player, isGuest: false, isSqlOwner: true, isBulkOwner: false, expires);
+
+        var result = InternalIdentityAssertion.Validate("secret", token, expires.AddMinutes(-1), out var failure);
+
+        Assert.Null(failure);
+        Assert.True(result!.Value.IsSqlOwner);
+        Assert.False(result.Value.IsBulkOwner);
+    }
+
+    [Fact]
+    public void A_payload_serialized_without_the_B_field_validates_with_bulk_owner_false()
+    {
+        // A hand-built payload the way a pre-#31 node would have minted it — no "B" property at
+        // all. Fail-closed means an old assertion can never confer the new capability.
+        var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);
+        var payload = System.Text.Encoding.UTF8.GetBytes(
+            $"{{\"I\":\"{Player}\",\"G\":false,\"E\":{expires.ToUnixTimeSeconds()},\"O\":true,\"L\":true}}");
+        var signature = System.Security.Cryptography.HMACSHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes("secret"), payload);
+        var token = InternalIdentityAssertion.Prefix
+            + Convert.ToBase64String(payload) + "." + Convert.ToBase64String(signature);
+
+        var result = InternalIdentityAssertion.Validate("secret", token, expires.AddMinutes(-1), out var failure);
+
+        Assert.Null(failure);
+        Assert.NotNull(result);
+        Assert.Equal(Player, result!.Value.Identity);
+        Assert.True(result.Value.IsSqlOwner);
+        Assert.False(result.Value.IsBulkOwner);
     }
 
     [Fact]
     public void An_expired_assertion_is_rejected()
     {
         var expires = DateTimeOffset.UnixEpoch.AddHours(1);
-        var token = InternalIdentityAssertion.Mint("secret", Player, false, false, expires);
+        var token = InternalIdentityAssertion.Mint("secret", Player, false, false, false, expires);
 
         Assert.Null(InternalIdentityAssertion.Validate("secret", token, expires.AddSeconds(1), out var failure));
         Assert.Contains("expired", failure);
@@ -305,7 +343,7 @@ public class InternalIdentityAssertionTests
     [Fact]
     public void A_tampered_assertion_fails_the_signature_check()
     {
-        var token = InternalIdentityAssertion.Mint("secret", Player, false, false, DateTimeOffset.UnixEpoch.AddDays(10_000));
+        var token = InternalIdentityAssertion.Mint("secret", Player, false, false, false, DateTimeOffset.UnixEpoch.AddDays(10_000));
         var payload = Convert.FromBase64String(token[InternalIdentityAssertion.Prefix.Length..].Split('.')[0]);
         payload[10] ^= 0xFF;
         var tampered = InternalIdentityAssertion.Prefix
@@ -318,7 +356,7 @@ public class InternalIdentityAssertionTests
     [Fact]
     public void An_assertion_minted_with_a_different_secret_is_rejected()
     {
-        var token = InternalIdentityAssertion.Mint("other-secret", Player, false, false, DateTimeOffset.UnixEpoch.AddDays(10_000));
+        var token = InternalIdentityAssertion.Mint("other-secret", Player, false, false, false, DateTimeOffset.UnixEpoch.AddDays(10_000));
         Assert.Null(InternalIdentityAssertion.Validate("secret", token, DateTimeOffset.UnixEpoch, out var failure));
         Assert.Contains("signature", failure);
     }

@@ -49,6 +49,11 @@ admin console runs **one-shot SQL over HTTP**, and terrain-gen **bulk-loads ~24.
 subscription protocol.
 - `POST /melange/call/{reducer}` — one-shot reducer invocation for tooling and CLIs.
 - `POST /melange/bulk` — the bulk ingestion path (one large write set, not one transaction per row).
+  Settled later (issue #31): the endpoint shipped answering any valid bearer token, which in a game every
+  player holds — and bulk writes bypass every reducer and its policies. It is now off by default
+  (`Bulk:Enabled`) and requires the `Bulk:OwnerRole` claim when on, mirroring the `Sql:*` posture; the
+  role is deliberately distinct from `Sql:OwnerRole` because read-everything and write-anything are
+  different capabilities.
 - `POST /melange/sql` — ad-hoc query endpoint; the aggregate-capable implementation lands in phase 08.
 - `POST /melange/ticket` — mints a short-lived connect ticket (phase 04).
 

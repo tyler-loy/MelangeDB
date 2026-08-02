@@ -28,6 +28,8 @@ public sealed class MelangeDbOptions
 
     public SqlOptions Sql { get; set; } = new();
 
+    public BulkOptions Bulk { get; set; } = new();
+
     public SchedulerOptions Scheduler { get; set; } = new();
 
     public EventsOptions Events { get; set; } = new();
@@ -401,6 +403,27 @@ public sealed class SqlOptions
     /// unusable by everyone.
     /// </summary>
     public string OwnerRole { get; set; } = "melange-owner";
+}
+
+/// <summary>Bulk ingestion options (<c>MelangeDb:Bulk:*</c>).</summary>
+public sealed class BulkOptions
+{
+    /// <summary>
+    /// Whether <c>{path}/bulk</c> answers at all. Off by default: bulk ingestion is a
+    /// trusted-pipeline surface that writes rows past every reducer and its policies, and a
+    /// deployment that never opted in should not be exposing one.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// The role claim that authorizes a caller on <c>{path}/bulk</c>, following the
+    /// <c>Sql:OwnerRole</c> precedent: the IdP is the gate, and bulk-write capability is a claim
+    /// it issues, not a list MelangeDB keeps. Deliberately distinct from <c>Sql:OwnerRole</c> —
+    /// read-everything and write-anything are different capabilities; an operator who wants one
+    /// god-role sets both keys to the same value. A caller without this role is refused outright,
+    /// never silently downgraded. Empty makes bulk ingestion unusable by everyone.
+    /// </summary>
+    public string OwnerRole { get; set; } = "melange-bulk-owner";
 }
 
 /// <summary>Options for the websocket and HTTP transport (<c>MelangeDb:Transport:*</c>).</summary>

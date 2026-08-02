@@ -252,7 +252,7 @@ public class ClusterAcceptanceTests
     public async Task The_gateway_refuses_internal_identity_assertions_from_clients()
     {
         var assertion = InternalIdentityAssertion.Mint(
-            ClusterFixture.Secret, ClusterFixture.Caller, false, false, DateTimeOffset.UtcNow.AddMinutes(5));
+            ClusterFixture.Secret, ClusterFixture.Caller, false, false, false, DateTimeOffset.UtcNow.AddMinutes(5));
         var serializer = new MessagePackFrameSerializer();
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(_cluster.GatewayUri, TestContext.Current.CancellationToken);

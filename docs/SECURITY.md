@@ -121,6 +121,20 @@ reducer carry an annotation. **Decided and shipped in phase 04**: allow-by-defau
 test so it cannot silently regress. Policies apply to client-originated calls only; in-process dispatch is
 the host's own code. Denial happens before any transaction opens — no log record exists for a refused call.
 
+### The bulk ingestion boundary
+
+Everything above rests on one premise: **the reducer is the authorization boundary** — reducer policies,
+argument validation, and reducer-body invariants stand between a client and the tables. Bulk ingestion
+(`/melange/bulk`) is the one write path where that premise does not hold. Bulk writes are direct: no
+`[Reducer(Policy = ...)]`, no row policy, no argument validation, none of the invariants a reducer body
+enforces — a path that bypasses all reducers at once, which is why gating it per caller cannot be left to
+each host to remember (issue #31 found it authorized by nothing beyond a syntactically valid bearer token,
+which every player holds). So the endpoint carries the `Sql:*` posture as a default rather than a recipe:
+**off unless `Bulk:Enabled` opts in, and refused without the caller's `Bulk:OwnerRole` claim when on** —
+a role deliberately distinct from `Sql:OwnerRole`, because read-everything and write-anything are different
+capabilities. `MelangeEngine.BulkInsert` itself stays ungated on purpose: the trust boundary is the wire,
+and direct engine callers are the host's own code (see "Explicitly not defended against").
+
 ## Gap 3 — Subscription cost limits
 
 Nothing currently stops a client from subscribing to `SELECT * FROM terrain_chunk_data` with no predicate and
