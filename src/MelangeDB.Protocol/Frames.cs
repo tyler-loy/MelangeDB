@@ -72,6 +72,7 @@ public static class MelangeErrorCodes
     public const string TokenExpired = "token_expired";
     public const string IdentityChanged = "identity_changed";
     public const string SqlDisabled = "sql_disabled";
+    public const string BulkDisabled = "bulk_disabled";
     public const string OwnerRequired = "owner_required";
     public const string InvalidAggregate = "invalid_aggregate";
     public const string NotRelationalTier = "not_relational";

@@ -442,7 +442,9 @@ public sealed class MelangeEngine : IDisposable
     /// values keyed by name; zero or missing <c>[AutoInc]</c> columns are allocated, explicit
     /// values observed. Returns null when <paramref name="rows"/> is empty. Unique indexes are
     /// checked against committed state, not within the batch — the batch is the loader's to keep
-    /// consistent.
+    /// consistent. Deliberately ungated: callers on the wire are gated at the HTTP endpoint
+    /// (<c>Bulk:Enabled</c> plus the <c>Bulk:OwnerRole</c> claim); direct engine callers are the
+    /// host's own code and are trusted.
     /// </summary>
     public CommitRecord? BulkInsert(Identity caller, IReadOnlyList<BulkRow> rows, ConnectionId connectionId = default)
     {
