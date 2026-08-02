@@ -52,6 +52,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             services,
             () => _options.CurrentValue.Auth,
             () => _options.CurrentValue.Sql,
+            () => _options.CurrentValue.Bulk,
             () => _options.CurrentValue.Cluster,
             _time);
     }

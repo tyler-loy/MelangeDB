@@ -39,6 +39,7 @@ internal sealed class GatewayRuntime
             services,
             () => Options.CurrentValue.Auth,
             () => Options.CurrentValue.Sql,
+            () => Options.CurrentValue.Bulk,
             () => Options.CurrentValue.Cluster,
             Time);
     }
