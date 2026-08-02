@@ -311,4 +311,54 @@ public class QueryShapeTests
             client.SubscribeAsync("DELETE FROM PlayerState", cancellationToken: TestContext.Current.CancellationToken));
         Assert.Equal(MelangeErrorCodes.ParseError, garbage.Code);
     }
+
+    /// <summary>
+    /// A primary-key range must read only the rows inside it — never the rows it passes to get
+    /// there.
+    ///
+    /// <para>The moving-range tests above all range over <c>X</c>, which is <c>[Index]</c>ed, so
+    /// they take <c>ScanIndexRange</c> and the primary-key range path went uncovered on cost. It
+    /// filtered a full <c>Scan</c>, so a window near the end of a table materialized every row
+    /// below it and discarded them: cost proportional to the window's distance from row zero, on
+    /// exactly the subscription shape terrain streaming uses. Rows below the low bound cannot
+    /// match an ordered key walk, so reading them is never work — this asserts the walk stays a
+    /// walk.</para>
+    /// </summary>
+    [Fact]
+    public async Task Primary_key_range_reads_only_the_rows_inside_the_range()
+    {
+        await using var host = await TransportTestHost.StartAsync();
+        for (var i = 0L; i < 500; i++)
+            host.Call("SetChunk", i, i, new byte[64]);
+
+        await using var client = host.CreateClient();
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var chunk = host.Engine.Schema.Get(typeof(Chunk));
+        long RowsScanned() => host.Engine.HotStore.Statistics().Tables.Single(t => t.Table == chunk.Id).RowsScanned;
+
+        // The window sits at the far end deliberately: under the old shape this cost 490 row
+        // reads to deliver 10, and a window at the near end would have hidden that.
+        var before = RowsScanned();
+        var subscription = await client.SubscribeAsync(
+            "SELECT * FROM Chunk WHERE Id BETWEEN :lo AND :hi",
+            new Dictionary<string, object?> { ["lo"] = 490L, ["hi"] = 499L },
+            TestContext.Current.CancellationToken);
+        Assert.Equal(10, subscription.Count);
+        Assert.Equal(0, RowsScanned() - before);
+
+        // And the re-scope path, which walks the table twice — once for the old window, once for
+        // the new — so it is the one a player crossing chunk boundaries pays over and over.
+        before = RowsScanned();
+        await client.RescopeAsync(
+            subscription,
+            new Dictionary<string, object?> { ["lo"] = 480L, ["hi"] = 489L },
+            TestContext.Current.CancellationToken);
+        // Not Count == 10: the window is the same size before and after, so a count check passes
+        // instantly against the *old* window and asserts nothing. Wait for the new bound.
+        await TransportTestHost.WaitUntilAsync(
+            () => subscription.Count == 10 && subscription.Rows.Min(r => (long)r.Columns["Id"]!) == 480L,
+            "the rescope diff");
+        Assert.Equal(0, RowsScanned() - before);
+    }
 }
