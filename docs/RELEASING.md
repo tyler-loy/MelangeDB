@@ -33,7 +33,8 @@ Three packages are not plain class libraries:
 Simple and boring, on purpose:
 
 - **`VersionPrefix` in `Directory.Build.props` is the single source of truth** for the next
-  release (currently `0.1.0`).
+  release. Read it there rather than here — a version repeated in prose is a version that goes
+  stale the first time someone releases without noticing the second copy.
 - **Publishing a GitHub Release publishes that version** to nuget.org. The publish job refuses a
   release whose tag does not match `VersionPrefix` exactly — bump the prefix in the same PR that
   prepares the release, then tag the merge commit.
