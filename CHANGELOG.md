@@ -10,8 +10,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing has been released yet. `0.1.0` will be the first tagged version. Everything below is what
-that release will contain — the work that landed before the repository was made public.
+Nothing yet.
+
+## [0.1.0] — 2026-08-03
+
+The first release: the work that landed before the repository was made public.
+
+**Alpha.** The reference-workload port ([phase 11](docs/road-to-0.1/plan-phase-11.md)) is the one
+outstanding phase, so no application has yet run on MelangeDB end to end. Everything below is
+implemented and tested, but "tested" and "proven in production" are different claims and only the
+first one is being made.
 
 ### Added
 
