@@ -160,8 +160,10 @@ dotnet tool install --global MelangeDB.Cli
 
 ## CI
 
-`.github/workflows/ci.yml` is the whole pipeline. Its `test` job runs on every PR, push to
-`main`, and `v*` tag: restore, Release build (warnings-as-errors), then the test suite in
+`.github/workflows/ci.yml` is the whole pipeline. Its `test` job runs on every PR, every push to
+`main`, and every published release — **not** on a pushed tag, which triggers nothing at all, so
+don't wait for a check mark to appear on one: restore, Release build (warnings-as-errors), then the
+test suite in
 **both** Release and Debug. Skipped tests fail the run — the Postgres suite self-skips when
 Docker is missing, and CI treats a skip as a broken environment, not a pass. `ubuntu-latest` has
 Docker preinstalled, which is what the Testcontainers suites use.

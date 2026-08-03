@@ -21,8 +21,9 @@
 
   <PropertyGroup Label="Versioning">
     <!-- The single source of truth for the next release. A release tag `v*` must equal this
-         value exactly (publish.yml enforces it); pushes to main publish it with a `-ci.N`
-         prerelease suffix stamped on. See docs/RELEASING.md. -->
+         value exactly (the publish job in ci.yml enforces it); pushes to main pack it with a
+         `-ci.N` prerelease suffix stamped on and keep it as a workflow artifact rather than
+         publishing it. See docs/RELEASING.md. -->
     <VersionPrefix>0.1.0</VersionPrefix>
   </PropertyGroup>
 
