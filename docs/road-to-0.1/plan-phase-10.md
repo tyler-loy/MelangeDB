@@ -7,7 +7,7 @@
 ## Why here
 
 This is the hard sharding case, and it exists because a single continuous world cannot use instancing. In
-Vibe Shaft, everyone in the town square interacts with everyone else, so they must share a writer — splitting
+the reference workload, everyone in the town square interacts with everyone else, so they must share a writer — splitting
 a crowded location is not available. Phase 09 built the mechanism against explicit, discrete transitions; this
 phase makes transitions implicit, continuous, and invisible.
 

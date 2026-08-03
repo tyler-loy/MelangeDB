@@ -8,7 +8,7 @@
   <ItemGroup>
     <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
     <!-- For the Postgres-backed IMembershipStore: cluster membership lives in the hub's own
-         Postgres rather than a new consensus dependency (docs/plan-phase-09.md, settled). -->
+         Postgres rather than a new consensus dependency (docs/road-to-0.1/plan-phase-09.md, settled). -->
     <ProjectReference Include="..\MelangeDB.Cluster\MelangeDB.Cluster.csproj" />
   </ItemGroup>
 

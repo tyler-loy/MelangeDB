@@ -9,7 +9,7 @@ namespace MelangeDB.Core;
 /// shard node trusts "this connection acts as identity X" because the assertion is HMAC-signed
 /// with the cluster secret — the client authenticated once, at the gateway, against the IdP, and
 /// re-validating its JWT on every shard node would be wasteful and impossible for hub-issued
-/// guest identities. The trust boundary this creates is stated in docs/SECURITY.md: any holder of
+/// guest identities. The trust boundary this creates is stated in docs/THREAT-MODEL.md: any holder of
 /// the cluster secret can assert any identity.
 /// </summary>
 public static class InternalIdentityAssertion

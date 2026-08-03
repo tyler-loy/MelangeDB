@@ -27,8 +27,8 @@
   </PropertyGroup>
 
   <PropertyGroup Label="Reproducible builds and symbols">
-    <!-- Symbols travel embedded in the assemblies rather than as .snupkg packages: GitHub
-         Packages has no symbol server, so a separate symbol package would have nowhere to go.
+    <!-- Symbols travel embedded in the assemblies rather than as .snupkg packages: one artifact
+         to publish, and no symbol server that has to be reachable for a stack trace to resolve.
          SourceLink itself ships in the SDK (.NET 8+) and needs no package reference. -->
     <DebugType>embedded</DebugType>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>

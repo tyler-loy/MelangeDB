@@ -5,7 +5,7 @@ namespace MelangeDB;
 /// type a table declaring <c>Scheduled</c> carries exactly one of. A one-shot timer's row is
 /// deleted transactionally with its fire — the row <em>is</em> the schedule; a repeating timer's
 /// row is written only when created, changed, or deleted, and its next fire is derived from the
-/// interval rather than persisted per fire (see docs/plan-phase-05.md on write amplification).
+/// interval rather than persisted per fire (see docs/road-to-0.1/plan-phase-05.md on write amplification).
 /// </summary>
 public readonly record struct ScheduleAt
 {

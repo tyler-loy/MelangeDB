@@ -8,7 +8,7 @@ namespace MelangeDB.Transport.Tests;
 /// <summary>
 /// The measurement behind two settled phase-04 decisions: per-row policy evaluation cost and
 /// column-mask cost on the delta path. Shipped as a test so the number regenerates on any machine;
-/// the recorded figures live in docs/plan-phase-04.md. The assertions are sanity ceilings only —
+/// the recorded figures live in docs/road-to-0.1/plan-phase-04.md. The assertions are sanity ceilings only —
 /// two orders of magnitude above the measurement — so the suite never flakes on a slow CI box.
 /// </summary>
 public class PolicyCostMeasurementTests(Xunit.ITestOutputHelper output)

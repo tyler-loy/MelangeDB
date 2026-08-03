@@ -9,7 +9,7 @@ issue [#20](https://github.com/tyler-loy/MelangeDB/issues/20), filed from the ph
 
 ## Why here
 
-Phase 11's scoping measured the gap precisely: across Vibe Shaft's three binding trees there are 459 call
+Phase 11's scoping measured the gap precisely: across the reference workload's three binding trees there are 459 call
 sites (214 table accessors, 156 row handlers, 89 reducer calls) that are mechanical against a typed client
 and a safety-destroying rewrite against `row.Columns["chunk_id"]` and stringly-named reducers. Phase 03
 deliberately deferred client codegen "once the wire format has settled" — protocol v1 has now shipped and
@@ -76,7 +76,7 @@ and **no schema** — MessagePack decoding is lossy (integers surface as `long`,
   and a typed representation waits for a real consumer to shape it.
 - ~~**Cache ownership.**~~ **Settled: one cache per table, merged across subscriptions, refcounted per
   key.** `Conn.Db.<Table>` is the shape 214 call sites expect; overlapping and re-scoped subscriptions
-  over the same table are Vibe Shaft's normal case, and a row leaves the cache only when its last
+  over the same table are the reference workload's normal case, and a row leaves the cache only when its last
   covering subscription drops it.
 - ~~**Row identity across a rescope.**~~ **Settled: encoded primary-key bytes, reconciled by diff.**
   When a rescope's new initial set completes, the typed cache diffs it against the merged state — deletes

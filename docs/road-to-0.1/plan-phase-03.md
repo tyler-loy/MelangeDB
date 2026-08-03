@@ -19,7 +19,7 @@ demonstrable, so it should be reached before anything in 04–08 is started.
 - Framed binary protocol: `CallReducer`, `Subscribe`, `Unsubscribe`, `SubscriptionApplied` (initial set),
   `TransactionUpdate` (deltas), `ReducerResult`, `Error`, `Ping`/`Pong`, `Resume`, `Reauthenticate`.
   Versioned handshake. **Every frame carries a channel tag from version one** (see the ordering
-  constraint below). `CallReducer` carries a `traceparent` (see [OBSERVABILITY.md](OBSERVABILITY.md)).
+  constraint below). `CallReducer` carries a `traceparent` (see [OBSERVABILITY.md](../OBSERVABILITY.md)).
 - `Reauthenticate` exists in this phase even though phase 04 owns its *semantics*, because a frame type cannot
   be retrofitted without a protocol version bump. A game session outlives a one-hour JWT; dropping the
   connection at expiry is unacceptable and ignoring expiry means revocation never takes effect, so in-band

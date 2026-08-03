@@ -128,7 +128,7 @@ internal sealed partial class HubRuntime : IDisposable
             throw new InvalidOperationException(
                 $"Cluster:NodeListenAddress '{cluster.NodeListenAddress}' is not an IP address. Use 127.0.0.1 " +
                 "(the default), 0.0.0.0 to accept nodes from other machines, or a specific interface address — " +
-                "and read the docs/SECURITY.md note before widening it.");
+                "and read the docs/THREAT-MODEL.md note before widening it.");
         }
 
         _listener = new TcpListener(listenAddress, cluster.NodeListenPort);

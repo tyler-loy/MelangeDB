@@ -110,7 +110,7 @@ guest/owner claims, expiry (capped by `Cluster:AssertionTtlSeconds`, never outli
 whether the session fires lifecycle reducers (only the hub attachment does — one real session start per
 client). Node links mutually authenticate with the same secret over exchanged nonces, so neither a rogue
 dialer nor a fake hub passes the handshake, and assertions are refused at the gateway itself so a client can
-never present one. The trust boundary is stated in docs/SECURITY.md rather than left as an accident: any
+never present one. The trust boundary is stated in docs/THREAT-MODEL.md rather than left as an accident: any
 holder of the cluster secret can assert any identity — a compromised shard node impersonates every player in
 its shards — accepted because nodes are your infrastructure, with the operational consequences (internal
 network for node endpoints, secret rotation invalidates all assertions) written down.

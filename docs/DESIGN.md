@@ -134,7 +134,7 @@ public sealed class CombatReducers(
     {
         if (!settings.CurrentValue.PvpEnabled) throw new RejectedException("PvP is off");
 
-        var attacker = ctx.Db.Players.FindByPrimaryKey(ctx.Caller)
+        var attacker = ctx.Db.Player.Id.Find(ctx.Caller)
             ?? throw new RejectedException("not joined");
 
         // ... mutate through ctx.Db; nothing touches disk here
@@ -247,7 +247,7 @@ Clients send a query; the server returns an initial result set and then streams 
 derived from the log as transactions commit.
 
 **v1 is single-table filtered subscriptions** with **column projection**. Three query shapes cover
-the real workload (see [VIBE-SHAFT-COVERAGE.md](VIBE-SHAFT-COVERAGE.md)):
+the real workload (see [REFERENCE-WORKLOAD.md](REFERENCE-WORKLOAD.md)):
 
 ```sql
 SELECT * FROM recipe                                        -- whole table
@@ -351,14 +351,18 @@ one large write set, rather than one transaction per row.
 ```
 src/MelangeDB.Abstractions      attributes, ReducerContext, Identity, core interfaces (no deps)
 src/MelangeDB.Core              schema model, write set, transactions, commit log, dispatcher, appliers
+src/MelangeDB.Protocol          wire format: frames, MessagePack codecs, reducer argument encoding
 src/MelangeDB.Storage.Faster    FASTER-backed IHotStore
 src/MelangeDB.Storage.Postgres  relational applier + reader
 src/MelangeDB.Server            websocket transport, subscription engine, auth
 src/MelangeDB.Client            C# client
+src/MelangeDB.Cluster           hub/shard node roles, placement routing, handoff
 src/MelangeDB.CodeGen           Roslyn source generator: registrations, serializers, typed clients
 src/MelangeDB.OpenTelemetry     optional: registers MelangeDB's ActivitySource/Meter names with OTel
+src/MelangeDB.Cli               the `melange` dotnet tool: schema manifest export
 tests/                          unit + integration
-samples/                        worker-service sample
+tools/MelangeDB.LoadTest        the load rig behind the recorded performance numbers
+samples/                        worker-service host + console client
 ```
 
 ## 10. Open questions
@@ -368,7 +372,7 @@ samples/                        worker-service sample
   opt-in makes the resident footprint a declared, computable artifact. Ships with the compile-time scan
   analyzer (MELANGE0017), the startup residency report, `.Any()`/`.Count`/`.First()`, `Residency.Auto`
   for anyone explicitly wanting threshold behaviour, and the per-table configuration override. See
-  [plan-phase-07.md](plan-phase-07.md).
+  [plan-phase-07.md](road-to-0.1/plan-phase-07.md).
 - **Wire serialization** — MessagePack gets us moving and has implementations in every client
   language; a source-generated binary format is faster. Put it behind `IMelangeSerializer` and defer.
 - **Schema migration** — how tier changes and column adds replay against an existing log. Worth
@@ -381,10 +385,10 @@ samples/                        worker-service sample
   deliberate migration; with AutoMigrate off (the default) the applier validates, stalls, and prints
   the exact DDL an operator would run. Columns present in Postgres but absent from the schema are
   left untouched. The hot-tier half — how column adds replay against an existing *log* — remains
-  open. See [plan-phase-08.md](plan-phase-08.md).
+  open. See [plan-phase-08.md](road-to-0.1/plan-phase-08.md).
 - ~~**Log compaction / snapshots**~~ — **Settled in phase 07: full snapshot + truncate.** Snapshot at an
   LSN beside the log, truncate behind it, never past the slowest applier, the slowest live event
   subscriber, or the Resume retention window; restart is snapshot plus tail replay. See
-  [plan-phase-07.md](plan-phase-07.md).
+  [plan-phase-07.md](road-to-0.1/plan-phase-07.md).
 - **Codegen targets** — a real project has several client trees (game client, admin web, CLI tools)
   generating from one schema. `MelangeDB.CodeGen` should emit to multiple output trees from the start.

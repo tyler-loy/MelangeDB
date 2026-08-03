@@ -48,7 +48,7 @@ interface.
   EF Core do. Spans `melange.reducer`,
   `melange.commit` (with an `melange.fsync` child so durability cost is separable from serialization cost), and
   `melange.apply`; metrics for transaction count, reducer and commit duration, write-set size, log head LSN, and
-  **`melange.applier.lag`**. See [OBSERVABILITY.md](OBSERVABILITY.md) for the full register and the
+  **`melange.applier.lag`**. See [OBSERVABILITY.md](../OBSERVABILITY.md) for the full register and the
   cardinality rules — caller identity goes on spans and never on metric dimensions.
 
 ## Out of scope

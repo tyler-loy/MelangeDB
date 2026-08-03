@@ -8,7 +8,7 @@ namespace MelangeDB.CodeGen;
 /// The server-side incremental generator: discovers <c>[Table]</c> structs and <c>[Reducer]</c>
 /// methods and emits schema registration, per-table codecs, typed accessors, and the
 /// argument-decoding reducer dispatcher — plus the structural MELANGE diagnostics. Client-side
-/// binding generation is deliberately a separate future generator; see docs/plan-phase-02.md.
+/// binding generation is deliberately a separate future generator; see docs/road-to-0.1/plan-phase-02.md.
 /// </summary>
 [Generator]
 public sealed class MelangeServerGenerator : IIncrementalGenerator

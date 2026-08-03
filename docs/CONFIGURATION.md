@@ -42,7 +42,7 @@ downtime catch-up can mean anything, and a "live" label on a startup-only key wo
 (2) `Scheduler:MaxConcurrentTicks` shipped **accepted-and-reserved at its default of 1**: the scheduler is
 a single-threaded dispatch loop on purpose, because reducer transactions serialize on the engine's
 single-writer lock and a tick worker pool would parallelize nothing that matters (see
-docs/plan-phase-05.md, scheduler fairness). Values above 1 bind and validate but do not change dispatch.
+docs/road-to-0.1/plan-phase-05.md, scheduler fairness). Values above 1 bind and validate but do not change dispatch.
 
 **Shipped as of phase 06** (defaults verified against `EventsOptions`): every `Events:*` key. Two notes made
 when it shipped: (1) `Events:RetryBackoffMs` is the **base of an exponential backoff** — each retry doubles it,
@@ -119,7 +119,7 @@ not meters — MelangeDB never learns the world's metric scale (chunk decoding i
 the margin (`HandoffMarginChunks`, the crossing depth that triggers) and the rate limit
 (`HandoffMinIntervalMs`, the floor between an entity's transfers), because hysteresis needs both a distance
 and a time to bound pacing. (2) `Cluster:BorderBandChunks` shipped at its planned default of 2 with the
-derivation documented rather than guessed (margin + one handoff window of travel; docs/plan-phase-10.md
+derivation documented rather than guessed (margin + one handoff window of travel; docs/road-to-0.1/plan-phase-10.md
 shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> HandoffMarginChunks`, `≤` the
 block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
 next border re-subscribe, when the owner sends a full band reset.
@@ -299,9 +299,9 @@ that were reshaped or removed when this shipped.
 | --- | --- | --- | --- | --- | --- |
 | `Cluster:Role` | enum | `None` | restart | 09 | `None` \| `Hub` \| `Shard`. `None` (the default) is the whole off switch: a single-node deployment ignores placement entirely and behaves exactly as in M1. |
 | `Cluster:NodeName` | string | `""` | restart | 09 | This node's stable name — the membership store's key for assignments and fencing. Required for shard nodes; the hub is `hub`. |
-| `Cluster:Secret` | string | `""` | restart | 09 | The cluster secret: HMAC key behind node-link mutual authentication and hub-minted identity assertions. Required whenever `Role != None`; treat like a database password — see docs/SECURITY.md for the trust boundary it draws. |
+| `Cluster:Secret` | string | `""` | restart | 09 | The cluster secret: HMAC key behind node-link mutual authentication and hub-minted identity assertions. Required whenever `Role != None`; treat like a database password — see docs/THREAT-MODEL.md for the trust boundary it draws. |
 | `Cluster:NodeListenPort` | int | `0` | restart | 09 | Hub only: the TCP port the node-link listener binds. `0` binds an ephemeral port (tests); production names one. |
-| `Cluster:NodeListenAddress` | string | `127.0.0.1` | restart | 09 | Hub only: the interface the node-link listener binds. The default admits only same-machine nodes — safe by construction; a multi-machine cluster sets `0.0.0.0` or a specific internal interface. Every connection still proves the cluster secret, but widening the bind should be paired with network-level controls — see docs/SECURITY.md. |
+| `Cluster:NodeListenAddress` | string | `127.0.0.1` | restart | 09 | Hub only: the interface the node-link listener binds. The default admits only same-machine nodes — safe by construction; a multi-machine cluster sets `0.0.0.0` or a specific internal interface. Every connection still proves the cluster secret, but widening the bind should be paired with network-level controls — see docs/THREAT-MODEL.md. |
 | `Cluster:HubAddress` | string | `""` | restart | 09 | Shard only: the hub's node-link address as `host:port`. |
 | `Cluster:PublicAddress` | string | `""` | restart | 09 | Shard only: the base HTTP address where this node's per-shard websocket endpoints are reachable **by the gateway**. Internal infrastructure — never handed to clients. |
 | `Cluster:AssertionTtlSeconds` | int | `300` | restart | 09 | Cap on an internal identity assertion's lifetime (an assertion never outlives the client token it vouches for). Bounds how long a captured assertion stays redeemable. |

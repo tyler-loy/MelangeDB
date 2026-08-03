@@ -59,7 +59,7 @@ public sealed class ClusterOptions
     /// The cluster secret: the HMAC key behind node-link mutual authentication and hub-minted
     /// identity assertions. Required whenever <see cref="Role"/> is not <c>None</c>; every node
     /// presents the same secret. Treat it like a database password — anyone holding it can join
-    /// the cluster and impersonate any player (see docs/SECURITY.md).
+    /// the cluster and impersonate any player (see docs/THREAT-MODEL.md).
     /// </summary>
     public string Secret { get; set; } = "";
 
@@ -74,7 +74,7 @@ public sealed class ClusterOptions
     /// <c>127.0.0.1</c>, only admits same-machine nodes — safe by construction. A multi-machine
     /// cluster sets <c>0.0.0.0</c> or a specific internal interface; every connection still has
     /// to prove the cluster secret, but widening the bind should be paired with network-level
-    /// controls (see docs/SECURITY.md).
+    /// controls (see docs/THREAT-MODEL.md).
     /// </summary>
     public string NodeListenAddress { get; set; } = "127.0.0.1";
 

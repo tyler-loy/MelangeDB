@@ -127,7 +127,7 @@ The registry of borrowed rows persists as a sidecar beside the shard's log (snap
 engine's own recovery), since border records below a truncation base are gone while their rows survive in the
 snapshot.
 
-**Chunk** — The developer's unit of world space (Vibe Shaft: 64 m squares). MelangeDB never interprets chunk
+**Chunk** — The developer's unit of world space (the reference workload: 64 m squares). MelangeDB never interprets chunk
 ids; the spatial strategy is handed a decoder (`SpatialGeometry.DecodeChunk`) and requires the chunk-id column
 to be at least 32 bits wide, because a `ushort` encoding (`cx * 157 + cy`) tops out at 65,535 and overflows
 when the world grows — a migration trap closed at registration, not discovered in production.
@@ -297,7 +297,7 @@ causally disjoint — no interest overlap between them.
 **Internal identity assertion** — The HMAC-signed token (cluster secret) the hub mints saying "this
 connection acts as identity X": the gateway validated the client's IdP token once, and shard nodes trust the
 assertion instead of re-validating JWTs — which also covers identities no external issuer can vouch for. The
-trust boundary it draws is stated in docs/SECURITY.md. Never accepted from clients.
+trust boundary it draws is stated in docs/THREAT-MODEL.md. Never accepted from clients.
 
 **Interest** — The set of foreign shards a node holds read-only slices of, returned by `InterestOf`.
 
