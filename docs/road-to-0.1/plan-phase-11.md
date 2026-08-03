@@ -1,4 +1,4 @@
-# Phase 11 — Vibe Shaft port and validation
+# Phase 11 — Reference workload port and validation
 
 **Goal:** the reference workload runs on MelangeDB, and the three original complaints are demonstrably fixed
 rather than argued.
@@ -7,8 +7,8 @@ rather than argued.
 
 ## Why here, and why that's partly a lie
 
-This is written last for planning, but **the port should start around phase 03.** A subset of Vibe Shaft's 82
-tables and 119 reducers is the most honest integration test available, and saving it for the end guarantees
+This is written last for planning, but **the port should start around phase 03.** A subset of the reference
+workload's 82 tables and 119 reducers is the most honest integration test available, and saving it for the end guarantees
 discovering API mistakes after they're expensive. Treat this phase as "the port completes and is measured,"
 not "the port begins."
 
@@ -88,5 +88,5 @@ comparison, and changing the game while changing the database destroys it.
   buried. The numbers are the deliverable, and a port that only reports wins is not evidence.
 - **The port will find API mistakes that are expensive to fix late.** The mitigation is the one at the top of
   this document: start porting at phase 03, not phase 11.
-- **A game is a moving target.** Vibe Shaft development continues during the port; the diff grows. A freeze or
+- **A game is a moving target.** Development of the reference workload continues during the port; the diff grows. A freeze or
   a short port window matters more than it looks.

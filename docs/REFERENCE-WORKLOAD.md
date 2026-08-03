@@ -1,7 +1,12 @@
-# Coverage check: Vibe Shaft against the MelangeDB design
+# Coverage check: the reference workload against the MelangeDB design
 
-Vibe Shaft (`C:\r\vibe-shaft`) is a live SpacetimeDB game and the only real workload MelangeDB has to
-satisfy. This audits [DESIGN.md](DESIGN.md) against what that module actually uses.
+The reference workload is a live SpacetimeDB game — 82 tables, three client trees, in production —
+and the only real workload MelangeDB has to satisfy. This audits [DESIGN.md](DESIGN.md) against what
+that module actually uses.
+
+Every number below was measured against its source rather than estimated. The game itself is a
+private codebase, so it is referred to throughout the docs as "the reference workload"; what matters
+here is the shape of what it does, all of which is reproduced in the tables that follow.
 
 ## The workload, measured
 
@@ -51,7 +56,7 @@ written in the deterministic style §3 asks for.
 
 ### 1. Scheduled reducers — the largest gap
 
-DESIGN.md does not mention scheduling at all. Vibe Shaft has **14** scheduled reducers, and they are
+DESIGN.md does not mention scheduling at all. The reference workload has **14** scheduled reducers, and they are
 not peripheral — they *are* the simulation: `TickCreatures`, `SimulateCreaturePopulation`, `GrowFlora`,
 `RespawnResource`, `TickBreath`, `TickStationHeat`, `WorkTick`, `ExpireTrade`, `ExpireProjects`,
 `DecayBuildings`, `DecayCorpse`, `DecayFelledTree`, `CompactChunk`, `CompactFlora`.
@@ -159,7 +164,7 @@ just `foreach (...) { exists = true; break; }` existence checks that want a `.An
   but it needs specifying — this is exactly the kind of thing that breaks on replay.
 - **Ad-hoc SQL endpoint.** Admin tooling runs one-shot queries with aggregates (`COUNT(*)`) that
   subscriptions can't express. Needed for parity with the existing admin console.
-- **Struct tables.** Vibe Shaft's tables are `public partial struct` mutated with `with` expressions;
+- **Struct tables.** The reference workload's tables are `public partial struct` mutated with `with` expressions;
   DESIGN.md §2 shows classes. Value types matter for allocation on the reducer hot path — match it.
 - **Bulk ingestion.** terrain-gen writes ~24.6k chunk blobs through reducers. That needs a bulk path,
   not 24.6k transactions.

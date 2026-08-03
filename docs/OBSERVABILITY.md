@@ -84,7 +84,7 @@ Getting this wrong is expensive in a real observability bill, and it is the sing
 ## Traces and the log do different jobs
 
 The commit log already records caller, reducer name, arguments, and timestamp for every transaction — a
-complete ordered audit trail (see [SECURITY.md](SECURITY.md)). So tracing is **not** for *what happened*.
+complete ordered audit trail (see [THREAT-MODEL.md](THREAT-MODEL.md)). So tracing is **not** for *what happened*.
 
 - **The log answers "what happened, and in what order."** It's the truth.
 - **Traces answer "how long did it take, and what caused what."** Latency and causality.

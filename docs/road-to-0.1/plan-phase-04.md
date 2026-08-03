@@ -94,7 +94,7 @@ namespace, so admin bypass is a plain lookup. Ship a test that encodes exactly t
 **Column-level visibility.** Row policies filter rows; nothing filters columns, and that gap is live in the
 reference workload today. `Creature` is `Public = true` and ships `NextThinkAt`, `SpookedUntil`,
 `LastDamagedAt`, and `HomeX/HomeZ` to every client — a complete AI oracle telling a cheater exactly when a
-creature next thinks and whether its alert radius is doubled. See [SECURITY.md](SECURITY.md) for the full
+creature next thinks and whether its alert radius is doubled. See [THREAT-MODEL.md](../THREAT-MODEL.md) for the full
 argument.
 
 ```csharp

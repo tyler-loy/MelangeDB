@@ -1,7 +1,10 @@
-# Defensive surface
+# Threat model — the defensive surface
 
 What a MelangeDB server can enforce against a client it does not trust. In a full-loot game a leaked row is
 wallhack-grade intel, so this is a correctness concern, not a hardening checklist.
+
+> This document is the threat model. To **report a vulnerability**, see
+> [SECURITY.md](../SECURITY.md) in the repository root.
 
 The audited reference workload hand-rolls three of the defenses below, which is the clearest possible signal
 that they belong in the database.
@@ -24,7 +27,7 @@ anyone building an audit system. Investigating an exploit is a log replay.
 
 ## Gap 1 — Column-level visibility
 
-**This is the real gap, and it's live in Vibe Shaft today.** `Creature` is `Public = true`, so every connected
+**This is the real gap, and it's live in the reference workload today.** `Creature` is `Public = true`, so every connected
 client receives every column — including columns that are purely server-internal AI state:
 
 ```csharp
@@ -98,7 +101,7 @@ The composition rule, which is easy to get backwards:
 
 ## Gap 2 — Reducer authorization
 
-Vibe Shaft calls `RequireAdmin(ctx)` **24 times**, by hand, at the top of privileged reducers. Every one of
+The reference workload calls `RequireAdmin(ctx)` **24 times**, by hand, at the top of privileged reducers. Every one of
 those call sites is a place where forgetting the line is a privilege escalation, and nothing detects the
 omission.
 

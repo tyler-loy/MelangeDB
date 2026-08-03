@@ -22,7 +22,7 @@ It also removes the reflection path from phase 01, which matters for startup tim
 - Discover `[Reducer]` methods; emit an argument-decoding dispatcher keyed by reducer name.
 - **Diagnostics are a first-class deliverable, not polish.** Report at compile time: a table with no
   `[PrimaryKey]`; `[AutoInc]` on a non-integer column; `[Unique]` on a `Partitioned` table (a unique
-  index is a single-writer guarantee — see [CLUSTERING.md](CLUSTERING.md)); a reducer whose parameters
+  index is a single-writer guarantee — see [CLUSTERING.md](../CLUSTERING.md)); a reducer whose parameters
   aren't serializable; `DateTime.Now` / `new Random()` in a reducer body (use `ctx.Timestamp` /
   `ctx.Random`); a subscription-visible table that is not `Public` — shipped as MELANGE0007, with
   `[ServerOnly]` as the compile-time marker of subscription visibility: a column mask only means anything

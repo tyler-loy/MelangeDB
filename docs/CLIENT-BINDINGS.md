@@ -25,9 +25,8 @@ melange-schema.json          ← committed next to the consumer(s)
 typed client bindings        ← one tree per consuming project; N consumers, one schema
 ```
 
-The exporter ships as the `melange` CLI (package `MelangeDB.Cli` on the repo feed, a dotnet
-tool). Install it once, then export the manifest either way — the two paths produce
-byte-identical files:
+The exporter ships as the `melange` CLI (the `MelangeDB.Cli` dotnet tool). Install it once, then
+export the manifest either way — the two paths produce byte-identical files:
 
 ```
 dotnet tool install --global MelangeDB.Cli
@@ -54,7 +53,7 @@ A client project then needs three things — the client library, the analyzer, a
 <AdditionalFiles Include="melange-schema.json" />
 ```
 
-(Or the `MelangeDB.Client` and `MelangeDB.CodeGen` packages, off the repo feed.) Adding the same
+(Or the `MelangeDB.Client` and `MelangeDB.CodeGen` NuGet packages.) Adding the same
 manifest to several projects is the whole multiple-output-trees story — a game client, an admin
 tool, and a CLI each generate their own tree from the one file, nothing to configure.
 

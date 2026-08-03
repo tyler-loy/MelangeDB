@@ -1,0 +1,36 @@
+name: Feature request or design question
+description: Propose something, or ask why something is the way it is
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Several things that look like omissions are recorded refusals — joins in subscriptions, an
+        unreliable/UDP transport, a sandbox for reducer code, exactly-once event delivery. The
+        reasoning is in [DESIGN.md](https://github.com/tyler-loy/MelangeDB/blob/main/docs/DESIGN.md)
+        and [ROADMAP.md](https://github.com/tyler-loy/MelangeDB/blob/main/docs/ROADMAP.md). If your
+        request is one of those, the useful conversation starts from disagreeing with the reasoning.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The workload that doesn't work today
+      description: >
+        What you are trying to build and where MelangeDB gets in the way. Concrete beats abstract —
+        the design decisions here were mostly settled by real workloads.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd propose
+      description: Optional. A sketch of the API or behaviour you have in mind.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >
+        Optional, but useful — a workaround that is merely awkward is a different problem from one
+        that is impossible.

@@ -145,7 +145,7 @@ public interface IShardStrategy
 }
 ```
 
-### Strategy A — spatial partitioning (Vibe Shaft)
+### Strategy A — spatial partitioning (the reference workload)
 
 A contiguous 10km world of 157×157 chunks. Shard = a rectangular block of chunks; shard key derives from
 `ChunkId`. Interest = the eight neighbouring blocks, narrowed per row to the border band
@@ -312,8 +312,8 @@ from its key on the first transfer. The shard id is its own column.
   for the same structural reason: its contract is unique-not-dense, so each shard allocates from an
   originator-prefixed range and no cross-shard sequence exists.
 - **Scheduled reducers partition with their rows.** Timers are rows (DESIGN.md §3), so a timer fires on
-  whichever node owns its shard — no global timer wheel, no leader election. Vibe Shaft's single global
-  `CreatureAiTick` row becomes one row per shard, and the hand-written "only chunks near a player"
+  whichever node owns its shard — no global timer wheel, no leader election. The reference workload's single
+  global `CreatureAiTick` row becomes one row per shard, and the hand-written "only chunks near a player"
   filtering becomes implicit in the partition.
 - **A replication gap that truncation erased is bootstrapped, never skipped.** A node whose replica cursor
   fell below the hub log's truncation base (down while the hub snapshotted) cannot be served from the log —
@@ -346,8 +346,9 @@ has two terms that grow differently:
 | **Cold world** | **Area (N²)** | Terrain, flora, water, LOD blobs — ~24.6k chunk rows, nearly all far from any player | **Paging** (DESIGN.md §8) |
 | **Live simulation** | **Player density** | Creatures, combat, buildings being ticked | **Sharding** (this doc) |
 
-Vibe Shaft's own `CreatureAiTick.cs` already says it: *"everything else in the world is inert, which is
-what makes a persistent world-wide population affordable."* Most of a 10km world is cold at any instant.
+The reference workload's own creature-tick code already says it: *"everything else in the world is inert,
+which is what makes a persistent world-wide population affordable."* Most of a 10km world is cold at any
+instant.
 
 Doubling that world to ~20km means 314×314 = 98,596 chunks, 4× the memory — the wall you hit. (It also
 overflows `ushort ChunkId`, since `cx * 157 + cy` tops out at 65,535; the key encoding widens regardless.)
@@ -389,10 +390,10 @@ bigger term and needs no coordination layer at all.
   nodes, per-shard owner, fencing token, and originator id — lives in the hub's own Postgres
   (`AddPostgresClusterMembership()`; in-memory for tests), the hub is its sole writer, failure detection is
   heartbeat silence past `Cluster:FailureTimeoutMs`, and a dead node's shards reassign under bumped fencing
-  tokens while the suspect self-fences on the same clock. See docs/plan-phase-09.md for the rationale.
+  tokens while the suspect self-fences on the same clock. See docs/road-to-0.1/plan-phase-09.md for the rationale.
 - ~~**Client protocol during dual attachment.**~~ **Settled in phase 09: the dual attachment is
   server-internal.** The wire protocol stays one socket, one session; the gateway owns the hub-plus-shard
-  mapping and the client never learns it. See docs/plan-phase-09.md.
+  mapping and the client never learns it. See docs/road-to-0.1/plan-phase-09.md.
 - **Does the hub shard?** For a very large deployment the hub's `Global` tables become the ceiling. Since
   they're the Postgres tier, the answer is probably "Postgres's problem, not ours" — but it needs saying.
   Explicitly out of phase 09's scope; still open.

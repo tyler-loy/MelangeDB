@@ -15,7 +15,7 @@ internal static class RowBlobSplitter
 {
     /// <summary>
     /// Payloads at or above this size go out of line. Below it, the indirection costs more than it
-    /// saves. Deliberately a constant, not configuration — see docs/plan-phase-07.md.
+    /// saves. Deliberately a constant, not configuration — see docs/road-to-0.1/plan-phase-07.md.
     /// </summary>
     public const int InlineThreshold = 256;
 

@@ -97,7 +97,7 @@ This only holds if a missing annotation is cheap to discover, so these ship *wit
 ### Configuration items go in the register
 
 This phase introduces the first settings a user will realistically tune, so it also establishes the standing
-convention: **every configuration item is added to [CONFIGURATION.md](CONFIGURATION.md) in the same change that
+convention: **every configuration item is added to [CONFIGURATION.md](../CONFIGURATION.md) in the same change that
 introduces it.** Not at the end of the phase, and not "when the docs get written." An undocumented knob is how
 a library turns into folklore, and this is the phase where the knobs start mattering.
 
@@ -197,7 +197,7 @@ for tests.
   over a `Resident` one.
 - The startup residency report's total matches measured process memory within a stated tolerance — a budget
   that doesn't predict reality is worse than none.
-- Every setting this phase introduced appears in [CONFIGURATION.md](CONFIGURATION.md) with its real default,
+- Every setting this phase introduced appears in [CONFIGURATION.md](../CONFIGURATION.md) with its real default,
   verified against the code rather than the plan.
 
 ## Risks

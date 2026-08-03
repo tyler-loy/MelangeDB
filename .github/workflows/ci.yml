@@ -1,10 +1,14 @@
 name: CI
 
+# A v* tag on its own publishes nothing — publishing is triggered by *publishing a GitHub Release*,
+# which is a deliberate act with release notes attached, and is then gated again on approval of the
+# `release` environment. See docs/RELEASING.md.
 on:
   pull_request:
   push:
     branches: [main]
-    tags: ['v*']
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -73,17 +77,18 @@ jobs:
             exit 1
           fi
 
-  # Publishes only on push events — a -ci.N prerelease from main, a stable from a v* tag —
-  # and only after the test job above is green. Pull requests never publish.
-  publish:
+  # Packs a -ci.N prerelease from main and keeps it as a workflow artifact — downloadable and
+  # inspectable, but never pushed to a public feed. A version pushed to nuget.org can never be
+  # deleted, only unlisted, and a prerelease per commit to main is not a stream worth making
+  # permanent. Deliberately has no `environment`, so ordinary pushes to main never wait on a
+  # reviewer. Pull requests never reach this job.
+  pack:
     if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     env:
-      FEED: https://nuget.pkg.github.com/tyler-loy/index.json
       PACKABLE: >-
         Abstractions Core Protocol Client Server CodeGen
         Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli
@@ -94,30 +99,83 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Verify tag matches VersionPrefix (stable releases)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Pack prerelease
+        run: |
+          suffix="ci.${{ github.run_number }}+${GITHUB_SHA::7}"
+          for name in $PACKABLE; do
+            dotnet pack "src/MelangeDB.$name/MelangeDB.$name.csproj" -c Release -o packages \
+              --version-suffix "$suffix"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-ci.${{ github.run_number }}
+          path: packages/*.nupkg
+          if-no-files-found: error
+
+  # Publishes to nuget.org. Triggered only by *publishing a GitHub Release* — a pushed tag alone
+  # does nothing — and gated a second time behind the `release` environment's required reviewer.
+  # Runs only after the test job above is green, so a broken release never publishes.
+  #
+  # Authentication is nuget.org Trusted Publishing (OIDC): no long-lived API key exists anywhere.
+  # NOTE: the trusted publishing policy is bound to this workflow's FILE NAME — renaming ci.yml, or
+  # moving this job into a different workflow file, breaks publishing until the policy on nuget.org
+  # is updated to match. If the policy also names an Environment, it must equal `release` below.
+  publish:
+    if: github.event_name == 'release'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write        # required: lets this job request the OIDC token nuget.org exchanges
+    env:
+      FEED: https://api.nuget.org/v3/index.json
+      PACKABLE: >-
+        Abstractions Core Protocol Client Server CodeGen
+        Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify release tag matches VersionPrefix
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           prefix=$(sed -n 's/.*<VersionPrefix>\(.*\)<\/VersionPrefix>.*/\1/p' Directory.Build.props)
-          tag=${GITHUB_REF_NAME#v}
-          if [ "$tag" != "$prefix" ]; then
-            echo "::error::Tag v$tag does not match VersionPrefix $prefix in Directory.Build.props."
+          if [ "${TAG#v}" != "$prefix" ]; then
+            echo "::error::Release tag $TAG does not match VersionPrefix $prefix in Directory.Build.props."
             exit 1
           fi
 
-      - name: Compute prerelease suffix (main builds)
-        if: github.ref == 'refs/heads/main'
-        run: echo "VERSION_SUFFIX=ci.${{ github.run_number }}+${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Verify NUGET_USER is set
+        run: |
+          if [ -z "${{ secrets.NUGET_USER }}" ]; then
+            echo '::error::NUGET_USER is not set. It is your nuget.org profile name, not your email'
+            echo '::error::address, and it is not a credential — see docs/RELEASING.md.'
+            exit 1
+          fi
 
       - name: Pack
         run: |
           for name in $PACKABLE; do
-            dotnet pack "src/MelangeDB.$name/MelangeDB.$name.csproj" -c Release -o packages \
-              ${VERSION_SUFFIX:+--version-suffix "$VERSION_SUFFIX"}
+            dotnet pack "src/MelangeDB.$name/MelangeDB.$name.csproj" -c Release -o packages
           done
 
-      - name: Push to GitHub Packages
+      # The exchanged key is valid for one hour, so it is requested immediately before the push
+      # rather than at the top of the job. One OIDC token buys exactly one API key.
+      - name: NuGet login (OIDC → short-lived key)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push to nuget.org
         run: |
           dotnet nuget push 'packages/*.nupkg' \
             --source "$FEED" \
-            --api-key '${{ secrets.GITHUB_TOKEN }}' \
+            --api-key '${{ steps.login.outputs.NUGET_API_KEY }}' \
             --skip-duplicate
