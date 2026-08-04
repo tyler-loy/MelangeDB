@@ -25,12 +25,31 @@ public sealed class TableSchema
             throw new ArgumentException($"Table '{name}' has no columns.", nameof(columns));
 
         // A table declaring Scheduled holds timer rows: exactly one ScheduleAt column, implicitly
-        // private, implicitly Local until clustering gives timer tables a placement.
+        // private, and always Local — which on a shard node's per-shard engine means per-shard,
+        // since timers are rows in that engine's own log (docs/CLUSTERING.md). Another placement
+        // is refused rather than silently overridden; it is compile error MELANGE0022, and this is
+        // its runtime mirror for the reflection path. Partitioned reaches here indistinguishable
+        // from the parameter's default, so only the compile-time check can catch that one.
         var scheduleAtColumns = columns.Count(c => c.Kind == ColumnKind.ScheduleAt);
         if (scheduled is not null)
         {
             if (scheduleAtColumns != 1)
                 throw new NotSupportedException($"Table '{name}' declares Scheduled and must declare exactly one ScheduleAt column; found {scheduleAtColumns}.");
+            if (placement is not (Placement.Local or Placement.Partitioned))
+            {
+                throw new NotSupportedException(
+                    $"Table '{name}' declares Scheduled and Placement.{placement}. A scheduled table holds timer rows and " +
+                    "is always Placement.Local: a shard node runs one engine per shard, so node-local timer rows are " +
+                    "per-shard timer rows. Drop the Placement declaration.");
+            }
+
+            if (shardBy is not null)
+            {
+                throw new NotSupportedException(
+                    $"Table '{name}' declares Scheduled and ShardBy = \"{shardBy}\". A scheduled table is Placement.Local " +
+                    "and is never sharded by a column — it is already one independent timer set per shard. Drop ShardBy.");
+            }
+
             isPublic = false;
             placement = Placement.Local;
         }

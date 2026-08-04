@@ -67,6 +67,18 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         if (_eventBus is { } bus)
             engine.AddTruncationFloor(() => bus.MinimumLiveCheckpointLsn);
 
+        // Seeding runs before the scheduler, so a timer row an init reducer inserts is in the
+        // pending set the scheduler builds rather than an observed commit arriving beside it. Only
+        // when this deployment is not clustered: the hub seeds its own engine once its placement
+        // guards are installed, and a shard node's engines are seeded per shard as each opens —
+        // this one owns no shard at all.
+        if (_monitor.CurrentValue.Cluster.Role == ClusterRole.None
+            && (MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)) is { } reducerHost)
+        {
+            // Both sites, because a single node is every site there is.
+            MelangeInitReducers.Fire(engine, reducerHost, _logger, "this database", ReducerSite.Hub, ReducerSite.Shard);
+        }
+
         // Scheduling starts only after recovery finished: the pending set is rebuilt from the
         // recovered timer rows, and overdue timers fire per Scheduler:CatchUpAfterDowntime.
         _scheduler = (MelangeScheduler?)_provider.GetService(typeof(MelangeScheduler));

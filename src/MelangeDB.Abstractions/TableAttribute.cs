@@ -71,9 +71,18 @@ public sealed class TableAttribute : Attribute
     /// <summary>
     /// Names the reducer this table's timer rows fire. Declaring it makes rows of this table
     /// scheduling data, not client data: the table must carry exactly one <see cref="ScheduleAt"/>
-    /// column, is implicitly private, and is implicitly <see cref="Placement.Local"/> until
-    /// clustering gives timer tables a placement. The named reducer's signature is
-    /// <c>void Name(ReducerContext ctx, ThisTable timer)</c>, and it is not client-callable.
+    /// column, is implicitly private, and is always <see cref="Placement.Local"/> — declaring any
+    /// other <see cref="Placement"/> alongside <c>Scheduled</c> is compile error MELANGE0022.
+    /// <para>
+    /// <c>Local</c> <em>is</em> the per-shard partitioning docs/CLUSTERING.md describes, because a
+    /// shard node runs one engine per shard it owns and timers are rows in that engine's own log:
+    /// node-local on a per-shard engine means shard-local, so one declared timer table becomes one
+    /// independent set of timers per shard, firing on whichever node owns it. Seed those rows from
+    /// a <see cref="ReducerKind.Init"/> reducer — a shard created on first visit starts empty, and
+    /// nothing else can reach into its engine to give it timers.
+    /// </para>
+    /// The named reducer's signature is <c>void Name(ReducerContext ctx, ThisTable timer)</c>, and
+    /// it is not client-callable.
     /// </summary>
     public string? Scheduled { get; set; }
 }

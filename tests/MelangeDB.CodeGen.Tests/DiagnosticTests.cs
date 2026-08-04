@@ -494,6 +494,107 @@ public class DiagnosticTests
     }
 
     [Fact]
+    public void Melange0022_fires_when_a_scheduled_table_declares_a_placement()
+    {
+        // The natural thing to try after reading CLUSTERING.md's "one timer row per shard": it
+        // used to compile clean and mean something else entirely.
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "Tick", Placement = Placement.Partitioned, ShardBy = nameof(ChunkId))]
+            public partial struct CreatureAiTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+                public uint ChunkId;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Tick(ReducerContext ctx, CreatureAiTick timer)
+                {
+                }
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0022");
+    }
+
+    [Fact]
+    public void Melange0022_is_silent_when_the_scheduled_table_states_the_placement_it_has()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "Tick", Placement = Placement.Local)]
+            public partial struct RegionTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Tick(ReducerContext ctx, RegionTick timer)
+                {
+                }
+            }
+            """);
+        Assert.Empty(result.MelangeDiagnostics);
+        Assert.Empty(result.Errors);
+    }
+
+    [Fact]
+    public void An_init_reducer_seeding_a_timer_table_compiles_clean()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = nameof(WorldReducers.TickCreatures))]
+            public partial struct CreatureAiTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+            }
+
+            public sealed class WorldReducers
+            {
+                [Reducer(ReducerKind.Init)]
+                public void SeedShard(ReducerContext ctx) =>
+                    ctx.Db.CreatureAiTick.Insert(new CreatureAiTick
+                    {
+                        ScheduledAt = ScheduleAt.Interval(System.TimeSpan.FromSeconds(1)),
+                    });
+
+                [Reducer]
+                public void TickCreatures(ReducerContext ctx, CreatureAiTick timer)
+                {
+                }
+            }
+            """);
+        Assert.Empty(result.MelangeDiagnostics);
+        Assert.Empty(result.Errors);
+    }
+
+    [Fact]
+    public void Melange0009_fires_on_an_init_reducer_with_parameters()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            public sealed class Reducers
+            {
+                [Reducer(ReducerKind.Init)]
+                public void Seed(ReducerContext ctx, int shard)
+                {
+                }
+            }
+            """);
+        Assert.Contains(result.MelangeDiagnostics, d => d.Id == "MELANGE0009");
+    }
+
+    [Fact]
     public void A_well_formed_scheduled_table_and_reducer_compile_clean()
     {
         var result = GeneratorTestHost.RunGenerator("""

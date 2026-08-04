@@ -315,6 +315,21 @@ from its key on the first transfer. The shard id is its own column.
   whichever node owns its shard — no global timer wheel, no leader election. The reference workload's single
   global `CreatureAiTick` row becomes one row per shard, and the hand-written "only chunks near a player"
   filtering becomes implicit in the partition.
+
+  The mechanism is `Placement.Local`, which a scheduled table always has (declaring another is compile error
+  MELANGE0022). That reads like "one per cluster" and is the opposite: a shard node runs one engine per shard
+  it owns, and a timer is a row in *that* engine's log, so node-local on a per-shard engine is shard-local.
+  One declared timer table is one independent timer set per shard.
+
+  **Those rows have to be seeded, and only the shard itself can do it.** A shard is created the first time a
+  session resolves to it, and its engine opens empty; no application code holds a handle on it. So a
+  shard-executed **`[Reducer(ReducerKind.Init)]`** fires once inside each shard's fresh engine, before its
+  scheduler starts — the hook the first player to walk into a never-visited block depends on. Without it that
+  block's shard serves reads and writes correctly and simply never ticks: creatures inert, nothing growing,
+  nothing decaying, no error anywhere. Fresh is "the log has no head", so reassignment and restart recover
+  rather than re-seed, while a crash between creating a shard and its first commit still seeds on the retry.
+  A shard that opens holding no rows in any scheduled table is logged as a warning (EventId 1723) — the state
+  is almost always a seeding mistake, and it is otherwise completely silent.
 - **A replication gap that truncation erased is bootstrapped, never skipped.** A node whose replica cursor
   fell below the hub log's truncation base (down while the hub snapshotted) cannot be served from the log —
   the gap's records are gone. The hub sends the full current `Replicated` state at one LSN instead

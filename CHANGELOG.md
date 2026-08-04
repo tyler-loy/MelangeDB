@@ -10,6 +10,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **`ReducerKind.Init`** — a reducer fired once on an engine that has never committed anything,
+  before its scheduler starts. Its `ReducerSite` picks the engine as for any other reducer:
+  shard-executed init reducers fire on every per-shard engine as that shard opens, hub-executed ones
+  on the hub, and both on the single engine of a deployment that is not clustered. Each fire is its
+  own transaction; a thrower is logged (EventId 1106), not rethrown.
+
 ### Fixed
 
 - **`schemaHash` no longer depends on the MelangeDB version.** The manifest's `generator` field was
@@ -18,6 +26,22 @@ All packages ship together at one version; there is no per-package versioning. S
   touched. The hash is now taken over the manifest rendered with both `schemaHash` and `generator`
   empty, so it identifies the schema and not the build that emitted it. **Hash values change once
   in this release**; after that, upgrading MelangeDB leaves them alone.
+- **A shard created on first visit had no timer rows, and nothing said so.** Shards are created
+  lazily when a session first resolves to one, and a scheduled table is `Placement.Local` — so its
+  timer rows live in that shard's own engine, which opened empty, and no `ReducerKind` could seed
+  them. The shard served reads and writes correctly and simply never ticked: in a spatial world, the
+  first player into a never-visited block found creatures inert, nothing growing and nothing
+  decaying, with no error anywhere. `ReducerKind.Init` is the fix; a shard that opens holding no rows
+  in any scheduled table is now also warned about (EventId 1723).
+
+### Changed
+
+- **A scheduled table declaring a `Placement` or `ShardBy` is now compile error `MELANGE0022`**
+  instead of having the declaration silently discarded. `[Table(Scheduled = "...", Placement =
+  Placement.Partitioned, ShardBy = ...)]` — the natural thing to write after reading
+  [docs/CLUSTERING.md](docs/CLUSTERING.md) — compiled clean and meant something else. Scheduled
+  tables are always `Local`, which on a per-shard engine already *is* per-shard. The runtime schema
+  registration mirrors the check for placements it can distinguish from the default.
 
 ## [0.1.0] — 2026-08-03
 

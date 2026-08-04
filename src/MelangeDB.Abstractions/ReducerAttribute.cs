@@ -11,6 +11,25 @@ public enum ReducerKind
 
     /// <summary>Fired when a client session ends. Not client-callable.</summary>
     ClientDisconnected,
+
+    /// <summary>
+    /// Fired once, on an engine that has never committed anything, before its scheduler starts —
+    /// the seam an application uses to seed the state a fresh database must already hold, timer
+    /// rows above all. Not client-callable.
+    /// <para>
+    /// <b>Which</b> engine is decided by the reducer's <see cref="ReducerSite"/>, exactly as for
+    /// any other reducer: a shard-executed one fires on <em>every</em> per-shard engine as that
+    /// shard is first opened (so a world's scheduled tables get their timers in each shard, which
+    /// is the only way a lazily-created shard ever ticks), a hub-executed one fires on the hub's
+    /// fresh engine, and in a deployment that is not clustered both fire on the single engine.
+    /// </para>
+    /// <para>
+    /// The contract: each fire is its own transaction, so a reducer that throws leaves the others'
+    /// writes in place — and a fresh engine whose <em>every</em> init reducer threw stays fresh, so
+    /// the next start tries again. Seed idempotently and the retry costs nothing.
+    /// </para>
+    /// </summary>
+    Init,
 }
 
 /// <summary>

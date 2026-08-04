@@ -375,6 +375,40 @@ public class SchedulerTests : IDisposable
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 
+    [Fact]
+    public async Task An_init_reducer_seeds_a_fresh_database_and_a_restart_does_not_seed_it_again()
+    {
+        var probe = new SchedulerProbe { SeedOnInit = true };
+        IHost Build() => TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+
+        using (var host = Build())
+        {
+            await host.StartAsync(TestContext.Current.CancellationToken);
+
+            // Seeded before the scheduler started, so the timer is in the pending set from the
+            // first instant rather than arriving as an observed commit beside it.
+            Assert.Equal(1, host.Engine().CommittedView.Count<WorldTickTimer>());
+            _time.Advance(TimeSpan.FromSeconds(10));
+            Assert.Equal(1, probe.WorldTicks);
+            await host.StopAsync(TestContext.Current.CancellationToken);
+        }
+
+        using (var restarted = Build())
+        {
+            await restarted.StartAsync(TestContext.Current.CancellationToken);
+
+            // The log has a head now, so this database is not fresh: seeding again would double
+            // every timer on every restart.
+            Assert.Equal(1, probe.InitFires);
+            Assert.Equal(1, restarted.Engine().CommittedView.Count<WorldTickTimer>());
+            await restarted.StopAsync(TestContext.Current.CancellationToken);
+        }
+    }
+
     private static MeterListener OverrunListener(Action onOverrun)
     {
         var listener = new MeterListener

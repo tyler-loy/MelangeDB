@@ -17,6 +17,7 @@ internal static class ModelExtractor
         var tier = "Hot";
         var residency = "Paged";
         var placement = "Partitioned";
+        string? declaredPlacement = null;
         string? shardBy = null;
         string? scheduled = null;
         foreach (var named in attribute.NamedArguments)
@@ -37,6 +38,7 @@ internal static class ModelExtractor
                     break;
                 case "Placement":
                     placement = named.Value.Value is int p ? p switch { 1 => "Replicated", 2 => "Global", 3 => "Local", _ => "Partitioned" } : "Partitioned";
+                    declaredPlacement = placement;
                     break;
                 case "ShardBy":
                     shardBy = named.Value.Value as string;
@@ -47,17 +49,36 @@ internal static class ModelExtractor
             }
         }
 
-        // A table declaring Scheduled holds timer rows: implicitly private, implicitly Local
-        // until clustering gives timer tables a placement.
-        if (scheduled is not null)
-        {
-            isPublic = false;
-            placement = "Local";
-        }
-
+        // A table declaring Scheduled holds timer rows: implicitly private, and always Local —
+        // which is per-shard, because a shard node runs one engine per shard and timers are rows
+        // in that engine's log. A conflicting declaration is MELANGE0022 below, not a silent
+        // override.
         var typeLocation = LocationInfo.From(
             (context.TargetNode as StructDeclarationSyntax)?.Identifier.GetLocation() ?? context.TargetNode.GetLocation());
         var diagnostics = new List<DiagnosticInfo>();
+        if (scheduled is not null)
+        {
+            if (declaredPlacement is not (null or "Local"))
+            {
+                diagnostics.Add(new DiagnosticInfo(
+                    "MELANGE0022",
+                    typeLocation,
+                    new EquatableArray<string>([tableName, $"Placement.{declaredPlacement}"])));
+            }
+
+            if (shardBy is not null)
+            {
+                diagnostics.Add(new DiagnosticInfo(
+                    "MELANGE0022",
+                    typeLocation,
+                    new EquatableArray<string>([tableName, $"ShardBy = \"{shardBy}\""])));
+            }
+
+            isPublic = false;
+            placement = "Local";
+            shardBy = null;
+        }
+
         var columns = new List<ColumnModel>();
         var enums = new List<EnumModel>();
 
@@ -132,7 +153,7 @@ internal static class ModelExtractor
 
         var attribute = context.Attributes[0];
         var kind = attribute.ConstructorArguments.Length > 0 && attribute.ConstructorArguments[0].Value is int k
-            ? k switch { 1 => "ClientConnected", 2 => "ClientDisconnected", _ => "Standard" }
+            ? k switch { 1 => "ClientConnected", 2 => "ClientDisconnected", 3 => "Init", _ => "Standard" }
             : "Standard";
         var reducerName = method.Name;
         string? policyFqn = null;
@@ -222,6 +243,8 @@ internal static class ModelExtractor
 
         if (kind is "ClientConnected" or "ClientDisconnected" && parameters.Count > 0)
             AddSignature(diagnostics, location, reducerName, "is a lifecycle reducer, which takes only ReducerContext — the transport has no arguments to supply");
+        if (kind is "Init" && parameters.Count > 0)
+            AddSignature(diagnostics, location, reducerName, "is an init reducer, which takes only ReducerContext — a fresh engine opening has no arguments to supply");
 
         var (touched, opaque) = AnalyzeTableTouches(method, context.TargetNode as MethodDeclarationSyntax);
         return new ReducerModel(

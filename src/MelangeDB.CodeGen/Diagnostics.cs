@@ -4,7 +4,7 @@ namespace MelangeDB.CodeGen;
 
 /// <summary>
 /// Every diagnostic MelangeDB reports at compile time. Ids are stable public API: MELANGE0001
-/// through MELANGE0017, never renumbered, each with a fires-test and a compiles-clean test.
+/// through MELANGE0022, never renumbered, each with a fires-test and a compiles-clean test.
 /// </summary>
 public static class Diagnostics
 {
@@ -176,6 +176,18 @@ public static class Diagnostics
         "MELANGE0021",
         "One project generates from one schema manifest",
         "This compilation carries several melange-schema.json AdditionalFiles ({0}). The bindings share one MelangeDB.Types namespace and one connection wrapper, so one project binds one module; split consumers of different modules into separate projects.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ScheduledTablePlacement = new(
+        "MELANGE0022",
+        "Scheduled tables are always Placement.Local",
+        "Table '{0}' declares Scheduled and {1}, which is discarded. A scheduled table holds timer rows and is always " +
+        "Placement.Local — and Local is per-shard, not one-per-cluster: a shard node runs one engine per shard it owns, " +
+        "and timers are rows in that engine's own log, so one declared timer table is one independent timer set per " +
+        "shard, firing on whichever node owns it (docs/CLUSTERING.md). Drop the declaration; seed each shard's rows " +
+        "from a [Reducer(ReducerKind.Init)] reducer.",
         Category,
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
