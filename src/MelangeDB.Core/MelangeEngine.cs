@@ -738,13 +738,14 @@ public sealed partial class MelangeEngine : IDisposable
         var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events);
 
         IReadOnlyList<RowOp> ops;
-        double bodyMs;
+        // Measured directly rather than as (total - commit): everything after the append — commit
+        // observers, applier notification, an automatic snapshot — is inside the same span, and
+        // subtracting would charge all of it to the module's reducer body. Declared out here so the
+        // abort path can report it too; null there means the body itself is what threw.
+        var bodyStarted = Stopwatch.GetTimestamp();
+        double? bodyMs = null;
         try
         {
-            // Measured directly rather than as (total - commit): everything after the append —
-            // commit observers, applier notification, an automatic snapshot — is inside the same
-            // span, and subtracting would charge all of it to the module's reducer body.
-            var bodyStarted = Stopwatch.GetTimestamp();
             body(context);
             bodyMs = Elapsed(bodyStarted);
             ops = writeSet.ToOps();
@@ -753,12 +754,19 @@ public sealed partial class MelangeEngine : IDisposable
         catch (Exception exception)
         {
             // Abort: nothing was appended, the write set is discarded, and the allocation stage
-            // was never committed — zero trace, no consumed AutoInc value.
+            // was never committed — zero trace, no consumed AutoInc value. The write lock was still
+            // held for the whole of it, so a slow abort is reported exactly like a slow commit.
             var outcome = exception is RejectedException ? "rejected" : "abort";
+            // The part before the whole: reading the body's clock after the transaction's would let
+            // the work between the two readings push a trivial abort's body past its own duration.
+            var abortedBodyMs = bodyMs ?? Elapsed(bodyStarted);
+            var abortedAfter = Elapsed(started);
             activity?.SetTag("melange.outcome", outcome);
             activity?.SetTag("melange.writeset.rows", 0);
             activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
-            _telemetry?.RecordTransaction(reducerName, outcome, Elapsed(started), 0);
+            _telemetry?.RecordTransaction(reducerName, outcome, abortedAfter, 0);
+            if (abortedAfter > _options.Telemetry.SlowReducerMs)
+                WarnSlowAbort(activity, reducerName, outcome, abortedAfter, abortedBodyMs);
             throw;
         }
 
@@ -792,7 +800,7 @@ public sealed partial class MelangeEngine : IDisposable
         var elapsed = Elapsed(started);
         _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
         if (elapsed > _options.Telemetry.SlowReducerMs)
-            WarnSlowReducer(activity, reducerName, elapsed, bodyMs, commitMs, fsyncMs, postCommitMs, ops.Count);
+            WarnSlowReducer(activity, reducerName, elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count);
 
         return committedLsn;
     }
@@ -835,6 +843,27 @@ public sealed partial class MelangeEngine : IDisposable
             LogMessages.SlowReducer(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, inlineFsync, postCommitMs, rows);
         else
             LogMessages.SlowReducerDeferredFsync(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, postCommitMs, rows);
+    }
+
+    /// <summary>
+    /// Reports one over-threshold transaction that aborted. Rolling back costs nothing and buys
+    /// nothing here: the write lock was held for the full duration either way, so a reducer that
+    /// walks five thousand rows and then rejects the move stalls every other writer exactly as long
+    /// as one that commits. Only the parts that happened are reported — there is no commit, no
+    /// fsync, and no post-commit to attribute, and zeroes would invite the reader to average them.
+    /// </summary>
+    private void WarnSlowAbort(Activity? activity, string reducerName, string outcome, double elapsed, double bodyMs)
+    {
+        activity?.AddEvent(new ActivityEvent(
+            "melange.slow_reducer",
+            tags: new ActivityTagsCollection
+            {
+                ["melange.duration_ms"] = elapsed,
+                ["melange.body_ms"] = bodyMs,
+                ["melange.outcome"] = outcome,
+                ["melange.writeset.rows"] = 0,
+            }));
+        LogMessages.SlowReducerAborted(_logger, reducerName, elapsed, outcome, _options.Telemetry.SlowReducerMs, bodyMs);
     }
 
     private static double Elapsed(long startedTimestamp) =>
@@ -887,6 +916,27 @@ public sealed partial class MelangeEngine : IDisposable
             double commitMs,
             double postCommitMs,
             int rows);
+
+        /// <summary>
+        /// 1003 for a transaction that aborted. Nothing was appended, so there is no commit, fsync,
+        /// or post-commit field — but the lock was held for the whole duration, which is the only
+        /// number that matters to everyone else. <c>Outcome</c> separates a bug (<c>abort</c>) from
+        /// an ordinary refusal (<c>rejected</c>) that happened to be expensive.
+        /// </summary>
+        [LoggerMessage(
+            EventId = 1003,
+            EventName = "SlowReducerAborted",
+            Level = LogLevel.Warning,
+            Message = "Reducer '{Reducer}' took {DurationMs:F1}ms and then {Outcome}, over the " +
+                      "Telemetry:SlowReducerMs threshold of {ThresholdMs}ms — body {BodyMs:F1}ms, nothing " +
+                      "appended. The write lock was held for all of it.")]
+        public static partial void SlowReducerAborted(
+            ILogger logger,
+            string reducer,
+            double durationMs,
+            string outcome,
+            int thresholdMs,
+            double bodyMs);
 
         private static readonly Action<ILogger, ulong, Exception?> CommitObserverFailedMessage =
             LoggerMessage.Define<ulong>(

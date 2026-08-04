@@ -29,6 +29,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A slow reducer that aborted warned about nothing.** `1003` fired only on the commit path, so a reducer
+  that spent 500 ms in its body and then threw was silent — while holding the write lock, and therefore
+  every other writer, for exactly as long as one that committed. A validating reducer that does its
+  expensive work before refusing, a transaction rejected by the cluster's span check, and a scheduled
+  reducer that throws were all invisible to the alarm built to catch them. Aborts now warn with the same
+  split, carrying `Outcome` (`abort`/`rejected`) and reporting only `DurationMs` and `BodyMs`, since nothing
+  was appended; the event name is `SlowReducerAborted`. Rejections warn too — an alert that considers them
+  routine can filter on `Outcome`.
 - **`schemaHash` no longer depends on the MelangeDB version.** The manifest's `generator` field was
   inside the hashed content, so every MelangeDB release rotated every schema hash — and
   `conn.SchemaHash`, whose only job is detecting drift, reported drift against a schema nobody had
