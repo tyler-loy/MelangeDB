@@ -108,6 +108,20 @@ public sealed class FileCommitLog : ICommitLog
         }
     }
 
+    /// <summary>
+    /// Milliseconds spent in the fsync inside the most recent <see cref="Append"/>, or null when
+    /// that append did not fsync in line — <see cref="FsyncPolicy.Interval"/> flushes on a timer
+    /// thread and <see cref="FsyncPolicy.OsBuffered"/> never flushes explicitly, so under either
+    /// there is no durability cost to charge to the appending transaction, and the honest answer is
+    /// "none" rather than "zero".
+    /// <para>
+    /// Read it on the thread that just returned from the <see cref="Append"/> whose cost is wanted:
+    /// appends are serialized by the engine's write lock, so that thread is the only one that can
+    /// have written the value it reads.
+    /// </para>
+    /// </summary>
+    internal double? LastAppendFsyncMilliseconds { get; private set; }
+
     /// <summary>Forces buffered appends to stable storage regardless of the fsync policy.</summary>
     public void FlushToDisk()
     {
@@ -161,7 +175,7 @@ public sealed class FileCommitLog : ICommitLog
                 _stream.Write(frame);
                 _stream.Write(payload);
                 AppendFaultInjection?.Invoke(_stream);
-                Flush(onCommit: true);
+                LastAppendFsyncMilliseconds = Flush(onCommit: true);
             }
             catch
             {
@@ -439,7 +453,11 @@ public sealed class FileCommitLog : ICommitLog
         _stream.Flush(flushToDisk: true);
     }
 
-    private void Flush(bool onCommit)
+    /// <summary>
+    /// Flushes per the configured policy, returning the milliseconds spent in an in-line fsync or
+    /// null when this policy does not fsync in line.
+    /// </summary>
+    private double? Flush(bool onCommit)
     {
         switch (_options.FsyncPolicy)
         {
@@ -448,18 +466,19 @@ public sealed class FileCommitLog : ICommitLog
                 {
                     var started = Stopwatch.GetTimestamp();
                     _stream.Flush(flushToDisk: true);
-                    _telemetry?.RecordFsyncDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                    var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                    _telemetry?.RecordFsyncDuration(elapsed);
+                    return elapsed;
                 }
 
-                break;
             case FsyncPolicy.Interval:
                 _stream.Flush();
                 if (onCommit)
                     EnsureFlushTimer();
-                break;
+                return null;
             case FsyncPolicy.OsBuffered:
                 _stream.Flush();
-                break;
+                return null;
             default:
                 throw new InvalidOperationException($"Unknown fsync policy {_options.FsyncPolicy}.");
         }

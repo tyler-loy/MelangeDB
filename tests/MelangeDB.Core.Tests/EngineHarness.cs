@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+
 namespace MelangeDB.Core.Tests;
 
 /// <summary>
@@ -17,15 +19,18 @@ internal sealed class EngineHarness : IDisposable
 
     private readonly Type[] _tables;
     private readonly bool _useReflectionSchema;
+    private readonly ILoggerFactory? _loggerFactory;
 
     public EngineHarness(
         FsyncPolicy fsyncPolicy = FsyncPolicy.OnCommit,
         bool telemetryEnabled = true,
         Type[]? tables = null,
-        bool useReflectionSchema = false)
+        bool useReflectionSchema = false,
+        ILoggerFactory? loggerFactory = null)
     {
         _tables = tables ?? DefaultTables;
         _useReflectionSchema = useReflectionSchema;
+        _loggerFactory = loggerFactory;
         Root = Directory.CreateTempSubdirectory("melange-test-").FullName;
         Options = new MelangeDbOptions
         {
@@ -103,5 +108,5 @@ internal sealed class EngineHarness : IDisposable
         new(new MelangeDB.Generated.MelangeModel().Tables().Where(t => tables.Contains(t.RowType)));
 
     private MelangeEngine CreateEngine() =>
-        new(Options, CreateRegistry());
+        new(Options, CreateRegistry(), _loggerFactory);
 }
