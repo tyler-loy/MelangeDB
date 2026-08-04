@@ -15,7 +15,7 @@ namespace MelangeDB.Types
     public static class MelangeSchema
     {
         /// <summary>The manifest's schema hash; compare against the server module's to surface drift.</summary>
-        public const string Hash = "35d1eb7e116b591528e66c4e365ca888a5de9ee998f3ded4718b6d309d3e579c";
+        public const string Hash = "c68709b6f2e7e330a9220eb1d1f0ab7b108cb03e1a05a34061283a8ed67ecb6f";
 
         public const string Module = "MelangeGeneratorTests";
     }

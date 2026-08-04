@@ -206,20 +206,6 @@ public class GeneratedOutputTests
     private static void AssertSnapshot(string hintName, string expectedFile)
     {
         var result = GeneratorTestHost.RunGenerator(SnapshotSource);
-        var (_, actual) = Assert.Single(result.GeneratedSources, s => s.HintName == hintName);
-        actual = actual.Replace("\r\n", "\n");
-
-        var expectedPath = Path.Combine(AppContext.BaseDirectory, "Snapshots", expectedFile);
-        Directory.CreateDirectory(Path.GetDirectoryName(expectedPath)!);
-        if (!File.Exists(expectedPath))
-        {
-            File.WriteAllText(expectedPath + ".actual", actual);
-            Assert.Fail($"Missing snapshot {expectedFile}; review and check in the .actual file written next to it.");
-        }
-
-        var expected = File.ReadAllText(expectedPath).Replace("\r\n", "\n");
-        if (expected != actual)
-            File.WriteAllText(expectedPath + ".actual", actual);
-        Assert.Equal(expected, actual);
+        GeneratorTestHost.AssertSnapshot(result, hintName, expectedFile);
     }
 }

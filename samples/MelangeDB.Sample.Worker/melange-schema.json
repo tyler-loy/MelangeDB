@@ -1,7 +1,7 @@
 {
   "format": 1,
-  "generator": "0.1.0.0",
-  "schemaHash": "d740de2cac1eb169604391640d40834efb184247141f4c2dbfc4265ea2662537",
+  "generator": "0.1.1.0",
+  "schemaHash": "8960d9743b69edbc265546a1d4a69c09b92301d8e85910887dc109ebdea1a9eb",
   "module": "MelangeDB.Sample.Worker",
   "enums": [],
   "tables": [

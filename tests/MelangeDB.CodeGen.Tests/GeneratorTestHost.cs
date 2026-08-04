@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text.RegularExpressions;
 using MelangeDB.CodeGen;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -89,7 +90,13 @@ internal static class GeneratorTestHost
     public static void AssertSnapshot(RunResult result, string hintName, string expectedFile)
     {
         var (_, actual) = Assert.Single(result.GeneratedSources, s => s.HintName == hintName);
-        actual = actual.Replace("\r\n", "\n");
+        AssertSnapshotText(actual, expectedFile);
+    }
+
+    /// <summary>Compares already-generated text against a checked-in snapshot.</summary>
+    public static void AssertSnapshotText(string generated, string expectedFile)
+    {
+        var actual = Normalize(generated);
 
         var expectedPath = Path.Combine(AppContext.BaseDirectory, "Snapshots", expectedFile);
         Directory.CreateDirectory(Path.GetDirectoryName(expectedPath)!);
@@ -99,11 +106,28 @@ internal static class GeneratorTestHost
             Assert.Fail($"Missing snapshot {expectedFile}; review and check in the .actual file written next to it.");
         }
 
-        var expected = File.ReadAllText(expectedPath).Replace("\r\n", "\n");
+        var expected = Normalize(File.ReadAllText(expectedPath));
         if (expected != actual)
             File.WriteAllText(expectedPath + ".actual", actual);
         Assert.Equal(expected, actual);
     }
+
+    private static readonly Regex GeneratorVersion = new(
+        "(\"{1,2}generator\"{1,2}:\\s*\"{1,2})[0-9][0-9.]*",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Normalizes line endings, and pins the emitted generator version to 0.0.0.0.
+    /// </summary>
+    /// <remarks>
+    /// The manifest records which MelangeDB built it — useful in a shipped artifact, useless in a
+    /// snapshot. Left alone it makes every release break these two tests on the version bump alone,
+    /// and a failure that always means "refresh the file" is how a real regression in generated
+    /// output eventually gets waved through. The version is asserted by shape here, not by value;
+    /// that it is emitted at all is what these snapshots are for.
+    /// </remarks>
+    private static string Normalize(string text) =>
+        GeneratorVersion.Replace(text.Replace("\r\n", "\n"), "${1}0.0.0.0");
 
     private sealed class InMemoryAdditionalText(string path, string content) : AdditionalText
     {

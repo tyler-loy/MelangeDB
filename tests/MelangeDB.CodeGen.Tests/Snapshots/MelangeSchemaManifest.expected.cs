@@ -11,14 +11,15 @@ namespace MelangeDB.Generated
     /// </summary>
     internal static class MelangeSchemaManifest
     {
-        /// <summary>SHA-256 over the manifest JSON rendered with an empty schemaHash field.</summary>
-        public const string Hash = "35d1eb7e116b591528e66c4e365ca888a5de9ee998f3ded4718b6d309d3e579c";
+        /// <summary>SHA-256 over the manifest JSON rendered with empty schemaHash and generator
+        /// fields, so it identifies the schema and not the MelangeDB version that emitted it.</summary>
+        public const string Hash = "c68709b6f2e7e330a9220eb1d1f0ab7b108cb03e1a05a34061283a8ed67ecb6f";
 
         /// <summary>The manifest JSON, verbatim.</summary>
         public const string Json = @"{
   ""format"": 1,
-  ""generator"": ""0.1.0.0"",
-  ""schemaHash"": ""35d1eb7e116b591528e66c4e365ca888a5de9ee998f3ded4718b6d309d3e579c"",
+  ""generator"": ""0.0.0.0"",
+  ""schemaHash"": ""c68709b6f2e7e330a9220eb1d1f0ab7b108cb03e1a05a34061283a8ed67ecb6f"",
   ""module"": ""MelangeGeneratorTests"",
   ""enums"": [
     {

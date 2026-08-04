@@ -60,7 +60,25 @@ changelog, and here, because a consumer pinning `0.x` deserves to know it before
 3. Draft a GitHub Release against that tag, write the notes, and publish it. That starts the run.
 4. The `test` job runs first. When it passes, the `publish` job parks awaiting approval of the
    `release` environment. Approve it, and the packages go to nuget.org.
-5. Bump `VersionPrefix` to the next version so `main` prereleases sort above the release.
+5. Bump `VersionPrefix` to the next version so `main` prereleases sort above the release. **The
+   bump changes two committed files**, because a manifest records the generator version that wrote
+   it and their staleness guards compare byte-for-byte on purpose. Re-export both in the same PR,
+   or CI fails on the bump alone:
+
+   ```
+   dotnet build samples/MelangeDB.Sample.Worker -c Debug
+   dotnet build tests/MelangeDB.Transport.Tests -c Debug
+   dotnet run --project src/MelangeDB.Cli -- schema \
+     samples/MelangeDB.Sample.Worker/bin/Debug/net10.0/MelangeDB.Sample.Worker.dll \
+     -o samples/MelangeDB.Sample.Worker/melange-schema.json
+   dotnet run --project src/MelangeDB.Cli -- schema \
+     tests/MelangeDB.Transport.Tests/bin/Debug/net10.0/MelangeDB.Transport.Tests.dll \
+     -o tests/MelangeDB.Transport.Tests/melange-schema.json
+   ```
+
+   The generator-code snapshots under `tests/MelangeDB.CodeGen.Tests/Snapshots/` need no such
+   treatment — they pin the version to `0.0.0.0` before comparing, because a snapshot of generated
+   code asserts the code, not which build emitted it.
 
 Two deliberate gates sit between a typo and a permanent nuget.org version: a pushed tag publishes
 nothing by itself, and the publish job waits on a reviewer even after the release exists. That

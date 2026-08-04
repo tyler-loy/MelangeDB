@@ -10,7 +10,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`schemaHash` no longer depends on the MelangeDB version.** The manifest's `generator` field was
+  inside the hashed content, so every MelangeDB release rotated every schema hash — and
+  `conn.SchemaHash`, whose only job is detecting drift, reported drift against a schema nobody had
+  touched. The hash is now taken over the manifest rendered with both `schemaHash` and `generator`
+  empty, so it identifies the schema and not the build that emitted it. **Hash values change once
+  in this release**; after that, upgrading MelangeDB leaves them alone.
 
 ## [0.1.0] — 2026-08-03
 
