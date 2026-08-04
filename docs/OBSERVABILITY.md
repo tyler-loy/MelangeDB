@@ -110,6 +110,14 @@ A `melange.reducer` span whose duration exceeds `Telemetry:SlowReducerMs` additi
 `melange.slow_reducer` span event (with `melange.duration_ms`) and produces a warning log entry — shipped
 with phase 02, threshold live-reloadable.
 
+**Read reducer duration as global write latency.** The engine's write lock is held across the entire
+transaction — body, commit guards, append, fsync, commit observers, and any automatic snapshot the commit
+triggers (see [DESIGN.md §4](DESIGN.md)). Every millisecond on a `melange.reducer` span is a millisecond in
+which no other transaction on that engine could start. So `Telemetry:SlowReducerMs` is not "how slow is too
+slow for this caller" but **"how long is it acceptable to freeze the world"**, and a `melange.reducer`
+histogram is the closest thing the system has to a write-stall metric. Reads are exempt: subscription fan-out
+and committed reads take no lock and keep serving throughout.
+
 ### Context propagation
 
 Two places, both of which need explicit protocol support:
