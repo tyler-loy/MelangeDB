@@ -131,6 +131,16 @@ reducer body.
 to the appending transaction; a zero would read as "the disk was instant". Those warnings keep event id
 `1003` — alerts key on the id — under the event name `SlowReducerDeferredFsync` rather than `SlowReducer`.
 
+**A transaction that aborts warns too.** Rolling back costs nothing and buys nothing: the write lock was
+held for the full duration either way, so a reducer that walks five thousand rows and then rejects the move
+stalls every other writer exactly as long as one that commits. Those entries carry `melange.outcome` /
+`Outcome` — `abort` for a bug, `rejected` for an ordinary refusal that happened to be expensive — under the
+event name `SlowReducerAborted`, again on id `1003`. They report `DurationMs` and `BodyMs` only: nothing was
+appended, so there is no commit, fsync, or post-commit to attribute, and zeroes would invite a dashboard to
+average them into the committed ones. A rejection is a normal outcome and warning on it is deliberate,
+because "rejections are cheap" is exactly the assumption that makes a validating reducer expensive; an alert
+that disagrees can filter on `Outcome`.
+
 **Read reducer duration as global write latency.** The engine's write lock is held across the entire
 transaction — body, commit guards, append, fsync, commit observers, and any automatic snapshot the commit
 triggers (see [DESIGN.md §4](DESIGN.md)). Every millisecond on a `melange.reducer` span is a millisecond in
@@ -209,7 +219,8 @@ Structured through `ILogger` with stable `EventId`s so log-based alerts don't br
 No parallel logging abstraction — the host's configured providers are the whole story.
 
 Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer` —
-also emitted as `SlowReducerDeferredFsync` under the same id when the fsync policy defers the flush —
+also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flush, and
+`SlowReducerAborted` when the transaction did not commit, both under the same id —
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
 `1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,

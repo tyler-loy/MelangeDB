@@ -261,6 +261,89 @@ public class TelemetryTests : IDisposable
         Assert.Contains("fsync deferred by CommitLog:FsyncPolicy", entry.Message);
     }
 
+    [Fact]
+    public void A_slow_reducer_that_throws_still_warns_because_the_lock_was_held_just_as_long()
+    {
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 0;
+
+        Assert.Throws<InvalidOperationException>(() => logged.Invoke("Crash", ctx =>
+        {
+            ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" });
+            throw new InvalidOperationException("boom");
+        }));
+
+        var entry = logs.Single(1003);
+        Assert.Equal("SlowReducerAborted", entry.EventName);
+        Assert.Equal("abort", entry.Fields["Outcome"]);
+        Assert.True(entry.Number("BodyMs") > 0);
+        // Nothing was appended, so there is nothing to attribute — and a zero would be averaged.
+        Assert.DoesNotContain("CommitMs", entry.Fields.Keys);
+        Assert.DoesNotContain("PostCommitMs", entry.Fields.Keys);
+        Assert.Contains("nothing appended", entry.Message);
+    }
+
+    [Fact]
+    public void A_slow_rejection_warns_too_and_the_outcome_field_is_what_separates_them()
+    {
+        // A rejection is an ordinary outcome — a player tried something illegal — but it costs the
+        // same lock time, and "rejections are cheap" is the assumption that makes a validating
+        // reducer expensive. It warns; the outcome field is how an alert can choose to ignore it.
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 0;
+
+        Assert.Throws<RejectedException>(() => logged.Invoke("Deny", _ => throw new RejectedException("illegal move")));
+
+        var entry = logs.Single(1003);
+        Assert.Equal("rejected", entry.Fields["Outcome"]);
+        Assert.Equal("Deny", entry.Fields["Reducer"]);
+    }
+
+    [Fact]
+    public void An_abort_carries_the_slow_reducer_span_event_with_the_outcome_and_no_commit_split()
+    {
+        _harness.Options.Telemetry.SlowReducerMs = 0;
+        Assert.Throws<RejectedException>(() => _harness.Invoke("Deny", _ => throw new RejectedException("no")));
+
+        var slow = SlowReducerEvent();
+        Assert.Equal("rejected", slow.Tags.Single(t => t.Key == "melange.outcome").Value);
+        Assert.Equal(0, slow.Tags.Single(t => t.Key == "melange.writeset.rows").Value);
+        Assert.True(Tag(slow, "melange.body_ms") <= Tag(slow, "melange.duration_ms"));
+        Assert.DoesNotContain(slow.Tags, t => t.Key == "melange.commit_ms");
+    }
+
+    [Fact]
+    public void A_fast_abort_stays_silent_so_ordinary_rejections_do_not_become_noise()
+    {
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 5_000;
+
+        Assert.Throws<RejectedException>(() => logged.Invoke("Deny", _ => throw new RejectedException("no")));
+
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1003);
+    }
+
+    [Fact]
+    public void A_commit_guard_that_rejects_slowly_is_not_charged_to_the_reducer_body()
+    {
+        // The cluster span check runs inside the same try as the body, so a transaction refused for
+        // touching two shards aborts having paid for both. Body time stays the body's.
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 0;
+        logged.Engine.AddCommitGuard(new SleepyGuard(TimeSpan.FromMilliseconds(60)));
+
+        Assert.Throws<RejectedException>(() => logged.Invoke("SpanBoth", ctx =>
+            ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" })));
+
+        var entry = logs.Single(1003);
+        Assert.True(entry.Number("DurationMs") >= 55, "the guard's cost is part of the stall");
+        Assert.True(entry.Number("BodyMs") < 30, "but it is not the body's");
+    }
+
     private ActivityEvent SlowReducerEvent()
     {
         var reducer = Stopped().Last(a => a.OperationName == "melange.reducer");
@@ -273,5 +356,14 @@ public class TelemetryTests : IDisposable
     private sealed class SleepyObserver(TimeSpan delay) : ICommitObserver
     {
         public void OnCommit(CommitRecord record) => Thread.Sleep(delay);
+    }
+
+    private sealed class SleepyGuard(TimeSpan delay) : ICommitGuard
+    {
+        public void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin)
+        {
+            Thread.Sleep(delay);
+            throw new RejectedException("this write set spans two shards");
+        }
     }
 }
