@@ -36,9 +36,15 @@ internal static class ManifestEmitter
     /// <summary>Builds the manifest JSON and its schema hash for an already-ordered model.</summary>
     public static (string Json, string Hash) Build(string module, TableModel[] tables, ReducerModel[] reducers)
     {
-        var withoutHash = Render(module, tables, reducers, schemaHash: string.Empty);
-        var hash = Sha256Hex(withoutHash);
-        return (Render(module, tables, reducers, hash), hash);
+        // Two fields are blanked before hashing, for different reasons. `schemaHash` because a hash
+        // cannot cover itself. `generator` because the hash identifies the *schema*, not the build
+        // that emitted it: leave the version in and every MelangeDB release rotates every schema
+        // hash, so `conn.SchemaHash` — whose only job is detecting drift — reports drift against a
+        // schema nobody touched. The emitted JSON still carries the real version; it just isn't
+        // part of the identity.
+        var hashable = Render(module, tables, reducers, schemaHash: string.Empty, generator: string.Empty);
+        var hash = Sha256Hex(hashable);
+        return (Render(module, tables, reducers, hash, GeneratorVersion()), hash);
     }
 
     /// <summary>Emits the generated source embedding the manifest verbatim.</summary>
@@ -58,7 +64,8 @@ internal static class ManifestEmitter
         builder.AppendLine("    /// </summary>");
         builder.AppendLine("    internal static class MelangeSchemaManifest");
         builder.AppendLine("    {");
-        builder.AppendLine("        /// <summary>SHA-256 over the manifest JSON rendered with an empty schemaHash field.</summary>");
+        builder.AppendLine("        /// <summary>SHA-256 over the manifest JSON rendered with empty schemaHash and generator");
+        builder.AppendLine("        /// fields, so it identifies the schema and not the MelangeDB version that emitted it.</summary>");
         builder.AppendLine($"        public const string Hash = \"{hash}\";");
         builder.AppendLine();
         builder.AppendLine("        /// <summary>The manifest JSON, verbatim.</summary>");
@@ -68,7 +75,12 @@ internal static class ManifestEmitter
         return builder.ToString();
     }
 
-    private static string Render(string module, TableModel[] tables, ReducerModel[] reducers, string schemaHash)
+    private static string Render(
+        string module,
+        TableModel[] tables,
+        ReducerModel[] reducers,
+        string schemaHash,
+        string generator)
     {
         var publicTables = tables.Where(static t => t.IsPublic).ToArray();
         var clientReducers = reducers.Where(IsClientCallable).ToArray();
@@ -77,7 +89,7 @@ internal static class ManifestEmitter
         var json = new JsonBuilder();
         json.BeginObject();
         json.Number("format", FormatVersion);
-        json.String("generator", GeneratorVersion());
+        json.String("generator", generator);
         json.String("schemaHash", schemaHash);
         json.String("module", module);
 
