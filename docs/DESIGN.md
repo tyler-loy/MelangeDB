@@ -161,6 +161,34 @@ analyzer should say so.
 writes accumulate in the write set. A reducer either returns (commit) or throws (abort, nothing
 appended).
 
+### The write lock covers the whole body, not just the commit
+
+An engine has one global write lock, and `MelangeEngine.Invoke` takes it around the *entire*
+transaction: the reducer body, the commit guards, the log append and its fsync, the commit
+observers, and any automatic snapshot the commit happens to trigger. Nothing about a reducer runs
+concurrently with another reducer on the same engine.
+
+So a reducer that spends 75 ms walking rows in memory before it writes anything holds every other
+transaction in the database still for 75 ms, whether or not it ends up committing much. The
+question a module author is answering is therefore not *"is this reducer slow for its caller"* but
+**"how long may this hold the entire world still."** The lock is per engine, and a shard node runs
+one engine per shard, so in a cluster "the world" means that shard — see
+[CLUSTERING.md](CLUSTERING.md).
+
+**Reads are not affected.** Committed reads and subscription fan-out go through a lock-free view
+over the hot store, so queries, deltas, and policy evaluation continue while a writer is in its
+body. Single-writer means one *writer*, not one thread.
+
+The consequence worth acting on: **a long sweep should be windowed across many short transactions
+rather than run as one.** Take a few hundred rows per tick and carry a cursor, rather than walking a
+million in one reducer — the sweep takes the same total time, but the world is only frozen in
+slices. `MELANGE0017` already pushes toward windowing for scans over non-resident tables; the lock
+scope is why windowing matters even when every row is `Resident` and the scan touches no disk.
+
+`Telemetry:SlowReducerMs` is the alarm for this, and it is best read as *"how long is it acceptable
+to freeze the world"* rather than "how slow is too slow" — see
+[OBSERVABILITY.md](OBSERVABILITY.md).
+
 ## 5. The commit log is the database
 
 This is the load-bearing decision.

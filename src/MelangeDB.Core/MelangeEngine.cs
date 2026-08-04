@@ -213,6 +213,13 @@ public sealed class MelangeEngine : IDisposable
     /// Invokes a reducer body as one transaction. <paramref name="reducerName"/> and
     /// <paramref name="arguments"/> are recorded as log metadata for audit; the write set is the
     /// authoritative payload. Nested invocations are forbidden and throw.
+    /// <para>
+    /// The engine's single write lock is held across the entire call — body, commit guards,
+    /// append and fsync, commit observers, and any automatic snapshot the commit triggers — so time
+    /// spent in the body is global write latency: no other transaction on this engine can start
+    /// until it returns. Readers are unaffected (<see cref="CommittedView"/> takes no lock). Window
+    /// long sweeps across many short transactions rather than running one long one.
+    /// </para>
     /// </summary>
     public ulong Invoke(
         string reducerName,
@@ -247,7 +254,8 @@ public sealed class MelangeEngine : IDisposable
     /// <summary>
     /// Invokes a reducer body with pre-encoded arguments — the generated dispatch path, which
     /// decoded (and validated) the same bytes before this call. <paramref name="parentContext"/>
-    /// parents the reducer span when a transport propagated a caller's trace context.
+    /// parents the reducer span when a transport propagated a caller's trace context. Holds the
+    /// write lock across the whole call, as the overload above describes.
     /// </summary>
     public ulong Invoke(
         string reducerName,

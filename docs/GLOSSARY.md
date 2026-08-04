@@ -553,7 +553,9 @@ default, file-backed reference implementation). Matters most for guests: the IdP
 the token *is* the character, and a client that loses it has lost the character.
 
 **Transaction** — One reducer invocation. Reads through the overlay, accumulates a write set, and commits by a
-single log append. Returns to commit, throws to abort with nothing appended.
+single log append. Returns to commit, throws to abort with nothing appended. Serialized end to end against
+every other transaction on the engine by the **write lock** — the body is inside the critical
+section, not only the append.
 
 **Transactional outbox** — The pattern making the event bus safe: events go into the write set and publish only
 after the commit point, so an event can never escape for a rolled-back transaction.
@@ -578,6 +580,13 @@ and only the last uncovering fires `OnDelete` — whether by delete, scope exit,
 and unsubscribe, while rows and events live on the shared cache. A completed initial set — first subscribe,
 re-establishment after resync, or a server-driven rescope — reconciles against that subscription's covered
 keys as a diff: deletes for departures, inserts for arrivals, updates for changed survivors. No flush.
+
+**Write lock** — The engine's single global writer lock, held across the *whole* transaction: reducer body,
+commit guards, log append and fsync, commit observers, and any automatic snapshot the commit triggers. Not
+just the commit point — **body time is global write latency**, so a 75 ms reducer stalls every other
+transaction on that engine for 75 ms. Readers never take it: committed reads and subscription fan-out run
+against a lock-free view throughout. One writer per engine, and on a shard node one engine per shard, so the
+lock is per-shard rather than per-node.
 
 **Write set** — The ordered row operations a transaction produced, keyed by table and primary key. **The
 authoritative payload of a log record** — logging the write set rather than the reducer invocation is what lets

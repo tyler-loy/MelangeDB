@@ -301,7 +301,10 @@ from its key on the first transfer. The shard id is its own column.
 
 - **Each shard is internally single-writer** — one serialized transaction loop, one commit log, exactly
   the semantics that make reducers pleasant. Multi-writer is a property of the *cluster*. The reducer
-  programming model does not change.
+  programming model does not change. The lock behind that loop covers each whole reducer body, not just
+  its commit ([DESIGN.md §4](DESIGN.md)), so a slow reducer stalls writes for its shard — which is also
+  the good news: it stalls *only* its shard, and sharding is what turns one global write stall into a
+  local one.
 - **One commit log per shard.** No global total order across the cluster — only per-shard order plus
   causal ordering via handoffs and the event bus. You cannot ask "what was the whole world's state at
   instant T." Games don't need that; ledgers do. Accepting it is what makes writes scale.

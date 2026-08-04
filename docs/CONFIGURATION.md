@@ -40,8 +40,9 @@ corrections made when it shipped: (1) `Scheduler:CatchUpAfterDowntime` is **`res
 register planned — it is read exactly once, at scheduler start after recovery, which is the only moment
 downtime catch-up can mean anything, and a "live" label on a startup-only key would be an empty promise;
 (2) `Scheduler:MaxConcurrentTicks` shipped **accepted-and-reserved at its default of 1**: the scheduler is
-a single-threaded dispatch loop on purpose, because reducer transactions serialize on the engine's
-single-writer lock and a tick worker pool would parallelize nothing that matters (see
+a single-threaded dispatch loop on purpose, because reducer transactions serialize end to end on the
+engine's single-writer lock — which covers each body, not merely each commit — and a tick worker pool
+would parallelize nothing that matters (see
 docs/road-to-0.1/plan-phase-05.md, scheduler fairness). Values above 1 bind and validate but do not change dispatch.
 
 **Shipped as of phase 06** (defaults verified against `EventsOptions`): every `Events:*` key. Two notes made
@@ -57,10 +58,10 @@ the subscriber's checkpoint lag is the honest measure of how far behind it is.
 `HotStore:MemoryBudgetBytes` planned no default and shipped with a real one — `134217728` (128 MiB) —
 because a paging store with an unset cap is unbounded, which is the failure mode this phase exists to
 remove. (2) `CommitLog:GroupCommit` shipped **accepted-and-reserved** at its default of `true` (the
-`Scheduler:MaxConcurrentTicks` precedent): the engine's single-writer lock serializes commits, so no
-two appends are ever in flight for one fsync to cover — the bulk-ingestion path is the batching that
-actually exists; the knob binds and validates so a future concurrent commit path can honor it without
-a config break. (3) `Residency:Default` is consulted only for tables whose attribute leaves residency
+`Scheduler:MaxConcurrentTicks` precedent): the engine's single-writer lock is held across each whole
+transaction, body included, so no two appends are ever in flight for one fsync to cover — the
+bulk-ingestion path is the batching that actually exists; the knob binds and validates so a future
+concurrent commit path can honor it without a config break. (3) `Residency:Default` is consulted only for tables whose attribute leaves residency
 unspecified — and because `Paged` is the attribute's default value, an attribute explicitly declaring
 `Paged` is indistinguishable from silence; under a non-`Paged` configured default, the per-table
 override is how a table is pinned back down. `Residency:<TableName>` is `careful` as planned: a
@@ -332,5 +333,5 @@ where it goes. See [OBSERVABILITY.md](OBSERVABILITY.md).
 | `Telemetry:IncludeCallerIdentity` | bool | `true` | live | 01 | Adds caller identity to **spans only** — never a metric dimension, which would be one time series per player. Turn off where identity is a privacy requirement. |
 | `Telemetry:IncludeReducerArguments` | bool | `false` | live | 01 | Off by default: arguments can contain anything, including secrets, and the commit log already records them. |
 | `Telemetry:DeltaSpanSampleRatio` | double | `0.01` | live | 03 | `melange.subscription.delta` is the highest-frequency operation in the system; tracing every one at full rate would cost more than the work. |
-| `Telemetry:SlowReducerMs` | int | `50` | live | 02 | Reducers over this threshold get a span event and a log entry. |
+| `Telemetry:SlowReducerMs` | int | `50` | live | 02 | Reducers over this threshold get a span event and a log entry. Pick the number as **"how long may one transaction freeze every other writer"** — the write lock covers the whole reducer body, so this is a global write-latency budget, not a per-caller one. |
 | `HealthChecks:ApplierLagThreshold` | long | `10000` | live | 08 | Transactions behind before the `melange-applier` check reports unhealthy. Applies to every applier — the hot store's included — though a decoupled applier (Postgres) is the one that realistically lags. |
