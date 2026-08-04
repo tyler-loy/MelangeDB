@@ -107,8 +107,29 @@ Source name: `MelangeDB`.
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
 A `melange.reducer` span whose duration exceeds `Telemetry:SlowReducerMs` additionally carries a
-`melange.slow_reducer` span event (with `melange.duration_ms`) and produces a warning log entry — shipped
-with phase 02, threshold live-reloadable.
+`melange.slow_reducer` span event and produces a warning log entry (`1003`) — shipped with phase 02,
+threshold live-reloadable. Both carry the same split, because a slow transaction has more than one cause
+and they call for opposite responses:
+
+| Field | Span event tag | Log field | What a large value means |
+| --- | --- | --- | --- |
+| Total | `melange.duration_ms` | `DurationMs` | How long the write lock was held. |
+| Body | `melange.body_ms` | `BodyMs` | The module does too much per transaction — narrow the window. |
+| Commit | `melange.commit_ms` | `CommitMs` | The log append, fsync included. |
+| Fsync | `melange.fsync_ms` | `FsyncMs` | Disk contention on this host — infrastructure, not application. |
+| Post-commit | `melange.post_commit_ms` | `PostCommitMs` | A commit observer, an applier handoff, or an automatic snapshot. |
+| Rows | `melange.writeset.rows` | `Rows` | Sizes the transaction; a wide body with one row op is a read-side problem. |
+
+`76.9ms body / 2.3ms commit` and `0.5ms body / 141.7ms commit (141.6ms fsync)` are the two failures that
+used to produce identical warnings — one fixed in the module, one on the host. Body time is measured
+directly rather than derived as *total − commit*: commit observers, applier notification, and any automatic
+snapshot run after the append but inside the same span, so subtracting would bill all of them to the
+reducer body.
+
+**The fsync field is absent, not zero, when the flush was deferred.** Under `CommitLog:FsyncPolicy` of
+`Interval` or `OsBuffered` the flush happens on a timer thread or not at all, so no durability cost belongs
+to the appending transaction; a zero would read as "the disk was instant". Those warnings keep event id
+`1003` — alerts key on the id — under the event name `SlowReducerDeferredFsync` rather than `SlowReducer`.
 
 **Read reducer duration as global write latency.** The engine's write lock is held across the entire
 transaction — body, commit guards, append, fsync, commit observers, and any automatic snapshot the commit
@@ -187,7 +208,8 @@ corresponds to a documented silent failure mode:
 Structured through `ILogger` with stable `EventId`s so log-based alerts don't break on message rewording.
 No parallel logging abstraction — the host's configured providers are the whole story.
 
-Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer`,
+Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer` —
+also emitted as `SlowReducerDeferredFsync` under the same id when the fsync policy defers the flush —
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
 `1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,

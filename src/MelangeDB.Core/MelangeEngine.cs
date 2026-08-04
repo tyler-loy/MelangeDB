@@ -11,7 +11,7 @@ namespace MelangeDB.Core;
 /// Return means commit; throw means abort with zero trace. Phase 02's host integration wraps this
 /// behind <c>AddMelangeDb</c>.
 /// </summary>
-public sealed class MelangeEngine : IDisposable
+public sealed partial class MelangeEngine : IDisposable
 {
     private readonly MelangeDbOptions _options;
     private readonly TimeProvider _time;
@@ -738,9 +738,15 @@ public sealed class MelangeEngine : IDisposable
         var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events);
 
         IReadOnlyList<RowOp> ops;
+        double bodyMs;
         try
         {
+            // Measured directly rather than as (total - commit): everything after the append —
+            // commit observers, applier notification, an automatic snapshot — is inside the same
+            // span, and subtracting would charge all of it to the module's reducer body.
+            var bodyStarted = Stopwatch.GetTimestamp();
             body(context);
+            bodyMs = Elapsed(bodyStarted);
             ops = writeSet.ToOps();
             RunCommitGuards(reducerName, ops, CommitOrigin.Reducer);
         }
@@ -757,19 +763,26 @@ public sealed class MelangeEngine : IDisposable
         }
 
         ulong committedLsn = 0;
+        var commitMs = 0d;
+        double? fsyncMs = null;
+        var postCommitMs = 0d;
         if (ops.Count > 0 || events.Events is { Count: > 0 })
         {
             using (var commit = _telemetry?.StartCommit())
             {
                 var commitStarted = Stopwatch.GetTimestamp();
                 var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, encodedArguments, ops, events.Events));
-                _telemetry?.RecordCommitDuration(Elapsed(commitStarted));
+                commitMs = Elapsed(commitStarted);
+                fsyncMs = _log.LastAppendFsyncMilliseconds;
+                _telemetry?.RecordCommitDuration(commitMs);
                 commit?.SetTag("melange.lsn", (long)record.Lsn);
                 commit?.SetTag("melange.writeset.bytes", record.SerializedLength);
+                var postCommitStarted = Stopwatch.GetTimestamp();
                 stage.Commit();
                 NotifyCommitObservers(record);
                 Appliers.NotifyAppended(record);
                 AfterCommit(timestamp);
+                postCommitMs = Elapsed(postCommitStarted);
                 committedLsn = record.Lsn;
             }
         }
@@ -779,29 +792,101 @@ public sealed class MelangeEngine : IDisposable
         var elapsed = Elapsed(started);
         _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
         if (elapsed > _options.Telemetry.SlowReducerMs)
-        {
-            activity?.AddEvent(new ActivityEvent(
-                "melange.slow_reducer",
-                tags: new ActivityTagsCollection { ["melange.duration_ms"] = elapsed }));
-            LogMessages.SlowReducer(_logger, reducerName, elapsed, _options.Telemetry.SlowReducerMs);
-        }
+            WarnSlowReducer(activity, reducerName, elapsed, bodyMs, commitMs, fsyncMs, postCommitMs, ops.Count);
 
         return committedLsn;
+    }
+
+    /// <summary>
+    /// Reports one over-threshold transaction split into the parts that fail for different reasons:
+    /// a wide body is the module's problem, a slow commit is the disk's, and a slow post-commit is
+    /// an observer or an automatic snapshot. Undifferentiated, the same warning covers all three and
+    /// tells the reader only where to start looking.
+    /// </summary>
+    private void WarnSlowReducer(
+        Activity? activity,
+        string reducerName,
+        double elapsed,
+        double bodyMs,
+        double commitMs,
+        double? fsyncMs,
+        double postCommitMs,
+        int rows)
+    {
+        if (activity is not null)
+        {
+            var tags = new ActivityTagsCollection
+            {
+                ["melange.duration_ms"] = elapsed,
+                ["melange.body_ms"] = bodyMs,
+                ["melange.commit_ms"] = commitMs,
+                ["melange.post_commit_ms"] = postCommitMs,
+                ["melange.writeset.rows"] = rows,
+            };
+            // Absent, not zero: under a deferred fsync policy there was no flush to attribute, and
+            // a zero would read as "the disk was instant".
+            if (fsyncMs is { } fsync)
+                tags["melange.fsync_ms"] = fsync;
+            activity.AddEvent(new ActivityEvent("melange.slow_reducer", tags: tags));
+        }
+
+        var threshold = _options.Telemetry.SlowReducerMs;
+        if (fsyncMs is { } inlineFsync)
+            LogMessages.SlowReducer(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, inlineFsync, postCommitMs, rows);
+        else
+            LogMessages.SlowReducerDeferredFsync(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, postCommitMs, rows);
     }
 
     private static double Elapsed(long startedTimestamp) =>
         Stopwatch.GetElapsedTime(startedTimestamp).TotalMilliseconds;
 
-    private static class LogMessages
+    private static partial class LogMessages
     {
-        private static readonly Action<ILogger, string, double, int, Exception?> SlowReducerMessage =
-            LoggerMessage.Define<string, double, int>(
-                LogLevel.Warning,
-                new EventId(1003, "SlowReducer"),
-                "Reducer '{Reducer}' took {DurationMs:F1}ms, over the Telemetry:SlowReducerMs threshold of {ThresholdMs}ms.");
+        // Source-generated rather than LoggerMessage.Define like its siblings below: the split
+        // carries more than the six type arguments Define offers, and every part has to stay a
+        // structured field or an alert cannot key on the actionable half.
 
-        public static void SlowReducer(ILogger logger, string reducer, double durationMs, int thresholdMs) =>
-            SlowReducerMessage(logger, reducer, durationMs, thresholdMs, null);
+        /// <summary>1003, in-line fsync: the whole split, including what durability cost.</summary>
+        [LoggerMessage(
+            EventId = 1003,
+            EventName = "SlowReducer",
+            Level = LogLevel.Warning,
+            Message = "Reducer '{Reducer}' took {DurationMs:F1}ms, over the Telemetry:SlowReducerMs threshold of " +
+                      "{ThresholdMs}ms — body {BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync {FsyncMs:F1}ms), " +
+                      "post-commit {PostCommitMs:F1}ms, {Rows} row ops.")]
+        public static partial void SlowReducer(
+            ILogger logger,
+            string reducer,
+            double durationMs,
+            int thresholdMs,
+            double bodyMs,
+            double commitMs,
+            double fsyncMs,
+            double postCommitMs,
+            int rows);
+
+        /// <summary>
+        /// 1003 under a deferred fsync policy. The flush happened on a timer thread or not at all,
+        /// so there is no fsync field: omitting it says "not measured here", where a zero would say
+        /// "the disk was instant". Same event id — alerts key on 1003 — but its own event name,
+        /// because "this deployment defers durability" is itself worth reading off the line.
+        /// </summary>
+        [LoggerMessage(
+            EventId = 1003,
+            EventName = "SlowReducerDeferredFsync",
+            Level = LogLevel.Warning,
+            Message = "Reducer '{Reducer}' took {DurationMs:F1}ms, over the Telemetry:SlowReducerMs threshold of " +
+                      "{ThresholdMs}ms — body {BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync deferred by " +
+                      "CommitLog:FsyncPolicy), post-commit {PostCommitMs:F1}ms, {Rows} row ops.")]
+        public static partial void SlowReducerDeferredFsync(
+            ILogger logger,
+            string reducer,
+            double durationMs,
+            int thresholdMs,
+            double bodyMs,
+            double commitMs,
+            double postCommitMs,
+            int rows);
 
         private static readonly Action<ILogger, ulong, Exception?> CommitObserverFailedMessage =
             LoggerMessage.Define<ulong>(

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace MelangeDB.Core.Tests;
@@ -178,5 +179,99 @@ public class TelemetryTests : IDisposable
         var before = Stopped().Count;
         silent.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
         Assert.Equal(before, Stopped().Count);
+    }
+
+    [Fact]
+    public void Slow_reducer_event_splits_the_duration_into_body_commit_and_post_commit()
+    {
+        _harness.Options.Telemetry.SlowReducerMs = 0; // Every transaction is "slow".
+        _harness.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+
+        var slow = SlowReducerEvent();
+        var duration = Tag(slow, "melange.duration_ms");
+        var body = Tag(slow, "melange.body_ms");
+        var commit = Tag(slow, "melange.commit_ms");
+        var postCommit = Tag(slow, "melange.post_commit_ms");
+
+        Assert.Equal(1, slow.Tags.Single(t => t.Key == "melange.writeset.rows").Value);
+        Assert.All([body, commit, postCommit], part => Assert.True(part >= 0));
+        Assert.True(body + commit + postCommit <= duration, $"{body}+{commit}+{postCommit} > {duration}");
+        // OnCommit is this harness's policy, so durability cost is attributable and reported.
+        Assert.True(Tag(slow, "melange.fsync_ms") <= commit);
+    }
+
+    [Fact]
+    public void A_slow_commit_observer_lands_on_post_commit_and_not_on_the_reducer_body()
+    {
+        // The reason body time is measured rather than derived: observers, appliers, and automatic
+        // snapshots all run after the append but inside the same span, so (duration - commit) would
+        // charge this observer's 60ms to a reducer body that did nothing.
+        _harness.Options.Telemetry.SlowReducerMs = 0;
+        _harness.Engine.AddCommitObserver(new SleepyObserver(TimeSpan.FromMilliseconds(60)));
+        _harness.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+
+        var slow = SlowReducerEvent();
+        Assert.True(Tag(slow, "melange.post_commit_ms") >= 55, "the observer's cost belongs to post-commit");
+        Assert.True(Tag(slow, "melange.body_ms") < 30, "an idle body must not inherit the observer's cost");
+    }
+
+    [Fact]
+    public void The_fsync_field_is_absent_rather_than_zero_when_the_policy_defers_the_flush()
+    {
+        using var deferred = new EngineHarness(FsyncPolicy.Interval);
+        deferred.Options.Telemetry.SlowReducerMs = 0;
+        deferred.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+
+        var slow = SlowReducerEvent();
+        Assert.Contains(slow.Tags, t => t.Key == "melange.commit_ms");
+        // Zero would read as "the disk was instant"; the flush simply did not happen here.
+        Assert.DoesNotContain(slow.Tags, t => t.Key == "melange.fsync_ms");
+    }
+
+    [Fact]
+    public void The_1003_log_record_carries_the_split_as_structured_fields()
+    {
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 0;
+        logged.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+
+        var entry = logs.Single(1003);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal("Join", entry.Fields["Reducer"]);
+        Assert.Equal(1, entry.Fields["Rows"]);
+        Assert.True(entry.Number("BodyMs") + entry.Number("CommitMs") + entry.Number("PostCommitMs")
+            <= entry.Number("DurationMs"));
+        Assert.Contains("body", entry.Message);
+        Assert.Contains("fsync", entry.Message);
+    }
+
+    [Fact]
+    public void A_deferred_fsync_policy_logs_1003_under_its_own_event_name_with_no_fsync_field()
+    {
+        using var logs = new LogCapture();
+        using var deferred = new EngineHarness(FsyncPolicy.OsBuffered, loggerFactory: logs);
+        deferred.Options.Telemetry.SlowReducerMs = 0;
+        deferred.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+
+        // Alerts key on the id, which is why it stays 1003; the name says why a number is missing.
+        var entry = logs.Single(1003);
+        Assert.Equal("SlowReducerDeferredFsync", entry.EventName);
+        Assert.DoesNotContain("FsyncMs", entry.Fields.Keys);
+        Assert.Contains("fsync deferred by CommitLog:FsyncPolicy", entry.Message);
+    }
+
+    private ActivityEvent SlowReducerEvent()
+    {
+        var reducer = Stopped().Last(a => a.OperationName == "melange.reducer");
+        return Assert.Single(reducer.Events, e => e.Name == "melange.slow_reducer");
+    }
+
+    private static double Tag(ActivityEvent slow, string key) =>
+        Assert.IsType<double>(slow.Tags.Single(t => t.Key == key).Value);
+
+    private sealed class SleepyObserver(TimeSpan delay) : ICommitObserver
+    {
+        public void OnCommit(CommitRecord record) => Thread.Sleep(delay);
     }
 }

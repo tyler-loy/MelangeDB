@@ -12,6 +12,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`1003 SlowReducer` now says which half was slow.** The warning and the `melange.slow_reducer` span
+  event carry `BodyMs`/`melange.body_ms`, `CommitMs`, `FsyncMs`, `PostCommitMs`, and `Rows` alongside the
+  total. A wide reducer body and a stalled disk produced identical warnings before, and telling them apart
+  meant pulling child spans out of a trace store by `trace_id` — for a warning whose whole job is to say
+  "look here". Body time is measured directly rather than derived as *total − commit*, so commit observers,
+  applier notification, and an automatic snapshot land in `PostCommitMs` instead of being billed to the
+  module's reducer body. Under a deferred `CommitLog:FsyncPolicy` the fsync field is **absent rather than
+  zero** and the entry keeps id `1003` under the event name `SlowReducerDeferredFsync`.
+
 - **`ReducerKind.Init`** — a reducer fired once on an engine that has never committed anything,
   before its scheduler starts. Its `ReducerSite` picks the engine as for any other reducer:
   shard-executed init reducers fire on every per-shard engine as that shard opens, hub-executed ones
