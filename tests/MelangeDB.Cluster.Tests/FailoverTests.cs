@@ -32,6 +32,11 @@ public class FailoverTests
         Assert.True(recovered.FencingToken > tokenBefore); // A new ownership term.
         Assert.Equal(77, recovered.Engine.CommittedView.Scan<Mob>().Single().Hp); // The shard's log is the shard.
 
+        // Recovery is not creation: the new owner opens a log that already has a head, so init
+        // reducers do not run again and the shard keeps the one set of timer rows it was seeded
+        // with. Re-seeding here would double every timer on every reassignment.
+        Assert.Equal(1, recovered.Engine.CommittedView.Count<SeededTick>());
+
         // Scheduled reducers keep firing — on the new owner, and only there.
         var ticksAtTakeover = recovered.Engine.CommittedView.Find<TickCount>(1L)?.Count ?? 0;
         await ClusterFixture.WaitUntilAsync(

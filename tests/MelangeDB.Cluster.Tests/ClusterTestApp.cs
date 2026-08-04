@@ -79,6 +79,31 @@ public partial struct ShardTick
     public ScheduleAt ScheduledAt;
 }
 
+/// <summary>
+/// What an init reducer seeds into every shard as it opens. Deliberately not the timer table the
+/// other tests drive by hand: this one proves a shard nobody scheduled anything on still has its
+/// timers. The interval is long enough never to fire inside a test — existence is the assertion.
+/// </summary>
+[Table(Scheduled = nameof(ClusterReducers.SeededTickFired))]
+public partial struct SeededTick
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public ScheduleAt ScheduledAt;
+}
+
+/// <summary>Per-shard state an init reducer creates; Local, so it lives in the shard's own engine.</summary>
+[Table(Placement = Placement.Local)]
+public partial struct ShardSeed
+{
+    [PrimaryKey]
+    public long Id;
+
+    public long Seeded;
+}
+
 public sealed record MobDied(ulong MobId, uint InstanceId);
 
 /// <summary>Collects handled events; the fixture asserts where handlers actually ran.</summary>
@@ -167,6 +192,23 @@ public sealed class ClusterReducers
     [Reducer]
     public void ScheduleTick(ReducerContext ctx, long everyMs) =>
         ctx.Db.ShardTick.Insert(new ShardTick { ScheduledAt = ScheduleAt.Interval(TimeSpan.FromMilliseconds(everyMs)) });
+
+    /// <summary>
+    /// The per-shard init hook: touches only Local tables, so it is shard-executed and fires once
+    /// on every shard engine as that shard opens — including a shard created by the first player
+    /// to walk into it, which is the case that had no timers at all before.
+    /// </summary>
+    [Reducer(ReducerKind.Init)]
+    public void SeedShard(ReducerContext ctx)
+    {
+        ctx.Db.ShardSeed.Insert(new ShardSeed { Id = 1, Seeded = ctx.Timestamp.UnixTimeMicroseconds });
+        ctx.Db.SeededTick.Insert(new SeededTick { ScheduledAt = ScheduleAt.Interval(TimeSpan.FromHours(1)) });
+    }
+
+    [Reducer]
+    public void SeededTickFired(ReducerContext ctx, SeededTick timer)
+    {
+    }
 
     [Reducer]
     public void Tick(ReducerContext ctx, ShardTick timer)

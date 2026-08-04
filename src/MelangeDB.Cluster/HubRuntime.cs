@@ -123,6 +123,13 @@ internal sealed partial class HubRuntime : IDisposable
         _engine.AddCommitGuard(new HubCommitGuard(_engine.Schema));
         _engine.AddCommitObserver(new ReplicaSignaller(this));
 
+        // Hub-executed init reducers seed the hub's own fresh engine — its Global and Replicated
+        // tables. Deliberately after the guards, so a seed that reaches for a Partitioned table
+        // fails with the placement rule in the message rather than writing a row the hub must not
+        // own. Shard-executed ones belong to the shards and fire as each shard's engine opens.
+        MelangeInitReducers.Fire(
+            _engine, _services.GetRequiredService<MelangeReducerHost>(), _logger, "the hub", ReducerSite.Hub);
+
         if (!IPAddress.TryParse(cluster.NodeListenAddress, out var listenAddress))
         {
             throw new InvalidOperationException(

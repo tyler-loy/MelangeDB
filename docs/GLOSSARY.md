@@ -308,6 +308,14 @@ blob columns are out of line, and the row's encoded index values. It is why `Cou
 walk faults nothing, and why index maintenance never reads an old row back from disk. Store-owned, like the
 indexes beside it.
 
+**Init reducer** — `ReducerKind.Init`: a reducer fired once on an engine whose log has no head — a database
+(or a shard) that has never committed anything — before its scheduler starts. The seam an application seeds
+from, and the only way a lazily-created shard gets the timer rows its `Local` scheduled tables need, since
+nothing outside that shard's engine can reach into it. Its `ReducerSite` picks the engine like any other
+reducer's: shard-executed ones fire per shard as each opens, hub-executed ones on the hub, both on the single
+engine of a deployment that is not clustered. Each fire is its own transaction; a thrower is logged, not
+rethrown, and leaves earlier seeds committed. Not client-callable.
+
 **Lifecycle reducer** — A reducer fired on a session transition: `ReducerKind.ClientConnected` on a
 completed websocket handshake, `ReducerKind.ClientDisconnected` on graceful close or heartbeat-detected
 drop, paired one-to-one per connection. Each fire is its own transaction. Not client-callable, and never

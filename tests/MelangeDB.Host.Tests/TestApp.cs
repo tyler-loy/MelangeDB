@@ -99,6 +99,17 @@ public sealed class SchedulerProbe
 
     public bool ThrowOnOneShot { get; set; }
 
+    /// <summary>Whether the init reducer seeds a world tick — off by default, so the other tests
+    /// see the empty database they were written against.</summary>
+    public bool SeedOnInit { get; set; }
+
+    private int _initFires;
+
+    /// <summary>How many times the init reducer has run across every host built on this probe.</summary>
+    public int InitFires => Volatile.Read(ref _initFires);
+
+    public void CountInitFire() => Interlocked.Increment(ref _initFires);
+
     /// <summary>Runs inside the WorldTick body — how the overrun tests make a tick slow.</summary>
     public Action<ReducerContext>? OnWorldTick { get; set; }
 
@@ -126,6 +137,18 @@ public sealed class TickReducers(SchedulerProbe probe)
         probe.CountOneShot();
         if (probe.WriteRows)
             ctx.Db.TickLog.Insert(new TickLog { Entry = $"once:{timer.Tag}" });
+    }
+
+    /// <summary>
+    /// The single-node half of the init seam: one engine is every site there is, so this runs at
+    /// startup on a database that has never committed anything — and only then.
+    /// </summary>
+    [Reducer(ReducerKind.Init)]
+    public void SeedWorld(ReducerContext ctx)
+    {
+        probe.CountInitFire();
+        if (probe.SeedOnInit)
+            ctx.Db.WorldTickTimer.Insert(new WorldTickTimer { ScheduledAt = ScheduleAt.Interval(TimeSpan.FromSeconds(10)) });
     }
 
     [Reducer]

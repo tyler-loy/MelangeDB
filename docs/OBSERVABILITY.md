@@ -232,6 +232,13 @@ client queued more than the cap during one transfer; further calls get a retryab
 owner — the fencing rule applied to triggers, and the guard that stops a stale origin from re-importing the
 past over the present) (10).
 
+Since 0.1.0: `1105 InitReducersFired` and `1106 InitReducerFailed` — a fresh engine's seeding, and a seed
+that threw and therefore created nothing (if that was a scheduled table's timer rows, that engine will never
+tick) — and `1723 ShardHasNoTimerRows`, a shard that opened holding no rows in **any** scheduled table. The
+last one is worth an alert in a world whose shards are created by players arriving: the state it names is
+otherwise completely silent, because a shard with no timers serves reads and writes perfectly and simply
+never ticks.
+
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
 the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`

@@ -103,15 +103,24 @@ public partial struct CreatureAiTick
 }
 ```
 
-**Lifecycle reducers** fire on session transitions:
+**Lifecycle reducers** fire on session transitions, and an **init reducer** fires once on a database
+that has never committed anything:
 
 ```csharp
 [Reducer(ReducerKind.ClientConnected)]    public void OnConnected(ReducerContext ctx) { }
 [Reducer(ReducerKind.ClientDisconnected)] public void OnDisconnected(ReducerContext ctx) { }
+[Reducer(ReducerKind.Init)]               public void Seed(ReducerContext ctx) { }
 ```
 
 "A client session began" must stay distinct from "someone ran an admin query." Conflating the two
 forces every module to special-case tooling identities to avoid spawning ghost player rows.
+
+`Init` exists because a timer row has to come from somewhere. Its cluster form is the load-bearing
+one — a shard is created the first time someone arrives in it, and a shard-executed init reducer is
+the only thing that can put rows in that new engine before it starts ticking (see
+[CLUSTERING.md](CLUSTERING.md)) — but it fires on any fresh engine, so the same seed runs in a
+single-node deployment. "Fresh" is a log with no head, which is why recovery and shard reassignment
+never re-seed and a crash before the first commit does.
 
 Timers must be **data, not code**. An inline `[Cron("*/5 * * * *")]` attribute would be simpler to read,
 but static code cannot be partitioned, transactionally scheduled, or rescheduled at runtime. Because a

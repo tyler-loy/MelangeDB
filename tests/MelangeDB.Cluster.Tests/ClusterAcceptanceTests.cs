@@ -152,6 +152,27 @@ public class ClusterAcceptanceTests
         engine.CommittedView.Find<TickCount>(1L)?.Count ?? 0;
 
     [Fact]
+    public async Task A_shard_created_on_first_visit_opens_already_holding_its_timer_rows()
+    {
+        // Nobody schedules anything on this shard: it is created the way a spatial world creates
+        // one, by someone arriving. Before init reducers existed it would have opened with an
+        // empty Local table, served reads and writes correctly, and never ticked.
+        var owner = await _cluster.EnsureShardOwnedAsync(60);
+        var shard = owner.Runtime.TryGetShard(new ShardKey(60))!;
+
+        Assert.Equal(1, shard.Engine.CommittedView.Count<SeededTick>());
+        Assert.NotNull(shard.Engine.CommittedView.Find<ShardSeed>(1L));
+
+        // Per shard, not per node: the same node's other shards were seeded into their own
+        // engines, and the seed is invisible from anywhere else.
+        var second = await _cluster.EnsureShardOwnedAsync(61);
+        Assert.Equal(1, second.Runtime.TryGetShard(new ShardKey(61))!.Engine.CommittedView.Count<SeededTick>());
+
+        // The hub owns no shard, so a shard-executed init reducer never ran there.
+        Assert.Null(_cluster.HubEngine.CommittedView.Find<ShardSeed>(1L));
+    }
+
+    [Fact]
     public async Task A_shard_spanning_transaction_trips_the_debug_check_with_a_clear_message()
     {
         var owner = await _cluster.EnsureShardOwnedAsync(40);

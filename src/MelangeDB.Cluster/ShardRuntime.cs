@@ -153,6 +153,14 @@ internal sealed partial class ShardRuntime : IDisposable
         Transport = new MelangeTransport(
             Engine, ReducerHost, options, time, loggerFactory, authenticator, sessions,
             new PolicySet(services, schema));
+
+        // A shard is created the first time a session resolves to it, and this engine opened
+        // empty: its scheduled tables are Local, so their timer rows live here and nowhere else,
+        // and nothing outside this constructor can reach in to create them. Seeding before
+        // Scheduler.Start() is what makes a never-visited block tick from its first tick rather
+        // than never — see MelangeInitReducers.
+        MelangeInitReducers.Fire(Engine, ReducerHost, _logger, $"{shard}", ReducerSite.Shard);
+        WarnIfNoTimerRows();
         Scheduler.Start();
     }
 
@@ -785,6 +793,39 @@ internal sealed partial class ShardRuntime : IDisposable
     }
 
     private string BorrowedSidecarPath => Path.Combine(Directory, "borrowed.sidecar");
+
+    /// <summary>
+    /// A shard holding no timer rows at all, for a schema that declares scheduled tables, is
+    /// almost always a seeding mistake — and it is the quiet kind: the shard serves reads and
+    /// writes correctly and simply never ticks, so nothing fails and nothing is logged unless it
+    /// is logged here. Checked at every open rather than only on a fresh shard, because timer rows
+    /// deleted later leave exactly the same silence.
+    /// </summary>
+    private void WarnIfNoTimerRows()
+    {
+        var scheduled = Engine.Schema.Tables.Where(static table => table.Scheduled is not null).ToList();
+        if (scheduled.Count == 0)
+            return;
+        var empty = new List<string>();
+        Engine.ReadConsistent(_ =>
+        {
+            foreach (var table in scheduled)
+            {
+                if (!Engine.HotStore.Scan(table.Id).Any())
+                    empty.Add(table.Name);
+            }
+        });
+
+        if (empty.Count == scheduled.Count)
+            LogShardHasNoTimers(_logger, Shard.Value, empty.Count, string.Join(", ", empty));
+    }
+
+    [LoggerMessage(EventId = 1723, EventName = "ShardHasNoTimerRows", Level = LogLevel.Warning,
+        Message = "Shard {Shard} holds no rows in any of its {Count} scheduled table(s) ({Tables}), so no scheduled " +
+            "reducer will ever fire on it — the shard will serve reads and writes correctly and simply never tick. " +
+            "Timer rows are Placement.Local and therefore per-shard: seed them from a [Reducer(ReducerKind.Init)] " +
+            "reducer, which runs on every shard as it opens (docs/CLUSTERING.md).")]
+    private static partial void LogShardHasNoTimers(ILogger logger, ulong shard, int count, string tables);
 
     [LoggerMessage(EventId = 1716, EventName = "BorrowedRegistryRebuilt", Level = LogLevel.Warning,
         Message = "Shard {Shard}'s borrowed-row sidecar was missing or unusable while its log is truncated; the registry was " +
