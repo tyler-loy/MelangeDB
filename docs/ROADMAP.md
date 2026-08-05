@@ -93,3 +93,7 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
 - **Dynamic rebalancing**, shard-level HA, and sharding the hub. Static assignment will visibly
   hotspot; the ceiling is published so the choice is informed.
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
+- **Snapshot isolation for read-heavy reducers.** The write lock covers the whole body, so a sweep
+  that reads for 200 ms and writes for 0.2 ms bills the other 199.8 ms to every writer on the engine.
+  Designed but not built — it hangs on giving `IHotStore` a read view an `Apply` cannot disturb. See
+  [design/snapshot-isolation.md](design/snapshot-isolation.md).
