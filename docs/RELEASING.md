@@ -39,11 +39,13 @@ Simple and boring, on purpose:
   release whose tag does not match `VersionPrefix` exactly — bump the prefix in the same PR that
   prepares the release, then tag the merge commit.
 - After releasing, bump `VersionPrefix` to the next version.
-- **Pushes to `main` do not publish.** They pack `<VersionPrefix>-ci.<run-number>+<short-sha>` and
-  upload it as a workflow artifact, so a prerelease is always available to download and inspect
-  without putting a version on nuget.org that can never be deleted — only unlisted. If consumable
-  prereleases become necessary, the options are a nuget.org prerelease stream or a separate
-  GitHub Packages feed; neither is wired up today.
+- **Pushes to `main` do not publish to nuget.org.** They pack
+  `<VersionPrefix>-ci.<run-number>`, upload it as a workflow artifact, and push it to
+  this repository's **GitHub Packages** feed. A version on nuget.org can never be deleted, only
+  unlisted, and a prerelease per commit to `main` is not a stream worth making permanent; a
+  GitHub Packages version can be deleted, so the per-commit stream lives there instead. See
+  [Consuming prereleases](#consuming-prereleases) — restoring from that feed needs
+  authentication even though the repository is public.
 
 All eleven packages always publish together at the same version. There is no per-package versioning —
 a MelangeDB version is one coherent set.
@@ -88,11 +90,24 @@ asymmetry is on purpose — a version on nuget.org can never be deleted, only un
 
 Two jobs in `.github/workflows/ci.yml` handle packages, and the split matters:
 
-- **`pack`** runs on pushes to `main`, packs the `-ci.N` prerelease, and uploads it as a workflow
-  artifact. It has **no** `environment`, so ordinary pushes never wait on a reviewer.
+- **`pack`** runs on pushes to `main`, packs the `-ci.N` prerelease, uploads it as a workflow
+  artifact, and pushes it to **GitHub Packages**. It has **no** `environment`, so ordinary pushes
+  never wait on a reviewer, and it authenticates with the built-in `GITHUB_TOKEN` — there is no
+  secret to configure. The only setting it needs is `permissions: packages: write` on the job.
 - **`publish`** runs **only** on `release: [published]`, is gated behind the `release` environment,
-  and pushes with `--skip-duplicate` so re-running a workflow is idempotent. Both jobs need the
-  `test` job green first.
+  and pushes to **nuget.org** via Trusted Publishing. Both jobs need the `test` job green first,
+  and both push with `--skip-duplicate` so re-running a workflow is idempotent — which matters
+  for `pack`, because a re-run reuses `github.run_number` and therefore repacks a version it has
+  already pushed.
+
+The two feeds carry different things on purpose: **nuget.org gets releases, GitHub Packages gets
+every commit to `main`.** Nothing reaches nuget.org without a published GitHub Release and a
+reviewer.
+
+A package is filed against a repository by the `<RepositoryUrl>` baked into the nupkg — set once in
+`Directory.Build.props`. Push a package whose `RepositoryUrl` names a different repository and the
+feed rejects it rather than quietly filing it somewhere else, so that property is load-bearing for
+more than the "Source" link on the listing.
 
 ### Trusted Publishing
 
@@ -176,6 +191,46 @@ The `melange` CLI installs as a tool:
 ```
 dotnet tool install --global MelangeDB.Cli
 ```
+
+### Consuming prereleases
+
+Every push to `main` publishes `<VersionPrefix>-ci.<run-number>` to GitHub Packages. That feed is
+not a default source, and — this is the part that surprises people — **restoring from it requires
+authentication even though this repository is public.** GitHub Packages has never supported
+anonymous NuGet restore; a public package is publicly *visible*, not publicly *restorable*.
+
+Add the source with a classic personal access token carrying the `read:packages` scope. Put it in a
+`nuget.config` beside the consuming solution rather than in the global one, so the credential's
+blast radius is one repository:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <packageSources>
+    <add key="melangedb-ci" value="https://nuget.pkg.github.com/tyler-loy/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <melangedb-ci>
+      <add key="Username" value="YOUR_GITHUB_USERNAME" />
+      <add key="ClearTextPassword" value="%GITHUB_PACKAGES_TOKEN%" />
+    </melangedb-ci>
+  </packageSourceCredentials>
+</configuration>
+```
+
+`%GITHUB_PACKAGES_TOKEN%` is expanded from the environment, so the token itself stays out of the
+file and out of version control. Then reference an explicit prerelease version — a floating range
+would drag in a new build of `main` on every restore, which is not what you want holding a
+dependency steady:
+
+```xml
+<PackageReference Include="MelangeDB.Core" Version="0.1.1-ci.42" />
+```
+
+All eleven packages are pushed together at the same `-ci.N`, so pin them to one number. Prereleases
+are **not** a supported surface: they are whatever `main` was at that commit, they can be deleted,
+and the API may change between two consecutive ones. Use them to try a fix before a release exists,
+not to run anything you care about.
 
 ## CI
 

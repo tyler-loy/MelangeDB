@@ -77,18 +77,25 @@ jobs:
             exit 1
           fi
 
-  # Packs a -ci.N prerelease from main and keeps it as a workflow artifact — downloadable and
-  # inspectable, but never pushed to a public feed. A version pushed to nuget.org can never be
-  # deleted, only unlisted, and a prerelease per commit to main is not a stream worth making
-  # permanent. Deliberately has no `environment`, so ordinary pushes to main never wait on a
-  # reviewer. Pull requests never reach this job.
+  # Packs a -ci.N prerelease from main and publishes it to this repository's GitHub Packages feed,
+  # which is a different bargain from nuget.org: a version there can never be deleted, only
+  # unlisted, and a prerelease per commit to main is not a stream worth making permanent. A
+  # GitHub Packages version can be deleted (below 5,000 downloads, which a CI prerelease will
+  # never reach), and the feed is scoped to this repository rather than the public index.
+  # The artifact upload stays — it is what you inspect when a package is malformed, and it
+  # survives a push that fails.
+  #
+  # Deliberately has no `environment`, so ordinary pushes to main never wait on a reviewer, and no
+  # OIDC: GITHUB_TOKEN authenticates to GitHub's own feed. Pull requests never reach this job.
   pack:
     if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write        # required: lets GITHUB_TOKEN push to the repo's package feed
     env:
+      FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
       PACKABLE: >-
         Abstractions Core Protocol Client Server CodeGen
         Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli
@@ -99,9 +106,15 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # No `+<sha>` build metadata on the version. NuGet defines build metadata as *not part of
+      # package identity*: two versions differing only after the `+` collide as duplicates, and it
+      # is never written into a consuming project file — so it can never tell a consumer which
+      # build they have, which was the only reason to put it there. The commit is recorded where
+      # it survives: `dotnet pack` writes <repository commit="..."> into the nuspec with the full
+      # sha, and SourceLink resolves sources from it.
       - name: Pack prerelease
         run: |
-          suffix="ci.${{ github.run_number }}+${GITHUB_SHA::7}"
+          suffix="ci.${{ github.run_number }}"
           for name in $PACKABLE; do
             dotnet pack "src/MelangeDB.$name/MelangeDB.$name.csproj" -c Release -o packages \
               --version-suffix "$suffix"
@@ -112,6 +125,20 @@ jobs:
           name: packages-ci.${{ github.run_number }}
           path: packages/*.nupkg
           if-no-files-found: error
+
+      # GitHub Packages binds a package to a repository through the <RepositoryUrl> baked into the
+      # nupkg (set in Directory.Build.props) — push a package whose RepositoryUrl names a different
+      # repo and the feed rejects it rather than silently filing it elsewhere.
+      #
+      # --skip-duplicate matters here because re-running a workflow reuses github.run_number, so a
+      # re-run packs the version it already pushed. Skipping is the correct outcome: the run goes
+      # green having changed nothing.
+      - name: Push prerelease to GitHub Packages
+        run: |
+          dotnet nuget push 'packages/*.nupkg' \
+            --source "$FEED" \
+            --api-key '${{ secrets.GITHUB_TOKEN }}' \
+            --skip-duplicate
 
   # Publishes to nuget.org. Triggered only by *publishing a GitHub Release* — a pushed tag alone
   # does nothing — and gated a second time behind the `release` environment's required reviewer.
