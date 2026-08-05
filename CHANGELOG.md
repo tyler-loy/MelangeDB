@@ -29,9 +29,26 @@ All packages ship together at one version; there is no per-package versioning. S
   implements it by holding each table's rows and indexes in persistent containers, so opening a view
   captures references rather than copying: measured at one million 96-byte rows, **identical
   container memory**, bulk build 0.57×, point reads 0.99×, full scan 1.24×, one put 0.39 µs against
-  0.22 µs — and pinning a view costs nothing where cloning the table cost 28.6 ms. This is the
-  groundwork for snapshot-isolated reducers ([docs/design/snapshot-isolation.md](docs/design/snapshot-isolation.md));
-  no reducer uses it yet, and `FasterHotStore` does not implement it yet.
+  0.22 µs — and pinning a view costs nothing where cloning the table cost 28.6 ms. `FasterHotStore`
+  implements it too, splitting the problem the way it splits storage: its managed-memory state (key
+  directory, indexes, a resident table's rows) is captured by reference, while a **paged** row's
+  payload — which a hybrid-log upsert overwrites in place, leaving no old version — is covered by an
+  undo overlay that costs one pre-image read per paged row written *while a view is open*, and
+  nothing at all while none is. Measured at 100,000 rows: opening a view is 37.9 ns (in-memory) and
+  58.0 ns (FASTER), independent of row count in both; holding one open costs the in-memory store
+  **nothing** (0.99× on a hundred-row apply) and the FASTER store **~188 ns per paged row written**.
+  One contract suite runs against both stores, because a reducer must
+  not behave differently for having been configured onto a different storage engine. Reading a paged
+  row through a view still takes the store lock for that row (1.24× on a full scan); a resident table
+  reads lock-free.
+  Changing a table's residency invalidates open views loudly rather than answering from bookkeeping
+  that no longer describes the data. This is the groundwork for snapshot-isolated reducers
+  ([docs/design/snapshot-isolation.md](docs/design/snapshot-isolation.md)); no reducer uses it yet.
+
+- **A benchmark project**, `bench/MelangeDB.Benchmarks`, so measured claims in the design documents
+  are reproducible rather than remembered — starting with the two that settled how a read view is
+  pinned. It does not run in CI: these are minutes-long measurements, and shared runners would
+  produce numbers not worth recording.
 
 - **`ReducerKind.Init`** — a reducer fired once on an engine that has never committed anything,
   before its scheduler starts. Its `ReducerSite` picks the engine as for any other reducer:
