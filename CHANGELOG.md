@@ -45,6 +45,14 @@ All packages ship together at one version; there is no per-package versioning. S
   that no longer describes the data. This is the groundwork for snapshot-isolated reducers
   ([docs/design/snapshot-isolation.md](docs/design/snapshot-isolation.md)); no reducer uses it yet.
 
+- **Prerelease packages from `main`.** Every push to `main` now publishes all eleven packages as
+  `<VersionPrefix>-ci.<run-number>` to this repository's GitHub Packages feed, so a fix can be
+  consumed before a release exists instead of only downloaded as a workflow artifact. nuget.org is
+  unchanged and still carries releases only — a version there can never be deleted, only unlisted,
+  which is why the per-commit stream lives on a feed whose versions can be. Restoring needs a token
+  even though the repository is public; that, and the reasons prereleases are not a supported
+  surface, are in [docs/RELEASING.md](docs/RELEASING.md).
+
 - **A benchmark project**, `bench/MelangeDB.Benchmarks`, so measured claims in the design documents
   are reproducible rather than remembered — starting with the two that settled how a read view is
   pinned. It does not run in CI: these are minutes-long measurements, and shared runners would
