@@ -21,6 +21,18 @@ All packages ship together at one version; there is no per-package versioning. S
   module's reducer body. Under a deferred `CommitLog:FsyncPolicy` the fsync field is **absent rather than
   zero** and the entry keeps id `1003` under the event name `SlowReducerDeferredFsync`.
 
+- **Pinned reads on the hot store.** A store may now hand out an `IHotStoreReadView` — a read view
+  fixed at one LSN that an `Apply` cannot disturb, however long it is held and however lazily its
+  enumerations are consumed. The read surface moved to a shared `IHotStoreReader` (`IHotStore` still
+  carries every member it did, so nothing implementing or calling it changes), and the capability
+  itself is the optional `IReadViewSource`, in the manner of `IResidencyControl`. `InMemoryHotStore`
+  implements it by holding each table's rows and indexes in persistent containers, so opening a view
+  captures references rather than copying: measured at one million 96-byte rows, **identical
+  container memory**, bulk build 0.57×, point reads 0.99×, full scan 1.24×, one put 0.39 µs against
+  0.22 µs — and pinning a view costs nothing where cloning the table cost 28.6 ms. This is the
+  groundwork for snapshot-isolated reducers ([docs/design/snapshot-isolation.md](docs/design/snapshot-isolation.md));
+  no reducer uses it yet, and `FasterHotStore` does not implement it yet.
+
 - **`ReducerKind.Init`** — a reducer fired once on an engine that has never committed anything,
   before its scheduler starts. Its `ReducerSite` picks the engine as for any other reducer:
   shard-executed init reducers fire on every per-shard engine as that shard opens, hub-executed ones

@@ -87,13 +87,11 @@ public void GrowFlora(ReducerContext ctx, FloraTick tick)
 - Threaded through `ReducerDescriptor` and the generated registration exactly as `Site` and `Policy`
   are.
 
-**Snapshot reads in `IHotStore` — this is the actual work.** The current contract
-([IHotStore.cs:9](../../src/MelangeDB.Abstractions/IHotStore.cs)) is explicit: *reads are safe only
-while no `Apply` runs*, and scans are lazy, so a lock-free sweep racing an apply "throws 'collection
-was modified' at best and yields a half-applied batch at worst." `InMemoryHotStore` is plain
-`Dictionary`/`SortedDictionary` with no synchronization. Every implementation needs a way to hand out
-a read view pinned at an LSN that an `Apply` cannot disturb. FASTER has the machinery natively;
-the in-memory store does not. **The reducer-side plumbing is the easy half of this feature.**
+**Pinned reads in `IHotStore` — the actual work. Done for the in-memory store; see
+[Decisions settled](#decisions-settled).** The read surface is now `IHotStoreReader`, shared by the
+live store and by `IHotStoreReadView` — a view pinned at one LSN, handed out by the optional
+`IReadViewSource` capability in the manner of `IResidencyControl`. `InMemoryHotStore` implements it.
+`FasterHotStore` does not yet, which is the remaining half.
 
 **Write-set reconcile before the guards.** A body that decided against a snapshot can emit an update
 for a row since deleted or an insert for a key since taken. `ReconcileOps` already solves exactly
@@ -167,17 +165,43 @@ path that consumes it.
 - **Read-your-writes inside the body is unaffected** — the write-set overlay is transaction-local and
   has nothing to do with which store view the reads resolve against.
 - **Isolation covers the hot store only**, because it is the only store in the transaction path.
+- **The in-memory store pins by holding its containers persistently**, not by copying and not by
+  keeping a second projection. Each table's rows and indexes are `ImmutableSortedDictionary` /
+  `ImmutableSortedSet`; a write publishes a new version, and `OpenReadView` captures the current one
+  per table. Row payloads are shared across versions — they are already never mutated in place, only
+  replaced — so a pin costs container nodes, not a copy of the data.
+
+  Measured at one million 96-byte rows, persistent against the mutable containers it replaced:
+
+  | | mutable | persistent | |
+  | --- | --- | --- | --- |
+  | container memory | 61.0 MB | 61.0 MB | **1.00×** |
+  | bulk build (replay) | 286.3 ms | 161.9 ms | 0.57× |
+  | point read | 1124.1 ms | 1114.4 ms | 0.99× |
+  | full scan | 9.8 ms | 12.1 ms | 1.24× |
+  | one put | 0.22 µs | 0.39 µs | 1.78× |
+  | **pin a read view** | **28.6 ms** (clone) | **~0 ms** (capture) | — |
+
+  Memory being identical is what settles it: the objection to a persistent structure was that
+  MelangeDB exists to fix a RAM ceiling, and it does not cost RAM. The put regression is ~0.17 µs on
+  an operation that runs under the write lock, against a copying pin that would have cost 28.6 ms
+  *inside that same lock* on the first write after any view opened. Bulk load gets faster, because
+  recovery builds through the containers' builders and publishes one version at the end.
+
+  The other two candidates are rejected on those numbers: **copy-on-write by cloning** pays the
+  28.6 ms per table per snapshot window, in the lock, which is worse than the stall the feature
+  removes; **a second projection off the applier pipeline** doubles resident memory permanently and
+  buys arbitrary staleness instead of a known LSN.
 
 ## Decisions to settle
 
-- **How the in-memory store takes a snapshot.** Copy-on-write per table, epoch-based versioning, or a
-  second projection maintained by its own applier off the existing pipeline (which would reuse
-  `ILogApplier` and its checkpoint wholesale). The third is the least new machinery and the most
-  memory — and RAM is the pain point MelangeDB exists to fix, so any per-table copy has to be opt-in
-  and has to show up in the startup residency report and `1501 ResidencyReport`. **This is the
-  decision the feature actually hangs on.**
 - **What FASTER's implementation costs.** It has concurrent sessions; whether a pinned read view is
-  free, cheap, or a checkpoint is unmeasured.
+  free, cheap, or a checkpoint is unmeasured. Until it implements `IReadViewSource`, a deployment on
+  the FASTER store cannot use snapshot isolation — which has to fail at **startup**, naming the
+  reducers that asked for it, rather than at the first tick.
+- **Whether a long-held view should be bounded.** A pinned view keeps its versions alive, so a reducer
+  that holds one for minutes retains every row those tables replaced meanwhile. Nothing enforces a
+  ceiling today, and nothing reports one being held.
 - **What the analyzer can enforce.** Read-modify-write is undecidable in general, but the common
   shape — `Find` by primary key, then `Update` the same row — is detectable, and a *warning*
   (`MELANGE0023`, the next free id) on that shape inside a snapshot reducer would catch `CensusApply`
