@@ -167,6 +167,7 @@ public class HotStoreReadViewTests : IDisposable
 
         using var view = Source.OpenReadView();
         using var writing = new CancellationTokenSource();
+        using var firstCommit = new ManualResetEventSlim();
         var written = 0;
         var writer = new Thread(() =>
         {
@@ -175,6 +176,7 @@ public class HotStoreReadViewTests : IDisposable
             {
                 Join($"p{i++:D4}", room: 9);
                 Interlocked.Increment(ref written);
+                firstCommit.Set();
             }
         })
         {
@@ -184,6 +186,13 @@ public class HotStoreReadViewTests : IDisposable
         writer.Start();
         try
         {
+            // Wait for the writer to be genuinely running before scanning. Two hundred rows take
+            // microseconds and a thread takes longer to start, so without this the scan finishes
+            // first and the test passes having raced nothing at all.
+            Assert.True(
+                firstCommit.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken),
+                "the writer thread never committed");
+
             // Interleaved deliberately: the scan yields lazily while commits land underneath it,
             // which against the live store is precisely the "collection was modified" case.
             var seen = 0;
@@ -200,10 +209,9 @@ public class HotStoreReadViewTests : IDisposable
         finally
         {
             writing.Cancel();
-            writer.Join(TimeSpan.FromSeconds(10));
+            Assert.True(writer.Join(TimeSpan.FromSeconds(10)), "the writer thread did not stop");
         }
 
-        Assert.True(Volatile.Read(ref written) > 0, "the writer never committed anything, so nothing was raced");
         Assert.Equal(200 + Volatile.Read(ref written), _harness.Engine.HotStore.Count(Players));
     }
 
