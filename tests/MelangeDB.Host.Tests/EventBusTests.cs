@@ -305,6 +305,17 @@ public class EventBusTests : IDisposable
             first.Reducers().Call("PublishNote", TestApp.Caller, "first");
             await WaitDeliveredAsync(Probe(first), 2);
             headAfterFirst = first.Engine().Log.HeadLsn;
+
+            // A handler records its receipt from inside DeliverAsync, and the checkpoint it
+            // advances is written after that call returns — so "delivered" happens strictly
+            // before "checkpointed". Stopping on the delivery signal can land in that gap, and
+            // a loop cancelled there leaves its checkpoint put and redelivers next start, which
+            // is at-least-once working as designed. What this test needs before it stops the
+            // host is the checkpoint, so wait for the checkpoint.
+            await EventProbe.WaitUntilAsync(
+                () => first.Bus().MinimumLiveCheckpointLsn == headAfterFirst,
+                "the subscribers never checkpointed at head");
+
             await first.StopAsync(TestContext.Current.CancellationToken);
         }
 
