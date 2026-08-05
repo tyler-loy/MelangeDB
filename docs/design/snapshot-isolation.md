@@ -87,11 +87,11 @@ public void GrowFlora(ReducerContext ctx, FloraTick tick)
 - Threaded through `ReducerDescriptor` and the generated registration exactly as `Site` and `Policy`
   are.
 
-**Pinned reads in `IHotStore` — the actual work. Done for the in-memory store; see
+**Pinned reads in `IHotStore` — the actual work, and it is done; see
 [Decisions settled](#decisions-settled).** The read surface is now `IHotStoreReader`, shared by the
 live store and by `IHotStoreReadView` — a view pinned at one LSN, handed out by the optional
-`IReadViewSource` capability in the manner of `IResidencyControl`. `InMemoryHotStore` implements it.
-`FasterHotStore` does not yet, which is the remaining half.
+`IReadViewSource` capability in the manner of `IResidencyControl`. Both stores implement it, by
+different means, and `ReadViewContractTests` runs one suite against both so they cannot drift.
 
 **Write-set reconcile before the guards.** A body that decided against a snapshot can emit an update
 for a row since deleted or an insert for a key since taken. `ReconcileOps` already solves exactly
@@ -193,12 +193,61 @@ path that consumes it.
   removes; **a second projection off the applier pipeline** doubles resident memory permanently and
   buys arbitrary staleness instead of a known LSN.
 
+  Reproducible: `dotnet run -c Release --project bench/MelangeDB.Benchmarks -- --filter '*Container*'`.
+
+- **The FASTER store pins the same two ways it stores.** Everything it holds in managed memory — the
+  key directory, the secondary indexes, and a resident table's rows — becomes persistent containers
+  and is captured by reference, exactly as above. A **paged** row's payload cannot be: it lives in
+  the hybrid log, where an upsert overwrites in place and leaves no old version to read. Those are
+  covered by an **undo overlay** — while any view is open, a write to a paged row first stashes that
+  row's pre-image on every view that has not already recorded one.
+
+  The cost is therefore proportional to **writes during the window**, not to table size: a sweep
+  reading a million rows while fifty change pays for fifty pre-image reads. While no view is open it
+  costs nothing at all, which is the overwhelmingly common case. Not chosen: FASTER's own
+  checkpoint/versioning machinery, which phase 07 deliberately kept out of the picture
+  ([plan-phase-07](../road-to-0.1/plan-phase-07.md)) — recovery is the engine's, and pinning a read
+  view is not a reason to reopen that.
+
+  Measured at the store seam, 100,000 rows, one paged table:
+
+  | | in-memory | FASTER |
+  | --- | --- | --- |
+  | open a read view | 37.9 ns, 280 B | 58.0 ns, 400 B |
+  | apply 100 rows, no view open | 56.6 µs | 32.1 µs |
+  | apply 100 rows, **a view open** | 55.9 µs (**0.99×**) | 50.9 µs (**1.58×**) |
+  | scan 100,000 rows, live | 2.08 ms | 29.5 ms |
+  | scan 100,000 rows, **through a view** | 1.81 ms (0.87×) | 36.6 ms (**1.24×**) |
+
+  Opening is tens of nanoseconds and independent of row count in both stores, which is the property
+  that makes this a pin rather than a copy wearing a different name. Holding one open is **free** in
+  the in-memory store — the containers were already persistent, so there is nothing extra to do —
+  and costs the FASTER store **~188 ns per paged row written**, which is the pre-image read. A
+  hundred-row transaction landing in the middle of a sweep pays 19 µs for it.
+
+  Reproducible: `dotnet run -c Release --project bench/MelangeDB.Benchmarks -- --filter '*ReadView*'`.
+
+  **The known limitation.** A paged row read through a view takes the store's own lock for the
+  duration of that row's read, because the hybrid log sits behind a single FASTER session. That still
+  frees the engine's *write* lock for the whole reducer body, which is the point of the feature, but
+  it does not make paged reads concurrent with writers. A **resident** table has no such limit — it
+  reads entirely from the pinned containers, lock-free — and a table a sweep scans hot is exactly the
+  one to declare `Residency.Resident`. Giving each view its own FASTER session would lift the
+  limitation; it is not done, and it is not measured.
+
+- **A residency change invalidates open views, loudly.** Promoting or demoting a table rewrites where
+  its rows live, so a view pinned across one would be answering from bookkeeping that no longer
+  describes the data. The view throws on next use, naming the table and pointing at
+  `Residency:AutoThresholdBytes` in case an `Auto` table is flipping under load. A plausible wrong
+  answer is the worse outcome.
+
 ## Decisions to settle
 
-- **What FASTER's implementation costs.** It has concurrent sessions; whether a pinned read view is
-  free, cheap, or a checkpoint is unmeasured. Until it implements `IReadViewSource`, a deployment on
-  the FASTER store cannot use snapshot isolation — which has to fail at **startup**, naming the
-  reducers that asked for it, rather than at the first tick.
+- **Whether a paged read through a view should get its own FASTER session.** It would make paged
+  reads genuinely concurrent with writers instead of serializing each row on the store lock. The
+  correctness argument is harder than it looks — the overlay probe and the store read stop being
+  atomic with each other — and a resident table, which is what a hot sweep should declare, does not
+  need it. Measure the gap before building it.
 - **Whether a long-held view should be bounded.** A pinned view keeps its versions alive, so a reducer
   that holds one for minutes retains every row those tables replaced meanwhile. Nothing enforces a
   ceiling today, and nothing reports one being held.

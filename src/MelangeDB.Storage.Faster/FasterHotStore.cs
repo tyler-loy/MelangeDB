@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Immutable;
 using System.Numerics;
 using FASTER.core;
 using MelangeDB.Core;
@@ -23,14 +24,25 @@ namespace MelangeDB.Storage.Faster;
 /// FASTER's checkpoint/recovery machinery stays entirely out of the picture, one recovery story
 /// covers both store engines, and crash consistency is inherited from the log. The cost is startup
 /// time proportional to snapshot size — sequential I/O, seconds at the reference scale.</para>
+///
+/// <para><b>Pinned reads</b> (<see cref="IReadViewSource"/>) are split the way the store itself is.
+/// Everything in managed memory — the key directory, the secondary indexes, and a resident table's
+/// rows — is held in persistent containers, so a view captures those by reference exactly as the
+/// in-memory store does. A <em>paged</em> row's payload cannot be captured that way: it lives in the
+/// hybrid log, where an upsert overwrites in place and leaves no old version to read. Those are
+/// covered by an undo overlay instead — while any view is open, a write to a paged row first stashes
+/// the row's pre-image on every view that has not already recorded one. The cost is therefore
+/// proportional to <em>writes during the window</em>, not to table size: a sweep scanning a million
+/// rows while fifty change pays for fifty.</para>
 /// </summary>
-public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
+public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSource, IDisposable
 {
     private readonly SchemaRegistry _registry;
     private readonly ILogger _logger;
     private readonly long _autoThresholdBytes;
     private readonly Lock _lock = new();
     private readonly Dictionary<TableId, TableState> _tables = [];
+    private readonly List<ReadView> _openViews = [];
 
     private readonly IDevice _mainDevice;
     private readonly FasterKV<SpanByte, SpanByte> _main;
@@ -166,7 +178,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
             // same shape as the in-memory store — no key snapshot, no per-row lookup.
             foreach (var pair in resident.ResidentRows)
             {
-                resident.RowsScanned++;
+                resident.AddRowsScanned(1);
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(pair.Key, pair.Value);
             }
 
@@ -182,7 +194,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
                     yield break;
                 bytes = ReadRow(state, key);
                 if (bytes is not null)
-                    state.RowsScanned++;
+                    state.AddRowsScanned(1);
             }
 
             if (bytes is not null)
@@ -306,6 +318,236 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
         }
     }
 
+    /// <summary>
+    /// Captures every table's current version and registers the view for pre-image capture — see
+    /// <see cref="IReadViewSource.OpenReadView"/>. Under the store lock, so the captured versions
+    /// share one LSN rather than straddling an apply.
+    /// </summary>
+    public IHotStoreReadView OpenReadView()
+    {
+        lock (_lock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var captured = new Dictionary<TableId, PinnedTable>(_tables.Count);
+            foreach (var (id, state) in _tables)
+                captured.Add(id, new PinnedTable(state, state.Current, state.ResidencyEpoch));
+            var view = new ReadView(this, AppliedLsn, captured);
+            _openViews.Add(view);
+            return view;
+        }
+    }
+
+    /// <summary>
+    /// Stashes a paged row's pre-image on every open view that has not already recorded one, before
+    /// the write that would destroy it. Only paged rows need this: a resident table's rows live in
+    /// the versioned containers a view already pinned. Called under the store lock, on the write
+    /// path, and it costs a row read — so it costs nothing at all while no view is open, which is
+    /// the overwhelmingly common case.
+    /// </summary>
+    private void CapturePreImage(TableState table, in RowKey key)
+    {
+        if (_openViews.Count == 0)
+            return;
+        var id = table.Schema.Id;
+        var epoch = table.ResidencyEpoch;
+        byte[]? preImage = null;
+        var read = false;
+        foreach (var view in _openViews)
+        {
+            if (!view.WantsPreImage(id, key, epoch))
+                continue;
+            if (!read)
+            {
+                preImage = ReadRow(table, key);
+                read = true;
+            }
+
+            view.CapturePreImage(id, key, preImage);
+        }
+    }
+
+    private void CloseReadView(ReadView view)
+    {
+        lock (_lock)
+        {
+            _openViews.Remove(view);
+        }
+    }
+
+    /// <summary>One table as a read view sees it: the owner, the pinned version, and the tier it was pinned in.</summary>
+    private readonly record struct PinnedTable(TableState Owner, TableVersion Version, int ResidencyEpoch);
+
+    /// <summary>
+    /// A read view over versions captured at one LSN, plus the undo overlay covering paged rows
+    /// whose payloads were overwritten since.
+    /// <para>
+    /// A <b>resident</b> table reads entirely from the pinned version, with no lock and no overlay —
+    /// which is the case worth optimising, since a table a sweep scans hot is exactly the one to
+    /// declare <see cref="Residency.Resident"/>. A <b>paged</b> table's row payload lives in the
+    /// hybrid log behind a single FASTER session, so each row read takes the store lock for its own
+    /// duration. That still frees the engine's write lock for the whole body, which is the point;
+    /// it does not make paged reads concurrent with writers, which a per-view FASTER session would.
+    /// </para>
+    /// </summary>
+    private sealed class ReadView(FasterHotStore store, ulong lsn, Dictionary<TableId, PinnedTable> tables)
+        : IHotStoreReadView
+    {
+        private readonly Dictionary<UndoKey, byte[]?> _undo = [];
+        private bool _disposed;
+
+        public ulong Lsn => lsn;
+
+        /// <summary>Whether this view still needs the pre-image of a row about to be overwritten.</summary>
+        public bool WantsPreImage(TableId table, in RowKey key, int residencyEpoch) =>
+            !_disposed
+            && tables.TryGetValue(table, out var pinned)
+            && pinned.ResidencyEpoch == residencyEpoch
+            && !_undo.ContainsKey(new UndoKey(table, key));
+
+        public void CapturePreImage(TableId table, in RowKey key, byte[]? preImage) =>
+            _undo[new UndoKey(table, key)] = preImage;
+
+        public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
+        {
+            if (Pin(table) is not { } pinned)
+            {
+                row = default;
+                return false;
+            }
+
+            var bytes = Read(pinned, key);
+            row = bytes;
+            return bytes is not null;
+        }
+
+        public long Count(TableId table) => Pin(table) is { } pinned ? pinned.Version.RowCount : 0;
+
+        public IEnumerable<RowKey> ScanKeys(TableId table) => Pin(table) is { } pinned ? pinned.Version.Keys : [];
+
+        public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table)
+        {
+            if (Pin(table) is not { } pinned)
+                return [];
+            return pinned.Version.IsResident
+                ? Resident(pinned)
+                : Materialize(pinned, pinned.Version.Directory.Keys);
+        }
+
+        public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
+        {
+            if (Pin(table) is not { } pinned)
+                return [];
+            var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
+            return index.TryGetValue(value, out var keys) ? Materialize(pinned, keys) : [];
+        }
+
+        public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
+        {
+            if (Pin(table) is not { } pinned)
+                return [];
+            var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
+            return Materialize(pinned, Range(index, low, high));
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+            _disposed = true;
+            store.CloseReadView(this);
+            _undo.Clear();
+            tables.Clear();
+        }
+
+        private static IEnumerable<RowKey> Range(
+            ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> index, RowKey low, RowKey high)
+        {
+            foreach (var (value, keys) in index)
+            {
+                if (value.CompareTo(low) < 0)
+                    continue;
+                if (value.CompareTo(high) > 0)
+                    yield break;
+                foreach (var key in keys)
+                    yield return key;
+            }
+        }
+
+        private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Resident(PinnedTable pinned)
+        {
+            var scanned = 0L;
+            try
+            {
+                foreach (var pair in pinned.Version.ResidentRows)
+                {
+                    scanned++;
+                    yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(pair.Key, pair.Value);
+                }
+            }
+            finally
+            {
+                pinned.Owner.AddRowsScanned(scanned);
+            }
+        }
+
+        private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Materialize(PinnedTable pinned, IEnumerable<RowKey> keys)
+        {
+            foreach (var key in keys)
+            {
+                ThrowIfUnusable(pinned);
+                if (Read(pinned, key) is { } bytes)
+                {
+                    pinned.Owner.AddRowsScanned(1);
+                    yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The row as of <see cref="Lsn"/>: the overlay first, because an entry there means the live
+        /// payload has already been overwritten; otherwise the store, which still holds it.
+        /// </summary>
+        private byte[]? Read(PinnedTable pinned, in RowKey key)
+        {
+            ThrowIfUnusable(pinned);
+            if (!pinned.Version.Contains(key))
+                return null;
+            if (pinned.Version.IsResident)
+                return pinned.Version.ResidentRows.TryGetValue(key, out var resident) ? resident : null;
+
+            // Both the overlay probe and the store read happen under the store lock, so a write
+            // cannot slip between them and hand back a payload from after the pin.
+            lock (store._lock)
+            {
+                return _undo.TryGetValue(new UndoKey(pinned.Owner.Schema.Id, key), out var preImage)
+                    ? preImage
+                    : store.ReadRow(pinned.Owner, pinned.Version, key);
+            }
+        }
+
+        private PinnedTable? Pin(TableId table)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, typeof(IHotStoreReadView));
+            if (!tables.TryGetValue(table, out var pinned))
+                return null;
+            ThrowIfUnusable(pinned);
+            return pinned;
+        }
+
+        private static void ThrowIfUnusable(PinnedTable pinned)
+        {
+            if (pinned.Owner.ResidencyEpoch == pinned.ResidencyEpoch)
+                return;
+            throw new InvalidOperationException(
+                $"Table '{pinned.Owner.Schema.Name}' changed residency tier while this read view was open, so the " +
+                "state it pinned no longer describes where the rows live. Reopen the view; if this fires during " +
+                "normal operation, an Auto-residency table is crossing Residency:AutoThresholdBytes under load — " +
+                "declare it Resident or Paged.");
+        }
+
+        private readonly record struct UndoKey(TableId Table, RowKey Key);
+    }
+
     private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(TableId table, IEnumerable<RowKey> keys)
     {
         foreach (var key in keys)
@@ -321,11 +563,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
         }
     }
 
-    private byte[]? ReadRow(TableState table, in RowKey key)
+    private byte[]? ReadRow(TableState table, in RowKey key) => ReadRow(table, table.Current, key);
+
+    private byte[]? ReadRow(TableState table, TableVersion version, in RowKey key)
     {
-        if (table.IsResident)
-            return table.ResidentRows.TryGetValue(key, out var resident) ? resident : null;
-        if (!table.Directory.TryGetValue(key, out var entry))
+        if (version.IsResident)
+            return version.ResidentRows.TryGetValue(key, out var resident) ? resident : null;
+        if (!version.Directory.TryGetValue(key, out var entry))
             return null;
 
         var rowKey = key;
@@ -362,6 +606,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
         var indexValues = table.EncodeIndexValues(row.Span);
         var (main, mask, blobs) = RowBlobSplitter.Split(table.Schema, row);
 
+        CapturePreImage(table, key);
         if (table.Directory.TryGetValue(key, out var previous))
         {
             table.Unindex(key, previous.IndexValues);
@@ -397,6 +642,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
 
         if (!table.Directory.TryGetValue(key, out var entry))
             return;
+        CapturePreImage(table, key);
         table.Unindex(key, entry.IndexValues);
         DeleteValue(_mainSession, StoreKey(table.Schema.Id, key));
         var mask = entry.BlobMask;
@@ -544,8 +790,40 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
     /// <summary>One row's pinned bookkeeping in a paged table: which bytes-columns are out of line, and the row's indexed values.</summary>
     private sealed record DirectoryEntry(uint BlobMask, RowKey[]? IndexValues);
 
+    /// <summary>
+    /// One immutable version of a table's managed-memory state: which tier it is in, a resident
+    /// table's rows, a paged table's key directory, and the secondary indexes positionally aligned
+    /// with the schema's index list. A write publishes a new version; a read view holds an older one.
+    /// Row payloads and index-value arrays are shared across versions — they are replaced, never
+    /// mutated — so an extra version costs container nodes, not a copy of the data.
+    /// </summary>
+    private sealed class TableVersion(
+        bool isResident,
+        ImmutableSortedDictionary<RowKey, byte[]> residentRows,
+        ImmutableSortedDictionary<RowKey, DirectoryEntry> directory,
+        ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes)
+    {
+        public bool IsResident { get; } = isResident;
+
+        public ImmutableSortedDictionary<RowKey, byte[]> ResidentRows { get; } = residentRows;
+
+        public ImmutableSortedDictionary<RowKey, DirectoryEntry> Directory { get; } = directory;
+
+        public ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Indexes { get; } = indexes;
+
+        public long RowCount => IsResident ? ResidentRows.Count : Directory.Count;
+
+        public IEnumerable<RowKey> Keys => IsResident ? ResidentRows.Keys : Directory.Keys;
+
+        public bool Contains(in RowKey key) => IsResident ? ResidentRows.ContainsKey(key) : Directory.ContainsKey(key);
+    }
+
     private sealed class TableState
     {
+        private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
+        private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
+        private TableVersion _current;
+
         public TableState(TableSchema schema, Residency declared)
         {
             var bytesColumns = schema.Columns.Count(c => c.Kind == ColumnKind.Bytes);
@@ -557,27 +835,69 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
 
             Schema = schema;
             Declared = declared;
-            IsResident = declared is Residency.Resident or Residency.Auto;
-            foreach (var index in schema.Indexes)
-                Indexes.Add(index.Column, []);
+            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
+            for (var i = 0; i < schema.Indexes.Count; i++)
+            {
+                _indexPositions[schema.Indexes[i].Column] = i;
+                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+            }
+
+            _current = new TableVersion(
+                declared is Residency.Resident or Residency.Auto,
+                ImmutableSortedDictionary<RowKey, byte[]>.Empty,
+                ImmutableSortedDictionary<RowKey, DirectoryEntry>.Empty,
+                indexes.MoveToImmutable());
         }
 
         public TableSchema Schema { get; }
 
         public Residency Declared { get; set; }
 
+        /// <summary>
+        /// The table's current version. Written under the store lock and read by a pinned view
+        /// without one, so publication is volatile: a reader must never see a torn reference.
+        /// </summary>
+        public TableVersion Current
+        {
+            get => Volatile.Read(ref _current);
+            private set => Volatile.Write(ref _current, value);
+        }
+
+        /// <summary>
+        /// Bumped by every tier migration. A read view captures it and refuses to serve reads once
+        /// it moves: a promote rewrites where rows live and a demote overwrites their hybrid-log
+        /// records, so a view pinned across one would be answering from bookkeeping that no longer
+        /// describes the data. Failing loudly beats a plausible wrong answer.
+        /// </summary>
+        public int ResidencyEpoch { get; private set; }
+
         /// <summary>Whether the table's rows are currently pinned in managed memory.</summary>
-        public bool IsResident { get; private set; }
+        public bool IsResident => Current.IsResident;
 
-        public SortedDictionary<RowKey, byte[]> ResidentRows { get; private set; } = [];
+        public ImmutableSortedDictionary<RowKey, byte[]> ResidentRows => Current.ResidentRows;
 
-        public SortedDictionary<RowKey, DirectoryEntry> Directory { get; private set; } = [];
-
-        public Dictionary<string, SortedDictionary<RowKey, SortedSet<RowKey>>> Indexes { get; } = [];
+        public ImmutableSortedDictionary<RowKey, DirectoryEntry> Directory => Current.Directory;
 
         public long PageFaults { get; set; }
 
-        public long RowsScanned { get; set; }
+        public long RowsScanned
+        {
+            get => Interlocked.Read(ref _rowsScanned);
+            set => Interlocked.Exchange(ref _rowsScanned, value);
+        }
+
+        private long _rowsScanned;
+
+        /// <summary>
+        /// Publishes scan progress. A resident table's rows are read from a pinned view with no lock
+        /// held, so several threads can be scanning the same table at once and this counter is the
+        /// one piece of shared state they touch.
+        /// </summary>
+        public void AddRowsScanned(long count)
+        {
+            if (count != 0)
+                Interlocked.Add(ref _rowsScanned, count);
+        }
 
         /// <summary>Row data bytes held in managed memory — what the Auto threshold compares against.</summary>
         public long ResidentDataBytes { get; private set; }
@@ -587,21 +907,26 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
 
         public long ResidentBytes => ResidentDataBytes + OverheadBytes;
 
-        public long RowCount => IsResident ? ResidentRows.Count : Directory.Count;
+        public long RowCount => Current.RowCount;
 
-        public SortedDictionary<RowKey, SortedSet<RowKey>> Index(string column) =>
-            Indexes.TryGetValue(column, out var index)
-                ? index
+        public int IndexPosition(string column) =>
+            _indexPositions.TryGetValue(column, out var position)
+                ? position
                 : throw new ArgumentException($"Table {Schema.Id} has no index on column '{column}'.", nameof(column));
 
-        public RowKey[] SnapshotKeys() =>
-            IsResident ? [.. ResidentRows.Keys] : [.. Directory.Keys];
+        public ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> Index(string column) =>
+            Current.Indexes[IndexPosition(column)];
+
+        public RowKey[] SnapshotKeys() => [.. Current.Keys];
 
         public void PutResident(RowKey key, byte[] bytes)
         {
-            if (ResidentRows.TryGetValue(key, out var previous))
+            var current = Current;
+            var rows = current.ResidentRows;
+            var indexes = current.Indexes;
+            if (rows.TryGetValue(key, out var previous))
             {
-                Unindex(key, EncodeIndexValues(previous));
+                indexes = Unindex(indexes, key, EncodeIndexValues(previous));
                 ResidentDataBytes -= previous.Length;
             }
             else
@@ -609,18 +934,26 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
                 OverheadBytes += key.Length + 32;
             }
 
-            ResidentRows[key] = bytes;
             ResidentDataBytes += bytes.Length;
-            Index(key, EncodeIndexValues(bytes));
+            Current = new TableVersion(
+                current.IsResident,
+                rows.SetItem(key, bytes),
+                current.Directory,
+                Index(indexes, key, EncodeIndexValues(bytes)));
         }
 
         public void RemoveResident(RowKey key)
         {
-            if (!ResidentRows.Remove(key, out var previous))
+            var current = Current;
+            if (!current.ResidentRows.TryGetValue(key, out var previous))
                 return;
             ResidentDataBytes -= previous.Length;
             OverheadBytes -= key.Length + 32;
-            Unindex(key, EncodeIndexValues(previous));
+            Current = new TableVersion(
+                current.IsResident,
+                current.ResidentRows.Remove(key),
+                current.Directory,
+                Unindex(current.Indexes, key, EncodeIndexValues(previous)));
         }
 
         public void PutDirectory(RowKey key, DirectoryEntry entry, DirectoryEntry? previous)
@@ -629,38 +962,45 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
                 OverheadBytes -= EntryOverhead(previous);
             else
                 OverheadBytes += key.Length + 32;
-            Directory[key] = entry;
             OverheadBytes += EntryOverhead(entry);
+            var current = Current;
+            Current = new TableVersion(
+                current.IsResident,
+                current.ResidentRows,
+                current.Directory.SetItem(key, entry),
+                current.Indexes);
         }
 
         public void RemoveDirectory(RowKey key, DirectoryEntry entry)
         {
-            Directory.Remove(key);
             OverheadBytes -= EntryOverhead(entry) + key.Length + 32;
+            var current = Current;
+            Current = new TableVersion(
+                current.IsResident,
+                current.ResidentRows,
+                current.Directory.Remove(key),
+                current.Indexes);
         }
 
-        /// <summary>Drops the resident dictionary and switches to paged bookkeeping; the caller re-puts the rows.</summary>
-        public void BeginPaged()
-        {
-            ResidentRows = [];
-            Directory = [];
-            foreach (var index in Indexes.Values)
-                index.Clear();
-            ResidentDataBytes = 0;
-            OverheadBytes = 0;
-            IsResident = false;
-        }
+        /// <summary>Drops the resident rows and switches to paged bookkeeping; the caller re-puts the rows.</summary>
+        public void BeginPaged() => BeginTier(isResident: false);
 
         /// <summary>Drops the paged bookkeeping and switches to resident storage; the caller re-puts the rows.</summary>
-        public void BeginResident()
+        public void BeginResident() => BeginTier(isResident: true);
+
+        private void BeginTier(bool isResident)
         {
-            ResidentRows = [];
-            Directory = [];
-            foreach (var index in Indexes.Values)
-                index.Clear();
+            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(_indexPositions.Count);
+            for (var i = 0; i < _indexPositions.Count; i++)
+                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
             ResidentDataBytes = 0;
             OverheadBytes = 0;
-            IsResident = true;
+            ResidencyEpoch++;
+            Current = new TableVersion(
+                isResident,
+                ImmutableSortedDictionary<RowKey, byte[]>.Empty,
+                ImmutableSortedDictionary<RowKey, DirectoryEntry>.Empty,
+                indexes.MoveToImmutable());
         }
 
         public RowKey[]? EncodeIndexValues(ReadOnlySpan<byte> rowBytes)
@@ -681,35 +1021,60 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IDisposable
         {
             if (values is null)
                 return;
-            for (var i = 0; i < Schema.Indexes.Count; i++)
-            {
-                var value = values[i];
-                if (value.Length == 0)
-                    continue; // A null column value is unindexed, matching the in-memory store.
-                var index = Indexes[Schema.Indexes[i].Column];
-                if (!index.TryGetValue(value, out var keys))
-                    index[value] = keys = [];
-                keys.Add(key);
-            }
+            var current = Current;
+            Current = new TableVersion(
+                current.IsResident, current.ResidentRows, current.Directory, Index(current.Indexes, key, values));
         }
 
         public void Unindex(RowKey key, RowKey[]? values)
         {
             if (values is null)
                 return;
+            var current = Current;
+            Current = new TableVersion(
+                current.IsResident, current.ResidentRows, current.Directory, Unindex(current.Indexes, key, values));
+        }
+
+        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Index(
+            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+            RowKey key,
+            RowKey[]? values)
+        {
+            if (values is null)
+                return indexes;
+            for (var i = 0; i < Schema.Indexes.Count; i++)
+            {
+                var value = values[i];
+                if (value.Length == 0)
+                    continue; // A null column value is unindexed, matching the in-memory store.
+                var index = indexes[i];
+                var keys = index.TryGetValue(value, out var existing) ? existing : EmptyKeys;
+                indexes = indexes.SetItem(i, index.SetItem(value, keys.Add(key)));
+            }
+
+            return indexes;
+        }
+
+        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Unindex(
+            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+            RowKey key,
+            RowKey[]? values)
+        {
+            if (values is null)
+                return indexes;
             for (var i = 0; i < Schema.Indexes.Count; i++)
             {
                 var value = values[i];
                 if (value.Length == 0)
                     continue;
-                var index = Indexes[Schema.Indexes[i].Column];
-                if (index.TryGetValue(value, out var keys))
-                {
-                    keys.Remove(key);
-                    if (keys.Count == 0)
-                        index.Remove(value);
-                }
+                var index = indexes[i];
+                if (!index.TryGetValue(value, out var keys))
+                    continue;
+                var remaining = keys.Remove(key);
+                indexes = indexes.SetItem(i, remaining.IsEmpty ? index.Remove(value) : index.SetItem(value, remaining));
             }
+
+            return indexes;
         }
 
         private RowKey? EncodeColumn(string column, ReadOnlySpan<byte> rowBytes)
