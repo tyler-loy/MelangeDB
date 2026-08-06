@@ -19,7 +19,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "Id",
                         ClrType = typeof(ulong),
-                        Kind = global::MelangeDB.Core.ColumnKind.UInt64,
+                        Kind = global::MelangeDB.ColumnKind.UInt64,
                         IsEnum = false,
                         IsPrimaryKey = true,
                         IsAutoInc = true,
@@ -33,7 +33,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "ChunkId",
                         ClrType = typeof(ushort),
-                        Kind = global::MelangeDB.Core.ColumnKind.UInt16,
+                        Kind = global::MelangeDB.ColumnKind.UInt16,
                         IsEnum = false,
                         IsPrimaryKey = false,
                         IsAutoInc = false,
@@ -47,7 +47,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "Kind",
                         ClrType = typeof(global::Snapshot.Species),
-                        Kind = global::MelangeDB.Core.ColumnKind.Int32,
+                        Kind = global::MelangeDB.ColumnKind.Int32,
                         IsEnum = true,
                         IsPrimaryKey = false,
                         IsAutoInc = false,
@@ -61,7 +61,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "X",
                         ClrType = typeof(float),
-                        Kind = global::MelangeDB.Core.ColumnKind.Float32,
+                        Kind = global::MelangeDB.ColumnKind.Float32,
                         IsEnum = false,
                         IsPrimaryKey = false,
                         IsAutoInc = false,
@@ -75,7 +75,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "Name",
                         ClrType = typeof(string),
-                        Kind = global::MelangeDB.Core.ColumnKind.String,
+                        Kind = global::MelangeDB.ColumnKind.String,
                         IsEnum = false,
                         IsPrimaryKey = false,
                         IsAutoInc = false,
@@ -89,7 +89,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "Genome",
                         ClrType = typeof(byte[]),
-                        Kind = global::MelangeDB.Core.ColumnKind.Bytes,
+                        Kind = global::MelangeDB.ColumnKind.Bytes,
                         IsEnum = false,
                         IsPrimaryKey = false,
                         IsAutoInc = false,
@@ -103,7 +103,7 @@ namespace MelangeDB.Generated
                     {
                         Name = "NextThinkAt",
                         ClrType = typeof(ulong),
-                        Kind = global::MelangeDB.Core.ColumnKind.UInt64,
+                        Kind = global::MelangeDB.ColumnKind.UInt64,
                         IsEnum = false,
                         IsPrimaryKey = false,
                         IsAutoInc = false,
@@ -124,7 +124,7 @@ namespace MelangeDB.Generated
 
         public override byte[] Serialize(in global::Snapshot.Creature row)
         {
-            var writer = new global::MelangeDB.Core.RowWriter(64);
+            var writer = new global::MelangeDB.RowWriter(64);
             writer.WriteUInt64(row.Id);
             writer.WriteUInt16(row.ChunkId);
             writer.WriteInt32((global::System.Int32)row.Kind);
@@ -137,7 +137,7 @@ namespace MelangeDB.Generated
 
         public override global::Snapshot.Creature Deserialize(global::System.ReadOnlySpan<byte> data)
         {
-            var reader = new global::MelangeDB.Core.RowReader(data);
+            var reader = new global::MelangeDB.RowReader(data);
             var row = default(global::Snapshot.Creature);
             row.Id = reader.ReadUInt64();
             row.ChunkId = reader.ReadUInt16();

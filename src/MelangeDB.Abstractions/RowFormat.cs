@@ -1,12 +1,38 @@
 using System.Buffers.Binary;
 using System.Text;
 
-namespace MelangeDB.Core;
+namespace MelangeDB;
+
+/// <summary>The wire kind of a column value. Enums serialize as their underlying integer kind.</summary>
+public enum ColumnKind : byte
+{
+    Bool = 1,
+    Int8 = 2,
+    UInt8 = 3,
+    Int16 = 4,
+    UInt16 = 5,
+    Int32 = 6,
+    UInt32 = 7,
+    Int64 = 8,
+    UInt64 = 9,
+    Float32 = 10,
+    Float64 = 11,
+    String = 12,
+    Bytes = 13,
+    Identity = 14,
+    Timestamp = 15,
+    ScheduleAt = 16,
+}
 
 /// <summary>
 /// A growable little-endian writer implementing row format v1 — the byte-for-byte format
-/// <see cref="RowSerializer"/> writes. Generated codecs use it so their output is
-/// indistinguishable from the reflection path's, which is what keeps existing logs readable.
+/// <c>RowSerializer</c> writes. Generated codecs use it so their output is indistinguishable from
+/// the reflection path's, which is what keeps existing logs readable.
+/// <para>
+/// This lives in Abstractions rather than Core because protocol v2 puts these same bytes on the
+/// wire: a client decoding a row and the engine writing one must agree byte for byte, and the only
+/// way to guarantee that is for both to run this code rather than two transcriptions of it.
+/// </para>
 /// </summary>
 public struct RowWriter
 {
@@ -126,6 +152,9 @@ public ref struct RowReader
 
     public RowReader(ReadOnlySpan<byte> data) => _data = data;
 
+    /// <summary>How many bytes have been consumed — the slice boundary a column-wise walk needs.</summary>
+    public readonly int Position => _position;
+
     public bool ReadBool() => ReadUInt8() != 0;
 
     public sbyte ReadInt8() => unchecked((sbyte)ReadUInt8());
@@ -196,5 +225,44 @@ public ref struct RowReader
     {
         var interval = ReadUInt8() != 0;
         return ScheduleAt.FromMicroseconds(interval, ReadInt64());
+    }
+
+    /// <summary>
+    /// Advances past one column of <paramref name="kind"/> without materializing it, and returns
+    /// how many bytes it occupied. This is what lets a projection copy a column's raw slice — the
+    /// bytes are already in the format the wire wants, so a projected row is a set of memcpys
+    /// rather than a decode and re-encode.
+    /// </summary>
+    public int SkipColumn(ColumnKind kind)
+    {
+        var start = _position;
+        switch (kind)
+        {
+            case ColumnKind.Bool or ColumnKind.Int8 or ColumnKind.UInt8:
+                _position += 1;
+                break;
+            case ColumnKind.Int16 or ColumnKind.UInt16:
+                _position += 2;
+                break;
+            case ColumnKind.Int32 or ColumnKind.UInt32 or ColumnKind.Float32:
+                _position += 4;
+                break;
+            case ColumnKind.Int64 or ColumnKind.UInt64 or ColumnKind.Float64 or ColumnKind.Timestamp:
+                _position += 8;
+                break;
+            case ColumnKind.Identity:
+                _position += Identity.Size;
+                break;
+            case ColumnKind.ScheduleAt:
+                _position += 9;
+                break;
+            case ColumnKind.String or ColumnKind.Bytes:
+                _position += _data[_position] == 0 ? 1 : 5 + BinaryPrimitives.ReadInt32LittleEndian(_data[(_position + 1)..]);
+                break;
+            default:
+                throw new NotSupportedException($"Unknown column kind {kind}.");
+        }
+
+        return _position - start;
     }
 }

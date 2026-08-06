@@ -1,26 +1,5 @@
 namespace MelangeDB.Core;
 
-/// <summary>The wire kind of a column value. Enums serialize as their underlying integer kind.</summary>
-public enum ColumnKind : byte
-{
-    Bool = 1,
-    Int8 = 2,
-    UInt8 = 3,
-    Int16 = 4,
-    UInt16 = 5,
-    Int32 = 6,
-    UInt32 = 7,
-    Int64 = 8,
-    UInt64 = 9,
-    Float32 = 10,
-    Float64 = 11,
-    String = 12,
-    Bytes = 13,
-    Identity = 14,
-    Timestamp = 15,
-    ScheduleAt = 16,
-}
-
 /// <summary>
 /// One column of a table: its declared CLR type, wire kind, constraints, and boxed accessors.
 /// Built by reflection in phase 01; phase 02's generator constructs these directly.
