@@ -277,40 +277,15 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         }
 
         public static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(
-            TableData owner, TableVersion version, TableId table, string column, RowKey value)
-        {
-            var index = version.Index(owner.IndexPosition(table, column));
-            if (!index.TryGetValue(value, out var keys))
-                return [];
-            return Resolve(version, keys);
-        }
+            TableData owner, TableVersion version, TableId table, string column, RowKey value) =>
+            Resolve(version, version.Index(owner.IndexPosition(table, column)).Equal(value));
 
         public static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(
-            TableData owner, TableVersion version, TableId table, string column, RowKey low, RowKey high)
-        {
-            var index = version.Index(owner.IndexPosition(table, column));
-            return Range(version, index, low, high);
-        }
-
-        private static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Range(
-            TableVersion version,
-            ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> index,
-            RowKey low,
-            RowKey high)
-        {
-            foreach (var (value, keys) in index)
-            {
-                if (value.CompareTo(low) < 0)
-                    continue;
-                if (value.CompareTo(high) > 0)
-                    yield break;
-                foreach (var pair in Resolve(version, keys))
-                    yield return pair;
-            }
-        }
+            TableData owner, TableVersion version, TableId table, string column, RowKey low, RowKey high) =>
+            Resolve(version, version.Index(owner.IndexPosition(table, column)).Range(low, high));
 
         private static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Resolve(
-            TableVersion version, ImmutableSortedSet<RowKey> keys)
+            TableVersion version, IEnumerable<RowKey> keys)
         {
             foreach (var key in keys)
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, version.Rows[key]);
@@ -325,18 +300,17 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
     /// </summary>
     private sealed class TableVersion(
         ImmutableSortedDictionary<RowKey, byte[]> rows,
-        ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes)
+        ImmutableArray<SecondaryIndex> indexes)
     {
         public ImmutableSortedDictionary<RowKey, byte[]> Rows { get; } = rows;
 
-        public ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Indexes { get; } = indexes;
+        public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
 
-        public ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> Index(int position) => Indexes[position];
+        public SecondaryIndex Index(int position) => Indexes[position];
     }
 
     private sealed class TableData
     {
-        private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
         private readonly TableSchema _schema;
         private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
 
@@ -349,12 +323,12 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
             _schema = schema;
             ResidencyLabel = residencyLabel;
             _indexColumns = new string[schema.Indexes.Count];
-            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
                 _indexColumns[i] = schema.Indexes[i].Column;
-                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+                indexes.Add(SecondaryIndex.Empty);
             }
 
             Current = new TableVersion(ImmutableSortedDictionary<RowKey, byte[]>.Empty, indexes.MoveToImmutable());
@@ -436,8 +410,8 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         /// </summary>
         public BulkLoader BeginBulkLoad() => new(this);
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Index(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Index(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             byte[] bytes)
         {
@@ -449,16 +423,14 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                 var value = values[position];
                 if (value.Length == 0)
                     continue; // A null column value is unindexed.
-                var index = indexes[position];
-                var keys = index.TryGetValue(value, out var existing) ? existing : EmptyKeys;
-                indexes = indexes.SetItem(position, index.SetItem(value, keys.Add(key)));
+                indexes = indexes.SetItem(position, indexes[position].Add(value, key));
             }
 
             return indexes;
         }
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Unindex(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Unindex(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             byte[] bytes)
         {
@@ -470,11 +442,7 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                 var value = values[position];
                 if (value.Length == 0)
                     continue;
-                var index = indexes[position];
-                if (!index.TryGetValue(value, out var keys))
-                    continue;
-                var remaining = keys.Remove(key);
-                indexes = indexes.SetItem(position, remaining.IsEmpty ? index.Remove(value) : index.SetItem(value, remaining));
+                indexes = indexes.SetItem(position, indexes[position].Remove(value, key));
             }
 
             return indexes;
@@ -517,14 +485,14 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         {
             private readonly TableData _table;
             private readonly ImmutableSortedDictionary<RowKey, byte[]>.Builder _rows;
-            private readonly ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Builder[] _indexes;
+            private readonly SecondaryIndex.Builder[] _indexes;
 
             public BulkLoader(TableData table)
             {
                 _table = table;
                 var current = table.Current;
                 _rows = current.Rows.ToBuilder();
-                _indexes = new ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Builder[current.Indexes.Length];
+                _indexes = new SecondaryIndex.Builder[current.Indexes.Length];
                 for (var i = 0; i < _indexes.Length; i++)
                     _indexes[i] = current.Indexes[i].ToBuilder();
             }
@@ -542,14 +510,13 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                     var value = values[position];
                     if (value.Length == 0)
                         continue;
-                    var index = _indexes[position];
-                    index[value] = (index.TryGetValue(value, out var keys) ? keys : EmptyKeys).Add(key);
+                    _indexes[position].Add(value, key);
                 }
             }
 
             public void Commit()
             {
-                var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(_indexes.Length);
+                var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexes.Length);
                 foreach (var index in _indexes)
                     indexes.Add(index.ToImmutable());
                 _table.Current = new TableVersion(_rows.ToImmutable(), indexes.MoveToImmutable());

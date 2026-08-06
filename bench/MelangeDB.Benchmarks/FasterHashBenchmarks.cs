@@ -45,7 +45,7 @@ public class FasterHashBenchmarks : IDisposable
     public void Setup()
     {
         _root = Directory.CreateTempSubdirectory("melange-bench-hash-").FullName;
-        _schema = SchemaRegistry.FromTypes(typeof(CommitRow));
+        _schema = BenchSchema.For(nameof(CommitRow));
         _table = _schema.Tables[0].Id;
 
         var options = new MelangeDbOptions

@@ -35,7 +35,9 @@ public class CommitPathBenchmarks : IDisposable
     private CommitRequest _request;
     private CommitRecord[] _records = [];
     private ulong _lsn;
+    private ulong _storeLsn;
     private int _next;
+    private int _applied;
 
     /// <summary>
     /// Write-set size. One row is the game tick's shape; a hundred is a sweep's. The per-op sites
@@ -52,7 +54,7 @@ public class CommitPathBenchmarks : IDisposable
     public void Setup()
     {
         _root = Directory.CreateTempSubdirectory("melange-bench-commit-").FullName;
-        _schema = SchemaRegistry.FromTypes(typeof(CommitRow));
+        _schema = BenchSchema.For(nameof(CommitRow));
         _table = _schema.Tables[0].Id;
         _caller = Identity.Hash("bench");
 
@@ -110,11 +112,20 @@ public class CommitPathBenchmarks : IDisposable
     [Benchmark(Description = "append to the log")]
     public ulong AppendToLog() => _log.Append(_request).Lsn;
 
-    /// <summary>The store side: one version publish per table, plus index maintenance.</summary>
+    /// <summary>
+    /// The store side: one version publish per table, plus index maintenance.
+    /// <para>
+    /// The record is re-stamped with a fresh LSN rather than replayed as prepared. A store ignores
+    /// any record at or below its applied LSN, so the second pass over a fixed array measures the
+    /// early return — which is how the first version of this row reported a whole apply as 3.5 ns
+    /// and looked like a triumph instead of a bug.
+    /// </para>
+    /// </summary>
     [Benchmark(Description = "apply to the store")]
     public ulong ApplyToStore()
     {
-        var record = _records[_next++ % _records.Length];
+        var source = _records[_applied++ % _records.Length];
+        var record = Record(++_storeLsn, source.WriteSet);
         _store.Apply(record);
         return record.Lsn;
     }

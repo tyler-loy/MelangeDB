@@ -39,8 +39,8 @@ public class ApplyBenchmarks
     public void Setup()
     {
         _schema = Indexes == 0
-            ? SchemaRegistry.FromTypes(typeof(PlainRow))
-            : SchemaRegistry.FromTypes(typeof(IndexedRow));
+            ? BenchSchema.For(nameof(PlainRow))
+            : BenchSchema.For(nameof(IndexedRow));
         var table = _schema.Tables[0];
         _table = table.Id;
 

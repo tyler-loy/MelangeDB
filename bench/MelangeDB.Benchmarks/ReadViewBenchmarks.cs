@@ -51,7 +51,7 @@ public class ReadViewBenchmarks : IDisposable
     public void Setup()
     {
         _root = Directory.CreateTempSubdirectory("melange-bench-").FullName;
-        _schema = SchemaRegistry.FromTypes(typeof(BenchRow));
+        _schema = BenchSchema.For(nameof(BenchRow));
         _table = _schema.Tables[0].Id;
 
         var options = new MelangeDbOptions

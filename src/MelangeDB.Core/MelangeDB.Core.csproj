@@ -19,6 +19,10 @@
          options instance when composing per-shard engines. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
     <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
+    <!-- Both storage engines hold secondary indexes in the same container, and a range scan that
+         seeks rather than walks is the same code in both. SecondaryIndex stays internal because it
+         is an engine building block, not something a module should see. -->
+    <InternalsVisibleTo Include="MelangeDB.Storage.Faster" />
     <!-- The commit-path benchmark measures LogRecordCodec on its own, because "which of the six
          allocation sites dominates" cannot be answered from the outside of a whole commit. -->
     <InternalsVisibleTo Include="MelangeDB.Benchmarks" />

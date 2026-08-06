@@ -44,7 +44,7 @@ public class FanoutBenchmarks : IDisposable
     public void Setup()
     {
         _root = Directory.CreateTempSubdirectory("melange-bench-fanout-").FullName;
-        _schema = SchemaRegistry.FromTypes(typeof(FanoutRow));
+        _schema = BenchSchema.For(nameof(FanoutRow));
 
         var options = new MelangeDbOptions
         {

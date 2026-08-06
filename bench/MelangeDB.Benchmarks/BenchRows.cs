@@ -1,4 +1,37 @@
+using System.Reflection;
+using MelangeDB.Core;
+
 namespace MelangeDB.Benchmarks;
+
+/// <summary>
+/// Builds a registry holding the <b>generated</b> schema for a table rather than a reflection-built
+/// one.
+/// <para>
+/// <c>SchemaRegistry.FromTypes</c> walks the type with reflection and produces a schema whose
+/// <c>Codec</c> is null, so every path that asks "is there a generated codec" takes its fallback.
+/// That is fine for a suite measuring containers and wrong for one measuring the codec — the
+/// generator emits <c>MelangeModel</c> for this assembly, and its schemas are the ones the server
+/// actually runs. Anything measuring encode, decode, or index maintenance goes through here.
+/// </para>
+/// </summary>
+internal static class BenchSchema
+{
+    private static readonly IReadOnlyList<TableSchema> Generated = LoadGenerated();
+
+    public static SchemaRegistry For(string tableName) =>
+        new([Generated.FirstOrDefault(t => t.Name == tableName)
+            ?? throw new InvalidOperationException(
+                $"No generated schema for '{tableName}'. Tables: {string.Join(", ", Generated.Select(t => t.Name))}.")]);
+
+    private static IReadOnlyList<TableSchema> LoadGenerated()
+    {
+        var assembly = typeof(BenchSchema).Assembly;
+        var attribute = assembly.GetCustomAttribute<MelangeGeneratedModelAttribute>()
+            ?? throw new InvalidOperationException(
+                "The benchmark assembly has no generated model; the CodeGen analyzer reference is missing.");
+        return ((IMelangeModel)Activator.CreateInstance(attribute.ModelType)!).Tables();
+    }
+}
 
 // The row types every suite measures against, declared here rather than nested inside the suites
 // for one reason: the source generator only emits a RowCodec for a public or internal type
@@ -182,6 +215,62 @@ internal struct Index8Row
 
     [Index]
     public ulong H;
+}
+
+/// <summary>
+/// Eight indexes on a row that also carries a string and a byte array. The scalar rows above make
+/// a full deserialize cheap, which is the case where extracting a column at a time costs almost
+/// nothing; these columns are the ones that have to be allocated and copied every time the row is
+/// deserialized, so this is where "deserialize once instead of per column" is supposed to pay.
+/// </summary>
+[Table]
+internal struct MixedIndex8Row
+{
+    [PrimaryKey]
+    public ulong Id;
+
+    [Index]
+    public ulong A;
+
+    [Index]
+    public ulong B;
+
+    [Index]
+    public ulong C;
+
+    [Index]
+    public ulong D;
+
+    [Index]
+    public ulong E;
+
+    [Index]
+    public ulong F;
+
+    [Index]
+    public ulong G;
+
+    [Index]
+    public ulong H;
+
+    public string Name;
+    public string Description;
+    public byte[] Blob;
+}
+
+/// <summary>One indexed column on a row carrying a string and a byte array.</summary>
+[Table]
+internal struct MixedIndex1Row
+{
+    [PrimaryKey]
+    public ulong Id;
+
+    [Index]
+    public ulong A;
+
+    public string Name;
+    public string Description;
+    public byte[] Blob;
 }
 
 /// <summary>A single indexed column over a large key space — the range-seek suite's subject.</summary>

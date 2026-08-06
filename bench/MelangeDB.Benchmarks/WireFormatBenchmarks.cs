@@ -48,8 +48,8 @@ public class WireFormatBenchmarks
     public void Setup()
     {
         _schema = Shape == RowShape.Wide
-            ? SchemaRegistry.FromTypes(typeof(WideRow))
-            : SchemaRegistry.FromTypes(typeof(NarrowRow));
+            ? BenchSchema.For(nameof(WideRow))
+            : BenchSchema.For(nameof(NarrowRow));
         _table = _schema.Tables[0];
         _columnNames = [.. _table.Columns.Select(c => c.Name)];
 

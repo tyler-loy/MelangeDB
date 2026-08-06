@@ -52,7 +52,7 @@ public class IndexRangeBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _schema = SchemaRegistry.FromTypes(typeof(RangeRow));
+        _schema = BenchSchema.For(nameof(RangeRow));
         _table = _schema.Tables[0];
         _store = new InMemoryHotStore(_schema, ResidencyResolver.Resolve(_schema, new MelangeDbOptions().Residency));
 

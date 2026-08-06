@@ -213,8 +213,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (!_tables.TryGetValue(table, out var state))
                 yield break;
-            var index = state.Index(column);
-            keys = index.TryGetValue(value, out var set) ? [.. set] : [];
+            keys = [.. state.Index(column).Equal(value)];
         }
 
         foreach (var pair in MaterializeRows(table, keys))
@@ -228,14 +227,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (!_tables.TryGetValue(table, out var state))
                 yield break;
-            foreach (var (value, set) in state.Index(column))
-            {
-                if (value.CompareTo(low) < 0)
-                    continue;
-                if (value.CompareTo(high) > 0)
-                    break;
-                keys.AddRange(set);
-            }
+            keys.AddRange(state.Index(column).Range(low, high));
         }
 
         foreach (var pair in MaterializeRows(table, keys))
@@ -442,7 +434,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (Pin(table) is not { } pinned)
                 return [];
             var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
-            return index.TryGetValue(value, out var keys) ? Materialize(pinned, keys) : [];
+            return Materialize(pinned, index.Equal(value));
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
@@ -450,7 +442,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (Pin(table) is not { } pinned)
                 return [];
             var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
-            return Materialize(pinned, Range(index, low, high));
+            return Materialize(pinned, index.Range(low, high));
         }
 
         public void Dispose()
@@ -461,20 +453,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             store.CloseReadView(this);
             _undo.Clear();
             tables.Clear();
-        }
-
-        private static IEnumerable<RowKey> Range(
-            ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> index, RowKey low, RowKey high)
-        {
-            foreach (var (value, keys) in index)
-            {
-                if (value.CompareTo(low) < 0)
-                    continue;
-                if (value.CompareTo(high) > 0)
-                    yield break;
-                foreach (var key in keys)
-                    yield return key;
-            }
         }
 
         private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Resident(PinnedTable pinned)
@@ -839,7 +817,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         bool isResident,
         ImmutableSortedDictionary<RowKey, byte[]> residentRows,
         ImmutableSortedDictionary<RowKey, DirectoryEntry> directory,
-        ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes)
+        ImmutableArray<SecondaryIndex> indexes)
     {
         public bool IsResident { get; } = isResident;
 
@@ -847,7 +825,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public ImmutableSortedDictionary<RowKey, DirectoryEntry> Directory { get; } = directory;
 
-        public ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Indexes { get; } = indexes;
+        public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
 
         public long RowCount => IsResident ? ResidentRows.Count : Directory.Count;
 
@@ -858,7 +836,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private sealed class TableState
     {
-        private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
         private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
 
         /// <summary>Indexed column names in index order — the codec's one-pass encode reads this per put.</summary>
@@ -877,12 +854,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             Schema = schema;
             Declared = declared;
             _indexColumns = new string[schema.Indexes.Count];
-            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
                 _indexColumns[i] = schema.Indexes[i].Column;
-                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+                indexes.Add(SecondaryIndex.Empty);
             }
 
             _current = new TableVersion(
@@ -957,7 +934,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 ? position
                 : throw new ArgumentException($"Table {Schema.Id} has no index on column '{column}'.", nameof(column));
 
-        public ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> Index(string column) =>
+        public SecondaryIndex Index(string column) =>
             Current.Indexes[IndexPosition(column)];
 
         public RowKey[] SnapshotKeys() => [.. Current.Keys];
@@ -1033,9 +1010,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         private void BeginTier(bool isResident)
         {
-            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(_indexPositions.Count);
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexPositions.Count);
             for (var i = 0; i < _indexPositions.Count; i++)
-                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+                indexes.Add(SecondaryIndex.Empty);
             ResidentDataBytes = 0;
             OverheadBytes = 0;
             ResidencyEpoch++;
@@ -1092,8 +1069,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 current.IsResident, current.ResidentRows, current.Directory, Unindex(current.Indexes, key, values));
         }
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Index(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Index(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             RowKey[]? values)
         {
@@ -1104,16 +1081,14 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 var value = values[i];
                 if (value.Length == 0)
                     continue; // A null column value is unindexed, matching the in-memory store.
-                var index = indexes[i];
-                var keys = index.TryGetValue(value, out var existing) ? existing : EmptyKeys;
-                indexes = indexes.SetItem(i, index.SetItem(value, keys.Add(key)));
+                indexes = indexes.SetItem(i, indexes[i].Add(value, key));
             }
 
             return indexes;
         }
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Unindex(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Unindex(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             RowKey[]? values)
         {
@@ -1124,11 +1099,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 var value = values[i];
                 if (value.Length == 0)
                     continue;
-                var index = indexes[i];
-                if (!index.TryGetValue(value, out var keys))
-                    continue;
-                var remaining = keys.Remove(key);
-                indexes = indexes.SetItem(i, remaining.IsEmpty ? index.Remove(value) : index.SetItem(value, remaining));
+                indexes = indexes.SetItem(i, indexes[i].Remove(value, key));
             }
 
             return indexes;

@@ -38,7 +38,7 @@ public class SnapshotBenchmarks : IDisposable
     public void Setup()
     {
         _root = Directory.CreateTempSubdirectory("melange-bench-snapshot-").FullName;
-        _schema = SchemaRegistry.FromTypes(typeof(CommitRow));
+        _schema = BenchSchema.For(nameof(CommitRow));
 
         var options = new MelangeDbOptions
         {
