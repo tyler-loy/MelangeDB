@@ -16,14 +16,21 @@ public enum RowShape
 }
 
 /// <summary>
-/// Measurement gap 5, and the gate on finding #15: what does sending a row as a named column map
-/// cost, against sending the schema-ordered v1 bytes the store already holds?
+/// Measurement gap 5, and the gate finding #15 passed: what does sending a row as a named column
+/// map cost, against sending the schema-ordered v1 bytes the store already holds?
 /// <para>
-/// #15 is a protocol break. It is worth doing if — and only if — the answer here is large, because
-/// the cost is not the encoder: it is the client, the bindings generator, and the cache all moving
-/// together. So this suite measures the three things that decision needs. <b>Bytes</b>, printed at
-/// setup, because bandwidth at 15 Hz × hundreds of players is the headline claim. <b>Encode</b>,
-/// which is server CPU on the fan-out path. <b>Decode</b>, which is client CPU on every frame.
+/// #15 was a protocol break, worth doing only if the answer here was large, because the cost was
+/// not the encoder: it was the client, the bindings generator, and the cache all moving together.
+/// So this suite measures the three things that decision needed. <b>Bytes</b>, printed at setup,
+/// because bandwidth at 15 Hz × hundreds of players was the headline claim. <b>Encode</b>, which is
+/// server CPU on the fan-out path. <b>Decode</b>, which is client CPU on every frame. The bytes
+/// answer was 1.18–1.40x and the CPU answer was 4.6–12.4x, so the headline was wrong and the
+/// decision was right; protocol v2 sends the bytes.
+/// </para>
+/// <para>
+/// The map path stays here now that nothing in the server runs it, because a benchmark that
+/// deletes its baseline can no longer say what was gained. Both halves are hand-rolled against
+/// <c>MsgPackWriter</c> for that reason.
 /// </para>
 /// <para>
 /// The map path is measured exactly as the server runs it — <c>RowWire.ToColumns</c> then a

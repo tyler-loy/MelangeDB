@@ -29,7 +29,7 @@ an absolute microsecond figure does not.
 | `FanoutBenchmarks` | One row changed, 1→500 subscribers watching: does fan-out's cost live in matching subscriptions or in producing wire values? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `ApplyBenchmarks` | What does batching a record's ops into one version publish buy over publishing one per op? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `IndexMaintenanceBenchmarks` | What does extracting a row's indexed columns cost, and does it scale with the number of indexes? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
-| `WireFormatBenchmarks` | Bytes, encode, and decode: a named column map against the schema-ordered v1 bytes the store already holds. | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
+| `WireFormatBenchmarks` | Bytes, encode, and decode: protocol v1's named column map against the schema-ordered v1 row bytes v2 sends. Keeps the map baseline it retired, because a benchmark that deletes its baseline can no longer say what was gained. | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `FasterHashBenchmarks` | What does the FASTER hash table's size cost when the row count outgrows it? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `SnapshotBenchmarks` | How long does a snapshot hold the write lock, and how does that scale with the resident set? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `IndexRangeBenchmarks` | Does a secondary-index range scan pay for **where** its window sits in the key space? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |

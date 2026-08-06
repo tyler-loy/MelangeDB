@@ -12,8 +12,8 @@ one whose premise does not hold for this store, and three whose measured numbers
 decision rather than confirming it. Read that first if you want the current state of the code rather
 than the history of the analysis.
 
-The seven measurement gaps are closed. Finding #15 — compact wire rows — is the one substantial item
-not done, and the outcomes section says what measuring it actually showed.
+The seven measurement gaps are closed, and every finding that was a work item is done — including
+#15, compact wire rows, which the measurement both justified and re-described.
 
 ---
 
@@ -450,8 +450,8 @@ decision rather than confirming one. That is the argument for measuring first, m
 - **Finding #15's headline is wrong, and its case is still strong.** The review calls compact wire
   rows "likely the #1 bandwidth and client CPU issue." Bandwidth: **1.18x (narrow) to 1.40x (wide)**
   — real, and not a protocol break's worth on its own. CPU and allocation: **4.6–12.4x on encode,
-  2.4–2.9x on decode, 2.4–3.6x less allocation**. It is worth doing, for reasons other than the ones
-  given.
+  2.4–2.9x on decode, 2.4–3.6x less allocation**. It was worth doing, for reasons other than the ones
+  given — and it landed as protocol v2.
 - **Finding #9's premise does not hold for this store.** See below.
 
 ### Done
@@ -473,16 +473,57 @@ decision rather than confirming one. That is the argument for measuring first, m
 | 8 | Snapshot under the write lock | Captured under the lock (header plus a pinned view), written outside it, truncated under it again |
 | 9 | FASTER reads take the store lock | Resident tables now read with no lock at all. Paged reads keep it — see below |
 | 12 | Index range scans start at the leftmost key | Both stores hold indexes as one `ImmutableSortedSet` of `(value, key)` entries, so a range seeks |
+| 15, 16 | Named column maps on the wire | Protocol v2: a wire descriptor per subscription, schema-ordered row bytes per row. See below |
 
 ### Not done, with reasons
 
 | # | Finding | Why not |
 | --- | --- | --- |
-| 15 | Compact wire rows | The one substantial item left. Measured and worth doing — 4.6–12.4x on encode, 2.4–2.9x on decode — but it is a protocol break across the frame types, the subscription engine, the client cache, the bindings generator, and the public untyped client API, and it deserves its own change rather than a corner of a performance sweep. |
-| 16 | Client apply path | Follows 15; nothing to do independently. |
 | 17 | Concurrent snapshot ticks | The review gates this on overrun metrics showing multi-tick pileups. They do not. |
 | 18 | Recovery rebuilds FASTER | Deliberately rejected in phase 07; not a work item. |
 | 20 | Telemetry sampling | "Keep this discipline" — not a work item. |
+
+### Finding #15: what the break actually bought
+
+The review's headline — "likely the #1 bandwidth and client CPU issue" — is half wrong, and the
+correct half is the whole case.
+
+**Bandwidth is not it.** A column map costs 1.18x the bytes on a narrow row and 1.40x on a wide one.
+Real, and not a protocol break's worth on its own: MessagePack's map keys are short strings that a
+websocket's deflate handles well, and the values dominate either way.
+
+**CPU is it, and it is spent in the worst possible place.** Encoding a row as a map costs **4.6–12.4x**
+what sending its bytes costs, and that cost is paid per subscriber per row on the fan-out path, under
+the engine's write lock — so it is not one client's latency, it is the next reducer's. Decoding costs
+**2.4–2.9x**, on every frame, on the client's frame thread. Allocation is 2.4–3.6x either way.
+
+What made the fix tractable is that the win was already sitting there: the store holds rows in row
+format v1, which is exactly what the wire wants. So the common case is not a cheaper encoding — it is
+**no encoding at all**. A full row on an unprojected subscription is the committed bytes handed to
+every subscriber: no decode, no dictionary, no copy. `FanoutSharingTests` asserts that by memory
+identity rather than by equality, because equality would pass against an implementation that copied.
+
+Three things the plan for this did not anticipate:
+
+- **A per-subscription descriptor is not sufficient.** Column policies are evaluated per *row* —
+  `ServerSubscription.VisibleColumns` takes the row bytes — so a hideout that hides a player's position
+  narrows one row and not the next. The finding lists a "column mask bitset" as optional; it is what
+  makes column policies expressible at all once names leave the wire. It costs one byte on rows that
+  do not need it.
+- **Schema drift needed a new home.** A map wire reports drift as a missing column; ordered bytes have
+  no names in them, so a schema off by one column decodes into *plausible garbage* — an int read four
+  bytes early is still an int. The check moved from per column per row to once per subscription,
+  against the descriptor, and got stronger for the move: a rename, a reorder, and a changed kind are
+  all one structural comparison, and the reorder is one the map wire could not have caught at all.
+- **Row format v1 had to leave Core.** A client cannot reference the engine, and transcribing the
+  format a second time on the client side is the drift hazard this codebase already knows about from
+  the log payload. `RowWriter`, `RowReader`, and `ColumnKind` moved to Abstractions so both halves run
+  the same code, and `RowWire`'s private `MeasureColumn` — a third transcription of the same widths —
+  went with them.
+
+The break is hard: there is no v1 encoder left, and a v1 peer is refused at the handshake rather than
+accepted and failed later on the first row it cannot read. That is the honest failure mode for a
+pre-1.0 break, and `HandshakeTests` pins it.
 
 ### Finding #9: the premise, corrected
 

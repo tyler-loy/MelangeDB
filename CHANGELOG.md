@@ -10,6 +10,53 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Breaking
+
+- **Protocol version 2: rows travel as schema-ordered bytes, not as named column maps.** Version 1 sent
+  every row and every delta op as a MessagePack map of column name to boxed value, which re-sent the
+  schema with each row, built a dictionary per subscriber per row on the fan-out path under the engine's
+  write lock, and rebuilt one per op on the client. Measured against the map shape: **1.18–1.40× the
+  bytes, 4.6–12.4× the encode time, 2.4–2.9× the decode time, and 2.4–3.6× the allocation.** The
+  performance sweep called this "likely the #1 bandwidth and client CPU issue" — the bandwidth half of
+  that is wrong, and the CPU half is the whole case, because it is spent on the fan-out path while the
+  write lock is held.
+
+  A subscription's shape now travels once, as a **wire descriptor** on the first initial-set chunk: the
+  table and its ordered, kinded columns. Every row after it is values. The unprojected case — no
+  projection, no `[ServerOnly]` column — costs the server nothing at all, because the store already holds
+  the row in the format the wire wants; a full row is the committed bytes handed to every subscriber
+  without a decode, a dictionary, or a copy. A projection copies the kept columns' raw slices in schema
+  order. A row narrowed by a **column policy** carries a mask bitset over the descriptor, which is empty
+  — one byte — for every row on a table that has no column policies.
+
+  **There is no version-1 encoder left, and no negotiation.** A version-1 peer is refused at the handshake
+  with `unsupported_version` rather than accepted and failed later on a row it cannot read. Clients must
+  be rebuilt against 0.1.2 bindings; a stale client is a handshake error, not a decode error.
+
+  For consumers of the public API:
+
+  - `WireRow` and `WireRowOp` carry `ReadOnlyMemory<byte> Row` and `ReadOnlyMemory<byte> ColumnMask`
+    where they carried `IReadOnlyDictionary<string, object?> Columns`. A delete's `Row` is empty.
+  - `MelangeRow` is a class rather than a record and exposes `Row`, `ColumnMask`, and `Descriptor`.
+    **`Columns` still works** and returns the same name→value map as before — decoded on first read and
+    then cached, so a typed client that never asks for it never builds it.
+  - `IClientRowCodec<TRow>.DecodeRow` takes a `ReadOnlySpan<byte>` and the interface gains `Columns`, the
+    shape the bindings were generated from. Both are emitted by the generator; hand-written codecs must
+    be updated.
+  - `ClientWireValues` is **removed**. It existed to undo MessagePack's deliberate lossiness — every
+    integer arriving as `long`, an `Identity` as raw bytes — and row bytes have no lossiness to undo.
+    `ClientRowShape.Verify` replaces it, and catches more: a renamed column, a **reordered** one, and one
+    whose kind changed all fail the same structural comparison, once per subscription, before any row
+    decodes. Ordered bytes have no names in them, so drift that the map wire reported as a missing column
+    would otherwise decode into plausible garbage.
+  - A row narrowed by a column policy reaching a **typed** cache now throws
+    `MelangeSchemaMismatchException` naming the untyped API, rather than filling the missing field with a
+    default. Partially visible rows were always the untyped API's business; this is the first release in
+    which the typed path cannot silently pretend otherwise.
+  - `RowWriter`, `RowReader`, and `ColumnKind` moved from `MelangeDB.Core` to `MelangeDB.Abstractions`,
+    namespace `MelangeDB`, so a client can read row bytes without referencing the engine. Generated code
+    is requalified automatically; hand-written references need the namespace change.
+
 ### Added
 
 - **Eight benchmark suites** in [bench/](bench/README.md), closing the seven measurement gaps the
