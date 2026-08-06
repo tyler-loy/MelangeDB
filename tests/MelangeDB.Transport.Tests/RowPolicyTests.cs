@@ -41,7 +41,7 @@ public class RowPolicyTests
         var marker = host.Call("GiveItem", alice, 0, "alice-cloak");
         var update = await raw.ReceiveUntilAsync<TransactionUpdateFrame>(TestContext.Current.CancellationToken);
         Assert.Equal(marker, update.Lsn);
-        var names = update.Updates.SelectMany(u => u.Ops).Select(op => op.Columns!["ItemName"]).ToList();
+        var names = update.Updates.SelectMany(u => u.Ops).Select(op => initial.Columns(op)["ItemName"]).ToList();
         Assert.Equal(["alice-cloak"], names);
     }
 
@@ -110,12 +110,13 @@ public class RowPolicyTests
         await using var aliceSocket = new RawSocketClient();
         await aliceSocket.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("alice"));
         var aliceInitial = await InitialSetAsync(aliceSocket, 1, "SELECT * FROM InventoryItem");
-        var itemKey = Assert.Single(aliceInitial).Key;
-        var itemId = Convert.ToUInt64(Assert.Single(aliceInitial).Columns["Id"], System.Globalization.CultureInfo.InvariantCulture);
+        var item = Assert.Single(aliceInitial.Rows);
+        var itemKey = item.Key;
+        var itemId = Convert.ToUInt64(aliceInitial.Columns(item)["Id"], System.Globalization.CultureInfo.InvariantCulture);
 
         await using var caroSocket = new RawSocketClient();
         await caroSocket.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("caro"));
-        Assert.Empty(await InitialSetAsync(caroSocket, 1, "SELECT * FROM InventoryItem"));
+        Assert.Empty((await InitialSetAsync(caroSocket, 1, "SELECT * FROM InventoryItem")).Rows);
 
         // The trade: the row moves to bob. For alice that row just became invisible — a delete on
         // the wire, or her cache would keep showing an item she no longer holds.
@@ -125,7 +126,7 @@ public class RowPolicyTests
         var op = Assert.Single(Assert.Single(toAlice.Updates).Ops);
         Assert.Equal(RowOpKind.Delete, op.Kind);
         Assert.Equal(itemKey, op.Key);
-        Assert.Null(op.Columns);
+        Assert.True(op.Row.IsEmpty, "a delete carries no row bytes");
 
         // Caro (neither owner) got nothing for the trade: her first frame is the later marker.
         var marker = host.Call("GiveItem", TestTokens.IdentityOf("caro"), 0, "caro-marker");
@@ -144,11 +145,11 @@ public class RowPolicyTests
 
         await using var guest = new RawSocketClient();
         await guest.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("visitor", role: "guest"));
-        Assert.Empty(await InitialSetAsync(guest, 1, "SELECT * FROM Chunk"));
+        Assert.Empty((await InitialSetAsync(guest, 1, "SELECT * FROM Chunk")).Rows);
 
         await using var member = new RawSocketClient();
         await member.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("visitor-upgraded"));
-        Assert.Single(await InitialSetAsync(member, 1, "SELECT * FROM Chunk"));
+        Assert.Single((await InitialSetAsync(member, 1, "SELECT * FROM Chunk")).Rows);
     }
 
     private sealed class MembersOnlyChunks : IRowPolicy<Chunk>
@@ -177,20 +178,9 @@ public class RowPolicyTests
         public bool IsVisibleTo(in SecretTable row, PolicyContext ctx) => true;
     }
 
-    private static string[] ItemNames(IReadOnlyList<WireRow> rows) =>
-        [.. rows.Select(r => (string)r.Columns["ItemName"]!).OrderBy(n => n, StringComparer.Ordinal)];
+    private static string[] ItemNames(WireInitialSet initial) =>
+        [.. initial.Rows.Select(r => (string)initial.Columns(r)["ItemName"]!).OrderBy(n => n, StringComparer.Ordinal)];
 
-    internal static async Task<List<WireRow>> InitialSetAsync(RawSocketClient raw, uint id, string query)
-    {
-        await raw.SendAsync(new SubscribeFrame(id, query, null), TestContext.Current.CancellationToken);
-        var rows = new List<WireRow>();
-        while (true)
-        {
-            var chunk = await raw.ReceiveUntilAsync<SubscriptionAppliedFrame>(
-                TestContext.Current.CancellationToken, f => f.SubscriptionId == id);
-            rows.AddRange(chunk.Rows);
-            if (chunk.IsLast)
-                return rows;
-        }
-    }
+    private static Task<WireInitialSet> InitialSetAsync(RawSocketClient raw, uint id, string query) =>
+        raw.InitialSetAsync(id, query);
 }

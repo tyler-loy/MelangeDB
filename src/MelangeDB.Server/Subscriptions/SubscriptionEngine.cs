@@ -117,14 +117,16 @@ internal sealed class SubscriptionEngine
             }
 
             nowKeys.Add(key);
-            if (!previousKeys.Contains(key))
-                ops.Add(new WireRowOp(RowOpKind.Insert, key.ToArray(), RowWire.ToColumns(subscription.Schema, row.Span, subscription.VisibleColumns(row.Span))));
+            if (previousKeys.Contains(key))
+                continue;
+            var (bytes, mask) = subscription.WireForm(row);
+            ops.Add(new WireRowOp(RowOpKind.Insert, key.ToArray(), bytes, mask));
         }
 
         foreach (var key in previousKeys)
         {
             if (!nowKeys.Contains(key))
-                ops.Add(new WireRowOp(RowOpKind.Delete, key.ToArray(), null));
+                ops.Add(new WireRowOp(RowOpKind.Delete, key.ToArray(), default, default));
         }
 
         return ops;
@@ -138,7 +140,7 @@ internal sealed class SubscriptionEngine
     public void Fanout(CommitRecord record)
     {
         var perSink = default(Dictionary<IDeltaSink, Dictionary<ServerSubscription, List<WireRowOp>>>);
-        var wire = default(WireColumnMemo);
+        var wire = default(WireRowMemo);
 
         // A record may carry several ops for one key (a border batch shipping a hot row's last
         // few ticks; reducer write sets coalesce and never do). The store's pre-image is
@@ -171,7 +173,7 @@ internal sealed class SubscriptionEngine
             // Nothing downstream writes to either: the key is a read-only frame field and the
             // column map is serialized, never mutated.
             var key = op.Key.ToArray();
-            (wire ??= new WireColumnMemo()).Reset(subscriptions[0].Schema, op.Row);
+            (wire ??= new WireRowMemo()).Reset(subscriptions[0].Schema, op.Row);
 
             foreach (var subscription in subscriptions)
             {
@@ -223,18 +225,16 @@ internal sealed class SubscriptionEngine
                     continue;
                 if (op.Kind == RowOpKind.Delete)
                 {
-                    (ops ??= []).Add(new WireRowOp(RowOpKind.Delete, op.Key.ToArray(), null));
+                    (ops ??= []).Add(new WireRowOp(RowOpKind.Delete, op.Key.ToArray(), default, default));
                 }
                 else if (subscription.RowVisible(op.Key, op.Row.Span))
                 {
-                    (ops ??= []).Add(new WireRowOp(
-                        op.Kind,
-                        op.Key.ToArray(),
-                        RowWire.ToColumns(subscription.Schema, op.Row.Span, subscription.VisibleColumns(op.Row.Span))));
+                    var (bytes, mask) = subscription.WireForm(op.Row);
+                    (ops ??= []).Add(new WireRowOp(op.Kind, op.Key.ToArray(), bytes, mask));
                 }
                 else if (op.Kind == RowOpKind.Update)
                 {
-                    (ops ??= []).Add(new WireRowOp(RowOpKind.Delete, op.Key.ToArray(), null));
+                    (ops ??= []).Add(new WireRowOp(RowOpKind.Delete, op.Key.ToArray(), default, default));
                 }
             }
 
@@ -249,7 +249,7 @@ internal sealed class SubscriptionEngine
         ServerSubscription subscription,
         in RowOp op,
         byte[] key,
-        WireColumnMemo wire,
+        WireRowMemo wire,
         bool hasOld,
         ReadOnlyMemory<byte> oldRow)
     {
@@ -265,7 +265,11 @@ internal sealed class SubscriptionEngine
             _telemetry?.RecordRowsFiltered(subscription.Schema.Name, 1);
 
         if (newVisible && !oldVisible)
-            return new WireRowOp(RowOpKind.Insert, key, wire.For(subscription.VisibleColumns(op.Row.Span)));
+        {
+            var inserted = subscription.VisibleColumns(op.Row.Span);
+            return new WireRowOp(RowOpKind.Insert, key, wire.For(inserted), subscription.MaskFor(inserted));
+        }
+
         if (newVisible && oldVisible)
         {
             var newColumns = subscription.VisibleColumns(op.Row.Span);
@@ -282,53 +286,52 @@ internal sealed class SubscriptionEngine
                 }
             }
 
-            return new WireRowOp(RowOpKind.Update, key, wire.For(newColumns));
+            return new WireRowOp(RowOpKind.Update, key, wire.For(newColumns), subscription.MaskFor(newColumns));
         }
 
         if (!newVisible && oldVisible)
-            return new WireRowOp(RowOpKind.Delete, key, null);
+            return new WireRowOp(RowOpKind.Delete, key, default, default);
         return null;
     }
 
     /// <summary>
-    /// One row's decoded wire columns, memoized across the subscriptions a fan-out visits it for.
+    /// One row's wire bytes, memoized across the subscriptions a fan-out visits it for.
     /// <para>
-    /// Every subscriber to a table decodes the same row bytes into the same map, so a commit on a
-    /// table with N subscribers used to build N identical dictionaries — on the engine thread,
-    /// holding the write lock, so the duplicated work stalls the next reducer rather than one
-    /// client. Keyed on the visible column set by reference: null means every column and is shared
-    /// by definition, and <see cref="ServerSubscription.ShareWireColumns"/> converges equal
-    /// projections onto one instance at registration so those hit too.
+    /// The unprojected case is now free outright: the store holds the row in the format the wire
+    /// wants, so a full row is the store's own memory handed to every subscriber — no decode, no
+    /// dictionary, no copy. That is protocol v2's point, and it is why this memo shrank from
+    /// deduplicating an expensive build to deduplicating a cheap one.
     /// </para>
     /// <para>
-    /// A per-row column-policy mask is a fresh set on every call and so misses deliberately — it
-    /// is genuinely per row, and paying a set comparison to discover that would cost more than the
-    /// decode it saves.
+    /// Projections still cost a copy, so they are still memoized, keyed on the column set by
+    /// reference: <see cref="ServerSubscription.ShareWireColumns"/> converges equal projections
+    /// onto one instance at registration, so two hundred players running the same client share one
+    /// projected copy. A per-row column-policy mask is a fresh set on every call and so misses
+    /// deliberately — it is genuinely per row, and paying a set comparison to discover that would
+    /// cost more than the copy it saves.
     /// </para>
     /// </summary>
-    private sealed class WireColumnMemo
+    private sealed class WireRowMemo
     {
-        private readonly Dictionary<object, Dictionary<string, object?>> _projected = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<object, ReadOnlyMemory<byte>> _projected = new(ReferenceEqualityComparer.Instance);
         private TableSchema _schema = null!;
         private ReadOnlyMemory<byte> _row;
-        private Dictionary<string, object?>? _all;
 
         public void Reset(TableSchema schema, ReadOnlyMemory<byte> row)
         {
             _schema = schema;
             _row = row;
-            _all = null;
             _projected.Clear();
         }
 
-        public Dictionary<string, object?> For(IReadOnlySet<string>? columns)
+        public ReadOnlyMemory<byte> For(IReadOnlySet<string>? columns)
         {
             if (columns is null)
-                return _all ??= RowWire.ToColumns(_schema, _row.Span, null);
+                return _row;
             if (_projected.TryGetValue(columns, out var cached))
                 return cached;
 
-            var built = RowWire.ToColumns(_schema, _row.Span, columns);
+            var built = RowWire.Project(_schema, _row, columns);
             _projected[columns] = built;
             return built;
         }

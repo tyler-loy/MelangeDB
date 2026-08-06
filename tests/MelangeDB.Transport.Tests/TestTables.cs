@@ -48,6 +48,48 @@ public partial struct Skill
     public int Level;
 }
 
+/// <summary>
+/// Every client-visible column kind in one row — the wire-fidelity table. Protocol v2 puts the
+/// server's own row bytes on the wire, so "the client reads what the server wrote" stopped being a
+/// property of a coercion table and became a property of the format itself. This is what proves it.
+/// </summary>
+[Table(Public = true)]
+public partial struct AllKinds
+{
+    [PrimaryKey]
+    public long Id;
+
+    public bool Flag;
+
+    public sbyte Int8;
+
+    public byte UInt8;
+
+    public short Int16;
+
+    public ushort UInt16;
+
+    public int Int32;
+
+    public uint UInt32;
+
+    public long Int64;
+
+    public ulong UInt64;
+
+    public float Float32;
+
+    public double Float64;
+
+    public string Text;
+
+    public byte[] Blob;
+
+    public Identity Who;
+
+    public Timestamp At;
+}
+
 /// <summary>Private: no subscription may name it, and the error must not confirm it exists.</summary>
 [Table]
 public partial struct SecretTable

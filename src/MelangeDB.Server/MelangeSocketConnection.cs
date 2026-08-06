@@ -892,16 +892,23 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 // static wire columns already exclude [ServerOnly].
                 var columns = initialSet.RowColumns is { } perRow ? perRow[_index] : Subscription.StaticWireColumns;
                 _index++;
-                rows.Add(new WireRow(key.ToArray(), RowWire.ToColumns(Subscription.Schema, row.Span, columns)));
+                rows.Add(new WireRow(
+                    key.ToArray(),
+                    RowWire.Project(Subscription.Schema, row, columns),
+                    Subscription.MaskFor(columns)));
                 budget += key.Length + row.Length;
             }
 
+            // The descriptor rides on chunk 0 and nowhere else: it describes the subscription, and
+            // repeating it per chunk would put back a slice of exactly what v2 removed.
+            var first = _chunk == 0;
             return new SubscriptionAppliedFrame(
                 Subscription.Id,
                 initialSet.AnchorLsn,
                 _chunk++,
                 IsLast: _index >= initialSet.Rows.Count,
-                rows)
+                rows,
+                first ? Subscription.Descriptor : null)
             { Channel = MelangeChannels.BulkFor(Subscription.Id) };
         }
     }

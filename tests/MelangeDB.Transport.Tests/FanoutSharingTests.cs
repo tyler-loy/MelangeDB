@@ -8,13 +8,18 @@ namespace MelangeDB.Transport.Tests;
 /// <summary>
 /// The fan-out runs under the engine's write lock, so anything it computes once per subscriber
 /// rather than once per row is a global stall that scales with player count. These pin the sharing
-/// that keeps it once per row: one decoded column map and one key buffer, handed to every
-/// subscriber that receives the op.
+/// that keeps it once per row: one wire row and one key buffer, handed to every subscriber that
+/// receives the op.
+/// <para>
+/// Under protocol v2 the shared thing is a span of bytes rather than a decoded dictionary, so
+/// "same instance" becomes "same memory" — which is a stronger claim, not a weaker one: it is
+/// satisfied only if the second subscriber's row aliases the first's rather than copying it.
+/// </para>
 /// </summary>
 public class FanoutSharingTests
 {
     [Fact]
-    public async Task Two_subscribers_to_one_table_receive_the_same_decoded_column_map()
+    public async Task Two_subscribers_to_one_table_receive_the_same_wire_row_memory()
     {
         await using var host = await TransportTestHost.StartAsync();
         host.Call("SpawnCreature", 10f, 777UL);
@@ -24,11 +29,11 @@ public class FanoutSharingTests
 
         host.Call("MoveCreature", creatureId, 11f);
 
-        // Same instance, not merely equal contents: proving equality would pass even if the row
-        // were decoded once per subscriber, which is the cost this exists to remove.
-        Assert.Same(ColumnsOf(first), ColumnsOf(second));
-        Assert.Same(KeyOf(first), KeyOf(second));
-        Assert.Equal(11f, Convert.ToSingle(ColumnsOf(first)!["X"], System.Globalization.CultureInfo.InvariantCulture));
+        // The same bytes, not merely equal ones: proving equality would pass even if the row were
+        // projected once per subscriber, which is the cost this exists to remove.
+        AssertSameMemory(RowOf(first.Sink), RowOf(second.Sink));
+        Assert.Same(KeyOf(first.Sink), KeyOf(second.Sink));
+        Assert.Equal(11f, Decode(first)["X"]);
     }
 
     [Fact]
@@ -36,7 +41,7 @@ public class FanoutSharingTests
     {
         // [ServerOnly] columns give Creature a non-null static wire set, so each subscription
         // compiles its own equal-but-distinct instance. Without the convergence at registration
-        // the memo below would key on two different references and decode the row twice.
+        // the memo below would key on two different references and project the row twice.
         await using var host = await TransportTestHost.StartAsync();
         host.Call("SpawnCreature", 10f, 777UL);
 
@@ -44,17 +49,16 @@ public class FanoutSharingTests
         var creatureId = FirstCreatureId(host);
         host.Call("MoveCreature", creatureId, 12f);
 
-        var columns = ColumnsOf(first);
-        Assert.Same(columns, ColumnsOf(second));
-        Assert.Equal(["Id", "X"], columns!.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        AssertSameMemory(RowOf(first.Sink), RowOf(second.Sink));
+        Assert.Equal(["Id", "X"], ColumnNames(first));
     }
 
     [Fact]
-    public async Task A_subscriber_whose_columns_differ_still_gets_its_own_map()
+    public async Task A_subscriber_whose_columns_differ_still_gets_its_own_row()
     {
         // The memo keys on the visible column set, so a narrower projection must not be handed the
-        // wider subscriber's dictionary — sharing is an optimization, never a widening of what a
-        // client is allowed to see.
+        // wider subscriber's bytes — sharing is an optimization, never a widening of what a client
+        // is allowed to see.
         await using var host = await TransportTestHost.StartAsync();
         host.Call("SpawnCreature", 10f, 777UL);
 
@@ -65,26 +69,54 @@ public class FanoutSharingTests
 
         host.Call("MoveCreature", FirstCreatureId(host), 13f);
 
-        Assert.NotSame(ColumnsOf(wide), ColumnsOf(narrow));
-        Assert.Equal(["Id", "X"], ColumnsOf(wide)!.Keys.OrderBy(k => k, StringComparer.Ordinal));
-        Assert.Equal(["X"], ColumnsOf(narrow)!.Keys);
+        Assert.False(SameMemory(RowOf(wide.Sink), RowOf(narrow.Sink)));
+        Assert.Equal(["Id", "X"], ColumnNames(wide));
+        Assert.Equal(["X"], ColumnNames(narrow));
+        Assert.Equal(["X"], Decode(narrow).Keys);
     }
 
-    private static (CapturingSink First, CapturingSink Second) RegisterPair(TransportTestHost host, string? projection = null)
+    [Fact]
+    public async Task An_unprojected_subscriber_is_handed_the_committed_row_bytes_untouched()
+    {
+        // Protocol v2's whole claim on the fan-out path: a table with nothing to hide sends the
+        // bytes that were committed, so a full row costs the encoder nothing at all — not a
+        // decode, not a dictionary, not even a copy. Creature cannot show this (its [ServerOnly]
+        // columns mean it is always projected), so this uses PlayerState, which has none.
+        await using var host = await TransportTestHost.StartAsync();
+        host.Call("Spawn", "mover", 1);
+
+        var subscriptions = new SubscriptionEngine(host.Engine, null);
+        var records = new List<CommitRecord>();
+        host.Engine.AddCommitObserver(new FanoutObserver(subscriptions));
+        host.Engine.AddCommitObserver(new RecordingObserver(records));
+        var watcher = Register(subscriptions, host, 1, projection: null, table: "PlayerState");
+
+        host.Call("Move", 5f);
+
+        var committed = Assert.Single(records.Last().WriteSet).Row;
+        AssertSameMemory(committed, RowOf(watcher.Sink));
+    }
+
+    private static (Registration First, Registration Second) RegisterPair(TransportTestHost host, string? projection = null)
     {
         var subscriptions = new SubscriptionEngine(host.Engine, null);
         host.Engine.AddCommitObserver(new FanoutObserver(subscriptions));
         return (Register(subscriptions, host, 1, projection), Register(subscriptions, host, 2, projection));
     }
 
-    private static CapturingSink Register(SubscriptionEngine subscriptions, TransportTestHost host, uint id, string? projection)
+    private static Registration Register(
+        SubscriptionEngine subscriptions,
+        TransportTestHost host,
+        uint id,
+        string? projection,
+        string table = "Creature")
     {
         var sink = new CapturingSink();
-        var columns = projection ?? "*";
-        var query = SqlSubsetParser.Parse($"SELECT {columns} FROM Creature", null);
+        var query = SqlSubsetParser.Parse($"SELECT {projection ?? "*"} FROM {table}", null);
+        ServerSubscription? subscription = null;
         host.Engine.ReadConsistent(head =>
-            subscriptions.Register(sink, id, query, new SubscriptionsOptions(), head, computeInitialSet: false));
-        return sink;
+            subscription = subscriptions.Register(sink, id, query, new SubscriptionsOptions(), head, computeInitialSet: false).Subscription);
+        return new Registration(sink, subscription!);
     }
 
     private static ulong FirstCreatureId(TransportTestHost host)
@@ -95,7 +127,16 @@ public class FanoutSharingTests
         return Convert.ToUInt64(columns["Id"], System.Globalization.CultureInfo.InvariantCulture);
     }
 
-    private static IReadOnlyDictionary<string, object?>? ColumnsOf(CapturingSink sink) => OpOf(sink).Columns;
+    private static IReadOnlyList<string> ColumnNames(Registration registration) =>
+        [.. registration.Subscription.Descriptor.Columns.Select(c => c.Name)];
+
+    private static Dictionary<string, object?> Decode(Registration registration)
+    {
+        var op = OpOf(registration.Sink);
+        return WireRowValues.ToColumns(registration.Subscription.Descriptor, op.Row.Span, op.ColumnMask.Span);
+    }
+
+    private static ReadOnlyMemory<byte> RowOf(CapturingSink sink) => OpOf(sink).Row;
 
     private static byte[] KeyOf(CapturingSink sink) => OpOf(sink).Key;
 
@@ -105,9 +146,26 @@ public class FanoutSharingTests
         return Assert.Single(Assert.Single(frame.Updates).Ops);
     }
 
+    /// <summary>Whether two spans are the very same bytes in memory, not merely equal ones.</summary>
+    private static bool SameMemory(ReadOnlyMemory<byte> left, ReadOnlyMemory<byte> right) =>
+        left.Length == right.Length
+        && !left.IsEmpty
+        && left.Span.Overlaps(right.Span, out var offset)
+        && offset == 0;
+
+    private static void AssertSameMemory(ReadOnlyMemory<byte> left, ReadOnlyMemory<byte> right) =>
+        Assert.True(SameMemory(left, right), "The two wire rows are separate buffers; the fan-out projected the row twice.");
+
+    private sealed record Registration(CapturingSink Sink, ServerSubscription Subscription);
+
     private sealed class FanoutObserver(SubscriptionEngine subscriptions) : ICommitObserver
     {
         public void OnCommit(CommitRecord record) => subscriptions.Fanout(record);
+    }
+
+    private sealed class RecordingObserver(List<CommitRecord> records) : ICommitObserver
+    {
+        public void OnCommit(CommitRecord record) => records.Add(record);
     }
 
     private sealed class CapturingSink : IDeltaSink

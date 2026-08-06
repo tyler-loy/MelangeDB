@@ -61,6 +61,14 @@ internal sealed class ServerSubscription
     /// </summary>
     public HashSet<string>? StaticWireColumns { get; private set; }
 
+    /// <summary>
+    /// The shape every row this subscription sends is encoded in — the ordered, kinded columns of
+    /// <see cref="StaticWireColumns"/>. Sent once on the first initial-set chunk and stable for the
+    /// subscription's life: re-scoping cannot change a projection, and a schema change means a new
+    /// epoch and a fresh subscribe.
+    /// </summary>
+    public WireDescriptor Descriptor { get; private set; } = null!;
+
     public HashSet<string>? Projection { get; private set; }
 
     public PredicateKind Predicate { get; private set; }
@@ -108,7 +116,7 @@ internal sealed class ServerSubscription
         var subscription = new ServerSubscription(sink, id, schema, policies?.For(schema.Id), context);
         subscription.ApplyProjection(query);
         subscription.ApplyPredicate(query, limits);
-        subscription.ComputeStaticWireColumns();
+        subscription.ComputeWireShape();
         return subscription;
     }
 
@@ -190,6 +198,26 @@ internal sealed class ServerSubscription
             : new HashSet<string>(Schema.Columns.Select(c => c.Name), StringComparer.Ordinal);
         evaluator.IntersectColumns(row, Context, visible);
         return visible;
+    }
+
+    /// <summary>
+    /// The mask that accompanies a row whose visible columns are <paramref name="visible"/>: empty
+    /// unless a column policy narrowed them for this row specifically. Reference equality with
+    /// <see cref="StaticWireColumns"/> is the test, and it is exact — <see cref="VisibleColumns"/>
+    /// returns that very instance when no column policy applies, and a fresh set when one does.
+    /// </summary>
+    public ReadOnlyMemory<byte> MaskFor(IReadOnlySet<string>? visible) =>
+        ReferenceEquals(visible, StaticWireColumns) ? default : RowWire.Mask(Descriptor.Columns, visible!);
+
+    /// <summary>
+    /// One row's wire form for this subscription: descriptor-shaped bytes and its column mask. The
+    /// fan-out path does not use this — it shares one projection across every subscriber through
+    /// the memo — but the cold paths (initial sets, re-scope diffs, resume replay) do.
+    /// </summary>
+    public (ReadOnlyMemory<byte> Row, ReadOnlyMemory<byte> Mask) WireForm(ReadOnlyMemory<byte> row)
+    {
+        var visible = VisibleColumns(row.Span);
+        return (RowWire.Project(Schema, row, visible), MaskFor(visible));
     }
 
     /// <summary>Whether a row belongs to this subscription. <paramref name="key"/> is the primary key.</summary>
@@ -302,21 +330,25 @@ internal sealed class ServerSubscription
     }
 
     /// <summary>
-    /// Precomputes the wire column set: the projection (already validated ServerOnly-free), else
-    /// all columns minus <c>[ServerOnly]</c>, else null meaning "all" — so subscriptions on tables
-    /// with nothing to hide pay nothing per row.
+    /// Precomputes the wire column set and the descriptor derived from it. The set is the
+    /// projection (already validated ServerOnly-free), else all columns minus <c>[ServerOnly]</c>,
+    /// else null meaning "all" — so subscriptions on tables with nothing to hide pay nothing per
+    /// row, and their rows go out as the store's own bytes.
     /// </summary>
-    private void ComputeStaticWireColumns()
+    private void ComputeWireShape()
     {
-        if (Projection is not null)
+        StaticWireColumns = Projection ?? (Schema.Columns.Any(c => c.IsServerOnly)
+            ? new HashSet<string>(Schema.Columns.Where(c => !c.IsServerOnly).Select(c => c.Name), StringComparer.Ordinal)
+            : null);
+
+        var columns = new List<WireColumn>(Schema.Columns.Count);
+        foreach (var column in Schema.Columns)
         {
-            StaticWireColumns = Projection;
-            return;
+            if (StaticWireColumns is null || StaticWireColumns.Contains(column.Name))
+                columns.Add(new WireColumn(column.Name, column.Kind));
         }
 
-        StaticWireColumns = Schema.Columns.Any(c => c.IsServerOnly)
-            ? new HashSet<string>(Schema.Columns.Where(c => !c.IsServerOnly).Select(c => c.Name), StringComparer.Ordinal)
-            : null;
+        Descriptor = new WireDescriptor(Schema.Name, columns);
     }
 
     private void ApplyPredicate(SubscriptionQuery query, SubscriptionsOptions limits)

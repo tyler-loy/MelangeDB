@@ -1,4 +1,5 @@
 using MelangeDB.Client;
+using MelangeDB.Protocol;
 using Xunit;
 
 namespace MelangeDB.Transport.Tests;
@@ -18,12 +19,20 @@ public class TypedCacheTests
 
         public string TableName => "Chunk";
 
-        public Chunk DecodeRow(IReadOnlyDictionary<string, object?> columns)
+        public IReadOnlyList<WireColumn> Columns { get; } =
+        [
+            new WireColumn("Id", ColumnKind.Int64),
+            new WireColumn("X", ColumnKind.Int64),
+            new WireColumn("Data", ColumnKind.Bytes),
+        ];
+
+        public Chunk DecodeRow(ReadOnlySpan<byte> data)
         {
+            var reader = new RowReader(data);
             var row = default(Chunk);
-            row.Id = ClientWireValues.ReadInt64(columns, "Id", "Chunk");
-            row.X = ClientWireValues.ReadInt64(columns, "X", "Chunk");
-            row.Data = ClientWireValues.ReadBytes(columns, "Data", "Chunk")!;
+            row.Id = reader.ReadInt64();
+            row.X = reader.ReadInt64();
+            row.Data = reader.ReadBytes()!;
             return row;
         }
 

@@ -28,7 +28,12 @@ internal sealed class RawSocketClient : IAsyncDisposable
     public async Task<WelcomeFrame> ConnectAsync(Uri uri, CancellationToken ct, string? token = "default")
     {
         await _socket.ConnectAsync(uri, ct);
-        await SendAsync(new HelloFrame(1, 1, token == "default" ? TestTokens.Default : token), ct);
+        await SendAsync(
+            new HelloFrame(
+                MessagePackFrameSerializer.ProtocolVersion,
+                MessagePackFrameSerializer.ProtocolVersion,
+                token == "default" ? TestTokens.Default : token),
+            ct);
         return Assert.IsType<WelcomeFrame>(await ReceiveAsync(ct));
     }
 

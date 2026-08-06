@@ -143,19 +143,30 @@ internal static class ClientEmitter
 
     private static void EmitCodec(StringBuilder builder, ClientTableModel table)
     {
-        builder.AppendLine($"    /// <summary>Decodes '{table.TableName}' wire rows through the one coercion table; no per-site casts.</summary>");
+        builder.AppendLine($"    /// <summary>Decodes '{table.TableName}' rows straight from the wire's row bytes: positional, no dictionary, no boxing.</summary>");
         builder.AppendLine($"    public sealed class {table.TypeName}RowCodec : global::MelangeDB.Client.IClientRowCodec<{table.TypeName}>");
         builder.AppendLine("    {");
         builder.AppendLine($"        public static readonly {table.TypeName}RowCodec Instance = new {table.TypeName}RowCodec();");
         builder.AppendLine();
+        builder.AppendLine("        // The shape these bindings were generated from, compared against the server's");
+        builder.AppendLine("        // descriptor once per subscription. Order is contract: the row bytes are positional.");
+        builder.AppendLine("        private static readonly global::MelangeDB.Protocol.WireColumn[] Shape = new global::MelangeDB.Protocol.WireColumn[]");
+        builder.AppendLine("        {");
+        foreach (var column in table.Columns.Items)
+            builder.AppendLine($"            new global::MelangeDB.Protocol.WireColumn({Literal(column.Name)}, global::MelangeDB.ColumnKind.{column.Kind}),");
+        builder.AppendLine("        };");
+        builder.AppendLine();
         builder.AppendLine($"        public string TableName => {Literal(table.TableName)};");
         builder.AppendLine();
-        builder.AppendLine($"        public {table.TypeName} DecodeRow(global::System.Collections.Generic.IReadOnlyDictionary<string, object> columns)");
+        builder.AppendLine("        public global::System.Collections.Generic.IReadOnlyList<global::MelangeDB.Protocol.WireColumn> Columns => Shape;");
+        builder.AppendLine();
+        builder.AppendLine($"        public {table.TypeName} DecodeRow(global::System.ReadOnlySpan<byte> data)");
         builder.AppendLine("        {");
+        builder.AppendLine("            var reader = new global::MelangeDB.RowReader(data);");
         builder.AppendLine($"            var row = default({table.TypeName});");
         foreach (var column in table.Columns.Items)
         {
-            var read = $"global::MelangeDB.Client.ClientWireValues.Read{column.Kind}(columns, {Literal(column.Name)}, {Literal(table.TableName)})";
+            var read = $"reader.Read{column.Kind}()";
             builder.AppendLine(column.EnumName is null
                 ? $"            row.{column.Name} = {read};"
                 : $"            row.{column.Name} = ({column.EnumName}){read};");

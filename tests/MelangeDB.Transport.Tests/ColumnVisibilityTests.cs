@@ -1,3 +1,4 @@
+using MelangeDB.Client;
 using MelangeDB.Protocol;
 using Microsoft.Extensions.DependencyInjection;
 using Xunit;
@@ -26,16 +27,20 @@ public class ColumnVisibilityTests
         // NextThinkAt ever reaches a frame, a cheater knows exactly when the AI thinks next.
         await using var admin = new RawSocketClient();
         await admin.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("admin-1"));
-        var initial = await RowPolicyTests.InitialSetAsync(admin, 1, "SELECT * FROM Creature");
-        var row = Assert.Single(initial);
-        Assert.Equal(["Id", "X"], row.Columns.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        var initial = await admin.InitialSetAsync(1, "SELECT * FROM Creature");
+        var row = Assert.Single(initial.Rows);
+
+        // The descriptor is the guarantee now: a [ServerOnly] column that never appears in it
+        // cannot appear in any row, because the rows are positional against it.
+        Assert.Equal(["Id", "X"], initial.ColumnNames);
+        Assert.Equal(["Id", "X"], initial.Columns(row).Keys.OrderBy(k => k, StringComparer.Ordinal));
 
         // The delta path hides them too.
-        var creatureId = Convert.ToUInt64(row.Columns["Id"], System.Globalization.CultureInfo.InvariantCulture);
+        var creatureId = Convert.ToUInt64(initial.Columns(row)["Id"], System.Globalization.CultureInfo.InvariantCulture);
         host.Call("MoveCreature", creatureId, 11f);
         var update = await admin.ReceiveUntilAsync<TransactionUpdateFrame>(TestContext.Current.CancellationToken);
         var op = Assert.Single(Assert.Single(update.Updates).Ops);
-        Assert.Equal(["Id", "X"], op.Columns!.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Equal(["Id", "X"], initial.Columns(op).Keys.OrderBy(k => k, StringComparer.Ordinal));
     }
 
     [Fact]
@@ -48,8 +53,10 @@ public class ColumnVisibilityTests
 
         await using var raw = new RawSocketClient();
         await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
-        var initial = await RowPolicyTests.InitialSetAsync(raw, 1, "SELECT * FROM Creature");
-        var creatureId = Convert.ToUInt64(Assert.Single(initial).Columns["Id"], System.Globalization.CultureInfo.InvariantCulture);
+        var initial = await raw.InitialSetAsync(1, "SELECT * FROM Creature");
+        var creatureId = Convert.ToUInt64(
+            initial.Columns(Assert.Single(initial.Rows))["Id"],
+            System.Globalization.CultureInfo.InvariantCulture);
 
         host.Call("NudgeCreatureThink", creatureId, 888UL);
         var marker = host.Call("SetChunk", 1L, 1L, new byte[] { 1 });
@@ -97,13 +104,20 @@ public class ColumnVisibilityTests
         await bob.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, TestTokens.For("bob"));
 
         // Direction one: alice cannot see a hidden player's position; the row itself is visible.
-        var toAlice = Assert.Single(await RowPolicyTests.InitialSetAsync(alice, 1, "SELECT * FROM PlayerState"));
-        Assert.False(toAlice.Columns.ContainsKey("X"), "another player's position leaked through the hideout mask");
-        Assert.Equal("Bob", toAlice.Columns["Name"]);
+        var aliceInitial = await alice.InitialSetAsync(1, "SELECT * FROM PlayerState");
+        var toAlice = aliceInitial.Columns(Assert.Single(aliceInitial.Rows));
+        Assert.False(toAlice.ContainsKey("X"), "another player's position leaked through the hideout mask");
+        Assert.Equal("Bob", toAlice["Name"]);
+
+        // The descriptor still names every column — a column policy narrows the ROW, per row, and
+        // says so with a mask. That is the distinction the mask exists to draw: [ServerOnly] is a
+        // shape, a hideout is a state.
+        Assert.Contains("X", aliceInitial.ColumnNames);
 
         // Direction two: the owner always sees their own row whole.
-        var toBob = Assert.Single(await RowPolicyTests.InitialSetAsync(bob, 1, "SELECT * FROM PlayerState"));
-        Assert.True(toBob.Columns.ContainsKey("X"), "the owner's own position was masked");
+        var bobInitial = await bob.InitialSetAsync(1, "SELECT * FROM PlayerState");
+        var toBob = bobInitial.Columns(Assert.Single(bobInitial.Rows));
+        Assert.True(toBob.ContainsKey("X"), "the owner's own position was masked");
 
         // The mask changes mid-subscription: bob leaves the hideout, and alice's client is
         // updated with the newly visible column — no resubscribe required for row-driven masks.
@@ -111,12 +125,37 @@ public class ColumnVisibilityTests
         var update = await alice.ReceiveUntilAsync<TransactionUpdateFrame>(TestContext.Current.CancellationToken);
         var op = Assert.Single(Assert.Single(update.Updates).Ops);
         Assert.Equal(RowOpKind.Update, op.Kind);
-        Assert.True(op.Columns!.ContainsKey("X"), "leaving the hideout must reveal the position");
+        Assert.True(aliceInitial.Columns(op).ContainsKey("X"), "leaving the hideout must reveal the position");
 
         // And back again: re-entering hides it, also as a live update.
         await bobClient.CallReducerAsync("Spawn", ["Bob", HideoutHidesPosition.HideoutRoom], TestContext.Current.CancellationToken);
         var hiddenAgain = await alice.ReceiveUntilAsync<TransactionUpdateFrame>(TestContext.Current.CancellationToken);
         var hiddenOp = Assert.Single(Assert.Single(hiddenAgain.Updates).Ops);
-        Assert.False(hiddenOp.Columns!.ContainsKey("X"), "re-entering the hideout must hide the position");
+        Assert.False(aliceInitial.Columns(hiddenOp).ContainsKey("X"), "re-entering the hideout must hide the position");
+    }
+
+    [Fact]
+    public async Task A_masked_row_reaching_a_typed_cache_fails_loudly_rather_than_filling_a_default()
+    {
+        // A generated row struct has a field for every column, so a row that arrived without one
+        // cannot be built honestly — and building it with X = 0 would hand the game a position for
+        // a player whose position is deliberately hidden. Under protocol v2 that is not a
+        // judgement call the client can duck: the row bytes simply do not contain the column, and
+        // reading them positionally as if they did would decode the next column into it.
+        await using var host = await TransportTestHost.StartAsync(services: services =>
+            services.AddSingleton<IColumnPolicy<PlayerState>, HideoutHidesPosition>());
+
+        await using var bobClient = host.CreateClient(o => o.Token = TestTokens.For("bob"));
+        await bobClient.ConnectAsync(TestContext.Current.CancellationToken);
+        await bobClient.CallReducerAsync("Spawn", ["Bob", HideoutHidesPosition.HideoutRoom], TestContext.Current.CancellationToken);
+
+        await using var aliceClient = host.CreateClient(o => o.Token = TestTokens.For("alice"));
+        await aliceClient.ConnectAsync(TestContext.Current.CancellationToken);
+        var conn = new MelangeDB.Types.MelangeConnection(aliceClient);
+
+        var failure = await Assert.ThrowsAsync<MelangeSubscriptionException>(
+            () => conn.Db.PlayerState.SubscribeAllAsync(TestContext.Current.CancellationToken));
+
+        Assert.Contains("untyped", failure.Message);
     }
 }
