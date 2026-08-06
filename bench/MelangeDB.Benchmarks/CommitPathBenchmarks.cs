@@ -106,7 +106,12 @@ public class CommitPathBenchmarks : IDisposable
     /// copy. Finding #6's first candidate, and the only one whose whole cost this row reports.
     /// </summary>
     [Benchmark(Description = "encode the log payload")]
-    public int EncodePayload() => LogRecordCodec.WritePayload(++_lsn, in _request).Length;
+    public int EncodePayload()
+    {
+        var length = LogRecordCodec.WritePayload(++_lsn, in _request, out var buffer);
+        LogRecordCodec.Release(buffer);
+        return length;
+    }
 
     /// <summary>Encode plus framing, CRC, and the write — the disk's share appears here.</summary>
     [Benchmark(Description = "append to the log")]
