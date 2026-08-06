@@ -16,6 +16,19 @@ public abstract class RowCodec
     /// The non-generic bridge the hot store uses for index maintenance without reflection.
     /// </summary>
     public abstract RowKey? EncodeColumnFromBytes(string column, ReadOnlySpan<byte> row);
+
+    /// <summary>
+    /// Encodes each of <paramref name="columns"/> from a serialized row into the matching slot of
+    /// <paramref name="destination"/>, reading the row once for the whole set. A default
+    /// <see cref="RowKey"/> — zero length — means the column was null, which is not indexed.
+    /// <para>
+    /// Index maintenance wants every indexed column of the row it is about to write, and asking
+    /// for them one at a time through <see cref="EncodeColumnFromBytes"/> deserialized the whole
+    /// row per column: a table with three indexes paid three full deserializes per put, each one
+    /// re-allocating that row's string and byte columns.
+    /// </para>
+    /// </summary>
+    public abstract void EncodeColumnsFromBytes(ReadOnlySpan<byte> row, IReadOnlyList<string> columns, RowKey[] destination);
 }
 
 /// <summary>
@@ -52,5 +65,14 @@ public abstract class RowCodec<TRow> : RowCodec
     {
         var typed = Deserialize(row);
         return EncodeColumn(column, in typed);
+    }
+
+    public sealed override void EncodeColumnsFromBytes(ReadOnlySpan<byte> row, IReadOnlyList<string> columns, RowKey[] destination)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        ArgumentNullException.ThrowIfNull(destination);
+        var typed = Deserialize(row);
+        for (var i = 0; i < columns.Count; i++)
+            destination[i] = EncodeColumn(columns[i], in typed) ?? default;
     }
 }

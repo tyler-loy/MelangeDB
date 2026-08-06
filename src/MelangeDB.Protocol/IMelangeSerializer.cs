@@ -13,6 +13,19 @@ public interface IMelangeSerializer
     /// <summary>Serializes one frame into one websocket message.</summary>
     byte[] Serialize(Frame frame);
 
+    /// <summary>
+    /// The exact number of bytes <see cref="Serialize"/> would produce for this frame, without
+    /// producing them. Implementations must answer by running their own write path against a
+    /// counting sink rather than by computing sizes separately — a size calculator maintained
+    /// beside the writer is free to drift from it.
+    /// <para>
+    /// The delta path needs a frame's size under the engine's write lock to judge backpressure,
+    /// but wants the encoding to happen on the connection's sender. This is what lets those two
+    /// happen in different places.
+    /// </para>
+    /// </summary>
+    int Measure(Frame frame);
+
     /// <summary>Deserializes one websocket message. Malformed input throws <see cref="MelangeProtocolException"/>.</summary>
     Frame Deserialize(ReadOnlySpan<byte> message);
 }

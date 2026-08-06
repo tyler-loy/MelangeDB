@@ -581,6 +581,18 @@ public sealed class HotStoreOptions
     /// Ignored by the in-memory engine, which does not page.
     /// </summary>
     public long MemoryBudgetBytes { get; set; } = 128 * 1024 * 1024;
+
+    /// <summary>
+    /// Hash buckets for the FASTER index, rounded up to a power of two. Zero derives it from
+    /// <see cref="MemoryBudgetBytes"/>.
+    /// <para>
+    /// This was a fixed 65,536 regardless of budget or row count, which is fine for a small table
+    /// and lengthens hash chains — and so pending I/O completions — on a large paged one. Set it
+    /// when the row count is known and far from what the budget implies; otherwise leave it
+    /// derived. Ignored by the in-memory engine, which has no hash index.
+    /// </para>
+    /// </summary>
+    public long HashBuckets { get; set; }
 }
 
 /// <summary>When the commit log forces appended records to stable storage.</summary>

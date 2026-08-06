@@ -10,6 +10,13 @@ public sealed class WriteSet
 {
     private readonly Dictionary<(TableId Table, RowKey Key), int> _slots = [];
     private readonly List<RowOp?> _ops = [];
+
+    /// <summary>
+    /// Slot positions per table, so reading one table's pending ops costs what that table staged
+    /// rather than what the whole transaction did. A reducer that stages thousands of rows across
+    /// tables and then reads one of them used to scan all of them per read.
+    /// </summary>
+    private readonly Dictionary<TableId, List<int>> _byTable = [];
     private int _count;
 
     /// <summary>The number of live (collapsed) ops.</summary>
@@ -26,6 +33,9 @@ public sealed class WriteSet
         if (!_slots.TryGetValue(slotKey, out var slot))
         {
             _slots.Add(slotKey, _ops.Count);
+            if (!_byTable.TryGetValue(op.Table, out var slots))
+                _byTable[op.Table] = slots = [];
+            slots.Add(_ops.Count);
             _ops.Add(op);
             _count++;
             return;
@@ -71,12 +81,18 @@ public sealed class WriteSet
         return false;
     }
 
-    /// <summary>Enumerates pending ops for one table in staging order.</summary>
+    /// <summary>
+    /// Enumerates pending ops for one table in staging order. A slot emptied by an insert that was
+    /// later deleted keeps its place in the table's list and is skipped here — the list records
+    /// where a table's ops live, not how many survive.
+    /// </summary>
     public IEnumerable<RowOp> OpsFor(TableId table)
     {
-        foreach (var op in _ops)
+        if (!_byTable.TryGetValue(table, out var slots))
+            yield break;
+        foreach (var slot in slots)
         {
-            if (op is { } live && live.Table == table)
+            if (_ops[slot] is { } live)
                 yield return live;
         }
     }

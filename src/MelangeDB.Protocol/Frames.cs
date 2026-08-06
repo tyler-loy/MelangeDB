@@ -1,6 +1,6 @@
 namespace MelangeDB.Protocol;
 
-/// <summary>The frame types of protocol version 1. Wire values are contract; never renumber.</summary>
+/// <summary>The frame types of protocol version 2. Wire values are contract; never renumber.</summary>
 public enum FrameType : byte
 {
     Hello = 1,
@@ -147,26 +147,38 @@ public sealed record UnsubscribedFrame(uint SubscriptionId) : Frame
     public override FrameType Type => FrameType.Unsubscribed;
 }
 
-/// <summary>A row in an initial set: the encoded primary key and the (possibly projected) column values.</summary>
-public readonly record struct WireRow(byte[] Key, IReadOnlyDictionary<string, object?> Columns);
+/// <summary>
+/// A row in an initial set: the encoded primary key and the row's values as schema-ordered v1 row
+/// bytes, shaped by the subscription's <see cref="WireDescriptor"/>.
+/// <see cref="ColumnMask"/> is empty unless a column policy masked this row.
+/// </summary>
+public readonly record struct WireRow(byte[] Key, ReadOnlyMemory<byte> Row, ReadOnlyMemory<byte> ColumnMask);
 
 /// <summary>
 /// One chunk of a subscription's initial result set, consistent at <see cref="AnchorLsn"/>. The
 /// delta stream carries only LSNs greater than the anchor, which is what makes the boundary
 /// gap-free and duplicate-free.
+/// <para>
+/// <see cref="Descriptor"/> rides on chunk 0 and is null on every chunk after it: it describes the
+/// subscription, not the chunk, and the client holds it until the subscription is re-established.
+/// </para>
 /// </summary>
 public sealed record SubscriptionAppliedFrame(
     uint SubscriptionId,
     ulong AnchorLsn,
     uint ChunkIndex,
     bool IsLast,
-    IReadOnlyList<WireRow> Rows) : Frame
+    IReadOnlyList<WireRow> Rows,
+    WireDescriptor? Descriptor = null) : Frame
 {
     public override FrameType Type => FrameType.SubscriptionApplied;
 }
 
-/// <summary>One row delta. <see cref="Columns"/> is null for a delete, and partial under projection.</summary>
-public readonly record struct WireRowOp(RowOpKind Kind, byte[] Key, IReadOnlyDictionary<string, object?>? Columns);
+/// <summary>
+/// One row delta. <see cref="Row"/> is empty for a delete, and shaped by the subscription's
+/// descriptor otherwise; <see cref="ColumnMask"/> is empty unless a column policy masked this row.
+/// </summary>
+public readonly record struct WireRowOp(RowOpKind Kind, byte[] Key, ReadOnlyMemory<byte> Row, ReadOnlyMemory<byte> ColumnMask);
 
 /// <summary>The deltas one subscription receives from one committed transaction.</summary>
 public sealed record SubscriptionUpdate(uint SubscriptionId, IReadOnlyList<WireRowOp> Ops);

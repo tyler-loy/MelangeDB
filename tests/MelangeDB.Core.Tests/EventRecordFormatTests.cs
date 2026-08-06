@@ -115,7 +115,9 @@ public class EventRecordFormatTests : IDisposable
             [],
             [new EventRecord("Some.Event", 2, new byte[] { 1, 2, 3 }), new EventRecord("Other.Event", 0, Array.Empty<byte>())]);
 
-        var payload = LogRecordCodec.WritePayload(4UL, request);
+        var length = LogRecordCodec.WritePayload(4UL, request, out var buffer);
+        var payload = buffer.AsSpan(0, length).ToArray();
+        LogRecordCodec.Release(buffer);
         var record = LogRecordCodec.ReadPayload(payload, payload.Length + 8);
 
         Assert.Equal((ushort)2, record.FormatVersion);

@@ -80,24 +80,27 @@ public class ZeroReflectionTests
         // The reflection serializer and the startup-only model discovery are the two sanctioned
         // uses of reflection in Core; the invocation path itself must never grow one. This fails
         // the moment Type.GetType, MethodInfo.Invoke, or Activator appear in a hot-path file.
-        string[] hotPathFiles =
+        (string Project, string File)[] hotPathFiles =
         [
-            "MelangeEngine.cs",
-            "TransactionDb.cs",
-            "WriteSet.cs",
-            Path.Combine("Store", "InMemoryHotStore.cs"),
-            Path.Combine("Serialization", "RowCodec.cs"),
-            Path.Combine("Serialization", "RowWriter.cs"),
-            Path.Combine("Serialization", "SchemaKeyCodec.cs"),
-            Path.Combine("Serialization", "ReducerArgsReader.cs"),
-            Path.Combine("Dispatch", "ReducerDescriptor.cs"),
-            Path.Combine("Hosting", "MelangeReducerHost.cs"),
+            ("MelangeDB.Core", "MelangeEngine.cs"),
+            ("MelangeDB.Core", "TransactionDb.cs"),
+            ("MelangeDB.Core", "WriteSet.cs"),
+            ("MelangeDB.Core", Path.Combine("Store", "InMemoryHotStore.cs")),
+            ("MelangeDB.Core", Path.Combine("Serialization", "RowCodec.cs")),
+            ("MelangeDB.Core", Path.Combine("Serialization", "SchemaKeyCodec.cs")),
+            ("MelangeDB.Core", Path.Combine("Serialization", "ReducerArgsReader.cs")),
+            ("MelangeDB.Core", Path.Combine("Dispatch", "ReducerDescriptor.cs")),
+            ("MelangeDB.Core", Path.Combine("Hosting", "MelangeReducerHost.cs")),
+
+            // Row format v1 lives in Abstractions rather than Core because protocol v2 puts these
+            // same bytes on the wire, and a client must read them without dragging in the engine.
+            ("MelangeDB.Abstractions", "RowFormat.cs"),
         ];
         string[] forbidden = ["System.Reflection", "MethodInfo", "GetMethod", "Type.GetType", "Activator.CreateInstance"];
 
-        foreach (var file in hotPathFiles)
+        foreach (var (project, file) in hotPathFiles)
         {
-            var path = Path.Combine(RepoRoot(), "src", "MelangeDB.Core", file);
+            var path = Path.Combine(RepoRoot(), "src", project, file);
             Assert.True(File.Exists(path), $"Hot-path file {file} moved; update this test's list.");
             var source = File.ReadAllText(path);
             foreach (var api in forbidden)

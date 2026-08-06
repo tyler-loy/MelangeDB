@@ -154,13 +154,43 @@ posture — off unless opted into, and owner-role-gated when on. See the Bulk in
 | `HotStore:Path` | string | `./data/hot` | restart | 01 | Directory for the hot store's files. |
 | `HotStore:Engine` | enum | `Auto` | restart | 07 | `InMemory` \| `Faster` \| `Auto`. `Auto` picks `Faster` when the FASTER storage package is registered, else `InMemory` — selection by registration, not by path, since `HotStore:Path` always has a default. `InMemory` is a legitimate choice, not just a test double. |
 | `HotStore:MemoryBudgetBytes` | long | `134217728` | restart | 07 | Cap on the paging buffer pool. **Excludes** resident tables, which are accounted separately — total footprint is this plus the residency report. Planned with no default; shipped with 128 MiB, because an unset cap is unbounded. Ignored by the in-memory engine, which does not page. |
+| `HotStore:HashBuckets` | long | `0` (derive) | restart | 07 | Hash buckets for the FASTER index, rounded up to a power of two and clamped to [2^16, 2^26]. Zero derives it from `MemoryBudgetBytes`. This was a hardcoded 65,536 — an index sized for roughly a quarter of a million records whatever the budget said; past that, chains lengthen and one probe becomes several, each a candidate for a pending completion on a paged table. Set it when the row count is known and far from what the budget implies. Ignored by the in-memory engine, which has no hash index. |
 | `CommitLog:Path` | string | `./data/log` | restart | 01 | |
-| `CommitLog:FsyncPolicy` | enum | `OnCommit` | live | 01 | `OnCommit` \| `Interval` \| `OsBuffered`. `OnCommit` is the only durable choice; the others trade a bounded window of committed-but-lost transactions for throughput and must say so in their XML docs. |
+| `CommitLog:FsyncPolicy` | enum | `OnCommit` | live | 01 | `OnCommit` \| `Interval` \| `OsBuffered`. `OnCommit` is the only durable choice; the others trade a bounded window of committed-but-lost transactions for throughput and must say so in their XML docs. **This is the first throughput ceiling you will hit** — see the note below. |
 | `CommitLog:FsyncIntervalMs` | int | `100` | live | 01 | Only read when `FsyncPolicy = Interval`. This is the size of the data-loss window. |
 | `CommitLog:GroupCommit` | bool | `true` | live | 07 | Batch concurrent commits into one fsync. Improves throughput without weakening durability. Deliberately **not** phase 01 — group commit is an optimization phase 01 explicitly defers; 01 only makes the fsync policy configurable. |
 | `Snapshots:Enabled` | bool | `true` | live | 07 | |
 | `Snapshots:IntervalTransactions` | long | `100000` | live | 07 | |
 | `Snapshots:TruncateLog` | bool | `true` | live | 07 | Truncation never passes the slowest applier or event-subscriber checkpoint regardless of this setting. |
+
+### Choosing an fsync policy
+
+This is the single setting with the largest effect on write throughput, and the published ceilings
+([CLUSTERING.md](CLUSTERING.md)) are a ~47× spread:
+
+| Policy | Sustained commits/s, one shard | What you lose on a crash |
+| --- | ---: | --- |
+| `OnCommit` (default) | ~1,100 | Nothing. A record is on stable storage before the commit returns. |
+| `Interval` (50 ms) | ~52,000 | Up to `FsyncIntervalMs` of committed transactions. |
+| `OsBuffered` | disk-independent | Whatever the page cache held. |
+
+The choice is per deployment, not per reducer, so pick for the **least forgiving** thing in the
+database. Two rules of thumb:
+
+- **Simulation state — positions, health, AI ticks, terrain edits.** `Interval` is the right
+  default. The data is reconstructible or quickly re-diverges from a stale value anyway, and 1,100
+  commits/s is a low ceiling for a populated shard. Note that the ceiling is *per shard* and adding
+  nodes does not raise it: one crowded town square is one writer.
+- **Money, inventory transfers, authentication, anything a player can dispute.** `OnCommit`. A
+  bounded loss window is still a window in which a purchase can vanish.
+
+If both live in one database, `OnCommit` is the answer and the ceiling is the cost of it. Splitting
+durability classes across separate shards is possible but buys less than it looks like: the
+throughput of the shard holding the strict tables is unchanged, and cross-shard reducers are the
+expensive kind.
+
+`GroupCommit` is accepted and reserved rather than effective — under the single-writer model there
+are no concurrent commits to batch — so it is not a way around the `OnCommit` ceiling.
 
 ## Residency
 
@@ -265,7 +295,7 @@ change that adds them. Added by the frame-tick pump, issue #26.
 | `Policies:DefaultReducerPosture` | enum | `Allow` | live | 04 | `Allow` \| `Deny`. `Deny` is safer but annotates every ordinary gameplay reducer; pair `Allow` with the report above. Governs client-originated calls only — in-process dispatch is the host's own code. |
 | `RateLimit:Enabled` | bool | `true` | live | 04 | |
 | `RateLimit:ReducerCallsPerSecond` | int | `20` | live | 04 | Default sustained rate; the bucket is per identity **per reducer**, so one spammed reducer cannot starve the rest of a player's actions. Rejected before a transaction opens, so it costs no log volume. Client-originated calls only. |
-| `RateLimit:BurstCapacity` | int | `60` | live | 04 | Bursts pass at human click speed; sustained rates are what actually stop macros. |
+| `RateLimit:BurstCapacity` | int | `60` | live | 04 | Bursts pass at human click speed; sustained rates are what actually stop macros. Buckets that have refilled to this are evicted, which changes no decision: a bucket is created full, so a refilled one is indistinguishable from one that never existed. A caller mid-burst is never evicted, so the sweep can never be a way through the limit. |
 | `RateLimit:PerReducer:<ReducerName>` | int | — | live | 04 | Per-reducer override of the global rate. |
 
 ## Scheduling

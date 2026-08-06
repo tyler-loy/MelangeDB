@@ -72,7 +72,10 @@ public class AuthLeakTests
         await socket.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
         var serializer = new MessagePackFrameSerializer();
         await socket.SendAsync(
-            serializer.Serialize(new HelloFrame(1, 1, null)),
+            serializer.Serialize(new HelloFrame(
+                MessagePackFrameSerializer.ProtocolVersion,
+                MessagePackFrameSerializer.ProtocolVersion,
+                null)),
             WebSocketMessageType.Binary,
             endOfMessage: true,
             TestContext.Current.CancellationToken);
@@ -92,7 +95,10 @@ public class AuthLeakTests
         await socket.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
         var serializer = new MessagePackFrameSerializer();
         await socket.SendAsync(
-            serializer.Serialize(new HelloFrame(1, 1, "not-a-jwt")),
+            serializer.Serialize(new HelloFrame(
+                MessagePackFrameSerializer.ProtocolVersion,
+                MessagePackFrameSerializer.ProtocolVersion,
+                "not-a-jwt")),
             WebSocketMessageType.Binary,
             endOfMessage: true,
             TestContext.Current.CancellationToken);

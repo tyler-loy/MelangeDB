@@ -2,8 +2,49 @@ using MelangeDB.Protocol;
 
 namespace MelangeDB.Client;
 
-/// <summary>One row in a subscription's local cache: the encoded primary key and the column values.</summary>
-public sealed record MelangeRow(byte[] Key, IReadOnlyDictionary<string, object?> Columns);
+/// <summary>
+/// One row in a subscription's local cache: the encoded primary key and the row's schema-ordered
+/// v1 bytes, shaped by the subscription's <see cref="WireDescriptor"/>.
+/// <para>
+/// <see cref="Columns"/> is the untyped view, and it is decoded on first read rather than on
+/// arrival. That laziness is most of protocol v2's client-side win: a typed client holds a
+/// <see cref="MelangeSubscription"/> under every typed cache, and it never asks for the map at all,
+/// so the dictionary, the strings, and the boxes are never built.
+/// </para>
+/// </summary>
+public sealed class MelangeRow
+{
+    // Benignly racy: two readers can each build a map, and both are equal and correct. A lock here
+    // would put contention on the read path of every row to save an allocation that happens once.
+    private IReadOnlyDictionary<string, object?>? _columns;
+
+    internal MelangeRow(byte[] key, ReadOnlyMemory<byte> row, ReadOnlyMemory<byte> columnMask, WireDescriptor descriptor)
+    {
+        Key = key;
+        Row = row;
+        ColumnMask = columnMask;
+        Descriptor = descriptor;
+    }
+
+    /// <summary>The encoded primary key — the same bytes the server keys deltas with.</summary>
+    public byte[] Key { get; }
+
+    /// <summary>The row's values as v1 row bytes, in <see cref="Descriptor"/> order.</summary>
+    public ReadOnlyMemory<byte> Row { get; }
+
+    /// <summary>
+    /// Which descriptor columns <see cref="Row"/> carries, as a bitset; empty means all of them,
+    /// which is every row on a subscription without column policies.
+    /// </summary>
+    public ReadOnlyMemory<byte> ColumnMask { get; }
+
+    /// <summary>The shape <see cref="Row"/> is encoded in, sent once per subscription.</summary>
+    public WireDescriptor Descriptor { get; }
+
+    /// <summary>The row's values by column name, decoded on first read and then cached.</summary>
+    public IReadOnlyDictionary<string, object?> Columns =>
+        _columns ??= WireRowValues.ToColumns(Descriptor, Row.Span, ColumnMask.Span);
+}
 
 /// <summary>
 /// A live subscription and its locally maintained row cache — a projection of the server's state,
@@ -21,6 +62,7 @@ public sealed class MelangeSubscription
     private readonly List<(ulong Lsn, IReadOnlyList<WireRowOp> Ops)> _pending = [];
     private readonly ISubscriptionSink? _sink;
     private TaskCompletionSource _applied = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private WireDescriptor? _descriptor;
     private ulong _anchorLsn;
     private bool _live;
 
@@ -44,6 +86,13 @@ public sealed class MelangeSubscription
 
     /// <summary>The LSN the initial set was consistent at.</summary>
     public ulong AnchorLsn => _anchorLsn;
+
+    /// <summary>
+    /// The shape this subscription's rows arrive in, sent by the server on the first initial-set
+    /// chunk. Null until the first chunk lands. It survives a resume deliberately: a resume is only
+    /// accepted against the same log epoch, and a schema change is a new epoch.
+    /// </summary>
+    public WireDescriptor? Descriptor => _descriptor;
 
     /// <summary>Fires for a row entering the subscription — by insert, or by moving into scope.</summary>
     public event Action<MelangeRow>? OnInsert;
@@ -106,14 +155,22 @@ public sealed class MelangeSubscription
             // replace; buffer them (exactly as during the first subscribe) and let the replay
             // below filter them against the anchor this set actually names.
             _live = false;
+
+            // The descriptor rides on chunk 0 and describes every row that follows it, including
+            // the deltas that arrive long after the set completes. A re-established or re-scoped
+            // subscription gets a fresh one and replaces the old.
+            if (chunk.Descriptor is { } descriptor)
+                _descriptor = descriptor;
             _initialRows.AddRange(chunk.Rows);
             if (!chunk.IsLast)
                 return;
 
+            var shape = _descriptor ?? throw new MelangeProtocolException(
+                $"Subscription {Id} received an initial set with no wire descriptor; the server never sent one on chunk 0.");
             _anchorLsn = chunk.AnchorLsn;
             _rows.Clear();
             foreach (var row in _initialRows)
-                _rows[new ByteKey(row.Key)] = new MelangeRow(row.Key, row.Columns);
+                _rows[new ByteKey(row.Key)] = new MelangeRow(row.Key, row.Row, row.ColumnMask, shape);
             _initialRows.Clear();
             _live = true;
             replay = [.. _pending];
@@ -204,6 +261,9 @@ public sealed class MelangeSubscription
         var kind = op.Kind;
         lock (_lock)
         {
+            // A subscription is only live after a completed initial set, and that set carried the
+            // descriptor — so a delta can never reach here without one.
+            var shape = _descriptor!;
             var key = new ByteKey(op.Key);
             switch (op.Kind)
             {
@@ -215,7 +275,7 @@ public sealed class MelangeSubscription
                         kind = RowOpKind.Update;
                     }
 
-                    current = new MelangeRow(op.Key, op.Columns!);
+                    current = new MelangeRow(op.Key, op.Row, op.ColumnMask, shape);
                     _rows[key] = current;
                     break;
                 case RowOpKind.Update:
@@ -229,7 +289,7 @@ public sealed class MelangeSubscription
                         kind = RowOpKind.Insert;
                     }
 
-                    current = new MelangeRow(op.Key, op.Columns!);
+                    current = new MelangeRow(op.Key, op.Row, op.ColumnMask, shape);
                     _rows[key] = current;
                     break;
                 case RowOpKind.Delete:

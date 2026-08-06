@@ -51,6 +51,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private readonly FasterKV<SpanByte, SpanByte>? _blob;
     private readonly ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions>? _blobSession;
     private readonly long _bufferPoolCapacityBytes;
+
+    /// <summary>Reused buffer for composed store and blob keys; see <see cref="StoreKey"/>.</summary>
+    private byte[] _keyScratch = new byte[64];
     private bool _disposed;
 
     public FasterHotStore(HotStoreContext context)
@@ -66,6 +69,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         var mainMemoryBits = anyBlobColumns ? totalBits - 1 : totalBits;
         var blobMemoryBits = totalBits - 1;
         _bufferPoolCapacityBytes = (1L << mainMemoryBits) + (anyBlobColumns ? 1L << blobMemoryBits : 0);
+        var hashBuckets = HashBuckets(context.Options.HotStore);
 
         // The store is rebuilt from snapshot + log replay on every start, so files left by a
         // previous run (clean or crashed) are stale projections; start from nothing.
@@ -75,7 +79,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         _mainDevice = Devices.CreateLogDevice(Path.Combine(path, "main.hlog"), deleteOnClose: true);
         _main = new FasterKV<SpanByte, SpanByte>(
-            1L << 16,
+            hashBuckets,
             new LogSettings
             {
                 LogDevice = _mainDevice,
@@ -89,7 +93,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             _blobDevice = Devices.CreateLogDevice(Path.Combine(path, "blob.hlog"), deleteOnClose: true);
             _blob = new FasterKV<SpanByte, SpanByte>(
-                1L << 16,
+                hashBuckets,
                 new LogSettings
                 {
                     LogDevice = _blobDevice,
@@ -149,14 +153,32 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
     {
+        if (!_tables.TryGetValue(table, out var state))
+        {
+            row = default;
+            return false;
+        }
+
+        // One volatile read of an immutable version. A resident table's rows are in managed memory,
+        // so answering from this version needs no lock at all — and this is the read the engine's
+        // fan-out makes per op, under the *engine* write lock, to fetch a pre-image. Taking the
+        // store lock there was contention on the one path that can least afford it.
+        //
+        // A concurrent demotion cannot make this stale: the version is captured once, and either it
+        // is the resident one (which has the rows) or it is not, in which case the paged path runs.
+        var version = state.Current;
+        if (version.IsResident)
+        {
+            var found = version.ResidentRows.TryGetValue(key, out var resident);
+            row = found ? resident : default;
+            return found;
+        }
+
+        // The paged path keeps the lock, and not for the session's sake: the hybrid log overwrites
+        // in place, so the directory probe and the record read must be atomic against a write, or a
+        // reader can hold a directory entry whose record a concurrent delete has already removed.
         lock (_lock)
         {
-            if (!_tables.TryGetValue(table, out var state))
-            {
-                row = default;
-                return false;
-            }
-
             var bytes = ReadRow(state, key);
             row = bytes;
             return bytes is not null;
@@ -202,49 +224,27 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
+    // The index lives in the table's immutable version, so collecting a key list needs no lock —
+    // only materializing the rows behind those keys does, and only for a paged table.
+
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
     {
-        RowKey[] keys;
-        lock (_lock)
-        {
-            if (!_tables.TryGetValue(table, out var state))
-                yield break;
-            var index = state.Index(column);
-            keys = index.TryGetValue(value, out var set) ? [.. set] : [];
-        }
-
-        foreach (var pair in MaterializeRows(table, keys))
-            yield return pair;
+        if (!_tables.TryGetValue(table, out var state))
+            return [];
+        var version = state.Current;
+        return MaterializeRows(state, version, [.. version.Indexes[state.IndexPosition(column)].Equal(value)]);
     }
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
     {
-        var keys = new List<RowKey>();
-        lock (_lock)
-        {
-            if (!_tables.TryGetValue(table, out var state))
-                yield break;
-            foreach (var (value, set) in state.Index(column))
-            {
-                if (value.CompareTo(low) < 0)
-                    continue;
-                if (value.CompareTo(high) > 0)
-                    break;
-                keys.AddRange(set);
-            }
-        }
-
-        foreach (var pair in MaterializeRows(table, keys))
-            yield return pair;
+        if (!_tables.TryGetValue(table, out var state))
+            return [];
+        var version = state.Current;
+        return MaterializeRows(state, version, [.. version.Indexes[state.IndexPosition(column)].Range(low, high)]);
     }
 
-    public long Count(TableId table)
-    {
-        lock (_lock)
-        {
-            return _tables.TryGetValue(table, out var state) ? state.RowCount : 0;
-        }
-    }
+    public long Count(TableId table) =>
+        _tables.TryGetValue(table, out var state) ? state.Current.RowCount : 0;
 
     public IEnumerable<RowKey> ScanKeys(TableId table)
     {
@@ -438,7 +438,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (Pin(table) is not { } pinned)
                 return [];
             var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
-            return index.TryGetValue(value, out var keys) ? Materialize(pinned, keys) : [];
+            return Materialize(pinned, index.Equal(value));
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
@@ -446,7 +446,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (Pin(table) is not { } pinned)
                 return [];
             var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
-            return Materialize(pinned, Range(index, low, high));
+            return Materialize(pinned, index.Range(low, high));
         }
 
         public void Dispose()
@@ -457,20 +457,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             store.CloseReadView(this);
             _undo.Clear();
             tables.Clear();
-        }
-
-        private static IEnumerable<RowKey> Range(
-            ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> index, RowKey low, RowKey high)
-        {
-            foreach (var (value, keys) in index)
-            {
-                if (value.CompareTo(low) < 0)
-                    continue;
-                if (value.CompareTo(high) > 0)
-                    yield break;
-                foreach (var key in keys)
-                    yield return key;
-            }
         }
 
         private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Resident(PinnedTable pinned)
@@ -548,18 +534,41 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         private readonly record struct UndoKey(TableId Table, RowKey Key);
     }
 
-    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(TableId table, IEnumerable<RowKey> keys)
+    /// <summary>
+    /// Reads the rows behind a key list. A resident version answers from managed memory with no
+    /// lock; a paged one takes the store lock per row, because the hybrid log overwrites in place
+    /// and the directory probe and record read have to be atomic against a concurrent write.
+    /// </summary>
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(
+        TableState state, TableVersion version, RowKey[] keys)
     {
+        if (version.IsResident)
+        {
+            foreach (var key in keys)
+            {
+                if (version.ResidentRows.TryGetValue(key, out var resident))
+                {
+                    state.AddRowsScanned(1);
+                    yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, resident);
+                }
+            }
+
+            yield break;
+        }
+
         foreach (var key in keys)
         {
             byte[]? bytes;
             lock (_lock)
             {
-                bytes = _tables.TryGetValue(table, out var state) ? ReadRow(state, key) : null;
+                bytes = ReadRow(state, key);
             }
 
             if (bytes is not null)
+            {
+                state.AddRowsScanned(1);
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
+            }
         }
     }
 
@@ -689,7 +698,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private byte[]? ReadValue(
         ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        byte[] keyBytes,
+        ReadOnlySpan<byte> keyBytes,
         TableState faultAccounting)
     {
         byte[]? output = null;
@@ -727,7 +736,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private static void UpsertValue(
         ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        byte[] keyBytes,
+        ReadOnlySpan<byte> keyBytes,
         ReadOnlySpan<byte> value)
     {
         unsafe
@@ -746,7 +755,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private static void DeleteValue(
         ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        byte[] keyBytes)
+        ReadOnlySpan<byte> keyBytes)
     {
         unsafe
         {
@@ -760,21 +769,55 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
-    private static byte[] StoreKey(TableId table, in RowKey key)
+    /// <summary>
+    /// Composes a store key into the scratch buffer. Every upsert, delete, and read used to
+    /// allocate a fresh array for a key that is dead the moment the call returns; under a heavy
+    /// apply rate that is pure garbage. The buffer is safe to share because every path that
+    /// composes a key holds the store lock -- which is also what makes the single session safe --
+    /// and the span is consumed before the next key is composed.
+    /// </summary>
+    private ReadOnlySpan<byte> StoreKey(TableId table, in RowKey key)
     {
-        var bytes = new byte[4 + key.Length];
+        var bytes = Scratch(4 + key.Length);
         BinaryPrimitives.WriteUInt32BigEndian(bytes, table.Value);
-        key.Span.CopyTo(bytes.AsSpan(4));
+        key.Span.CopyTo(bytes[4..]);
         return bytes;
     }
 
-    private static byte[] BlobKey(TableId table, in RowKey key, int bytesColumnOrdinal)
+    private ReadOnlySpan<byte> BlobKey(TableId table, in RowKey key, int bytesColumnOrdinal)
     {
-        var bytes = new byte[4 + key.Length + 1];
+        var bytes = Scratch(4 + key.Length + 1);
         BinaryPrimitives.WriteUInt32BigEndian(bytes, table.Value);
-        key.Span.CopyTo(bytes.AsSpan(4));
+        key.Span.CopyTo(bytes[4..]);
         bytes[^1] = checked((byte)bytesColumnOrdinal);
         return bytes;
+    }
+
+    private Span<byte> Scratch(int length)
+    {
+        if (_keyScratch.Length < length)
+            _keyScratch = new byte[Math.Max(length, _keyScratch.Length * 2)];
+        return _keyScratch.AsSpan(0, length);
+    }
+
+    /// <summary>
+    /// Hash buckets for the FASTER index: the operator's figure when set, else derived from the
+    /// memory budget. A bucket holds several entries, so the target is roughly one per few
+    /// expected records; the budget is the only proxy for record count the store has at
+    /// construction, since the rows themselves arrive later by replay.
+    /// <para>
+    /// The previous fixed 65,536 sized the index for about a quarter of a million records whatever
+    /// the budget said. Past that, chains lengthen and a lookup that should be one probe becomes
+    /// several -- each one a candidate for a pending completion on a paged table.
+    /// </para>
+    /// </summary>
+    private static long HashBuckets(HotStoreOptions options)
+    {
+        // A record averages a few hundred bytes and a bucket serves several, so budget/1024 keeps
+        // the index proportional to what the buffer pool can hold without dwarfing it.
+        var target = options.HashBuckets > 0 ? options.HashBuckets : Math.Max(options.MemoryBudgetBytes, 2L << 20) / 1024;
+        var clamped = Math.Clamp(target, 1L << 16, 1L << 26);
+        return BitOperations.IsPow2(clamped) ? clamped : 1L << (64 - BitOperations.LeadingZeroCount((ulong)clamped));
     }
 
     private static void CleanStoreFiles(string path)
@@ -801,7 +844,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         bool isResident,
         ImmutableSortedDictionary<RowKey, byte[]> residentRows,
         ImmutableSortedDictionary<RowKey, DirectoryEntry> directory,
-        ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes)
+        ImmutableArray<SecondaryIndex> indexes)
     {
         public bool IsResident { get; } = isResident;
 
@@ -809,7 +852,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public ImmutableSortedDictionary<RowKey, DirectoryEntry> Directory { get; } = directory;
 
-        public ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Indexes { get; } = indexes;
+        public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
 
         public long RowCount => IsResident ? ResidentRows.Count : Directory.Count;
 
@@ -820,8 +863,10 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private sealed class TableState
     {
-        private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
         private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
+
+        /// <summary>Indexed column names in index order — the codec's one-pass encode reads this per put.</summary>
+        private readonly string[] _indexColumns;
         private TableVersion _current;
 
         public TableState(TableSchema schema, Residency declared)
@@ -835,11 +880,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
             Schema = schema;
             Declared = declared;
-            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
+            _indexColumns = new string[schema.Indexes.Count];
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
-                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+                _indexColumns[i] = schema.Indexes[i].Column;
+                indexes.Add(SecondaryIndex.Empty);
             }
 
             _current = new TableVersion(
@@ -914,7 +961,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 ? position
                 : throw new ArgumentException($"Table {Schema.Id} has no index on column '{column}'.", nameof(column));
 
-        public ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> Index(string column) =>
+        public SecondaryIndex Index(string column) =>
             Current.Indexes[IndexPosition(column)];
 
         public RowKey[] SnapshotKeys() => [.. Current.Keys];
@@ -990,9 +1037,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         private void BeginTier(bool isResident)
         {
-            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(_indexPositions.Count);
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexPositions.Count);
             for (var i = 0; i < _indexPositions.Count; i++)
-                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+                indexes.Add(SecondaryIndex.Empty);
             ResidentDataBytes = 0;
             OverheadBytes = 0;
             ResidencyEpoch++;
@@ -1003,15 +1050,29 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 indexes.MoveToImmutable());
         }
 
+        /// <summary>
+        /// Every indexed column's encoded value for one row, positionally aligned with the schema's
+        /// index list; a zero-length key is a null column value, which is not indexed. One pass over
+        /// the row for the whole set — encoding a column at a time deserialized the entire row per
+        /// index, so a three-index table paid three full deserializes per put.
+        /// </summary>
         public RowKey[]? EncodeIndexValues(ReadOnlySpan<byte> rowBytes)
         {
             if (Schema.Indexes.Count == 0)
                 return null;
-            var values = new RowKey[Schema.Indexes.Count];
-            for (var i = 0; i < Schema.Indexes.Count; i++)
+            var values = new RowKey[_indexColumns.Length];
+            if (Schema.Codec is { } codec)
             {
-                var column = Schema.Indexes[i].Column;
-                values[i] = EncodeColumn(column, rowBytes) ?? default;
+                codec.EncodeColumnsFromBytes(rowBytes, _indexColumns, values);
+                return values;
+            }
+
+            var row = RowSerializer.Deserialize(Schema, rowBytes.ToArray());
+            for (var i = 0; i < _indexColumns.Length; i++)
+            {
+                var columnSchema = Schema.Column(_indexColumns[i]);
+                var value = columnSchema.GetValue(row);
+                values[i] = value is null ? default : SchemaKeyCodec.Encode(columnSchema, value);
             }
 
             return values;
@@ -1035,8 +1096,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 current.IsResident, current.ResidentRows, current.Directory, Unindex(current.Indexes, key, values));
         }
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Index(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Index(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             RowKey[]? values)
         {
@@ -1047,16 +1108,14 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 var value = values[i];
                 if (value.Length == 0)
                     continue; // A null column value is unindexed, matching the in-memory store.
-                var index = indexes[i];
-                var keys = index.TryGetValue(value, out var existing) ? existing : EmptyKeys;
-                indexes = indexes.SetItem(i, index.SetItem(value, keys.Add(key)));
+                indexes = indexes.SetItem(i, indexes[i].Add(value, key));
             }
 
             return indexes;
         }
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Unindex(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Unindex(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             RowKey[]? values)
         {
@@ -1067,24 +1126,10 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 var value = values[i];
                 if (value.Length == 0)
                     continue;
-                var index = indexes[i];
-                if (!index.TryGetValue(value, out var keys))
-                    continue;
-                var remaining = keys.Remove(key);
-                indexes = indexes.SetItem(i, remaining.IsEmpty ? index.Remove(value) : index.SetItem(value, remaining));
+                indexes = indexes.SetItem(i, indexes[i].Remove(value, key));
             }
 
             return indexes;
-        }
-
-        private RowKey? EncodeColumn(string column, ReadOnlySpan<byte> rowBytes)
-        {
-            if (Schema.Codec is { } codec)
-                return codec.EncodeColumnFromBytes(column, rowBytes);
-            var row = RowSerializer.Deserialize(Schema, rowBytes.ToArray());
-            var columnSchema = Schema.Column(column);
-            var value = columnSchema.GetValue(row);
-            return value is null ? null : SchemaKeyCodec.Encode(columnSchema, value);
         }
 
         private static long EntryOverhead(DirectoryEntry entry)

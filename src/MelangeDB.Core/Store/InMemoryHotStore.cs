@@ -72,15 +72,34 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         ArgumentNullException.ThrowIfNull(record);
         if (record.Lsn <= AppliedLsn)
             return;
+
+        if (record.WriteSet.Count == 1)
+        {
+            // The ordinary reducer commit. Grouping one op by table would cost more than it saves.
+            var op = record.WriteSet[0];
+            if (_tables.TryGetValue(op.Table, out var table))
+                table.Apply([op]);
+            AppliedLsn = record.Lsn;
+            return;
+        }
+
+        // Several ops for one table become one version publish. Every intermediate version was
+        // structurally shared but never observed — the whole record applies under the engine's
+        // write lock, so no reader can land between two of its ops — and each one cost a path copy
+        // of the row map plus one of every secondary index. Border batches and multi-row reducers
+        // paid that per row.
+        var byTable = new Dictionary<TableId, List<RowOp>>();
         foreach (var op in record.WriteSet)
         {
-            if (!_tables.TryGetValue(op.Table, out var table))
+            if (!_tables.ContainsKey(op.Table))
                 continue; // A table this projection doesn't know; nothing to project.
-            if (op.Kind == RowOpKind.Delete)
-                table.Remove(op.Key);
-            else
-                table.Put(op.Key, op.Row);
+            if (!byTable.TryGetValue(op.Table, out var ops))
+                byTable[op.Table] = ops = [];
+            ops.Add(op);
         }
+
+        foreach (var (id, ops) in byTable)
+            _tables[id].Apply(ops);
 
         AppliedLsn = record.Lsn;
     }
@@ -258,40 +277,15 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         }
 
         public static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(
-            TableData owner, TableVersion version, TableId table, string column, RowKey value)
-        {
-            var index = version.Index(owner.IndexPosition(table, column));
-            if (!index.TryGetValue(value, out var keys))
-                return [];
-            return Resolve(version, keys);
-        }
+            TableData owner, TableVersion version, TableId table, string column, RowKey value) =>
+            Resolve(version, version.Index(owner.IndexPosition(table, column)).Equal(value));
 
         public static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(
-            TableData owner, TableVersion version, TableId table, string column, RowKey low, RowKey high)
-        {
-            var index = version.Index(owner.IndexPosition(table, column));
-            return Range(version, index, low, high);
-        }
-
-        private static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Range(
-            TableVersion version,
-            ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> index,
-            RowKey low,
-            RowKey high)
-        {
-            foreach (var (value, keys) in index)
-            {
-                if (value.CompareTo(low) < 0)
-                    continue;
-                if (value.CompareTo(high) > 0)
-                    yield break;
-                foreach (var pair in Resolve(version, keys))
-                    yield return pair;
-            }
-        }
+            TableData owner, TableVersion version, TableId table, string column, RowKey low, RowKey high) =>
+            Resolve(version, version.Index(owner.IndexPosition(table, column)).Range(low, high));
 
         private static IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Resolve(
-            TableVersion version, ImmutableSortedSet<RowKey> keys)
+            TableVersion version, IEnumerable<RowKey> keys)
         {
             foreach (var key in keys)
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, version.Rows[key]);
@@ -306,31 +300,35 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
     /// </summary>
     private sealed class TableVersion(
         ImmutableSortedDictionary<RowKey, byte[]> rows,
-        ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes)
+        ImmutableArray<SecondaryIndex> indexes)
     {
         public ImmutableSortedDictionary<RowKey, byte[]> Rows { get; } = rows;
 
-        public ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Indexes { get; } = indexes;
+        public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
 
-        public ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>> Index(int position) => Indexes[position];
+        public SecondaryIndex Index(int position) => Indexes[position];
     }
 
     private sealed class TableData
     {
-        private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
         private readonly TableSchema _schema;
         private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
+
+        /// <summary>Indexed column names in index order — the codec's one-pass encode reads this per put.</summary>
+        private readonly string[] _indexColumns;
         private long _rowsScanned;
 
         public TableData(TableSchema schema, Residency residencyLabel = Residency.Paged)
         {
             _schema = schema;
             ResidencyLabel = residencyLabel;
-            var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
+            _indexColumns = new string[schema.Indexes.Count];
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
-                indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
+                _indexColumns[i] = schema.Indexes[i].Column;
+                indexes.Add(SecondaryIndex.Empty);
             }
 
             Current = new TableVersion(ImmutableSortedDictionary<RowKey, byte[]>.Empty, indexes.MoveToImmutable());
@@ -365,33 +363,45 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                 ? position
                 : throw new ArgumentException($"Table {table} has no index on column '{column}'.", nameof(column));
 
-        public void Put(RowKey key, ReadOnlyMemory<byte> row)
+        /// <summary>
+        /// Applies one record's ops for this table as a single version publish. The ops thread
+        /// through local row and index references, so a later op in the same record sees the
+        /// earlier ones — and only the result is published.
+        /// </summary>
+        public void Apply(List<RowOp> ops)
         {
             var current = Current;
             var rows = current.Rows;
             var indexes = current.Indexes;
-            if (rows.TryGetValue(key, out var previous))
+            foreach (var op in ops)
             {
-                indexes = Unindex(indexes, key, previous);
-                ResidentBytes -= previous.Length;
-            }
-            else
-            {
-                ResidentBytes += key.Length;
+                if (op.Kind == RowOpKind.Delete)
+                {
+                    if (!rows.TryGetValue(op.Key, out var removed))
+                        continue;
+                    ResidentBytes -= op.Key.Length + removed.Length;
+                    indexes = Unindex(indexes, op.Key, removed);
+                    rows = rows.Remove(op.Key);
+                    continue;
+                }
+
+                if (rows.TryGetValue(op.Key, out var previous))
+                {
+                    indexes = Unindex(indexes, op.Key, previous);
+                    ResidentBytes -= previous.Length;
+                }
+                else
+                {
+                    ResidentBytes += op.Key.Length;
+                }
+
+                var bytes = op.Row.ToArray();
+                ResidentBytes += bytes.Length;
+                rows = rows.SetItem(op.Key, bytes);
+                indexes = Index(indexes, op.Key, bytes);
             }
 
-            var bytes = row.ToArray();
-            ResidentBytes += bytes.Length;
-            Current = new TableVersion(rows.SetItem(key, bytes), Index(indexes, key, bytes));
-        }
-
-        public void Remove(RowKey key)
-        {
-            var current = Current;
-            if (!current.Rows.TryGetValue(key, out var previous))
-                return;
-            ResidentBytes -= key.Length + previous.Length;
-            Current = new TableVersion(current.Rows.Remove(key), Unindex(current.Indexes, key, previous));
+            Current = new TableVersion(rows, indexes);
         }
 
         /// <summary>
@@ -400,67 +410,74 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         /// </summary>
         public BulkLoader BeginBulkLoad() => new(this);
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Index(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Index(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             byte[] bytes)
         {
             if (indexes.Length == 0)
                 return indexes;
-            foreach (var (column, value) in IndexedValues(bytes))
+            var values = IndexedValues(bytes);
+            for (var position = 0; position < values.Length; position++)
             {
-                var position = _indexPositions[column];
-                var index = indexes[position];
-                var keys = index.TryGetValue(value, out var existing) ? existing : EmptyKeys;
-                indexes = indexes.SetItem(position, index.SetItem(value, keys.Add(key)));
+                var value = values[position];
+                if (value.Length == 0)
+                    continue; // A null column value is unindexed.
+                indexes = indexes.SetItem(position, indexes[position].Add(value, key));
             }
 
             return indexes;
         }
 
-        private ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> Unindex(
-            ImmutableArray<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>> indexes,
+        private ImmutableArray<SecondaryIndex> Unindex(
+            ImmutableArray<SecondaryIndex> indexes,
             RowKey key,
             byte[] bytes)
         {
             if (indexes.Length == 0)
                 return indexes;
-            foreach (var (column, value) in IndexedValues(bytes))
+            var values = IndexedValues(bytes);
+            for (var position = 0; position < values.Length; position++)
             {
-                var position = _indexPositions[column];
-                var index = indexes[position];
-                if (!index.TryGetValue(value, out var keys))
+                var value = values[position];
+                if (value.Length == 0)
                     continue;
-                var remaining = keys.Remove(key);
-                indexes = indexes.SetItem(position, remaining.IsEmpty ? index.Remove(value) : index.SetItem(value, remaining));
+                indexes = indexes.SetItem(position, indexes[position].Remove(value, key));
             }
 
             return indexes;
         }
 
-        private IEnumerable<(string Column, RowKey Value)> IndexedValues(byte[] bytes)
+        /// <summary>
+        /// Every indexed column's encoded value for one row, positionally aligned with the schema's
+        /// index list; a zero-length key is a null column value, which is not indexed.
+        /// <para>
+        /// One pass over the row for the whole set. Asking for a column at a time deserialized the
+        /// entire row per index, so a three-index table paid three full deserializes — and three
+        /// re-allocations of that row's string and byte columns — on every put and every remove.
+        /// </para>
+        /// </summary>
+        private RowKey[] IndexedValues(byte[] bytes)
         {
+            var values = new RowKey[_indexColumns.Length];
+
             // The generated codec path: no reflection, no boxing. Falls back to the boxed column
             // accessors when the schema was built by reflection.
             if (_schema.Codec is { } codec)
             {
-                foreach (var index in _schema.Indexes)
-                {
-                    if (codec.EncodeColumnFromBytes(index.Column, bytes) is { } value)
-                        yield return (index.Column, value);
-                }
-
-                yield break;
+                codec.EncodeColumnsFromBytes(bytes, _indexColumns, values);
+                return values;
             }
 
             var row = RowSerializer.Deserialize(_schema, bytes);
-            foreach (var index in _schema.Indexes)
+            for (var i = 0; i < _indexColumns.Length; i++)
             {
-                var column = _schema.Column(index.Column);
+                var column = _schema.Column(_indexColumns[i]);
                 var value = column.GetValue(row);
-                if (value is not null)
-                    yield return (index.Column, SchemaKeyCodec.Encode(column, value));
+                values[i] = value is null ? default : SchemaKeyCodec.Encode(column, value);
             }
+
+            return values;
         }
 
         /// <summary>Accumulates a bulk load into builders and publishes one version at the end.</summary>
@@ -468,14 +485,14 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         {
             private readonly TableData _table;
             private readonly ImmutableSortedDictionary<RowKey, byte[]>.Builder _rows;
-            private readonly ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Builder[] _indexes;
+            private readonly SecondaryIndex.Builder[] _indexes;
 
             public BulkLoader(TableData table)
             {
                 _table = table;
                 var current = table.Current;
                 _rows = current.Rows.ToBuilder();
-                _indexes = new ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Builder[current.Indexes.Length];
+                _indexes = new SecondaryIndex.Builder[current.Indexes.Length];
                 for (var i = 0; i < _indexes.Length; i++)
                     _indexes[i] = current.Indexes[i].ToBuilder();
             }
@@ -487,16 +504,19 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                     _table.ResidentBytes += key.Length;
                 _rows[key] = bytes;
                 _table.ResidentBytes += bytes.Length;
-                foreach (var (column, value) in _table.IndexedValues(bytes))
+                var values = _table.IndexedValues(bytes);
+                for (var position = 0; position < values.Length; position++)
                 {
-                    var index = _indexes[_table._indexPositions[column]];
-                    index[value] = (index.TryGetValue(value, out var keys) ? keys : EmptyKeys).Add(key);
+                    var value = values[position];
+                    if (value.Length == 0)
+                        continue;
+                    _indexes[position].Add(value, key);
                 }
             }
 
             public void Commit()
             {
-                var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(_indexes.Length);
+                var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexes.Length);
                 foreach (var index in _indexes)
                     indexes.Add(index.ToImmutable());
                 _table.Current = new TableVersion(_rows.ToImmutable(), indexes.MoveToImmutable());

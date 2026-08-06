@@ -1,7 +1,7 @@
 {
   "format": 1,
-  "generator": "0.1.1.0",
-  "schemaHash": "54a8e93c3eb73ab45486cd0775d13da2a791c36253c43590c79f9f354b3314ff",
+  "generator": "0.1.2.0",
+  "schemaHash": "0b1c6f29c1ef17b4549b9122e9cfc59c8a76d9a82acecf4d40d1713159bbaf09",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -20,6 +20,140 @@
     }
   ],
   "tables": [
+    {
+      "name": "AllKinds",
+      "type": "AllKinds",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "Int64",
+          "primaryKey": true,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Flag",
+          "kind": "Bool",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Int8",
+          "kind": "Int8",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "UInt8",
+          "kind": "UInt8",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Int16",
+          "kind": "Int16",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "UInt16",
+          "kind": "UInt16",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Int32",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "UInt32",
+          "kind": "UInt32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Int64",
+          "kind": "Int64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "UInt64",
+          "kind": "UInt64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Float32",
+          "kind": "Float32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Float64",
+          "kind": "Float64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Text",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Blob",
+          "kind": "Bytes",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Who",
+          "kind": "Identity",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "At",
+          "kind": "Timestamp",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    },
     {
       "name": "Chunk",
       "type": "Chunk",

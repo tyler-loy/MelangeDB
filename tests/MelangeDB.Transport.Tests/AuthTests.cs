@@ -96,7 +96,7 @@ public class AuthTests
         await using var raw = new RawSocketClient();
         raw.SetRequestHeader("Authorization", "Bearer " + TestTokens.Default);
         var welcome = await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, token: null);
-        Assert.Equal(1, welcome.Version);
+        Assert.Equal(MessagePackFrameSerializer.ProtocolVersion, welcome.Version);
         await raw.SendAsync(new PingFrame(3), TestContext.Current.CancellationToken);
         Assert.Equal(3u, (await raw.ReceiveUntilAsync<PongFrame>(TestContext.Current.CancellationToken)).Id);
     }
@@ -199,7 +199,10 @@ public class AuthTests
         await refused.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
         var serializer = new MessagePackFrameSerializer();
         await refused.SendAsync(
-            serializer.Serialize(new HelloFrame(1, 1, TestTokens.Default)),
+            serializer.Serialize(new HelloFrame(
+                MessagePackFrameSerializer.ProtocolVersion,
+                MessagePackFrameSerializer.ProtocolVersion,
+                TestTokens.Default)),
             System.Net.WebSockets.WebSocketMessageType.Binary,
             endOfMessage: true,
             TestContext.Current.CancellationToken);

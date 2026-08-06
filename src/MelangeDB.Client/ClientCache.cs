@@ -108,14 +108,16 @@ public sealed class ClientCache<TRow>
     /// <summary>Finds the cached row with the same primary key as <paramref name="row"/>.</summary>
     public bool TryFind(in TRow row, out TRow cached) => TryFind(_codec.EncodePrimaryKey(in row), out cached);
 
+    internal IClientRowCodec<TRow> Codec => _codec;
+
     internal TypedCacheBinding<TRow> CreateBinding() => new(this);
 
-    internal void Cover(TypedCacheBinding<TRow> binding, byte[] key, IReadOnlyDictionary<string, object?> columns)
+    internal void Cover(TypedCacheBinding<TRow> binding, MelangeRow row)
     {
         List<Action>? pending = null;
         lock (_lock)
         {
-            CoverLocked(binding, new ByteKey(key), columns, ref pending);
+            CoverLocked(binding, new ByteKey(row.Key), row, ref pending);
         }
 
         Dispatch(pending);
@@ -156,7 +158,7 @@ public sealed class ClientCache<TRow>
             foreach (var key in departed)
                 UncoverLocked(binding, key, ref pending);
             foreach (var row in rows)
-                CoverLocked(binding, new ByteKey(row.Key), row.Columns, ref pending);
+                CoverLocked(binding, new ByteKey(row.Key), row, ref pending);
         }
 
         Dispatch(pending);
@@ -178,20 +180,21 @@ public sealed class ClientCache<TRow>
     private void CoverLocked(
         TypedCacheBinding<TRow> binding,
         ByteKey key,
-        IReadOnlyDictionary<string, object?> columns,
+        MelangeRow row,
         ref List<Action>? pending)
     {
+        binding.VerifyShape(_codec, row);
         var newlyCovered = binding.Covered.Add(key);
         if (_entries.TryGetValue(key, out var entry))
         {
             if (newlyCovered)
                 entry.RefCount++;
-            if (!ColumnsEqual(entry.Columns, columns))
+            if (!entry.Bytes.Span.SequenceEqual(row.Row.Span))
             {
                 var previous = entry.Row;
-                var current = _codec.DecodeRow(columns);
+                var current = _codec.DecodeRow(row.Row.Span);
                 entry.Row = current;
-                entry.Columns = columns;
+                entry.Bytes = row.Row;
                 var fire = OnUpdate;
                 if (fire is not null)
                     (pending ??= []).Add(() => fire(previous, current));
@@ -200,8 +203,8 @@ public sealed class ClientCache<TRow>
             return;
         }
 
-        var inserted = _codec.DecodeRow(columns);
-        _entries[key] = new Entry { Row = inserted, Columns = columns, RefCount = 1 };
+        var inserted = _codec.DecodeRow(row.Row.Span);
+        _entries[key] = new Entry { Row = inserted, Bytes = row.Row, RefCount = 1 };
         var fireInsert = OnInsert;
         if (fireInsert is not null)
             (pending ??= []).Add(() => fireInsert(inserted));
@@ -232,38 +235,20 @@ public sealed class ClientCache<TRow>
     }
 
     /// <summary>
-    /// Value equality over two wire column maps — the duplicate detector that keeps an
-    /// overlapping subscription's identical copy of an update from firing a second event.
-    /// <c>Equals</c> rather than <c>==</c> so NaN compares equal to itself.
+    /// One cached row: the decoded struct, and the wire bytes it was decoded from — which are the
+    /// duplicate detector that keeps an overlapping subscription's identical copy of an update from
+    /// firing a second event.
+    /// <para>
+    /// Under protocol v1 this compared two column maps value by value, with an explicit
+    /// <c>Equals</c> case so a NaN would compare equal to itself. Byte comparison gets that for
+    /// free and is exact besides: two subscriptions over one table share a descriptor, so equal
+    /// rows are byte-identical rows.
+    /// </para>
     /// </summary>
-    private static bool ColumnsEqual(IReadOnlyDictionary<string, object?> left, IReadOnlyDictionary<string, object?> right)
-    {
-        if (ReferenceEquals(left, right))
-            return true;
-        if (left.Count != right.Count)
-            return false;
-        foreach (var (name, leftValue) in left)
-        {
-            if (!right.TryGetValue(name, out var rightValue))
-                return false;
-            var equal = (leftValue, rightValue) switch
-            {
-                (null, null) => true,
-                (byte[] a, byte[] b) => a.AsSpan().SequenceEqual(b),
-                (null, _) or (_, null) => false,
-                var (a, b) => a.Equals(b),
-            };
-            if (!equal)
-                return false;
-        }
-
-        return true;
-    }
-
     private sealed class Entry
     {
         public required TRow Row;
-        public required IReadOnlyDictionary<string, object?> Columns;
+        public required ReadOnlyMemory<byte> Bytes;
         public required int RefCount;
     }
 }
@@ -276,11 +261,34 @@ internal sealed class TypedCacheBinding<TRow> : ISubscriptionSink
     where TRow : struct
 {
     private readonly ClientCache<TRow> _cache;
+    private WireDescriptor? _verified;
 
     internal TypedCacheBinding(ClientCache<TRow> cache) => _cache = cache;
 
     /// <summary>The keys this subscription currently covers. Guarded by the cache's lock.</summary>
     internal HashSet<ByteKey> Covered { get; } = [];
+
+    /// <summary>
+    /// Checks, once per descriptor, that the server's shape is the one these bindings were
+    /// generated from — and per row, that no column policy narrowed it. A binding belongs to one
+    /// subscription, which holds one descriptor instance for its life, so the structural comparison
+    /// runs once per initial set and the per-row cost is an emptiness test on a span.
+    /// </summary>
+    internal void VerifyShape(IClientRowCodec<TRow> codec, MelangeRow row)
+    {
+        if (!ReferenceEquals(_verified, row.Descriptor))
+        {
+            ClientRowShape.Verify(codec.TableName, codec.Columns, row.Descriptor);
+            _verified = row.Descriptor;
+        }
+
+        if (row.ColumnMask.IsEmpty)
+            return;
+
+        throw new MelangeSchemaMismatchException(
+            $"Table '{codec.TableName}': a column policy masked columns out of this row, so it cannot fill the generated row struct. "
+            + "Read partially visible rows through the untyped subscription API, which reports exactly which columns arrived.");
+    }
 
     public void OnSnapshot(IReadOnlyList<MelangeRow> rows) => _cache.ApplySnapshot(this, rows);
 
@@ -293,7 +301,7 @@ internal sealed class TypedCacheBinding<TRow> : ISubscriptionSink
         }
         else if (current is not null)
         {
-            _cache.Cover(this, current.Key, current.Columns);
+            _cache.Cover(this, current);
         }
     }
 

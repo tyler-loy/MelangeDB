@@ -451,8 +451,14 @@ samples/                        worker-service host + console client
   analyzer (MELANGE0017), the startup residency report, `.Any()`/`.Count`/`.First()`, `Residency.Auto`
   for anyone explicitly wanting threshold behaviour, and the per-table configuration override. See
   [plan-phase-07.md](road-to-0.1/plan-phase-07.md).
-- **Wire serialization** — MessagePack gets us moving and has implementations in every client
-  language; a source-generated binary format is faster. Put it behind `IMelangeSerializer` and defer.
+- ~~**Wire serialization**~~ — **Half settled in protocol v2.** MessagePack still frames, because it
+  has implementations in every client language and `IMelangeSerializer` keeps that replaceable. But
+  *rows* no longer travel as MessagePack maps: they travel as the schema-ordered v1 bytes the store
+  already holds, described once per subscription by a wire descriptor. That is the source-generated
+  binary format, arrived at from the other direction — measured at 4.6–12.4× on encode and 2.4–2.9× on
+  decode, with the bytes a comparatively minor 1.18–1.40×. Reducer arguments and parameter maps are
+  still MessagePack values and are the remaining half. See
+  [design/performance-sweep.md](design/performance-sweep.md).
 - **Schema migration** — how tier changes and column adds replay against an existing log. Worth
   designing for early: in SpacetimeDB every schema change means republish plus regenerating bindings
   for every client tree, and stale-schema clients simply break. **The relational tier's half settled

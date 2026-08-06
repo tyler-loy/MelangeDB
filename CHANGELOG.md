@@ -10,7 +10,72 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Breaking
+
+- **Protocol version 2: rows travel as schema-ordered bytes, not as named column maps.** Version 1 sent
+  every row and every delta op as a MessagePack map of column name to boxed value, which re-sent the
+  schema with each row, built a dictionary per subscriber per row on the fan-out path under the engine's
+  write lock, and rebuilt one per op on the client. Measured against the map shape: **1.18–1.40× the
+  bytes, 4.6–12.4× the encode time, 2.4–2.9× the decode time, and 2.4–3.6× the allocation.** The
+  performance sweep called this "likely the #1 bandwidth and client CPU issue" — the bandwidth half of
+  that is wrong, and the CPU half is the whole case, because it is spent on the fan-out path while the
+  write lock is held.
+
+  A subscription's shape now travels once, as a **wire descriptor** on the first initial-set chunk: the
+  table and its ordered, kinded columns. Every row after it is values. The unprojected case — no
+  projection, no `[ServerOnly]` column — costs the server nothing at all, because the store already holds
+  the row in the format the wire wants; a full row is the committed bytes handed to every subscriber
+  without a decode, a dictionary, or a copy. A projection copies the kept columns' raw slices in schema
+  order. A row narrowed by a **column policy** carries a mask bitset over the descriptor, which is empty
+  — one byte — for every row on a table that has no column policies.
+
+  **There is no version-1 encoder left, and no negotiation.** A version-1 peer is refused at the handshake
+  with `unsupported_version` rather than accepted and failed later on a row it cannot read. Clients must
+  be rebuilt against 0.1.2 bindings; a stale client is a handshake error, not a decode error.
+
+  For consumers of the public API:
+
+  - `WireRow` and `WireRowOp` carry `ReadOnlyMemory<byte> Row` and `ReadOnlyMemory<byte> ColumnMask`
+    where they carried `IReadOnlyDictionary<string, object?> Columns`. A delete's `Row` is empty.
+  - `MelangeRow` is a class rather than a record and exposes `Row`, `ColumnMask`, and `Descriptor`.
+    **`Columns` still works** and returns the same name→value map as before — decoded on first read and
+    then cached, so a typed client that never asks for it never builds it.
+  - `IClientRowCodec<TRow>.DecodeRow` takes a `ReadOnlySpan<byte>` and the interface gains `Columns`, the
+    shape the bindings were generated from. Both are emitted by the generator; hand-written codecs must
+    be updated.
+  - `ClientWireValues` is **removed**. It existed to undo MessagePack's deliberate lossiness — every
+    integer arriving as `long`, an `Identity` as raw bytes — and row bytes have no lossiness to undo.
+    `ClientRowShape.Verify` replaces it, and catches more: a renamed column, a **reordered** one, and one
+    whose kind changed all fail the same structural comparison, once per subscription, before any row
+    decodes. Ordered bytes have no names in them, so drift that the map wire reported as a missing column
+    would otherwise decode into plausible garbage.
+  - A row narrowed by a column policy reaching a **typed** cache now throws
+    `MelangeSchemaMismatchException` naming the untyped API, rather than filling the missing field with a
+    default. Partially visible rows were always the untyped API's business; this is the first release in
+    which the typed path cannot silently pretend otherwise.
+  - `RowWriter`, `RowReader`, and `ColumnKind` moved from `MelangeDB.Core` to `MelangeDB.Abstractions`,
+    namespace `MelangeDB`, so a client can read row bytes without referencing the engine. Generated code
+    is requalified automatically; hand-written references need the namespace change.
+
 ### Added
+
+- **Eight benchmark suites** in [bench/](bench/README.md), closing the seven measurement gaps the
+  performance sweep left open: commit-path attribution, fan-out against subscriber count, batched apply,
+  index maintenance, wire format, FASTER hash sizing, snapshot duration, and index range position. The
+  project now runs the source generator, so a suite measures the generated codec rather than the
+  reflection fallback. Results, and the three decisions the numbers changed rather than confirmed, are in
+  [docs/design/performance-sweep.md](docs/design/performance-sweep.md).
+
+- **`HotStore:HashBuckets`.** Sizes the FASTER hash index, rounded up to a power of two; zero derives it
+  from `HotStore:MemoryBudgetBytes`. It was a hardcoded 65,536 regardless of budget or row count — an
+  index sized for roughly a quarter of a million records whatever the configuration said, past which
+  chains lengthen and a lookup that should be one probe becomes several, each a candidate for a pending
+  I/O completion on a paged table.
+- **Fsync workload guidance** in [docs/CONFIGURATION.md](docs/CONFIGURATION.md): the ~47× spread between
+  `OnCommit` and `Interval`, and the rule for choosing between them — simulation state takes `Interval`,
+  anything a player can dispute takes `OnCommit`, and a database holding both takes `OnCommit`.
+- **`IMelangeSerializer.Measure`.** The exact serialized length of a frame without producing it, so the
+  delta path can judge backpressure under the engine's write lock and encode on the sender.
 
 - **`1003 SlowReducer` now says which half was slow.** The warning and the `melange.slow_reducer` span
   event carry `BodyMs`/`melange.body_ms`, `CommitMs`, `FsyncMs`, `PostCommitMs`, and `Rows` alongside the
@@ -118,6 +183,67 @@ All packages ship together at one version; there is no per-package versioning. S
   in any scheduled table is now also warned about (EventId 1723).
 
 ### Changed
+
+- **Secondary index range scans seek to their lower bound.** Both storage engines held indexes as a
+  dictionary of value → nested key set, which cannot seek: a range query started at the leftmost value and
+  discarded everything below its window, so a ten-row window at the far end of a large index paid for the
+  whole index. Both now hold one sorted set of *(value, key)* entries, where the lower bound is a binary
+  search. Index maintenance got cheaper on the way past — adding a row is one entry insert rather than
+  read-inner-set, rebuild, write-back.
+
+- **Snapshots write outside the engine's write lock.** `TakeSnapshot` scanned every table, wrote the file,
+  fsynced, and truncated while holding the lock, so nothing committed for the duration — measured at about
+  547 ms for a million rows. It now captures the header and pins a read view under the lock (about a
+  millisecond), writes from the pin outside it, and re-takes the lock only to truncate. Evaluating the
+  retention floors after the capture is safe in the only direction that matters: floors advance, and the
+  result is capped by the snapshot's own LSN. Two snapshots never write at once; an overlapping automatic
+  trigger is skipped and logged at Debug as `1509 SnapshotAlreadyRunning`. A store with no pinned-read
+  capability keeps the old behaviour, having no way to offer a consistent view outside the lock.
+
+- **A resident FASTER table reads with no store lock.** `TryGetRow`, `ScanIndex`, `ScanIndexRange`, and
+  `Count` answer from one volatile read of an immutable version when the table is resident. `TryGetRow` is
+  the one that mattered: the engine's fan-out calls it per op, to fetch a pre-image, while already holding
+  the engine write lock. Paged reads keep the store lock, and it is not there for the session's sake — the
+  hybrid log overwrites in place, so the directory probe and the record read must be atomic against a
+  concurrent write.
+
+- **The commit-log payload writes into a pooled buffer.** `MemoryStream` plus `BinaryWriter` plus a final
+  `ToArray` becomes a span writer over a bounded pool, and reducer and event-type names encode straight into
+  it. Measured under interval fsync: a hundred-row payload drops from 44,488 B and 7,961 ns to 72 B and
+  2,524 ns, and the whole commit allocates 14–20% less at every write-set size. The pool is bounded at
+  256 KB rather than `ArrayPool<byte>.Shared`, so a bulk load of large blobs cannot park megabytes of
+  retained buffers beside the memory budget this database reports as a computed artifact. The record format
+  is byte-for-byte unchanged; logs written by earlier builds read as before.
+
+- **A row is decoded once per fan-out, not once per subscriber.** `RowWire.ToColumns` ran per
+  subscription, so a commit on a table with N subscribers built N identical column dictionaries — and N
+  copies of the same key — on the engine thread while holding the write lock. Both are computed once per
+  op and shared; equal projections converge on one wire-column set at registration so the memo can key on
+  reference identity.
+- **Delta frames are measured under the write lock and encoded on the sender.** The full MessagePack
+  encode used to run on the engine thread, once per connection, before the next reducer could enter.
+  `Subscriptions:MaxBufferedBytes` keeps its exact meaning and its default: measuring runs the writer's
+  own path against a counting sink, so it cannot drift from what serialization produces.
+- **`FilterRange` on a primary key walks the key directory.** It filtered a full merged scan, reading
+  every row below the window to discard it — the same defect `ScanKeys` fixed for subscriptions (~3s
+  against ~5ms on a 24k-row table of 9KB blobs), which had survived on the reducer-facing side because
+  `ScanKeys` had exactly one caller. It now seeks to the low bound and stops at the high one.
+- **The merged overlay scan streams.** It built a `SortedDictionary` of the entire store scan whenever
+  the write set held any pending op for the table, so a reducer that inserted one row and then took
+  `First` read the whole table — and on a paged store faulted all of it in.
+- **Index maintenance reads a row once per put, not once per indexed column.** A three-index table paid
+  three full deserializes — each re-allocating that row's string and byte columns — on every put and
+  every remove.
+- **The in-memory store publishes one version per record per table, not one per op.** Every intermediate
+  version was structurally shared but never observable, and each cost a path copy of the row map plus one
+  of every secondary index.
+- **`WriteSet.OpsFor` is indexed by table.** It scanned every staged op to find one table's, on every
+  overlay read.
+- **Refilled rate-limiter buckets are evicted.** The map held one bucket per (identity, reducer) forever.
+  Eviction changes no decision: buckets are created full, so a refilled bucket is indistinguishable from
+  one that never existed, and a caller mid-burst is never evicted.
+- **The FASTER store composes keys into a reused buffer** instead of allocating a `byte[]` per upsert,
+  delete, and read.
 
 - **`1003 SlowReducer` now thresholds on the locked portion, not the total**, at every isolation level,
   and carries `LockedMs` and `Isolation` alongside the existing split (`melange.locked_ms` and

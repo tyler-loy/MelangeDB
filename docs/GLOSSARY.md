@@ -191,7 +191,10 @@ after how many attempts, and why — one JSON line under `Events:DeadLetterPath`
 retries exhaust; delivery then advances past the event, so a poison message can never wedge a subscriber's
 checkpoint.
 
-**Column mask** — The set of columns visible to a particular caller for a particular row.
+**Column mask** — The set of columns visible to a particular caller for a particular row. On the wire it is a
+bitset over the subscription's [wire descriptor](#definitions), empty when every descriptor column is present —
+which is every row on a table without column policies. A mask is per *row*, not per subscription: a
+[column policy](#three-kinds-of-policy) can narrow one row and not the next.
 
 **Commit log** — The ordered, append-only, LSN-addressed record of committed transactions. **The system of
 record.** Every store is a projection of it. One log per shard.
@@ -262,7 +265,9 @@ against the anchor the set names. Closes the phase 10 cross-log soft spot server
 anchor remains the deferred protocol-level hardening.
 
 **Frame** — One protocol message on the wire: one MessagePack-encoded unit carrying its type, its channel tag,
-and its fields. Ordering is guaranteed only within a frame's channel.
+and its fields. Ordering is guaranteed only within a frame's channel. Rows inside a frame are *not* MessagePack
+values: since protocol v2 they are the schema-ordered v1 row bytes the store holds, described by a
+[wire descriptor](#definitions).
 
 **Frame-tick pump** — The Manual dispatch mode's drain: `MelangeClient.FrameTick(maxFrames)` applies queued
 whole frames — one `TransactionUpdate` frame is one whole commit, so a budgeted tick never observes half a
@@ -552,6 +557,12 @@ passes the slowest live one (`MelangeEventBus.MinimumLiveCheckpointLsn`). Idle p
 `Events:SubscriberExpirySeconds` it is evicted loudly, leaving a tombstone; the returning subscriber is told it
 lost its place and starts from current state. Persisted in a sidecar beside the log, per the epoch precedent.
 
+**Secondary index** — The store-side map from an indexed column's encoded value to the primary keys holding
+it, kept in managed memory beside the data by both storage engines. Held as one sorted set of
+*(value, key)* **index entries** rather than a dictionary of nested key sets, which is what lets a range query
+seek to its lower bound instead of walking from the leftmost value and discarding everything below the window.
+A null column value is not indexed — the zero-length key is the sentinel.
+
 **Subscription** — A standing single-table query producing an initial result set and then a delta stream.
 Anchored to one LSN across that boundary so a client observes no gap or duplicate.
 
@@ -603,6 +614,12 @@ and only the last uncovering fires `OnDelete` — whether by delete, scope exit,
 and unsubscribe, while rows and events live on the shared cache. A completed initial set — first subscribe,
 re-establishment after resync, or a server-driven rescope — reconciles against that subscription's covered
 keys as a diff: deletes for departures, inserts for arrivals, updates for changed survivors. No flush.
+
+**Wire descriptor** — The shape a subscription's rows arrive in: its table, and its columns in row-byte order
+with their kinds. Sent once, on the first initial-set chunk, and held for the subscription's life — which is what
+lets every row after it be values alone. Stable by construction: re-scoping cannot change a projection, and a
+schema change means a new log epoch and therefore a fresh subscribe. A typed client compares it against the shape
+its bindings were generated from, once, before any row decodes.
 
 **Write lock** — The engine's single global writer lock, held across the *whole* transaction: reducer body,
 commit guards, log append and fsync, commit observers, and any automatic snapshot the commit triggers. Not

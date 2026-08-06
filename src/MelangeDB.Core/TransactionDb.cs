@@ -171,12 +171,9 @@ internal sealed class TransactionDb : IDbView
 
         if (columnSchema.IsPrimaryKey)
         {
-            foreach (var (key, bytes) in ScanMerged(schema))
-            {
-                if (key.CompareTo(lowKey) >= 0 && key.CompareTo(highKey) <= 0)
-                    yield return Materialize<TRow>(schema, bytes);
-            }
-
+            var stored = StoredKeyRange(schema, lowKey, highKey);
+            foreach (var (_, bytes) in MergePending(stored, PendingInOrder(schema.Id, lowKey, highKey)))
+                yield return Materialize<TRow>(schema, bytes);
             yield break;
         }
 
@@ -217,29 +214,13 @@ internal sealed class TransactionDb : IDbView
 
     /// <summary>
     /// The first row in primary-key order: the store's first key raced against the overlay's, so
-    /// at most one row materializes. A pending delete of the store's first key falls back to the
-    /// merged scan — rare, and still lazy.
+    /// exactly one row materializes and nothing else pages in. The merged scan streams, so this
+    /// needs no separate no-pending-ops path to stay lazy.
     /// </summary>
     public TRow? First<TRow>()
         where TRow : struct
     {
         var schema = Resolve<TRow>(TableAccess.Read);
-        var hasPending = false;
-        foreach (var _ in _writeSet.OpsFor(schema.Id))
-        {
-            hasPending = true;
-            break;
-        }
-
-        if (!hasPending)
-        {
-            // The common committed-state path: the store's scan is lazy, so exactly one row
-            // materializes and nothing else pages in.
-            foreach (var (_, bytes) in _store.Scan(schema.Id))
-                return Materialize<TRow>(schema, bytes);
-            return null;
-        }
-
         foreach (var (_, bytes) in ScanMerged(schema))
             return Materialize<TRow>(schema, bytes);
         return null;
@@ -364,26 +345,96 @@ internal sealed class TransactionDb : IDbView
         }
     }
 
+    /// <summary>
+    /// The whole table through the overlay, in primary-key order.
+    /// <para>
+    /// This used to build a <see cref="SortedDictionary{TKey,TValue}"/> of the entire store scan
+    /// and then walk it, which read — and on a paged store faulted in — every row of the table the
+    /// moment the transaction had staged a single op. A reducer that inserted one row and then
+    /// took <see cref="First{TRow}"/> paid for the whole table. Both inputs are already ordered,
+    /// so the merge streams instead and a caller that stops early stops paying.
+    /// </para>
+    /// </summary>
     private IEnumerable<(RowKey Key, ReadOnlyMemory<byte> Row)> ScanMerged(TableSchema schema)
+        => MergePending(_store.Scan(schema.Id), PendingInOrder(schema.Id));
+
+    /// <summary>
+    /// Rows whose primary keys fall within [<paramref name="low"/>, <paramref name="high"/>], read
+    /// through the key directory rather than a scan-and-filter: the keys are ordered, so rows below
+    /// the window were never candidates and never need reading, and the walk stops at the top of
+    /// it. Subscriptions fixed this on their side of the seam — a range near the end of a paged
+    /// table used to page in everything ahead of it, ~3s against ~5ms on a 24k-row table of 9KB
+    /// blobs — and a reducer's window query deserves the same treatment.
+    /// </summary>
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> StoredKeyRange(TableSchema schema, RowKey low, RowKey high)
     {
-        var pendingKeys = new SortedSet<RowKey>();
-        foreach (var op in _writeSet.OpsFor(schema.Id))
-            pendingKeys.Add(op.Key);
-
-        var merged = new SortedDictionary<RowKey, ReadOnlyMemory<byte>>();
-        foreach (var pair in _store.Scan(schema.Id))
+        foreach (var key in _store.ScanKeys(schema.Id))
         {
-            if (!pendingKeys.Contains(pair.Key))
-                merged[pair.Key] = pair.Value;
+            if (key.CompareTo(low) < 0)
+                continue;
+            if (key.CompareTo(high) > 0)
+                yield break;
+            if (_store.TryGetRow(schema.Id, key, out var row))
+                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, row);
+        }
+    }
+
+    /// <summary>
+    /// Two-way merge of an ordered stored side with the transaction's ordered pending ops. A
+    /// pending op supersedes the stored row on the same key — a delete drops it — and pending
+    /// inserts slot into key order.
+    /// </summary>
+    private static IEnumerable<(RowKey Key, ReadOnlyMemory<byte> Row)> MergePending(
+        IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> stored,
+        List<RowOp> pending)
+    {
+        var next = 0;
+        foreach (var (key, row) in stored)
+        {
+            while (next < pending.Count && pending[next].Key.CompareTo(key) < 0)
+            {
+                if (pending[next].Kind != RowOpKind.Delete)
+                    yield return (pending[next].Key, pending[next].Row);
+                next++;
+            }
+
+            if (next < pending.Count && pending[next].Key == key)
+            {
+                if (pending[next].Kind != RowOpKind.Delete)
+                    yield return (key, pending[next].Row);
+                next++;
+                continue;
+            }
+
+            yield return (key, row);
         }
 
-        foreach (var key in pendingKeys)
+        for (; next < pending.Count; next++)
         {
-            if (_writeSet.TryGetPending(schema.Id, key, out var op) && op.Kind != RowOpKind.Delete)
-                merged[key] = op.Row;
+            if (pending[next].Kind != RowOpKind.Delete)
+                yield return (pending[next].Key, pending[next].Row);
+        }
+    }
+
+    /// <summary>
+    /// The table's pending ops in primary-key order, optionally bounded to a key range. The write
+    /// set collapses by key, so there is at most one op per key and the sort is unambiguous.
+    /// </summary>
+    private List<RowOp> PendingInOrder(TableId table, RowKey? low = null, RowKey? high = null)
+    {
+        List<RowOp>? pending = null;
+        foreach (var op in _writeSet.OpsFor(table))
+        {
+            if (low is { } lowKey && op.Key.CompareTo(lowKey) < 0)
+                continue;
+            if (high is { } highKey && op.Key.CompareTo(highKey) > 0)
+                continue;
+            (pending ??= []).Add(op);
         }
 
-        foreach (var pair in merged)
-            yield return (pair.Key, pair.Value);
+        if (pending is null)
+            return [];
+        pending.Sort(static (left, right) => left.Key.CompareTo(right.Key));
+        return pending;
     }
 }

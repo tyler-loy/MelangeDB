@@ -3,13 +3,22 @@
 How a client project gets typed rows, caches, reducer stubs, and subscription helpers from one
 schema — phase 12, issue [#20](https://github.com/tyler-loy/MelangeDB/issues/20).
 
-The wire is the constraint everything here answers to: frames carry per-row `name → value` maps
-and **no schema**, and MessagePack decoding is lossy (integers surface as `long`, `Identity` as
-32 raw bytes, `Timestamp` as its microsecond count). A typed client therefore owns the name→CLR
-mapping entirely on its side, and it learns the schema from a **manifest** — a JSON file the
-server module exports — never from referencing server code. Sharing the module assembly would
-drag server types across a boundary the wire itself doesn't share, and could never describe
-reducers anyway, whose bodies exist only in the server compilation.
+The wire is the constraint everything here answers to: rows arrive as **schema-ordered bytes**, and
+what they mean is described once per subscription by a [wire descriptor](GLOSSARY.md#definitions)
+rather than repeated per row. A typed client therefore decodes positionally, and it learns the shape
+to decode into from a **manifest** — a JSON file the server module exports — never from referencing
+server code. Sharing the module assembly would drag server types across a boundary the wire itself
+doesn't share, and could never describe reducers anyway, whose bodies exist only in the server
+compilation.
+
+That makes the manifest load-bearing in a way it was not under protocol v1, and the bindings say so
+loudly. Ordered bytes carry no names, so a client generated from a stale manifest would read a
+renamed, reordered, or re-kinded column into *plausible garbage* rather than failing. The generated
+codec therefore carries the column shape it was built from, and it is compared against the server's
+descriptor once per subscription, before any row decodes — a mismatch throws
+`MelangeSchemaMismatchException` naming the column and both kinds. Re-export the manifest when the
+module's tables change; the mismatch is the reminder, and it arrives at subscribe time rather than as
+wrong data.
 
 ## The workflow
 

@@ -25,11 +25,16 @@ public class ProtocolTests
         new SubscribeFrame(4, "SELECT * FROM t", null),
         new UnsubscribeFrame(3),
         new UnsubscribedFrame(3),
-        new SubscriptionAppliedFrame(3, 10UL, 2, false, [new WireRow([1, 2], new Dictionary<string, object?> { ["Id"] = 1L, ["Name"] = "x" })]) { Channel = 19 },
+        new SubscriptionAppliedFrame(
+            3, 10UL, 0, false,
+            [new WireRow([1, 2], new byte[] { 7, 0, 0, 0, 0, 0, 0, 0 }, default)],
+            new WireDescriptor("t", [new WireColumn("Id", ColumnKind.Int64), new WireColumn("Name", ColumnKind.String)])) { Channel = 19 },
+        new SubscriptionAppliedFrame(3, 10UL, 2, false, [new WireRow([1, 2], new byte[] { 9 }, new byte[] { 0b01 })]) { Channel = 19 },
         new SubscriptionAppliedFrame(3, 10UL, 3, true, []),
         new TransactionUpdateFrame(11UL, [new SubscriptionUpdate(3, [
-            new WireRowOp(RowOpKind.Insert, [1], new Dictionary<string, object?> { ["Id"] = 1L }),
-            new WireRowOp(RowOpKind.Delete, [2], null),
+            new WireRowOp(RowOpKind.Insert, [1], new byte[] { 1, 0, 0, 0 }, default),
+            new WireRowOp(RowOpKind.Update, [3], new byte[] { 2 }, new byte[] { 0b10 }),
+            new WireRowOp(RowOpKind.Delete, [2], default, default),
         ])])
         { Channel = MelangeChannels.Data },
         new ErrorFrame("parse", "Expected FROM", 0, 3),
@@ -49,6 +54,69 @@ public class ProtocolTests
         Assert.Equal(frame.Type, decoded.Type);
         Assert.Equal(frame.Channel, decoded.Channel);
         Assert.Equal(Convert.ToHexString(_serializer.Serialize(frame)), Convert.ToHexString(_serializer.Serialize(decoded)));
+    }
+
+    [Theory]
+    [MemberData(nameof(Frames))]
+    public void Measure_reports_exactly_what_serialize_produces(Frame frame)
+    {
+        // The delta path measures a frame under the engine's write lock and encodes it later, on
+        // the sender. If these two ever disagree, the backpressure ledger drifts from the bytes
+        // actually queued and Subscriptions:MaxBufferedBytes quietly stops meaning what it says.
+        Assert.Equal(_serializer.Serialize(frame).Length, _serializer.Measure(frame));
+    }
+
+    [Fact]
+    public void Measure_agrees_with_serialize_at_every_length_boundary()
+    {
+        // MessagePack picks its length prefix by size, so the sizes worth checking are the ones
+        // either side of each prefix change — and multibyte text, where character count and byte
+        // count part ways. Parameter maps are where values still ride under protocol v2.
+        foreach (var value in BoundaryValues())
+        {
+            var frame = new SubscribeFrame(1, "SELECT * FROM t WHERE a = :v", new Dictionary<string, object?> { ["v"] = value });
+            Assert.Equal(_serializer.Serialize(frame).Length, _serializer.Measure(frame));
+        }
+
+        // Rows ride as binary now, and binary has its own prefix boundaries.
+        foreach (var length in (int[])[0, 1, 254, 255, 256, 65_535, 65_536])
+        {
+            var frame = new TransactionUpdateFrame(1UL, [new SubscriptionUpdate(1, [
+                new WireRowOp(RowOpKind.Insert, [1], new byte[length], new byte[length == 0 ? 0 : 1]),
+            ])]);
+            Assert.Equal(_serializer.Serialize(frame).Length, _serializer.Measure(frame));
+        }
+    }
+
+    [Fact]
+    public void Measuring_a_frame_never_produces_its_bytes()
+    {
+        // Measure exists to avoid the encode, so a counting writer that quietly allocated and
+        // filled a buffer would defeat the point while still passing every equality check above.
+        var writer = MsgPackWriter.Counting();
+        MessagePackFrameSerializer.WriteValue(ref writer, new string('m', 5_000));
+
+        Assert.Empty(writer.ToArray());
+        Assert.True(writer.Length > 5_000);
+    }
+
+    private static IEnumerable<object?> BoundaryValues()
+    {
+        foreach (var length in (int[])[0, 1, 31, 32, 255, 256, 65_535, 65_536])
+        {
+            yield return new string('a', length);
+            yield return new string('é', length); // Two bytes per char: byte count is not char count.
+            yield return new byte[length];
+        }
+
+        foreach (var number in (long[])[0, 127, 128, 255, 256, 65_535, 65_536, long.MaxValue, -1, -32, -33, -128, -129, long.MinValue])
+            yield return number;
+
+        yield return null;
+        yield return true;
+        yield return 3.5d;
+        yield return 2.25f;
+        yield return ulong.MaxValue;
     }
 
     [Fact]

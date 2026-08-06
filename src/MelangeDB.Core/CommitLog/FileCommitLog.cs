@@ -160,30 +160,43 @@ public sealed class FileCommitLog : ICommitLog
             }
 
             var lsn = _headLsn + 1;
-            var payload = LogRecordCodec.WritePayload(lsn, request);
-            Span<byte> frame = stackalloc byte[FrameSize];
-            BinaryPrimitives.WriteUInt32LittleEndian(frame, (uint)payload.Length);
-            BinaryPrimitives.WriteUInt32LittleEndian(frame[4..], Crc32.Compute(payload));
 
-            // The append is atomic or it is nothing: if the flush fails (disk full being the
-            // realistic case), the written bytes are rolled back so a later append can neither
-            // land after an orphaned record of an aborted transaction nor re-mint its LSN.
-            var previousLength = _stream.Length;
+            // The payload buffer comes from the pool and goes back below. CRC and the write both
+            // take a span, so nothing here needs it to be a right-sized array — which is what the
+            // old ToArray copy was paying for.
+            var length = LogRecordCodec.WritePayload(lsn, request, out var buffer);
             try
             {
-                _stream.Seek(0, SeekOrigin.End);
-                _stream.Write(frame);
-                _stream.Write(payload);
-                AppendFaultInjection?.Invoke(_stream);
-                LastAppendFsyncMilliseconds = Flush(onCommit: true);
+                var payload = buffer.AsSpan(0, length);
+                Span<byte> frame = stackalloc byte[FrameSize];
+                BinaryPrimitives.WriteUInt32LittleEndian(frame, (uint)length);
+                BinaryPrimitives.WriteUInt32LittleEndian(frame[4..], Crc32.Compute(payload));
+
+                // The append is atomic or it is nothing: if the flush fails (disk full being the
+                // realistic case), the written bytes are rolled back so a later append can neither
+                // land after an orphaned record of an aborted transaction nor re-mint its LSN.
+                var previousLength = _stream.Length;
+                try
+                {
+                    _stream.Seek(0, SeekOrigin.End);
+                    _stream.Write(frame);
+                    _stream.Write(payload);
+                    AppendFaultInjection?.Invoke(_stream);
+                    LastAppendFsyncMilliseconds = Flush(onCommit: true);
+                }
+                catch
+                {
+                    RollBackPartialAppend(previousLength);
+                    throw;
+                }
+
+                _headLsn = lsn;
             }
-            catch
+            finally
             {
-                RollBackPartialAppend(previousLength);
-                throw;
+                LogRecordCodec.Release(buffer);
             }
 
-            _headLsn = lsn;
             return new CommitRecord
             {
                 Lsn = lsn,
@@ -194,7 +207,7 @@ public sealed class FileCommitLog : ICommitLog
                 Arguments = request.Arguments,
                 WriteSet = request.WriteSet,
                 Events = request.Events ?? [],
-                SerializedLength = FrameSize + payload.Length,
+                SerializedLength = FrameSize + length,
             };
         }
     }

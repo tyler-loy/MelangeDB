@@ -51,7 +51,7 @@ public class ReadViewBenchmarks : IDisposable
     public void Setup()
     {
         _root = Directory.CreateTempSubdirectory("melange-bench-").FullName;
-        _schema = SchemaRegistry.FromTypes(typeof(BenchRow));
+        _schema = BenchSchema.For(nameof(BenchRow));
         _table = _schema.Tables[0].Id;
 
         var options = new MelangeDbOptions
@@ -193,18 +193,4 @@ public class ReadViewBenchmarks : IDisposable
         };
     }
 
-    /// <summary>
-    /// The benchmark's table. Fields are written by the schema's reflection accessors rather than by
-    /// this file, which is what CS0649 is objecting to.
-    /// </summary>
-    [Table]
-#pragma warning disable CS0649
-    private struct BenchRow
-    {
-        [PrimaryKey]
-        public ulong Id;
-
-        public byte[] Payload;
-    }
-#pragma warning restore CS0649
 }

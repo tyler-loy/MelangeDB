@@ -117,8 +117,9 @@ public class QueryShapeTests
         var mine = updates.Where(u => u.Updates.Any(g => g.SubscriptionId == subscription.Id)).ToList();
         var ops = mine.SelectMany(u => u.Updates.Where(g => g.SubscriptionId == subscription.Id)).SelectMany(g => g.Ops).ToList();
         var op = Assert.Single(ops);
-        Assert.Equal(["Name", "PlayerNum", "TotalXp"], op.Columns!.Keys.Order().ToList());
-        Assert.Equal(999L, op.Columns["TotalXp"]);
+        var columns = WireRowValues.ToColumns(subscription.Descriptor!, op.Row.Span, op.ColumnMask.Span);
+        Assert.Equal(["Name", "PlayerNum", "TotalXp"], columns.Keys.Order().ToList());
+        Assert.Equal(999L, columns["TotalXp"]);
         Assert.Equal(999L, subscription.Rows.Single().Columns["TotalXp"]);
     }
 

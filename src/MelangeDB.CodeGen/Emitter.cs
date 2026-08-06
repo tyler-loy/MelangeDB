@@ -88,7 +88,7 @@ internal static class Emitter
 
         builder.AppendLine($"        public override byte[] Serialize(in {row} row)");
         builder.AppendLine("        {");
-        builder.AppendLine("            var writer = new global::MelangeDB.Core.RowWriter(64);");
+        builder.AppendLine("            var writer = new global::MelangeDB.RowWriter(64);");
         foreach (var column in table.Columns.Items)
             builder.AppendLine($"            writer.Write{column.Kind}({CastToWire(column, $"row.{column.Name}")});");
         builder.AppendLine("            return writer.ToArray();");
@@ -97,7 +97,7 @@ internal static class Emitter
 
         builder.AppendLine($"        public override {row} Deserialize(global::System.ReadOnlySpan<byte> data)");
         builder.AppendLine("        {");
-        builder.AppendLine("            var reader = new global::MelangeDB.Core.RowReader(data);");
+        builder.AppendLine("            var reader = new global::MelangeDB.RowReader(data);");
         builder.AppendLine($"            var row = default({row});");
         foreach (var column in table.Columns.Items)
             builder.AppendLine($"            row.{column.Name} = {CastFromWire(column, $"reader.Read{column.Kind}()")};");
@@ -171,7 +171,7 @@ internal static class Emitter
             builder.AppendLine("                    {");
             builder.AppendLine($"                        Name = {Literal(column.Name)},");
             builder.AppendLine($"                        ClrType = typeof({column.ClrFqn}),");
-            builder.AppendLine($"                        Kind = global::MelangeDB.Core.ColumnKind.{column.Kind},");
+            builder.AppendLine($"                        Kind = global::MelangeDB.ColumnKind.{column.Kind},");
             builder.AppendLine($"                        IsEnum = {(column.IsEnum ? "true" : "false")},");
             builder.AppendLine($"                        IsPrimaryKey = {(column.IsPrimaryKey ? "true" : "false")},");
             builder.AppendLine($"                        IsAutoInc = {(column.IsAutoInc ? "true" : "false")},");

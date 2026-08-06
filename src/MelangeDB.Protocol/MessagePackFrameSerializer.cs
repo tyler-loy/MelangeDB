@@ -1,15 +1,28 @@
 namespace MelangeDB.Protocol;
 
 /// <summary>
-/// Protocol version 1 framing: every frame is one MessagePack array of
-/// <c>[type, channel, ...fields]</c>. Values in row maps and parameter maps use native
-/// MessagePack types; <see cref="Identity"/> travels as 32-byte binary and <see cref="Timestamp"/>
-/// as its microsecond integer.
+/// Protocol version 2 framing: every frame is one MessagePack array of
+/// <c>[type, channel, ...fields]</c>. Parameter maps use native MessagePack types;
+/// <see cref="Identity"/> travels as 32-byte binary and <see cref="Timestamp"/> as its microsecond
+/// integer.
+/// <para>
+/// Rows do not. Version 1 sent every row as a MessagePack map of column name to boxed value, which
+/// re-sent the schema with every row and cost the encoder a dictionary build per subscriber per
+/// row. Version 2 sends the schema-ordered v1 row bytes the store already holds, shaped once per
+/// subscription by a <see cref="WireDescriptor"/>. Measured against the map shape: 1.18–1.40x the
+/// bytes, 4.6–12.4x the encode time, 2.4–2.9x the decode time. The bytes were never the headline —
+/// the CPU was, and it is spent on the fan-out path under the engine's write lock.
+/// </para>
+/// <para>
+/// The break is hard: there is no version-1 encoder left, and a version-1 peer is turned away at
+/// the handshake with <see cref="MelangeErrorCodes.UnsupportedVersion"/> rather than allowed to
+/// fail later on a row it cannot read.
+/// </para>
 /// </summary>
 public sealed class MessagePackFrameSerializer : IMelangeSerializer
 {
     /// <summary>The protocol version this serializer implements.</summary>
-    public const int ProtocolVersion = 1;
+    public const int ProtocolVersion = 2;
 
     public string Name => "MessagePack";
 
@@ -17,6 +30,20 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
     {
         ArgumentNullException.ThrowIfNull(frame);
         var writer = new MsgPackWriter(64);
+        Write(ref writer, frame);
+        return writer.ToArray();
+    }
+
+    public int Measure(Frame frame)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        var writer = MsgPackWriter.Counting();
+        Write(ref writer, frame);
+        return writer.Length;
+    }
+
+    private static void Write(ref MsgPackWriter writer, Frame frame)
+    {
         switch (frame)
         {
             case HelloFrame f:
@@ -63,17 +90,19 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 writer.WriteUInt64(f.SubscriptionId);
                 break;
             case SubscriptionAppliedFrame f:
-                Header(ref writer, f, 5);
+                Header(ref writer, f, 6);
                 writer.WriteUInt64(f.SubscriptionId);
                 writer.WriteUInt64(f.AnchorLsn);
                 writer.WriteUInt64(f.ChunkIndex);
                 writer.WriteBool(f.IsLast);
+                WriteDescriptor(ref writer, f.Descriptor);
                 writer.WriteArrayHeader(f.Rows.Count);
                 foreach (var row in f.Rows)
                 {
-                    writer.WriteArrayHeader(2);
+                    writer.WriteArrayHeader(3);
                     writer.WriteBinary(row.Key);
-                    WriteValueMap(ref writer, row.Columns);
+                    writer.WriteBinary(row.Row.Span);
+                    writer.WriteBinary(row.ColumnMask.Span);
                 }
 
                 break;
@@ -88,10 +117,11 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                     writer.WriteArrayHeader(update.Ops.Count);
                     foreach (var op in update.Ops)
                     {
-                        writer.WriteArrayHeader(3);
+                        writer.WriteArrayHeader(4);
                         writer.WriteInt64((byte)op.Kind);
                         writer.WriteBinary(op.Key);
-                        WriteValueMap(ref writer, op.Columns);
+                        writer.WriteBinary(op.Row.Span);
+                        writer.WriteBinary(op.ColumnMask.Span);
                     }
                 }
 
@@ -142,8 +172,6 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
             default:
                 throw new NotSupportedException($"Unknown frame type {frame.GetType()}.");
         }
-
-        return writer.ToArray();
     }
 
     public Frame Deserialize(ReadOnlySpan<byte> message)
@@ -215,19 +243,60 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
         var anchor = reader.ReadUInt64();
         var chunkIndex = (uint)reader.ReadUInt64();
         var isLast = reader.ReadBool();
+        var descriptor = ReadDescriptor(ref reader);
         var rowCount = reader.ReadArrayHeader();
         var rows = new List<WireRow>(rowCount);
         for (var i = 0; i < rowCount; i++)
         {
             var parts = reader.ReadArrayHeader();
-            if (parts != 2)
-                throw new MelangeProtocolException("A wire row is [key, columns].");
+            if (parts != 3)
+                throw new MelangeProtocolException("A wire row is [key, row, mask].");
             var key = reader.ReadBinary();
-            var columns = ReadValueMap(ref reader) ?? throw new MelangeProtocolException("An initial-set row requires columns.");
-            rows.Add(new WireRow(key, columns));
+            var row = reader.ReadBinary();
+            var mask = reader.ReadBinary();
+            rows.Add(new WireRow(key, row, mask));
         }
 
-        return new SubscriptionAppliedFrame(subscriptionId, anchor, chunkIndex, isLast, rows);
+        return new SubscriptionAppliedFrame(subscriptionId, anchor, chunkIndex, isLast, rows, descriptor);
+    }
+
+    private static void WriteDescriptor(ref MsgPackWriter writer, WireDescriptor? descriptor)
+    {
+        if (descriptor is null)
+        {
+            writer.WriteNil();
+            return;
+        }
+
+        writer.WriteArrayHeader(2);
+        writer.WriteString(descriptor.Table);
+        writer.WriteArrayHeader(descriptor.Columns.Count);
+        foreach (var column in descriptor.Columns)
+        {
+            writer.WriteArrayHeader(2);
+            writer.WriteString(column.Name);
+            writer.WriteInt64((byte)column.Kind);
+        }
+    }
+
+    private static WireDescriptor? ReadDescriptor(ref MsgPackReader reader)
+    {
+        if (reader.TryReadNil())
+            return null;
+        if (reader.ReadArrayHeader() != 2)
+            throw new MelangeProtocolException("A wire descriptor is [table, columns].");
+        var table = reader.ReadString() ?? throw new MelangeProtocolException("A wire descriptor requires a table name.");
+        var count = reader.ReadArrayHeader();
+        var columns = new WireColumn[count];
+        for (var i = 0; i < count; i++)
+        {
+            if (reader.ReadArrayHeader() != 2)
+                throw new MelangeProtocolException("A wire descriptor column is [name, kind].");
+            var name = reader.ReadString() ?? throw new MelangeProtocolException("A wire descriptor column requires a name.");
+            columns[i] = new WireColumn(name, (ColumnKind)reader.ReadInt64());
+        }
+
+        return new WireDescriptor(table, columns);
     }
 
     private static TransactionUpdateFrame ReadTransactionUpdate(ref MsgPackReader reader)
@@ -246,12 +315,13 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
             for (var j = 0; j < opCount; j++)
             {
                 var opParts = reader.ReadArrayHeader();
-                if (opParts != 3)
-                    throw new MelangeProtocolException("A row op is [kind, key, columns].");
+                if (opParts != 4)
+                    throw new MelangeProtocolException("A row op is [kind, key, row, mask].");
                 var kind = (RowOpKind)reader.ReadInt64();
                 var key = reader.ReadBinary();
-                var columns = ReadValueMap(ref reader);
-                ops.Add(new WireRowOp(kind, key, columns));
+                var row = reader.ReadBinary();
+                var mask = reader.ReadBinary();
+                ops.Add(new WireRowOp(kind, key, row, mask));
             }
 
             updates.Add(new SubscriptionUpdate(subscriptionId, ops));

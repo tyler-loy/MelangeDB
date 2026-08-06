@@ -15,22 +15,37 @@ namespace MelangeDB.Types
         public byte[] Genome;
     }
 
-    /// <summary>Decodes 'Creature' wire rows through the one coercion table; no per-site casts.</summary>
+    /// <summary>Decodes 'Creature' rows straight from the wire's row bytes: positional, no dictionary, no boxing.</summary>
     public sealed class CreatureRowCodec : global::MelangeDB.Client.IClientRowCodec<Creature>
     {
         public static readonly CreatureRowCodec Instance = new CreatureRowCodec();
 
+        // The shape these bindings were generated from, compared against the server's
+        // descriptor once per subscription. Order is contract: the row bytes are positional.
+        private static readonly global::MelangeDB.Protocol.WireColumn[] Shape = new global::MelangeDB.Protocol.WireColumn[]
+        {
+            new global::MelangeDB.Protocol.WireColumn("Id", global::MelangeDB.ColumnKind.UInt64),
+            new global::MelangeDB.Protocol.WireColumn("ChunkId", global::MelangeDB.ColumnKind.UInt16),
+            new global::MelangeDB.Protocol.WireColumn("Kind", global::MelangeDB.ColumnKind.Int32),
+            new global::MelangeDB.Protocol.WireColumn("X", global::MelangeDB.ColumnKind.Float32),
+            new global::MelangeDB.Protocol.WireColumn("Name", global::MelangeDB.ColumnKind.String),
+            new global::MelangeDB.Protocol.WireColumn("Genome", global::MelangeDB.ColumnKind.Bytes),
+        };
+
         public string TableName => "Creature";
 
-        public Creature DecodeRow(global::System.Collections.Generic.IReadOnlyDictionary<string, object> columns)
+        public global::System.Collections.Generic.IReadOnlyList<global::MelangeDB.Protocol.WireColumn> Columns => Shape;
+
+        public Creature DecodeRow(global::System.ReadOnlySpan<byte> data)
         {
+            var reader = new global::MelangeDB.RowReader(data);
             var row = default(Creature);
-            row.Id = global::MelangeDB.Client.ClientWireValues.ReadUInt64(columns, "Id", "Creature");
-            row.ChunkId = global::MelangeDB.Client.ClientWireValues.ReadUInt16(columns, "ChunkId", "Creature");
-            row.Kind = (Species)global::MelangeDB.Client.ClientWireValues.ReadInt32(columns, "Kind", "Creature");
-            row.X = global::MelangeDB.Client.ClientWireValues.ReadFloat32(columns, "X", "Creature");
-            row.Name = global::MelangeDB.Client.ClientWireValues.ReadString(columns, "Name", "Creature");
-            row.Genome = global::MelangeDB.Client.ClientWireValues.ReadBytes(columns, "Genome", "Creature");
+            row.Id = reader.ReadUInt64();
+            row.ChunkId = reader.ReadUInt16();
+            row.Kind = (Species)reader.ReadInt32();
+            row.X = reader.ReadFloat32();
+            row.Name = reader.ReadString();
+            row.Genome = reader.ReadBytes();
             return row;
         }
 
