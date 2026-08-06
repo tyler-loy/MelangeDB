@@ -1383,7 +1383,7 @@ public sealed partial class MelangeEngine : IDisposable
         private static readonly Action<ILogger, ulong, Exception?> SnapshotAlreadyRunningMessage =
             LoggerMessage.Define<ulong>(
                 LogLevel.Debug,
-                new EventId(1507, "SnapshotAlreadyRunning"),
+                new EventId(1509, "SnapshotAlreadyRunning"),
                 "Snapshot at LSN {Lsn} skipped: another snapshot is still writing. Snapshots write " +
                 "outside the write lock, so an interval short enough to overlap one is the signal — " +
                 "raise Snapshots:IntervalTransactions rather than treating this as an error.");

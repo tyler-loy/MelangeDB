@@ -255,8 +255,10 @@ also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flus
 buffer-pool cap, and the total they sum to — `1502 SnapshotWritten`, `1503 LogTruncated` (naming the floor it
 respected), `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
 `1505 AutoResidencyDemoted` — an `Auto` table crossing its threshold is the cliff arriving, and it announces
-itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, and `1508 ResidencyChanged`, the careful
-per-table override being applied at runtime (07); `1601 PostgresApplierStalled` — the loud stall the phase-08
+itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, `1508 ResidencyChanged` — the careful
+per-table override being applied at runtime (07) — and `1509 SnapshotAlreadyRunning`, Debug-level, the
+only signal that snapshots now write outside the write lock: an interval short enough for two to
+overlap is a configuration to raise, not an error to chase; `1601 PostgresApplierStalled` — the loud stall the phase-08
 risk register demands: first failure always, then every 30 seconds under `Diagnostics:ReportApplierLag` with
 the growing lag — `1602 PostgresApplierRecovered`, `1603 PostgresSchemaMigrated` (the DDL AutoMigrate
 applied — automatic must not mean silent), `1604 PostgresMigrationRefused` (carrying the exact pending DDL,

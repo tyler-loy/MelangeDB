@@ -552,6 +552,12 @@ passes the slowest live one (`MelangeEventBus.MinimumLiveCheckpointLsn`). Idle p
 `Events:SubscriberExpirySeconds` it is evicted loudly, leaving a tombstone; the returning subscriber is told it
 lost its place and starts from current state. Persisted in a sidecar beside the log, per the epoch precedent.
 
+**Secondary index** — The store-side map from an indexed column's encoded value to the primary keys holding
+it, kept in managed memory beside the data by both storage engines. Held as one sorted set of
+*(value, key)* **index entries** rather than a dictionary of nested key sets, which is what lets a range query
+seek to its lower bound instead of walking from the leftmost value and discarding everything below the window.
+A null column value is not indexed — the zero-length key is the sentinel.
+
 **Subscription** — A standing single-table query producing an initial result set and then a delta stream.
 Anchored to one LSN across that boundary so a client observes no gap or duplicate.
 

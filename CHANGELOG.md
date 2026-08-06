@@ -12,6 +12,13 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Eight benchmark suites** in [bench/](bench/README.md), closing the seven measurement gaps the
+  performance sweep left open: commit-path attribution, fan-out against subscriber count, batched apply,
+  index maintenance, wire format, FASTER hash sizing, snapshot duration, and index range position. The
+  project now runs the source generator, so a suite measures the generated codec rather than the
+  reflection fallback. Results, and the three decisions the numbers changed rather than confirmed, are in
+  [docs/design/performance-sweep.md](docs/design/performance-sweep.md).
+
 - **`HotStore:HashBuckets`.** Sizes the FASTER hash index, rounded up to a power of two; zero derives it
   from `HotStore:MemoryBudgetBytes`. It was a hardcoded 65,536 regardless of budget or row count — an
   index sized for roughly a quarter of a million records whatever the configuration said, past which
@@ -129,6 +136,37 @@ All packages ship together at one version; there is no per-package versioning. S
   in any scheduled table is now also warned about (EventId 1723).
 
 ### Changed
+
+- **Secondary index range scans seek to their lower bound.** Both storage engines held indexes as a
+  dictionary of value → nested key set, which cannot seek: a range query started at the leftmost value and
+  discarded everything below its window, so a ten-row window at the far end of a large index paid for the
+  whole index. Both now hold one sorted set of *(value, key)* entries, where the lower bound is a binary
+  search. Index maintenance got cheaper on the way past — adding a row is one entry insert rather than
+  read-inner-set, rebuild, write-back.
+
+- **Snapshots write outside the engine's write lock.** `TakeSnapshot` scanned every table, wrote the file,
+  fsynced, and truncated while holding the lock, so nothing committed for the duration — measured at about
+  547 ms for a million rows. It now captures the header and pins a read view under the lock (about a
+  millisecond), writes from the pin outside it, and re-takes the lock only to truncate. Evaluating the
+  retention floors after the capture is safe in the only direction that matters: floors advance, and the
+  result is capped by the snapshot's own LSN. Two snapshots never write at once; an overlapping automatic
+  trigger is skipped and logged at Debug as `1509 SnapshotAlreadyRunning`. A store with no pinned-read
+  capability keeps the old behaviour, having no way to offer a consistent view outside the lock.
+
+- **A resident FASTER table reads with no store lock.** `TryGetRow`, `ScanIndex`, `ScanIndexRange`, and
+  `Count` answer from one volatile read of an immutable version when the table is resident. `TryGetRow` is
+  the one that mattered: the engine's fan-out calls it per op, to fetch a pre-image, while already holding
+  the engine write lock. Paged reads keep the store lock, and it is not there for the session's sake — the
+  hybrid log overwrites in place, so the directory probe and the record read must be atomic against a
+  concurrent write.
+
+- **The commit-log payload writes into a pooled buffer.** `MemoryStream` plus `BinaryWriter` plus a final
+  `ToArray` becomes a span writer over a bounded pool, and reducer and event-type names encode straight into
+  it. Measured under interval fsync: a hundred-row payload drops from 44,488 B and 7,961 ns to 72 B and
+  2,524 ns, and the whole commit allocates 14–20% less at every write-set size. The pool is bounded at
+  256 KB rather than `ArrayPool<byte>.Shared`, so a bulk load of large blobs cannot park megabytes of
+  retained buffers beside the memory budget this database reports as a computed artifact. The record format
+  is byte-for-byte unchanged; logs written by earlier builds read as before.
 
 - **A row is decoded once per fan-out, not once per subscriber.** `RowWire.ToColumns` ran per
   subscription, so a commit on a table with N subscribers built N identical column dictionaries — and N

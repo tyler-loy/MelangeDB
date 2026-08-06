@@ -5,11 +5,15 @@ already measured.
 
 Date: 2026-08-05. Branch context: `feat/snapshot-isolation` (and current tree at time of review).
 
-**Status: partly acted on.** The review below is kept as written — it is the record of what was
-found and why it was ranked the way it was. What has since been done to it, including two defects
-the review missed and one finding it overstated, is in [the outcomes section](#outcomes) at the
-bottom. Read that first if you are looking for the current state of the code rather than the
-history of the analysis.
+**Status: acted on, with one item left.** The review below is kept as written — it is the record of
+what was found and why it was ranked the way it was. What has since been done to it is in [the
+outcomes section](#outcomes) at the bottom: two defects the review missed, one finding it overstated,
+one whose premise does not hold for this store, and three whose measured numbers changed the
+decision rather than confirming it. Read that first if you want the current state of the code rather
+than the history of the analysis.
+
+The seven measurement gaps are closed. Finding #15 — compact wire rows — is the one substantial item
+not done, and the outcomes section says what measuring it actually showed.
 
 ---
 
@@ -427,6 +431,29 @@ the delta queue is FIFO per connection with a single sender. Backpressure was th
 the drop must stay synchronous under the engine lock, because a deferred sweep once raced a client
 re-subscribe and left it silently dead. That constraint, not ordering, is what shaped the fix.
 
+### Round two: what the measurements changed
+
+The first round shipped with the caveat that none of the seven measurement gaps were closed. They
+are closed now, by [eight benchmark suites](../../bench/README.md), and three of them changed a
+decision rather than confirming one. That is the argument for measuring first, made concretely:
+
+- **Finding #5 is not the unconditional win it was recorded as.** Single-pass index extraction is
+  **2.9–3.3x faster and allocates 4.7x less** on rows carrying strings and byte arrays — and
+  **1.3–1.7x *slower*** on rows of fixed-width scalars with fewer than eight indexes, because a
+  scalar row costs almost nothing to deserialize and iterating a column list costs more than the
+  repeat deserializes it saves. The fix is right for the shape real tables have; the regression is
+  about 10 ns inside a ~500 ns write, and is recorded rather than optimised away.
+- **Finding #6 named six allocation sites. Only one of them was worth doing.** The log payload is
+  15–19% of everything a commit allocates, steady from one row to a hundred; framing and CRC add
+  barely a hundred bytes on top. Pooling that one site alone took 14–20% off the whole commit's
+  allocation.
+- **Finding #15's headline is wrong, and its case is still strong.** The review calls compact wire
+  rows "likely the #1 bandwidth and client CPU issue." Bandwidth: **1.18x (narrow) to 1.40x (wide)**
+  — real, and not a protocol break's worth on its own. CPU and allocation: **4.6–12.4x on encode,
+  2.4–2.9x on decode, 2.4–3.6x less allocation**. It is worth doing, for reasons other than the ones
+  given.
+- **Finding #9's premise does not hold for this store.** See below.
+
 ### Done
 
 | # | Finding | What landed |
@@ -435,32 +462,87 @@ re-subscribe and left it silently dead. That constraint, not ordering, is what s
 | — | Per-subscriber column maps | One decode and one key copy per op, shared across subscribers |
 | 1, 3 | Fan-out encodes under the lock | Frames are **measured** under the lock and encoded on the sender; `MsgPackWriter` gained a counting mode so measuring runs the same write path |
 | 4 | Per-op version publish | One `TableVersion` per record per table in the in-memory store |
-| 5 | Index encode deserializes per column | `RowCodec.EncodeColumnsFromBytes` — one pass, positional `RowKey[]` |
+| 5 | Index encode deserializes per column | `RowCodec.EncodeColumnsFromBytes` — one pass, positional `RowKey[]`. See the caveat above |
 | 7 | `ScanMerged` materializes | Two-way streaming merge; `First` no longer needs its own lazy path |
 | 10 | Fixed hash table size | Derived from the memory budget, with `HotStore:HashBuckets` to override |
 | 11 | Per-op key allocation | Composed into a reused buffer under the store lock |
 | 13, 14 | `OpsFor` is O(all ops) | Slot positions indexed per table |
 | 19 | Unbounded rate-limiter map | Refilled buckets evicted — safe because buckets are created full |
 | 2 | Fsync guidance | Workload table and the two rules of thumb in [CONFIGURATION.md](../CONFIGURATION.md) |
+| 6 | Commit-path allocation | The log payload writes into a bounded pooled buffer. **One** of the six sites, because the benchmark said the other five were not where the bytes were |
+| 8 | Snapshot under the write lock | Captured under the lock (header plus a pinned view), written outside it, truncated under it again |
+| 9 | FASTER reads take the store lock | Resident tables now read with no lock at all. Paged reads keep it — see below |
+| 12 | Index range scans start at the leftmost key | Both stores hold indexes as one `ImmutableSortedSet` of `(value, key)` entries, so a range seeks |
 
 ### Not done, with reasons
 
 | # | Finding | Why not |
 | --- | --- | --- |
-| 6 | Commit-path allocation trim | Untouched. Wants the interval-fsync commit breakdown (measurement gap 1) to say which of the six sites actually dominates, rather than pooling all of them on principle. |
-| 8 | Snapshot under the write lock | Untouched. The pin is cheap and the write is not, but truncation has to stay ordered against the retention floors, and that coordination is the actual work. |
-| 9 | FASTER session pool | Untouched. Paged reads still take the store lock per row. A structural change to session ownership, not a sizing fix. |
-| 12 | Index range seek | Untouched. `ImmutableSortedDictionary` has no seek, so this needs the index container replaced — an `ImmutableSortedSet` of `(value, key)` entries would seek *and* make maintenance cheaper, but it is a refactor across both stores. |
-| 15 | Compact wire rows | Untouched. The largest single item and a protocol break; wants measurement gap 5 (bytes/s for maps vs a v1 projection) before the client, the bindings generator, and the cache all move. |
+| 15 | Compact wire rows | The one substantial item left. Measured and worth doing — 4.6–12.4x on encode, 2.4–2.9x on decode — but it is a protocol break across the frame types, the subscription engine, the client cache, the bindings generator, and the public untyped client API, and it deserves its own change rather than a corner of a performance sweep. |
 | 16 | Client apply path | Follows 15; nothing to do independently. |
 | 17 | Concurrent snapshot ticks | The review gates this on overrun metrics showing multi-tick pileups. They do not. |
 | 18 | Recovery rebuilds FASTER | Deliberately rejected in phase 07; not a work item. |
 | 20 | Telemetry sampling | "Keep this discipline" — not a work item. |
 
-### Measurement gaps: still open
+### Finding #9: the premise, corrected
 
-None of the seven were closed. Every "done" row above is a structural fix whose correctness is
-tested but whose *magnitude* is unmeasured on this hardware — the sweep removed work that provably
-happened, it did not demonstrate how much that work cost. Gaps 1 (commit breakdown), 2 (fan-out vs
-subscription count), and 3 (batched vs per-op apply) now have code worth pointing at, and should be
-run before anyone quotes a number.
+The review reads the FASTER store's lock as protecting its single `ClientSession`, and asks for a
+session pool. The code says otherwise, and the comment on the pinned read path says it outright: the
+hybrid log **overwrites in place**, so the directory probe and the record read have to be atomic
+against a concurrent write, or a reader can hold a directory entry whose record a concurrent delete
+has already removed. The lock is a correctness mechanism for a log with no old versions. Pooling
+sessions would admit more threads and every one of them would still need it.
+
+What was available instead: a resident table's rows live in managed memory inside persistent
+containers, reachable through one volatile read of an immutable version — no session, no hybrid log,
+no overlay, and so no lock. That is now the path for `TryGetRow`, `ScanIndex`, `ScanIndexRange`, and
+`Count`. `TryGetRow` is the one that matters, because the engine's fan-out calls it per op to fetch
+a pre-image while holding the *engine* write lock.
+
+Making **paged** reads concurrent needs pre-images captured with a version stamp readers can compare
+— which is what a pinned read view already implements — not a change to session ownership.
+
+### Measurement gaps: closed
+
+All seven, by the suites in [`bench/`](../../bench/README.md). Numbers here come from one machine
+(Windows 11, .NET 10, Release, `--job short`); ratios between rows of the same run travel, absolute
+figures do not. Re-run before quoting.
+
+| Gap | Suite | What it said |
+| --- | --- | --- |
+| 1 | `CommitPathBenchmarks` | Under `OnCommit` the fsync is over 95% of a commit and nothing else matters. Under `Interval` the log payload is 15–19% of commit allocation at every write-set size |
+| 2 | `FanoutBenchmarks` | Fan-out cost against 1 to 500 subscribers, with shared and with distinct projections |
+| 3 | `ApplyBenchmarks` | Batching a record's ops into one version publish is 1.3–1.9x faster; the gap is widest on tables with **no** secondary index, where index work does not dilute it |
+| 4 | `IndexMaintenanceBenchmarks` | Single-pass extraction wins 2.9–3.3x on mixed rows and loses 1.3–1.7x on scalar ones |
+| 5 | `WireFormatBenchmarks` | Maps cost 1.18–1.40x the bytes, 4.6–12.4x the encode time, 2.4–2.9x the decode time |
+| 6 | `FasterHashBenchmarks` | Point-read cost against a derived hash size and a deliberately undersized one |
+| 7 | `SnapshotBenchmarks` | A million-row snapshot held the write lock about 547 ms; pinning a view instead costs about 1 ms. This is what moved #8 from "worth considering" to done |
+
+### Three tests that did not work, and what replaced them
+
+All the same mistake in different clothes: **asserting the answer, when the answer was never what
+changed.**
+
+The index range seek was first tested by asserting the position a seek returns. A linear walk
+returns the same position, so the test passed against a deliberately scanning implementation. What
+separates a seek from a scan is how much work it does, so the test counts comparisons through the
+set's own comparer: under 200 for a window a scan reaches in 3,997.
+
+The batched apply (round one) was first tested by comparing a batched record against the same ops
+applied one at a time. Both sides run the same accounting code, so a leak in that code appears on
+both sides and cancels — confirmed by mutating the delete path and watching the test stay green.
+What replaced it asserts an absolute: a table emptied by deletes weighs nothing.
+
+The log payload rewrite avoided a third instance. A round trip through this codec's own reader
+passes when the writer and the reader are wrong in the same direction, which is exactly the mistake
+available when one change touches both. So the format test asserts byte equality against the
+previous encoder, transcribed into the test file where changing the codec cannot change it.
+
+### One regression the existing tests caught
+
+Pooling the log payload through `ArrayPool<byte>.Shared` failed the residency test, and rightly. A
+shared pool retains whatever it is handed, so one bulk load of hundred-kilobyte blobs parks
+megabytes of buffers beside a memory budget this database reports as a computed artifact. The fix is
+a bounded pool with a 256 KB ceiling: the steady state pools, and a rare oversized bulk record
+allocates once and stays collectable. The memory report is one of the few numbers here that is a
+promise rather than an observation, and a test that guards it earned its keep.
