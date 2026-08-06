@@ -51,6 +51,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private readonly FasterKV<SpanByte, SpanByte>? _blob;
     private readonly ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions>? _blobSession;
     private readonly long _bufferPoolCapacityBytes;
+
+    /// <summary>Reused buffer for composed store and blob keys; see <see cref="StoreKey"/>.</summary>
+    private byte[] _keyScratch = new byte[64];
     private bool _disposed;
 
     public FasterHotStore(HotStoreContext context)
@@ -66,6 +69,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         var mainMemoryBits = anyBlobColumns ? totalBits - 1 : totalBits;
         var blobMemoryBits = totalBits - 1;
         _bufferPoolCapacityBytes = (1L << mainMemoryBits) + (anyBlobColumns ? 1L << blobMemoryBits : 0);
+        var hashBuckets = HashBuckets(context.Options.HotStore);
 
         // The store is rebuilt from snapshot + log replay on every start, so files left by a
         // previous run (clean or crashed) are stale projections; start from nothing.
@@ -75,7 +79,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         _mainDevice = Devices.CreateLogDevice(Path.Combine(path, "main.hlog"), deleteOnClose: true);
         _main = new FasterKV<SpanByte, SpanByte>(
-            1L << 16,
+            hashBuckets,
             new LogSettings
             {
                 LogDevice = _mainDevice,
@@ -89,7 +93,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             _blobDevice = Devices.CreateLogDevice(Path.Combine(path, "blob.hlog"), deleteOnClose: true);
             _blob = new FasterKV<SpanByte, SpanByte>(
-                1L << 16,
+                hashBuckets,
                 new LogSettings
                 {
                     LogDevice = _blobDevice,
@@ -689,7 +693,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private byte[]? ReadValue(
         ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        byte[] keyBytes,
+        ReadOnlySpan<byte> keyBytes,
         TableState faultAccounting)
     {
         byte[]? output = null;
@@ -727,7 +731,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private static void UpsertValue(
         ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        byte[] keyBytes,
+        ReadOnlySpan<byte> keyBytes,
         ReadOnlySpan<byte> value)
     {
         unsafe
@@ -746,7 +750,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private static void DeleteValue(
         ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        byte[] keyBytes)
+        ReadOnlySpan<byte> keyBytes)
     {
         unsafe
         {
@@ -760,21 +764,55 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
-    private static byte[] StoreKey(TableId table, in RowKey key)
+    /// <summary>
+    /// Composes a store key into the scratch buffer. Every upsert, delete, and read used to
+    /// allocate a fresh array for a key that is dead the moment the call returns; under a heavy
+    /// apply rate that is pure garbage. The buffer is safe to share because every path that
+    /// composes a key holds the store lock -- which is also what makes the single session safe --
+    /// and the span is consumed before the next key is composed.
+    /// </summary>
+    private ReadOnlySpan<byte> StoreKey(TableId table, in RowKey key)
     {
-        var bytes = new byte[4 + key.Length];
+        var bytes = Scratch(4 + key.Length);
         BinaryPrimitives.WriteUInt32BigEndian(bytes, table.Value);
-        key.Span.CopyTo(bytes.AsSpan(4));
+        key.Span.CopyTo(bytes[4..]);
         return bytes;
     }
 
-    private static byte[] BlobKey(TableId table, in RowKey key, int bytesColumnOrdinal)
+    private ReadOnlySpan<byte> BlobKey(TableId table, in RowKey key, int bytesColumnOrdinal)
     {
-        var bytes = new byte[4 + key.Length + 1];
+        var bytes = Scratch(4 + key.Length + 1);
         BinaryPrimitives.WriteUInt32BigEndian(bytes, table.Value);
-        key.Span.CopyTo(bytes.AsSpan(4));
+        key.Span.CopyTo(bytes[4..]);
         bytes[^1] = checked((byte)bytesColumnOrdinal);
         return bytes;
+    }
+
+    private Span<byte> Scratch(int length)
+    {
+        if (_keyScratch.Length < length)
+            _keyScratch = new byte[Math.Max(length, _keyScratch.Length * 2)];
+        return _keyScratch.AsSpan(0, length);
+    }
+
+    /// <summary>
+    /// Hash buckets for the FASTER index: the operator's figure when set, else derived from the
+    /// memory budget. A bucket holds several entries, so the target is roughly one per few
+    /// expected records; the budget is the only proxy for record count the store has at
+    /// construction, since the rows themselves arrive later by replay.
+    /// <para>
+    /// The previous fixed 65,536 sized the index for about a quarter of a million records whatever
+    /// the budget said. Past that, chains lengthen and a lookup that should be one probe becomes
+    /// several -- each one a candidate for a pending completion on a paged table.
+    /// </para>
+    /// </summary>
+    private static long HashBuckets(HotStoreOptions options)
+    {
+        // A record averages a few hundred bytes and a bucket serves several, so budget/1024 keeps
+        // the index proportional to what the buffer pool can hold without dwarfing it.
+        var target = options.HashBuckets > 0 ? options.HashBuckets : Math.Max(options.MemoryBudgetBytes, 2L << 20) / 1024;
+        var clamped = Math.Clamp(target, 1L << 16, 1L << 26);
+        return BitOperations.IsPow2(clamped) ? clamped : 1L << (64 - BitOperations.LeadingZeroCount((ulong)clamped));
     }
 
     private static void CleanStoreFiles(string path)
