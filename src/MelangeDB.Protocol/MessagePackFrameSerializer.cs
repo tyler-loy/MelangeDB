@@ -17,6 +17,20 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
     {
         ArgumentNullException.ThrowIfNull(frame);
         var writer = new MsgPackWriter(64);
+        Write(ref writer, frame);
+        return writer.ToArray();
+    }
+
+    public int Measure(Frame frame)
+    {
+        ArgumentNullException.ThrowIfNull(frame);
+        var writer = MsgPackWriter.Counting();
+        Write(ref writer, frame);
+        return writer.Length;
+    }
+
+    private static void Write(ref MsgPackWriter writer, Frame frame)
+    {
         switch (frame)
         {
             case HelloFrame f:
@@ -142,8 +156,6 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
             default:
                 throw new NotSupportedException($"Unknown frame type {frame.GetType()}.");
         }
-
-        return writer.ToArray();
     }
 
     public Frame Deserialize(ReadOnlySpan<byte> message)

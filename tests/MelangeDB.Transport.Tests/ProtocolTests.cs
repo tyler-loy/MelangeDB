@@ -51,6 +51,62 @@ public class ProtocolTests
         Assert.Equal(Convert.ToHexString(_serializer.Serialize(frame)), Convert.ToHexString(_serializer.Serialize(decoded)));
     }
 
+    [Theory]
+    [MemberData(nameof(Frames))]
+    public void Measure_reports_exactly_what_serialize_produces(Frame frame)
+    {
+        // The delta path measures a frame under the engine's write lock and encodes it later, on
+        // the sender. If these two ever disagree, the backpressure ledger drifts from the bytes
+        // actually queued and Subscriptions:MaxBufferedBytes quietly stops meaning what it says.
+        Assert.Equal(_serializer.Serialize(frame).Length, _serializer.Measure(frame));
+    }
+
+    [Fact]
+    public void Measure_agrees_with_serialize_at_every_length_boundary()
+    {
+        // MessagePack picks its length prefix by size, so the sizes worth checking are the ones
+        // either side of each prefix change — and multibyte text, where character count and byte
+        // count part ways.
+        foreach (var value in BoundaryValues())
+        {
+            var frame = new TransactionUpdateFrame(1UL, [new SubscriptionUpdate(1, [
+                new WireRowOp(RowOpKind.Insert, [1], new Dictionary<string, object?> { ["v"] = value }),
+            ])]);
+            Assert.Equal(_serializer.Serialize(frame).Length, _serializer.Measure(frame));
+        }
+    }
+
+    [Fact]
+    public void Measuring_a_frame_never_produces_its_bytes()
+    {
+        // Measure exists to avoid the encode, so a counting writer that quietly allocated and
+        // filled a buffer would defeat the point while still passing every equality check above.
+        var writer = MsgPackWriter.Counting();
+        MessagePackFrameSerializer.WriteValue(ref writer, new string('m', 5_000));
+
+        Assert.Empty(writer.ToArray());
+        Assert.True(writer.Length > 5_000);
+    }
+
+    private static IEnumerable<object?> BoundaryValues()
+    {
+        foreach (var length in (int[])[0, 1, 31, 32, 255, 256, 65_535, 65_536])
+        {
+            yield return new string('a', length);
+            yield return new string('é', length); // Two bytes per char: byte count is not char count.
+            yield return new byte[length];
+        }
+
+        foreach (var number in (long[])[0, 127, 128, 255, 256, 65_535, 65_536, long.MaxValue, -1, -32, -33, -128, -129, long.MinValue])
+            yield return number;
+
+        yield return null;
+        yield return true;
+        yield return 3.5d;
+        yield return 2.25f;
+        yield return ulong.MaxValue;
+    }
+
     [Fact]
     public void Wire_values_round_trip_across_messagepack_boundaries()
     {

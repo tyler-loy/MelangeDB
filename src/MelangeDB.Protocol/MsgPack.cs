@@ -13,8 +13,28 @@ public struct MsgPackWriter
 {
     private byte[] _buffer;
     private int _position;
+    private readonly bool _counting;
 
     public MsgPackWriter(int sizeHint) => _buffer = new byte[Math.Max(sizeHint, 32)];
+
+    private MsgPackWriter(bool counting)
+    {
+        _buffer = [];
+        _counting = counting;
+    }
+
+    /// <summary>
+    /// A writer that counts bytes instead of producing them: every write advances
+    /// <see cref="Length"/> and touches no buffer, so nothing is allocated and nothing is copied.
+    /// <para>
+    /// This exists so a caller can learn a frame's exact serialized size without paying to build
+    /// it — the delta path needs the size under the engine's write lock to judge backpressure, but
+    /// wants the encoding itself to happen on the sender. Measuring by running the same write path
+    /// is the point: a hand-written size calculator beside the writer would be free to drift from
+    /// it, and the drift would surface as a backpressure threshold that is quietly wrong.
+    /// </para>
+    /// </summary>
+    public static MsgPackWriter Counting() => new(counting: true);
 
     /// <summary>The number of bytes written so far.</summary>
     public readonly int Length => _position;
@@ -126,8 +146,12 @@ public struct MsgPackWriter
             WriteBigEndian((uint)byteCount);
         }
 
-        Ensure(byteCount);
-        Encoding.UTF8.GetBytes(value, _buffer.AsSpan(_position));
+        if (!_counting)
+        {
+            Ensure(byteCount);
+            Encoding.UTF8.GetBytes(value, _buffer.AsSpan(_position));
+        }
+
         _position += byteCount;
     }
 
@@ -149,8 +173,12 @@ public struct MsgPackWriter
             WriteBigEndian((uint)value.Length);
         }
 
-        Ensure(value.Length);
-        value.CopyTo(_buffer.AsSpan(_position));
+        if (!_counting)
+        {
+            Ensure(value.Length);
+            value.CopyTo(_buffer.AsSpan(_position));
+        }
+
         _position += value.Length;
     }
 
@@ -190,33 +218,54 @@ public struct MsgPackWriter
         }
     }
 
-    /// <summary>The written bytes as a right-sized array.</summary>
-    public readonly byte[] ToArray() => _buffer.AsSpan(0, _position).ToArray();
+    /// <summary>
+    /// The written bytes as a right-sized array. Empty on a <see cref="Counting"/> writer, which
+    /// holds no buffer to return — read <see cref="Length"/> instead.
+    /// </summary>
+    public readonly byte[] ToArray() => _counting ? [] : _buffer.AsSpan(0, _position).ToArray();
 
     private void WriteByte(byte value)
     {
+        if (_counting)
+        {
+            _position++;
+            return;
+        }
+
         Ensure(1);
         _buffer[_position++] = value;
     }
 
     private void WriteBigEndian(ushort value)
     {
-        Ensure(2);
-        BinaryPrimitives.WriteUInt16BigEndian(_buffer.AsSpan(_position), value);
+        if (!_counting)
+        {
+            Ensure(2);
+            BinaryPrimitives.WriteUInt16BigEndian(_buffer.AsSpan(_position), value);
+        }
+
         _position += 2;
     }
 
     private void WriteBigEndian(uint value)
     {
-        Ensure(4);
-        BinaryPrimitives.WriteUInt32BigEndian(_buffer.AsSpan(_position), value);
+        if (!_counting)
+        {
+            Ensure(4);
+            BinaryPrimitives.WriteUInt32BigEndian(_buffer.AsSpan(_position), value);
+        }
+
         _position += 4;
     }
 
     private void WriteBigEndian(ulong value)
     {
-        Ensure(8);
-        BinaryPrimitives.WriteUInt64BigEndian(_buffer.AsSpan(_position), value);
+        if (!_counting)
+        {
+            Ensure(8);
+            BinaryPrimitives.WriteUInt64BigEndian(_buffer.AsSpan(_position), value);
+        }
+
         _position += 8;
     }
 

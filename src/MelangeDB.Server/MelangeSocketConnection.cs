@@ -27,7 +27,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private readonly IMelangeSerializer _serializer;
 
     private readonly ConcurrentQueue<byte[]> _priority = new();
-    private readonly ConcurrentQueue<byte[]> _delta = new();
+    private readonly ConcurrentQueue<PendingDelta> _delta = new();
     private readonly List<BulkStream> _bulk = [];
     private readonly SemaphoreSlim _sendSignal = new(0);
     private readonly CancellationTokenSource _closed = new();
@@ -188,7 +188,16 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             await Task.Delay(5).ConfigureAwait(false);
     }
 
-    /// <summary>Queues one transaction's deltas. Called under the engine's write lock, in LSN order.</summary>
+    /// <summary>
+    /// Queues one transaction's deltas. Called under the engine's write lock, in LSN order.
+    /// <para>
+    /// The frame is measured here and encoded on the sender. Measuring is what backpressure needs
+    /// — and it has to happen here, because the drop is synchronous under the engine lock and must
+    /// stay that way: a deferred sweep raced a client's re-subscribe and left it silently dead.
+    /// Encoding is what the client needs, and nothing about it belongs on the engine thread, where
+    /// every byte written is a byte the next reducer waits behind.
+    /// </para>
+    /// </summary>
     public void EnqueueDelta(TransactionUpdateFrame frame)
     {
         if (_resumeBuffering)
@@ -197,8 +206,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             return;
         }
 
-        var bytes = _serializer.Serialize(frame);
-        var buffered = Interlocked.Add(ref _bufferedDeltaBytes, bytes.Length);
+        var length = _serializer.Measure(frame);
+        var buffered = Interlocked.Add(ref _bufferedDeltaBytes, length);
         var limits = _transport.Options.Subscriptions;
         if (buffered > limits.MaxBufferedBytes && limits.BackpressurePolicy != BackpressurePolicy.Buffer)
         {
@@ -206,8 +215,27 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             return;
         }
 
-        _delta.Enqueue(bytes);
+        _delta.Enqueue(new PendingDelta(frame, length));
         _sendSignal.Release();
+    }
+
+    /// <summary>
+    /// A queued delta: the frame as computed under the engine's write lock, plus the exact number
+    /// of bytes it will occupy once the sender encodes it. The length rides along because the
+    /// backpressure ledger is debited on dequeue and must be debited by what it was credited.
+    /// </summary>
+    private readonly record struct PendingDelta(TransactionUpdateFrame Frame, int Length);
+
+    /// <summary>
+    /// Queues a delta and credits the backpressure ledger, without encoding it. The resume paths
+    /// use this: replaying a long gap would otherwise build every frame's bytes up front and hold
+    /// them all while the socket drains one at a time.
+    /// </summary>
+    private void EnqueueMeasured(TransactionUpdateFrame frame)
+    {
+        var length = _serializer.Measure(frame);
+        Interlocked.Add(ref _bufferedDeltaBytes, length);
+        _delta.Enqueue(new PendingDelta(frame, length));
     }
 
     private void ApplyBackpressure(BackpressurePolicy policy)
@@ -640,20 +668,14 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             var updates = SubscriptionEngine.ComputeReplayUpdates(registered, record);
             if (updates.Count == 0)
                 continue;
-            var bytes = _serializer.Serialize(new TransactionUpdateFrame(record.Lsn, updates) { Channel = MelangeChannels.Data });
-            Interlocked.Add(ref _bufferedDeltaBytes, bytes.Length);
-            _delta.Enqueue(bytes);
+            EnqueueMeasured(new TransactionUpdateFrame(record.Lsn, updates) { Channel = MelangeChannels.Data });
             _sendSignal.Release();
         }
 
         engine.ReadConsistent(_ =>
         {
             foreach (var frame in _resumeBuffer)
-            {
-                var bytes = _serializer.Serialize(frame);
-                Interlocked.Add(ref _bufferedDeltaBytes, bytes.Length);
-                _delta.Enqueue(bytes);
-            }
+                EnqueueMeasured(frame);
 
             _resumeBuffer.Clear();
             _resumeBuffering = false;
@@ -752,8 +774,14 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         if (_priority.TryDequeue(out bytes!))
             return true;
         var delta = _heldDelta;
-        if (delta is null && _delta.TryDequeue(out delta!))
-            Interlocked.Add(ref _bufferedDeltaBytes, -delta.Length);
+        if (delta is null && _delta.TryDequeue(out var queued))
+        {
+            // The encode the engine thread did not do. Off the lock, on the connection that
+            // actually wants these bytes.
+            Interlocked.Add(ref _bufferedDeltaBytes, -queued.Length);
+            delta = _serializer.Serialize(queued.Frame);
+        }
+
         if (delta is not null)
         {
             if (TryBuildFirstChunk(out bytes!))
