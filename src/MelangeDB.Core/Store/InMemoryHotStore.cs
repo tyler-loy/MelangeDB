@@ -320,16 +320,21 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
         private readonly TableSchema _schema;
         private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
+
+        /// <summary>Indexed column names in index order — the codec's one-pass encode reads this per put.</summary>
+        private readonly string[] _indexColumns;
         private long _rowsScanned;
 
         public TableData(TableSchema schema, Residency residencyLabel = Residency.Paged)
         {
             _schema = schema;
             ResidencyLabel = residencyLabel;
+            _indexColumns = new string[schema.Indexes.Count];
             var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
+                _indexColumns[i] = schema.Indexes[i].Column;
                 indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
             }
 
@@ -407,9 +412,12 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         {
             if (indexes.Length == 0)
                 return indexes;
-            foreach (var (column, value) in IndexedValues(bytes))
+            var values = IndexedValues(bytes);
+            for (var position = 0; position < values.Length; position++)
             {
-                var position = _indexPositions[column];
+                var value = values[position];
+                if (value.Length == 0)
+                    continue; // A null column value is unindexed.
                 var index = indexes[position];
                 var keys = index.TryGetValue(value, out var existing) ? existing : EmptyKeys;
                 indexes = indexes.SetItem(position, index.SetItem(value, keys.Add(key)));
@@ -425,9 +433,12 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         {
             if (indexes.Length == 0)
                 return indexes;
-            foreach (var (column, value) in IndexedValues(bytes))
+            var values = IndexedValues(bytes);
+            for (var position = 0; position < values.Length; position++)
             {
-                var position = _indexPositions[column];
+                var value = values[position];
+                if (value.Length == 0)
+                    continue;
                 var index = indexes[position];
                 if (!index.TryGetValue(value, out var keys))
                     continue;
@@ -438,29 +449,36 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
             return indexes;
         }
 
-        private IEnumerable<(string Column, RowKey Value)> IndexedValues(byte[] bytes)
+        /// <summary>
+        /// Every indexed column's encoded value for one row, positionally aligned with the schema's
+        /// index list; a zero-length key is a null column value, which is not indexed.
+        /// <para>
+        /// One pass over the row for the whole set. Asking for a column at a time deserialized the
+        /// entire row per index, so a three-index table paid three full deserializes — and three
+        /// re-allocations of that row's string and byte columns — on every put and every remove.
+        /// </para>
+        /// </summary>
+        private RowKey[] IndexedValues(byte[] bytes)
         {
+            var values = new RowKey[_indexColumns.Length];
+
             // The generated codec path: no reflection, no boxing. Falls back to the boxed column
             // accessors when the schema was built by reflection.
             if (_schema.Codec is { } codec)
             {
-                foreach (var index in _schema.Indexes)
-                {
-                    if (codec.EncodeColumnFromBytes(index.Column, bytes) is { } value)
-                        yield return (index.Column, value);
-                }
-
-                yield break;
+                codec.EncodeColumnsFromBytes(bytes, _indexColumns, values);
+                return values;
             }
 
             var row = RowSerializer.Deserialize(_schema, bytes);
-            foreach (var index in _schema.Indexes)
+            for (var i = 0; i < _indexColumns.Length; i++)
             {
-                var column = _schema.Column(index.Column);
+                var column = _schema.Column(_indexColumns[i]);
                 var value = column.GetValue(row);
-                if (value is not null)
-                    yield return (index.Column, SchemaKeyCodec.Encode(column, value));
+                values[i] = value is null ? default : SchemaKeyCodec.Encode(column, value);
             }
+
+            return values;
         }
 
         /// <summary>Accumulates a bulk load into builders and publishes one version at the end.</summary>
@@ -487,9 +505,13 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                     _table.ResidentBytes += key.Length;
                 _rows[key] = bytes;
                 _table.ResidentBytes += bytes.Length;
-                foreach (var (column, value) in _table.IndexedValues(bytes))
+                var values = _table.IndexedValues(bytes);
+                for (var position = 0; position < values.Length; position++)
                 {
-                    var index = _indexes[_table._indexPositions[column]];
+                    var value = values[position];
+                    if (value.Length == 0)
+                        continue;
+                    var index = _indexes[position];
                     index[value] = (index.TryGetValue(value, out var keys) ? keys : EmptyKeys).Add(key);
                 }
             }

@@ -822,6 +822,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         private static readonly ImmutableSortedSet<RowKey> EmptyKeys = ImmutableSortedSet<RowKey>.Empty;
         private readonly Dictionary<string, int> _indexPositions = new(StringComparer.Ordinal);
+
+        /// <summary>Indexed column names in index order — the codec's one-pass encode reads this per put.</summary>
+        private readonly string[] _indexColumns;
         private TableVersion _current;
 
         public TableState(TableSchema schema, Residency declared)
@@ -835,10 +838,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
             Schema = schema;
             Declared = declared;
+            _indexColumns = new string[schema.Indexes.Count];
             var indexes = ImmutableArray.CreateBuilder<ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
+                _indexColumns[i] = schema.Indexes[i].Column;
                 indexes.Add(ImmutableSortedDictionary<RowKey, ImmutableSortedSet<RowKey>>.Empty);
             }
 
@@ -1003,15 +1008,29 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 indexes.MoveToImmutable());
         }
 
+        /// <summary>
+        /// Every indexed column's encoded value for one row, positionally aligned with the schema's
+        /// index list; a zero-length key is a null column value, which is not indexed. One pass over
+        /// the row for the whole set — encoding a column at a time deserialized the entire row per
+        /// index, so a three-index table paid three full deserializes per put.
+        /// </summary>
         public RowKey[]? EncodeIndexValues(ReadOnlySpan<byte> rowBytes)
         {
             if (Schema.Indexes.Count == 0)
                 return null;
-            var values = new RowKey[Schema.Indexes.Count];
-            for (var i = 0; i < Schema.Indexes.Count; i++)
+            var values = new RowKey[_indexColumns.Length];
+            if (Schema.Codec is { } codec)
             {
-                var column = Schema.Indexes[i].Column;
-                values[i] = EncodeColumn(column, rowBytes) ?? default;
+                codec.EncodeColumnsFromBytes(rowBytes, _indexColumns, values);
+                return values;
+            }
+
+            var row = RowSerializer.Deserialize(Schema, rowBytes.ToArray());
+            for (var i = 0; i < _indexColumns.Length; i++)
+            {
+                var columnSchema = Schema.Column(_indexColumns[i]);
+                var value = columnSchema.GetValue(row);
+                values[i] = value is null ? default : SchemaKeyCodec.Encode(columnSchema, value);
             }
 
             return values;
@@ -1075,16 +1094,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             }
 
             return indexes;
-        }
-
-        private RowKey? EncodeColumn(string column, ReadOnlySpan<byte> rowBytes)
-        {
-            if (Schema.Codec is { } codec)
-                return codec.EncodeColumnFromBytes(column, rowBytes);
-            var row = RowSerializer.Deserialize(Schema, rowBytes.ToArray());
-            var columnSchema = Schema.Column(column);
-            var value = columnSchema.GetValue(row);
-            return value is null ? null : SchemaKeyCodec.Encode(columnSchema, value);
         }
 
         private static long EntryOverhead(DirectoryEntry entry)
