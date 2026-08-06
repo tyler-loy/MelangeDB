@@ -138,6 +138,33 @@ internal sealed class ServerSubscription
     }
 
     /// <summary>
+    /// Adopts an already-registered subscription's <see cref="StaticWireColumns"/> when it holds
+    /// the same names, so that equal projections on a table converge on one set instance.
+    /// <para>
+    /// Purely an identity change — the contents are equal either way. It exists so the fan-out's
+    /// wire-column memo can key on reference identity instead of comparing sets per row per
+    /// subscriber: two hundred players running the same client ask for the same columns, and
+    /// without this they would each hold a private, equal, un-poolable set. Registration is rare
+    /// and already scans the table for an initial set, so the peer walk is free by comparison.
+    /// </para>
+    /// </summary>
+    internal void ShareWireColumns(IReadOnlyList<ServerSubscription> peers)
+    {
+        // Null is "every column" — already a shared sentinel, and nothing to converge.
+        if (StaticWireColumns is not { } mine)
+            return;
+
+        foreach (var peer in peers)
+        {
+            if (peer.StaticWireColumns is { } theirs && !ReferenceEquals(theirs, mine) && theirs.SetEquals(mine))
+            {
+                StaticWireColumns = theirs;
+                return;
+            }
+        }
+    }
+
+    /// <summary>
     /// Whether the caller's row policies admit <paramref name="row"/> — union: any policy is
     /// enough, and a table with no row policies is fully visible (it compiled, so it is public).
     /// True with no <see cref="Context"/>: that is the owner-mode bypass.
