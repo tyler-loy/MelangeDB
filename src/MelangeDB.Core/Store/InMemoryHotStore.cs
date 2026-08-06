@@ -72,15 +72,34 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         ArgumentNullException.ThrowIfNull(record);
         if (record.Lsn <= AppliedLsn)
             return;
+
+        if (record.WriteSet.Count == 1)
+        {
+            // The ordinary reducer commit. Grouping one op by table would cost more than it saves.
+            var op = record.WriteSet[0];
+            if (_tables.TryGetValue(op.Table, out var table))
+                table.Apply([op]);
+            AppliedLsn = record.Lsn;
+            return;
+        }
+
+        // Several ops for one table become one version publish. Every intermediate version was
+        // structurally shared but never observed — the whole record applies under the engine's
+        // write lock, so no reader can land between two of its ops — and each one cost a path copy
+        // of the row map plus one of every secondary index. Border batches and multi-row reducers
+        // paid that per row.
+        var byTable = new Dictionary<TableId, List<RowOp>>();
         foreach (var op in record.WriteSet)
         {
-            if (!_tables.TryGetValue(op.Table, out var table))
+            if (!_tables.ContainsKey(op.Table))
                 continue; // A table this projection doesn't know; nothing to project.
-            if (op.Kind == RowOpKind.Delete)
-                table.Remove(op.Key);
-            else
-                table.Put(op.Key, op.Row);
+            if (!byTable.TryGetValue(op.Table, out var ops))
+                byTable[op.Table] = ops = [];
+            ops.Add(op);
         }
+
+        foreach (var (id, ops) in byTable)
+            _tables[id].Apply(ops);
 
         AppliedLsn = record.Lsn;
     }
@@ -370,33 +389,45 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                 ? position
                 : throw new ArgumentException($"Table {table} has no index on column '{column}'.", nameof(column));
 
-        public void Put(RowKey key, ReadOnlyMemory<byte> row)
+        /// <summary>
+        /// Applies one record's ops for this table as a single version publish. The ops thread
+        /// through local row and index references, so a later op in the same record sees the
+        /// earlier ones — and only the result is published.
+        /// </summary>
+        public void Apply(List<RowOp> ops)
         {
             var current = Current;
             var rows = current.Rows;
             var indexes = current.Indexes;
-            if (rows.TryGetValue(key, out var previous))
+            foreach (var op in ops)
             {
-                indexes = Unindex(indexes, key, previous);
-                ResidentBytes -= previous.Length;
-            }
-            else
-            {
-                ResidentBytes += key.Length;
+                if (op.Kind == RowOpKind.Delete)
+                {
+                    if (!rows.TryGetValue(op.Key, out var removed))
+                        continue;
+                    ResidentBytes -= op.Key.Length + removed.Length;
+                    indexes = Unindex(indexes, op.Key, removed);
+                    rows = rows.Remove(op.Key);
+                    continue;
+                }
+
+                if (rows.TryGetValue(op.Key, out var previous))
+                {
+                    indexes = Unindex(indexes, op.Key, previous);
+                    ResidentBytes -= previous.Length;
+                }
+                else
+                {
+                    ResidentBytes += op.Key.Length;
+                }
+
+                var bytes = op.Row.ToArray();
+                ResidentBytes += bytes.Length;
+                rows = rows.SetItem(op.Key, bytes);
+                indexes = Index(indexes, op.Key, bytes);
             }
 
-            var bytes = row.ToArray();
-            ResidentBytes += bytes.Length;
-            Current = new TableVersion(rows.SetItem(key, bytes), Index(indexes, key, bytes));
-        }
-
-        public void Remove(RowKey key)
-        {
-            var current = Current;
-            if (!current.Rows.TryGetValue(key, out var previous))
-                return;
-            ResidentBytes -= key.Length + previous.Length;
-            Current = new TableVersion(current.Rows.Remove(key), Unindex(current.Indexes, key, previous));
+            Current = new TableVersion(rows, indexes);
         }
 
         /// <summary>
