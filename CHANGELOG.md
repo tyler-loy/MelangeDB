@@ -12,6 +12,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`HotStore:HashBuckets`.** Sizes the FASTER hash index, rounded up to a power of two; zero derives it
+  from `HotStore:MemoryBudgetBytes`. It was a hardcoded 65,536 regardless of budget or row count — an
+  index sized for roughly a quarter of a million records whatever the configuration said, past which
+  chains lengthen and a lookup that should be one probe becomes several, each a candidate for a pending
+  I/O completion on a paged table.
+- **Fsync workload guidance** in [docs/CONFIGURATION.md](docs/CONFIGURATION.md): the ~47× spread between
+  `OnCommit` and `Interval`, and the rule for choosing between them — simulation state takes `Interval`,
+  anything a player can dispute takes `OnCommit`, and a database holding both takes `OnCommit`.
+- **`IMelangeSerializer.Measure`.** The exact serialized length of a frame without producing it, so the
+  delta path can judge backpressure under the engine's write lock and encode on the sender.
+
 - **`1003 SlowReducer` now says which half was slow.** The warning and the `melange.slow_reducer` span
   event carry `BodyMs`/`melange.body_ms`, `CommitMs`, `FsyncMs`, `PostCommitMs`, and `Rows` alongside the
   total. A wide reducer body and a stalled disk produced identical warnings before, and telling them apart
@@ -118,6 +129,36 @@ All packages ship together at one version; there is no per-package versioning. S
   in any scheduled table is now also warned about (EventId 1723).
 
 ### Changed
+
+- **A row is decoded once per fan-out, not once per subscriber.** `RowWire.ToColumns` ran per
+  subscription, so a commit on a table with N subscribers built N identical column dictionaries — and N
+  copies of the same key — on the engine thread while holding the write lock. Both are computed once per
+  op and shared; equal projections converge on one wire-column set at registration so the memo can key on
+  reference identity.
+- **Delta frames are measured under the write lock and encoded on the sender.** The full MessagePack
+  encode used to run on the engine thread, once per connection, before the next reducer could enter.
+  `Subscriptions:MaxBufferedBytes` keeps its exact meaning and its default: measuring runs the writer's
+  own path against a counting sink, so it cannot drift from what serialization produces.
+- **`FilterRange` on a primary key walks the key directory.** It filtered a full merged scan, reading
+  every row below the window to discard it — the same defect `ScanKeys` fixed for subscriptions (~3s
+  against ~5ms on a 24k-row table of 9KB blobs), which had survived on the reducer-facing side because
+  `ScanKeys` had exactly one caller. It now seeks to the low bound and stops at the high one.
+- **The merged overlay scan streams.** It built a `SortedDictionary` of the entire store scan whenever
+  the write set held any pending op for the table, so a reducer that inserted one row and then took
+  `First` read the whole table — and on a paged store faulted all of it in.
+- **Index maintenance reads a row once per put, not once per indexed column.** A three-index table paid
+  three full deserializes — each re-allocating that row's string and byte columns — on every put and
+  every remove.
+- **The in-memory store publishes one version per record per table, not one per op.** Every intermediate
+  version was structurally shared but never observable, and each cost a path copy of the row map plus one
+  of every secondary index.
+- **`WriteSet.OpsFor` is indexed by table.** It scanned every staged op to find one table's, on every
+  overlay read.
+- **Refilled rate-limiter buckets are evicted.** The map held one bucket per (identity, reducer) forever.
+  Eviction changes no decision: buckets are created full, so a refilled bucket is indistinguishable from
+  one that never existed, and a caller mid-burst is never evicted.
+- **The FASTER store composes keys into a reused buffer** instead of allocating a `byte[]` per upsert,
+  delete, and read.
 
 - **`1003 SlowReducer` now thresholds on the locked portion, not the total**, at every isolation level,
   and carries `LockedMs` and `Isolation` alongside the existing split (`melange.locked_ms` and
