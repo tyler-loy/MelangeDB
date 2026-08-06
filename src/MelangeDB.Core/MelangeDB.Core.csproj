@@ -19,6 +19,9 @@
          options instance when composing per-shard engines. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
     <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
+    <!-- The commit-path benchmark measures LogRecordCodec on its own, because "which of the six
+         allocation sites dominates" cannot be answered from the outside of a whole commit. -->
+    <InternalsVisibleTo Include="MelangeDB.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>

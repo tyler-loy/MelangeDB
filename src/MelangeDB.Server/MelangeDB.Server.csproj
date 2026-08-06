@@ -21,6 +21,9 @@
          connection, authenticator, and subscription machinery a single node uses. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
     <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
+    <!-- The wire and fan-out suites measure RowWire and the subscription engine directly; the whole
+         question they answer is what a row costs between the store and the socket. -->
+    <InternalsVisibleTo Include="MelangeDB.Benchmarks" />
   </ItemGroup>
 
 </Project>

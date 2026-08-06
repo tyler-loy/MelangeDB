@@ -17,6 +17,13 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Storage.Faster\MelangeDB.Storage.Faster.csproj" />
+    <!-- The fan-out and wire suites measure the subscription engine and the frame serializer, which
+         is where the delta path's cost actually lives. -->
+    <ProjectReference Include="..\..\src\MelangeDB.Server\MelangeDB.Server.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.Protocol\MelangeDB.Protocol.csproj" />
+    <!-- Without the generator every suite falls back to the reflection codec, which is not the path
+         the server runs. Gap 4 is a question about the generated codec specifically. -->
+    <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>
