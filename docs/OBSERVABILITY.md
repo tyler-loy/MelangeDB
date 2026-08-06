@@ -106,19 +106,29 @@ Source name: `MelangeDB`.
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
-A `melange.reducer` span whose duration exceeds `Telemetry:SlowReducerMs` additionally carries a
+A `melange.reducer` span whose **locked portion** exceeds `Telemetry:SlowReducerMs` additionally carries a
 `melange.slow_reducer` span event and produces a warning log entry (`1003`) — shipped with phase 02,
 threshold live-reloadable. Both carry the same split, because a slow transaction has more than one cause
 and they call for opposite responses:
 
 | Field | Span event tag | Log field | What a large value means |
 | --- | --- | --- | --- |
-| Total | `melange.duration_ms` | `DurationMs` | How long the write lock was held. |
+| Locked | `melange.locked_ms` | `LockedMs` | How long the write lock was held — the threshold fires on this, and it is global write latency. |
+| Total | `melange.duration_ms` | `DurationMs` | The whole transaction. Equal to `LockedMs` under `Isolation.Serialized`. |
 | Body | `melange.body_ms` | `BodyMs` | The module does too much per transaction — narrow the window. |
 | Commit | `melange.commit_ms` | `CommitMs` | The log append, fsync included. |
 | Fsync | `melange.fsync_ms` | `FsyncMs` | Disk contention on this host — infrastructure, not application. |
 | Post-commit | `melange.post_commit_ms` | `PostCommitMs` | A commit observer, an applier handoff, or an automatic snapshot. |
 | Rows | `melange.writeset.rows` | `Rows` | Sizes the transaction; a wide body with one row op is a read-side problem. |
+| Isolation | `melange.isolation` | `Isolation` | `serialized` or `snapshot` — which of the two numbers above to believe. |
+
+**`LockedMs` and `DurationMs` are the same interval under the default `Isolation.Serialized`**, because the
+write lock covers the whole transaction; that path's warnings are exactly what they were before snapshot
+isolation existed. Under `Isolation.Snapshot` the body ran outside the lock, so the gap between the two
+numbers is precisely the stall that isolation level removed — and a 500 ms snapshot body does not warn at
+all, because it froze nothing. That is the point of thresholding on the locked half: an alert built to catch
+write stalls should not fire on a reducer that caused none. `melange.isolation` is also a tag on the
+`melange.reducer` span itself, so the two populations can be separated before any warning is involved.
 
 `76.9ms body / 2.3ms commit` and `0.5ms body / 141.7ms commit (141.6ms fsync)` are the two failures that
 used to produce identical warnings — one fixed in the module, one on the host. Body time is measured
@@ -131,23 +141,37 @@ reducer body.
 to the appending transaction; a zero would read as "the disk was instant". Those warnings keep event id
 `1003` — alerts key on the id — under the event name `SlowReducerDeferredFsync` rather than `SlowReducer`.
 
-**A transaction that aborts warns too.** Rolling back costs nothing and buys nothing: the write lock was
-held for the full duration either way, so a reducer that walks five thousand rows and then rejects the move
-stalls every other writer exactly as long as one that commits. Those entries carry `melange.outcome` /
-`Outcome` — `abort` for a bug, `rejected` for an ordinary refusal that happened to be expensive — under the
-event name `SlowReducerAborted`, again on id `1003`. They report `DurationMs` and `BodyMs` only: nothing was
-appended, so there is no commit, fsync, or post-commit to attribute, and zeroes would invite a dashboard to
-average them into the committed ones. A rejection is a normal outcome and warning on it is deliberate,
-because "rejections are cheap" is exactly the assumption that makes a validating reducer expensive; an alert
-that disagrees can filter on `Outcome`.
+**A transaction that aborts warns too.** For a serialized transaction, rolling back costs nothing and buys
+nothing: the write lock was held for the full duration either way, so a reducer that walks five thousand rows
+and then rejects the move stalls every other writer exactly as long as one that commits. Those entries carry
+`melange.outcome` / `Outcome` — `abort` for a bug, `rejected` for an ordinary refusal that happened to be
+expensive — under the event name `SlowReducerAborted`, again on id `1003`. They report `LockedMs`,
+`DurationMs`, and `BodyMs` only: nothing was appended, so there is no commit, fsync, or post-commit to
+attribute, and zeroes would invite a dashboard to average them into the committed ones. A rejection is a
+normal outcome and warning on it is deliberate, because "rejections are cheap" is exactly the assumption that
+makes a validating reducer expensive; an alert that disagrees can filter on `Outcome`. A *snapshot*
+transaction that threw in its body held no lock and so does not reach this warning at all; one rejected by a
+commit guard reports the commit attempt it did hold.
 
-**Read reducer duration as global write latency.** The engine's write lock is held across the entire
-transaction — body, commit guards, append, fsync, commit observers, and any automatic snapshot the commit
-triggers (see [DESIGN.md §4](DESIGN.md)). Every millisecond on a `melange.reducer` span is a millisecond in
-which no other transaction on that engine could start. So `Telemetry:SlowReducerMs` is not "how slow is too
-slow for this caller" but **"how long is it acceptable to freeze the world"**, and a `melange.reducer`
-histogram is the closest thing the system has to a write-stall metric. Reads are exempt: subscription fan-out
-and committed reads take no lock and keep serving throughout.
+**`1004 SnapshotIsolationUnavailable`** fires once per engine when a reducer declares
+`Isolation.Snapshot` but the configured hot store does not implement `IReadViewSource`. Such reducers run
+serialized — correct, just not faster — and both shipped stores offer pinned reads, so this is a signal about
+a custom or future store rather than about a MelangeDB deployment. Degrading rather than refusing to start is
+deliberate: isolation is a latency property, not a semantic one. Degrading *silently* is what would be wrong.
+
+**Read reducer duration as global write latency — unless the span says `snapshot`.** For the default
+`Isolation.Serialized`, the engine's write lock is held across the entire transaction: body, commit guards,
+append, fsync, commit observers, and any automatic snapshot the commit triggers (see
+[DESIGN.md §4](DESIGN.md)). Every millisecond on such a `melange.reducer` span is a millisecond in which no
+other transaction on that engine could start. So `Telemetry:SlowReducerMs` is not "how slow is too slow for
+this caller" but **"how long is it acceptable to freeze the world"**, and a `melange.reducer` histogram is
+the closest thing the system has to a write-stall metric. Reads are exempt: subscription fan-out and
+committed reads take no lock and keep serving throughout.
+
+A span tagged `melange.isolation=snapshot` breaks that reading, on purpose — its body ran outside the lock,
+so its duration is what the reducer cost and **not** what it cost everyone else. Use `melange.locked_ms` for
+the write-stall view and filter the histogram by isolation, or a sweep deliberately moved off the lock will
+show up as the worst write-latency offender on the dashboard precisely because it stopped being one.
 
 ### Context propagation
 
@@ -221,6 +245,7 @@ No parallel logging abstraction — the host's configured providers are the whol
 Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer` —
 also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flush, and
 `SlowReducerAborted` when the transaction did not commit, both under the same id —
+`1004 SnapshotIsolationUnavailable`, once per engine when a store offers no pinned reads,
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
 `1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,

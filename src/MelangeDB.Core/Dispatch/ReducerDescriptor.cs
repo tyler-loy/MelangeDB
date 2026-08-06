@@ -20,7 +20,8 @@ public sealed class ReducerDescriptor
         ReducerArgsValidator validate,
         ReducerBodyInvoker invoke,
         Type? policy = null,
-        ReducerSite site = ReducerSite.Shard)
+        ReducerSite site = ReducerSite.Shard,
+        Isolation isolation = Isolation.Serialized)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(reducerClass);
@@ -33,6 +34,7 @@ public sealed class ReducerDescriptor
         Invoke = invoke;
         Policy = policy;
         ExecutionSite = site == ReducerSite.Auto ? ReducerSite.Shard : site;
+        Isolation = isolation;
     }
 
     /// <summary>The reducer's public name; the dispatcher's key.</summary>
@@ -61,6 +63,13 @@ public sealed class ReducerDescriptor
     /// <see cref="ReducerSite.Auto"/> here. Single-node deployments ignore it.
     /// </summary>
     public ReducerSite ExecutionSite { get; }
+
+    /// <summary>
+    /// How the body is isolated, from <c>[Reducer(Isolation = ...)]</c>; see
+    /// <see cref="MelangeDB.Isolation"/>. <see cref="Isolation.Serialized"/> unless declared
+    /// otherwise — the engine never infers this.
+    /// </summary>
+    public Isolation Isolation { get; }
 }
 
 /// <summary>Encodes reducer arguments into the wire form the generated dispatcher decodes.</summary>

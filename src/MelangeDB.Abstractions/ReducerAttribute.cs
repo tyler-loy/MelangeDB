@@ -53,6 +53,49 @@ public enum ReducerSite
 }
 
 /// <summary>
+/// How a reducer body is isolated from other transactions on the same engine.
+/// <para>
+/// <b>The rule that decides which one you want:</b> snapshot isolation is safe for
+/// <em>recompute-from-scratch</em> and unsafe for <em>read-modify-write</em>. A body that reads
+/// state, computes a value from it, and writes that value is safe — if the state moved underneath,
+/// two concurrent runs each write a defensible answer and the last one wins. A body that reads a
+/// value, adds a delta, and writes the sum is not: two runs read the same number and one increment
+/// is lost, silently and permanently.
+/// </para>
+/// <para>
+/// Both shapes routinely live in the same reducer, which is why this is opt-in per reducer and
+/// never inferred. The compiler cannot tell a recompute from an increment; the module author can.
+/// </para>
+/// </summary>
+public enum Isolation
+{
+    /// <summary>
+    /// The engine's write lock is held across the whole transaction — body, guards, append, and
+    /// commit. One global lock around the whole body <em>is</em> serializable, and this is the
+    /// default. Time spent in the body is global write latency.
+    /// </summary>
+    Serialized,
+
+    /// <summary>
+    /// The body runs outside the write lock against a read view pinned at one LSN; only reconcile,
+    /// the commit guards, and the append serialize. A sweep that spends 200 ms reading and 0.2 ms
+    /// writing stops charging the other 199.8 ms to every writer on the engine.
+    /// <para>
+    /// What you give up: the body's reads are <b>advisory</b>. There is no read-set validation and
+    /// no retry — the declaration is the contract. Rows read may have changed by the time the write
+    /// set lands, and the write set is reconciled against committed state (an update of a row since
+    /// deleted becomes an insert, a delete of a missing row drops) so it applies cleanly. Reconcile
+    /// fixes op <em>shape</em>, never op <em>value</em>: it cannot rescue a lost increment.
+    /// </para>
+    /// <para>
+    /// Read-your-writes inside the body is unaffected — the write-set overlay is transaction-local
+    /// and has nothing to do with which store view the reads resolve against.
+    /// </para>
+    /// </summary>
+    Snapshot,
+}
+
+/// <summary>
 /// Marks a method as a reducer: invoked as a single transaction against the database. A reducer is
 /// synchronous, performs no I/O, returns to commit, and throws to abort with nothing appended.
 /// </summary>
@@ -86,4 +129,12 @@ public sealed class ReducerAttribute : Attribute
     /// error naming this property).
     /// </summary>
     public ReducerSite Site { get; set; }
+
+    /// <summary>
+    /// How this reducer's body is isolated; see <see cref="MelangeDB.Isolation"/>. Leave at
+    /// <see cref="Isolation.Serialized"/> unless the body is a read-heavy sweep whose reads can be
+    /// advisory — and read the eligibility rule before setting it, because the failure mode of
+    /// getting it wrong is lost writes with no error anywhere.
+    /// </summary>
+    public Isolation Isolation { get; set; }
 }

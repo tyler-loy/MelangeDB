@@ -10,12 +10,19 @@ namespace MelangeDB.Core;
 internal sealed class TransactionDb : IDbView
 {
     private readonly SchemaRegistry _registry;
-    private readonly IHotStore _store;
+    private readonly IHotStoreReader _store;
     private readonly WriteSet _writeSet;
     private readonly AutoIncStage _autoInc;
     private readonly TableAccessGuard? _guard;
 
-    public TransactionDb(SchemaRegistry registry, IHotStore store, WriteSet writeSet, AutoIncStage autoInc, TableAccessGuard? guard = null)
+    /// <summary>
+    /// Takes an <see cref="IHotStoreReader"/> rather than an <see cref="IHotStore"/> because a
+    /// snapshot-isolated transaction hands it an <see cref="IHotStoreReadView"/> pinned at one LSN
+    /// instead of the live store. Nothing here needs a member the live store adds — no
+    /// <c>Apply</c>, no <c>AppliedLsn</c> — so reading and applying stay separable, which is the
+    /// whole point of the split.
+    /// </summary>
+    public TransactionDb(SchemaRegistry registry, IHotStoreReader store, WriteSet writeSet, AutoIncStage autoInc, TableAccessGuard? guard = null)
     {
         _registry = registry;
         _store = store;

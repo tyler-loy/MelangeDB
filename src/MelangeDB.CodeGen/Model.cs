@@ -178,7 +178,8 @@ internal sealed record ReducerModel(
     string DeclaredSite = "Auto",
     EquatableArray<string> TouchedTables = default,
     bool OpaqueBody = false,
-    EquatableArray<EnumModel> Enums = default)
+    EquatableArray<EnumModel> Enums = default,
+    string Isolation = "Serialized")
 {
     public bool IsValid => Diagnostics.Length == 0;
 

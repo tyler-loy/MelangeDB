@@ -20,14 +20,17 @@ internal sealed class EngineHarness : IDisposable
     private readonly Type[] _tables;
     private readonly bool _useReflectionSchema;
     private readonly ILoggerFactory? _loggerFactory;
+    private readonly IHotStoreProvider? _storeProvider;
 
     public EngineHarness(
         FsyncPolicy fsyncPolicy = FsyncPolicy.OnCommit,
         bool telemetryEnabled = true,
         Type[]? tables = null,
         bool useReflectionSchema = false,
-        ILoggerFactory? loggerFactory = null)
+        ILoggerFactory? loggerFactory = null,
+        IHotStoreProvider? storeProvider = null)
     {
+        _storeProvider = storeProvider;
         _tables = tables ?? DefaultTables;
         _useReflectionSchema = useReflectionSchema;
         _loggerFactory = loggerFactory;
@@ -53,6 +56,21 @@ internal sealed class EngineHarness : IDisposable
 
     public void Invoke(string reducerName, Action<ReducerContext> body) =>
         Engine.Invoke(reducerName, Caller, body);
+
+    /// <summary>
+    /// Invokes under <see cref="Isolation.Snapshot"/>. Goes through the pre-encoded overload because
+    /// that is the one the generated dispatcher uses, and it is the only one carrying the isolation
+    /// argument — an isolation level is a property of a declared reducer, not of an ad-hoc call.
+    /// </summary>
+    public void InvokeSnapshot(string reducerName, Action<ReducerContext> body) =>
+        Engine.Invoke(
+            reducerName,
+            Caller,
+            ReadOnlyMemory<byte>.Empty,
+            body,
+            ConnectionId.None,
+            parentContext: default,
+            Isolation.Snapshot);
 
     /// <summary>
     /// Restarts the engine, rebuilding from the log alone. Windows file sharing requires closing
@@ -108,5 +126,5 @@ internal sealed class EngineHarness : IDisposable
         new(new MelangeDB.Generated.MelangeModel().Tables().Where(t => tables.Contains(t.RowType)));
 
     private MelangeEngine CreateEngine() =>
-        new(Options, CreateRegistry(), _loggerFactory);
+        new(Options, CreateRegistry(), _loggerFactory, hotStoreProvider: _storeProvider);
 }
