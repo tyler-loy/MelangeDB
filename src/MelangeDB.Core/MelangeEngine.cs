@@ -26,6 +26,10 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly List<Func<ulong?>> _truncationFloors = [];
     private TableAccessGuard? _tableGuard;
     private readonly IDisposable? _storeLifetime;
+    // Null when the configured hot store does not offer pinned reads. Snapshot-isolated reducers
+    // then run serialized instead — see InvokeCore's fallback, which says so once and loudly.
+    private IReadViewSource? _readViewSource;
+    private int _snapshotUnavailableReported;
     private long _commitsSinceSnapshot;
     private Timestamp? _tailTimestamp;
     private bool _disposed;
@@ -76,6 +80,7 @@ public sealed partial class MelangeEngine : IDisposable
 
             _tailTimestamp = RecoveredTailTimestamp;
             HotStore = store;
+            _readViewSource = store as IReadViewSource;
             Appliers = new ApplierPipeline(_log, _telemetry);
             Appliers.Register(new HotStoreApplier(store));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
@@ -254,8 +259,14 @@ public sealed partial class MelangeEngine : IDisposable
     /// <summary>
     /// Invokes a reducer body with pre-encoded arguments — the generated dispatch path, which
     /// decoded (and validated) the same bytes before this call. <paramref name="parentContext"/>
-    /// parents the reducer span when a transport propagated a caller's trace context. Holds the
-    /// write lock across the whole call, as the overload above describes.
+    /// parents the reducer span when a transport propagated a caller's trace context.
+    /// <para>
+    /// Holds the write lock across the whole call as the overload above describes, unless
+    /// <paramref name="isolation"/> is <see cref="Isolation.Snapshot"/> — then the body runs outside
+    /// the lock against a read view pinned at one LSN, and only reconcile, the guards, and the
+    /// append serialize. Read <see cref="Isolation"/> before declaring that: the failure mode of
+    /// declaring it on a read-modify-write body is lost writes with no error anywhere.
+    /// </para>
     /// </summary>
     public ulong Invoke(
         string reducerName,
@@ -263,7 +274,8 @@ public sealed partial class MelangeEngine : IDisposable
         ReadOnlyMemory<byte> encodedArguments,
         Action<ReducerContext> body,
         ConnectionId connectionId = default,
-        ActivityContext parentContext = default)
+        ActivityContext parentContext = default,
+        Isolation isolation = Isolation.Serialized)
     {
         ArgumentException.ThrowIfNullOrEmpty(reducerName);
         ArgumentNullException.ThrowIfNull(body);
@@ -272,6 +284,19 @@ public sealed partial class MelangeEngine : IDisposable
             throw new InvalidOperationException(
                 "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
                 "Extract shared logic into a plain method both reducers call.");
+        }
+
+        if (isolation == Isolation.Snapshot && ReadViewOrFallback() is { } source)
+        {
+            _inReducer.Value = true;
+            try
+            {
+                return InvokeSnapshot(reducerName, caller, body, encodedArguments, connectionId, parentContext, source);
+            }
+            finally
+            {
+                _inReducer.Value = false;
+            }
         }
 
         lock (_writeLock)
@@ -286,6 +311,27 @@ public sealed partial class MelangeEngine : IDisposable
                 _inReducer.Value = false;
             }
         }
+    }
+
+    /// <summary>
+    /// The pinned-read capability, or null when the configured store has none — in which case a
+    /// snapshot-isolated reducer runs serialized and the engine says so once.
+    /// <para>
+    /// Degrading rather than failing is deliberate. Isolation is a <em>latency</em> property, not a
+    /// semantic one: a body written for snapshot isolation is still correct when run serialized,
+    /// just slower and holding the lock. Refusing to start would turn a performance feature into a
+    /// hard dependency on a store capability that <see cref="IReadViewSource"/> deliberately makes
+    /// optional. Degrading <em>silently</em> is the option that is actually wrong, which is why this
+    /// warns rather than merely not-crashing.
+    /// </para>
+    /// </summary>
+    private IReadViewSource? ReadViewOrFallback()
+    {
+        if (_readViewSource is { } source)
+            return source;
+        if (Interlocked.Exchange(ref _snapshotUnavailableReported, 1) == 0)
+            LogMessages.SnapshotIsolationUnavailable(_logger, HotStore.GetType().Name);
+        return null;
     }
 
     /// <summary>
@@ -729,6 +775,7 @@ public sealed partial class MelangeEngine : IDisposable
         ActivityContext parentContext = default)
     {
         using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments, parentContext);
+        activity?.SetTag("melange.isolation", "serialized");
         var started = Stopwatch.GetTimestamp();
         var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
         var writeSet = new WriteSet();
@@ -765,8 +812,10 @@ public sealed partial class MelangeEngine : IDisposable
             activity?.SetTag("melange.writeset.rows", 0);
             activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
             _telemetry?.RecordTransaction(reducerName, outcome, abortedAfter, 0);
+            // The whole of a serialized transaction is the locked portion: `started` is read inside
+            // the lock, so this duration and the lock hold are the same interval.
             if (abortedAfter > _options.Telemetry.SlowReducerMs)
-                WarnSlowAbort(activity, reducerName, outcome, abortedAfter, abortedBodyMs);
+                WarnSlowAbort(activity, reducerName, outcome, abortedAfter, abortedBodyMs, abortedAfter, Isolation.Serialized);
             throw;
         }
 
@@ -799,10 +848,158 @@ public sealed partial class MelangeEngine : IDisposable
         activity?.SetTag("melange.writeset.rows", ops.Count);
         var elapsed = Elapsed(started);
         _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
+        // Locked and total are the same interval here, by construction: `started` is read inside
+        // the lock. The threshold is on the locked portion at every isolation level, and for a
+        // serialized transaction that is the whole transaction — so this path's behaviour is
+        // exactly what it was before snapshot isolation existed.
         if (elapsed > _options.Telemetry.SlowReducerMs)
-            WarnSlowReducer(activity, reducerName, elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count);
+            WarnSlowReducer(activity, reducerName, elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count, elapsed, Isolation.Serialized);
 
         return committedLsn;
+    }
+
+    /// <summary>
+    /// Invokes a reducer body under <see cref="Isolation.Snapshot"/>: the body runs <em>outside</em>
+    /// the write lock against an <see cref="IHotStoreReadView"/> pinned at one LSN, and only the
+    /// commit — reconcile, the guards, the append, and the post-commit fan-out — serializes.
+    /// <para>
+    /// Two things differ from the serialized path beyond where the lock sits, and both are forced by
+    /// the body no longer being alone. AutoInc ids are <b>reserved as allocated</b> rather than
+    /// staged, because two concurrent bodies staging against one sequence hand out the same id. And
+    /// the write set is <b>reconciled</b> against committed state before the guards see it, because
+    /// the body decided against a view that may since have moved: an update of a row someone deleted
+    /// becomes an insert, a delete of a row already gone drops. Reconcile fixes op shape, never op
+    /// value — it cannot rescue a lost increment, which is why the eligibility rule on
+    /// <see cref="Isolation"/> is the feature's first documentation and not its last.
+    /// </para>
+    /// </summary>
+    private ulong InvokeSnapshot(
+        string reducerName,
+        Identity caller,
+        Action<ReducerContext> body,
+        ReadOnlyMemory<byte> encodedArguments,
+        ConnectionId connectionId,
+        ActivityContext parentContext,
+        IReadViewSource source)
+    {
+        using var activity = _telemetry?.StartReducer(reducerName, caller, arguments: null, encodedArguments, parentContext);
+        activity?.SetTag("melange.isolation", "snapshot");
+        var started = Stopwatch.GetTimestamp();
+
+        // What the body sees. The log record gets its own timestamp at append time below: a body
+        // that ran for 200 ms would otherwise stamp a record 200 ms older than one a serialized
+        // transaction appended meanwhile, putting the log's timestamps out of order against its own
+        // LSNs. The body still wants a stable start-of-transaction clock — a scheduled sweep derives
+        // its next fire from it, and deriving that from commit time would drift the cadence by
+        // however long the body happened to take.
+        var bodyTimestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
+        var writeSet = new WriteSet();
+        var stage = _sequencer.BeginStage(reserveEagerly: true);
+        var random = new Random(unchecked((int)bodyTimestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
+        var events = new EventStage(_options.Events);
+
+        IReadOnlyList<RowOp> ops;
+        var bodyStarted = Stopwatch.GetTimestamp();
+        double? bodyMs = null;
+        try
+        {
+            // Disposed before the lock is taken: the pin is the body's, and holding it across the
+            // commit would keep versions alive for no reader.
+            using (var view = source.OpenReadView())
+            {
+                var context = new ReducerContext(
+                    caller,
+                    connectionId,
+                    bodyTimestamp,
+                    random,
+                    new TransactionDb(Schema, view, writeSet, stage, _tableGuard),
+                    events);
+                body(context);
+            }
+
+            bodyMs = Elapsed(bodyStarted);
+            ops = writeSet.ToOps();
+        }
+        catch (Exception exception)
+        {
+            // Aborted in the body, which held no lock — so unlike a serialized abort this one
+            // stalled nobody, and the locked portion it reports is zero.
+            ReportAbort(activity, reducerName, exception, Elapsed(started), bodyMs ?? Elapsed(bodyStarted), lockedMs: 0);
+            throw;
+        }
+
+        ulong committedLsn = 0;
+        var commitMs = 0d;
+        double? fsyncMs = null;
+        var postCommitMs = 0d;
+        var lockedStarted = Stopwatch.GetTimestamp();
+        double lockedMs;
+        try
+        {
+            lock (_writeLock)
+            {
+                // Measured from inside: waiting for the lock is not holding it, and billing the wait
+                // to this transaction would blame the queue on whoever happened to be last in it.
+                lockedStarted = Stopwatch.GetTimestamp();
+                ops = ReconcileOps(ops);
+                RunCommitGuards(reducerName, ops, CommitOrigin.Reducer);
+                if (ops.Count > 0 || events.Events is { Count: > 0 })
+                {
+                    using var commit = _telemetry?.StartCommit();
+                    var commitStarted = Stopwatch.GetTimestamp();
+                    var record = _log.Append(new CommitRequest(
+                        Timestamp.FromDateTimeOffset(_time.GetUtcNow()), caller, reducerName, encodedArguments, ops, events.Events));
+                    commitMs = Elapsed(commitStarted);
+                    fsyncMs = _log.LastAppendFsyncMilliseconds;
+                    _telemetry?.RecordCommitDuration(commitMs);
+                    commit?.SetTag("melange.lsn", (long)record.Lsn);
+                    commit?.SetTag("melange.writeset.bytes", record.SerializedLength);
+                    var postCommitStarted = Stopwatch.GetTimestamp();
+                    stage.Commit();
+                    NotifyCommitObservers(record);
+                    Appliers.NotifyAppended(record);
+                    AfterCommit(record.Timestamp);
+                    postCommitMs = Elapsed(postCommitStarted);
+                    committedLsn = record.Lsn;
+                }
+
+                lockedMs = Elapsed(lockedStarted);
+            }
+        }
+        catch (Exception exception)
+        {
+            // A guard rejected, or the append failed. The body's work is discarded; the ids it
+            // reserved are not returned to the sequence, which is what "unique, not dense" buys.
+            ReportAbort(activity, reducerName, exception, Elapsed(started), bodyMs.GetValueOrDefault(), Elapsed(lockedStarted));
+            throw;
+        }
+
+        activity?.SetTag("melange.outcome", "commit");
+        activity?.SetTag("melange.writeset.rows", ops.Count);
+        var elapsed = Elapsed(started);
+        _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
+        if (lockedMs > _options.Telemetry.SlowReducerMs)
+            WarnSlowReducer(activity, reducerName, elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count, lockedMs, Isolation.Snapshot);
+
+        return committedLsn;
+    }
+
+    /// <summary>Shared abort reporting for the snapshot path's two failure points.</summary>
+    private void ReportAbort(
+        Activity? activity,
+        string reducerName,
+        Exception exception,
+        double elapsed,
+        double bodyMs,
+        double lockedMs)
+    {
+        var outcome = exception is RejectedException ? "rejected" : "abort";
+        activity?.SetTag("melange.outcome", outcome);
+        activity?.SetTag("melange.writeset.rows", 0);
+        activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
+        _telemetry?.RecordTransaction(reducerName, outcome, elapsed, 0);
+        if (lockedMs > _options.Telemetry.SlowReducerMs)
+            WarnSlowAbort(activity, reducerName, outcome, elapsed, bodyMs, lockedMs, Isolation.Snapshot);
     }
 
     /// <summary>
@@ -819,7 +1016,9 @@ public sealed partial class MelangeEngine : IDisposable
         double commitMs,
         double? fsyncMs,
         double postCommitMs,
-        int rows)
+        int rows,
+        double lockedMs,
+        Isolation isolation)
     {
         if (activity is not null)
         {
@@ -830,6 +1029,11 @@ public sealed partial class MelangeEngine : IDisposable
                 ["melange.commit_ms"] = commitMs,
                 ["melange.post_commit_ms"] = postCommitMs,
                 ["melange.writeset.rows"] = rows,
+                // The number the threshold actually fired on, and the one an alert about write
+                // latency wants. For a serialized transaction it equals melange.duration_ms; for a
+                // snapshot one the gap between them is the stall the feature removed.
+                ["melange.locked_ms"] = lockedMs,
+                ["melange.isolation"] = IsolationTag(isolation),
             };
             // Absent, not zero: under a deferred fsync policy there was no flush to attribute, and
             // a zero would read as "the disk was instant".
@@ -839,20 +1043,34 @@ public sealed partial class MelangeEngine : IDisposable
         }
 
         var threshold = _options.Telemetry.SlowReducerMs;
+        var tag = IsolationTag(isolation);
         if (fsyncMs is { } inlineFsync)
-            LogMessages.SlowReducer(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, inlineFsync, postCommitMs, rows);
+            LogMessages.SlowReducer(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, inlineFsync, postCommitMs, rows, lockedMs, tag);
         else
-            LogMessages.SlowReducerDeferredFsync(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, postCommitMs, rows);
+            LogMessages.SlowReducerDeferredFsync(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, postCommitMs, rows, lockedMs, tag);
     }
 
+    private static string IsolationTag(Isolation isolation) =>
+        isolation == Isolation.Snapshot ? "snapshot" : "serialized";
+
     /// <summary>
-    /// Reports one over-threshold transaction that aborted. Rolling back costs nothing and buys
-    /// nothing here: the write lock was held for the full duration either way, so a reducer that
-    /// walks five thousand rows and then rejects the move stalls every other writer exactly as long
-    /// as one that commits. Only the parts that happened are reported — there is no commit, no
-    /// fsync, and no post-commit to attribute, and zeroes would invite the reader to average them.
+    /// Reports one over-threshold transaction that aborted. For a serialized transaction, rolling
+    /// back costs nothing and buys nothing: the write lock was held for the full duration either
+    /// way, so a reducer that walks five thousand rows and then rejects the move stalls every other
+    /// writer exactly as long as one that commits. For a snapshot transaction that threw in its
+    /// body, the locked portion is zero and it stalled nobody — which is why the threshold is on
+    /// <paramref name="lockedMs"/> and not on the total. Only the parts that happened are reported —
+    /// there is no commit, no fsync, and no post-commit to attribute, and zeroes would invite the
+    /// reader to average them.
     /// </summary>
-    private void WarnSlowAbort(Activity? activity, string reducerName, string outcome, double elapsed, double bodyMs)
+    private void WarnSlowAbort(
+        Activity? activity,
+        string reducerName,
+        string outcome,
+        double elapsed,
+        double bodyMs,
+        double lockedMs,
+        Isolation isolation)
     {
         activity?.AddEvent(new ActivityEvent(
             "melange.slow_reducer",
@@ -862,8 +1080,11 @@ public sealed partial class MelangeEngine : IDisposable
                 ["melange.body_ms"] = bodyMs,
                 ["melange.outcome"] = outcome,
                 ["melange.writeset.rows"] = 0,
+                ["melange.locked_ms"] = lockedMs,
+                ["melange.isolation"] = IsolationTag(isolation),
             }));
-        LogMessages.SlowReducerAborted(_logger, reducerName, elapsed, outcome, _options.Telemetry.SlowReducerMs, bodyMs);
+        LogMessages.SlowReducerAborted(
+            _logger, reducerName, elapsed, outcome, _options.Telemetry.SlowReducerMs, bodyMs, lockedMs, IsolationTag(isolation));
     }
 
     private static double Elapsed(long startedTimestamp) =>
@@ -875,14 +1096,25 @@ public sealed partial class MelangeEngine : IDisposable
         // carries more than the six type arguments Define offers, and every part has to stay a
         // structured field or an alert cannot key on the actionable half.
 
-        /// <summary>1003, in-line fsync: the whole split, including what durability cost.</summary>
+        /// <summary>
+        /// 1003, in-line fsync: the whole split, including what durability cost.
+        /// <para>
+        /// <c>LockedMs</c> is the number the threshold fired on and the one that is global write
+        /// latency; <c>DurationMs</c> is the whole transaction. Under
+        /// <c>Isolation.Serialized</c> they are equal by construction. Under
+        /// <c>Isolation.Snapshot</c> the gap between them is exactly the stall the isolation level
+        /// removed, which makes a 500 ms serialized transaction and a 500 ms snapshot one
+        /// distinguishable on the line rather than only in a trace.
+        /// </para>
+        /// </summary>
         [LoggerMessage(
             EventId = 1003,
             EventName = "SlowReducer",
             Level = LogLevel.Warning,
-            Message = "Reducer '{Reducer}' took {DurationMs:F1}ms, over the Telemetry:SlowReducerMs threshold of " +
-                      "{ThresholdMs}ms — body {BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync {FsyncMs:F1}ms), " +
-                      "post-commit {PostCommitMs:F1}ms, {Rows} row ops.")]
+            Message = "Reducer '{Reducer}' held the write lock {LockedMs:F1}ms, over the Telemetry:SlowReducerMs " +
+                      "threshold of {ThresholdMs}ms — {Isolation} isolation, {DurationMs:F1}ms in total, body " +
+                      "{BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync {FsyncMs:F1}ms), post-commit " +
+                      "{PostCommitMs:F1}ms, {Rows} row ops.")]
         public static partial void SlowReducer(
             ILogger logger,
             string reducer,
@@ -892,7 +1124,9 @@ public sealed partial class MelangeEngine : IDisposable
             double commitMs,
             double fsyncMs,
             double postCommitMs,
-            int rows);
+            int rows,
+            double lockedMs,
+            string isolation);
 
         /// <summary>
         /// 1003 under a deferred fsync policy. The flush happened on a timer thread or not at all,
@@ -904,9 +1138,10 @@ public sealed partial class MelangeEngine : IDisposable
             EventId = 1003,
             EventName = "SlowReducerDeferredFsync",
             Level = LogLevel.Warning,
-            Message = "Reducer '{Reducer}' took {DurationMs:F1}ms, over the Telemetry:SlowReducerMs threshold of " +
-                      "{ThresholdMs}ms — body {BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync deferred by " +
-                      "CommitLog:FsyncPolicy), post-commit {PostCommitMs:F1}ms, {Rows} row ops.")]
+            Message = "Reducer '{Reducer}' held the write lock {LockedMs:F1}ms, over the Telemetry:SlowReducerMs " +
+                      "threshold of {ThresholdMs}ms — {Isolation} isolation, {DurationMs:F1}ms in total, body " +
+                      "{BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync deferred by CommitLog:FsyncPolicy), " +
+                      "post-commit {PostCommitMs:F1}ms, {Rows} row ops.")]
         public static partial void SlowReducerDeferredFsync(
             ILogger logger,
             string reducer,
@@ -915,28 +1150,52 @@ public sealed partial class MelangeEngine : IDisposable
             double bodyMs,
             double commitMs,
             double postCommitMs,
-            int rows);
+            int rows,
+            double lockedMs,
+            string isolation);
 
         /// <summary>
         /// 1003 for a transaction that aborted. Nothing was appended, so there is no commit, fsync,
-        /// or post-commit field — but the lock was held for the whole duration, which is the only
-        /// number that matters to everyone else. <c>Outcome</c> separates a bug (<c>abort</c>) from
-        /// an ordinary refusal (<c>rejected</c>) that happened to be expensive.
+        /// or post-commit field. <c>Outcome</c> separates a bug (<c>abort</c>) from an ordinary
+        /// refusal (<c>rejected</c>) that happened to be expensive.
+        /// <para>
+        /// A serialized transaction held the lock for its whole duration whether it committed or
+        /// not, so <c>LockedMs</c> equals <c>DurationMs</c> there. A snapshot transaction that threw
+        /// in its body held nothing — it does not reach this warning at all, since the threshold is
+        /// on the locked portion; one that was rejected by a guard reports only the commit attempt.
+        /// </para>
         /// </summary>
         [LoggerMessage(
             EventId = 1003,
             EventName = "SlowReducerAborted",
             Level = LogLevel.Warning,
-            Message = "Reducer '{Reducer}' took {DurationMs:F1}ms and then {Outcome}, over the " +
-                      "Telemetry:SlowReducerMs threshold of {ThresholdMs}ms — body {BodyMs:F1}ms, nothing " +
-                      "appended. The write lock was held for all of it.")]
+            Message = "Reducer '{Reducer}' held the write lock {LockedMs:F1}ms and then {Outcome}, over the " +
+                      "Telemetry:SlowReducerMs threshold of {ThresholdMs}ms — {Isolation} isolation, " +
+                      "{DurationMs:F1}ms in total, body {BodyMs:F1}ms, nothing appended.")]
         public static partial void SlowReducerAborted(
             ILogger logger,
             string reducer,
             double durationMs,
             string outcome,
             int thresholdMs,
-            double bodyMs);
+            double bodyMs,
+            double lockedMs,
+            string isolation);
+
+        /// <summary>
+        /// 1004: a reducer declared <c>Isolation.Snapshot</c> but the configured hot store offers no
+        /// pinned reads, so it ran serialized instead. Once per engine — the point is that the
+        /// degradation is stated, not that every call restates it.
+        /// </summary>
+        [LoggerMessage(
+            EventId = 1004,
+            EventName = "SnapshotIsolationUnavailable",
+            Level = LogLevel.Warning,
+            Message = "A reducer declared Isolation.Snapshot but the configured hot store '{Store}' does not " +
+                      "implement IReadViewSource, so snapshot-isolated reducers on this engine run serialized " +
+                      "and hold the write lock for their whole body. They remain correct; they are not faster. " +
+                      "This is reported once.")]
+        public static partial void SnapshotIsolationUnavailable(ILogger logger, string store);
 
         private static readonly Action<ILogger, ulong, Exception?> CommitObserverFailedMessage =
             LoggerMessage.Define<ulong>(

@@ -158,6 +158,7 @@ internal static class ModelExtractor
         var reducerName = method.Name;
         string? policyFqn = null;
         var declaredSite = "Auto";
+        var isolation = "Serialized";
         foreach (var named in attribute.NamedArguments)
         {
             if (named.Key == "Name" && named.Value.Value is string explicitName)
@@ -166,6 +167,8 @@ internal static class ModelExtractor
                 policyFqn = Fqn(policyType);
             if (named.Key == "Site" && named.Value.Value is int site)
                 declaredSite = site switch { 1 => "Hub", 2 => "Shard", _ => "Auto" };
+            if (named.Key == "Isolation" && named.Value.Value is int isolationValue)
+                isolation = isolationValue switch { 1 => "Snapshot", _ => "Serialized" };
         }
 
         var location = LocationInfo.From(
@@ -259,7 +262,8 @@ internal static class ModelExtractor
             DeclaredSite: declaredSite,
             TouchedTables: touched,
             OpaqueBody: opaque,
-            Enums: new EquatableArray<EnumModel>([.. enums]));
+            Enums: new EquatableArray<EnumModel>([.. enums]),
+            Isolation: isolation);
     }
 
     /// <summary>

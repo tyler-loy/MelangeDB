@@ -93,8 +93,9 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
 - **Dynamic rebalancing**, shard-level HA, and sharding the hub. Static assignment will visibly
   hotspot; the ceiling is published so the choice is informed.
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
-- **Snapshot isolation for read-heavy reducers.** The write lock covers the whole body, so a sweep
-  that reads for 200 ms and writes for 0.2 ms bills the other 199.8 ms to every writer on the engine.
-  The store half is built — both hot stores hand out a read view pinned at an LSN that an `Apply`
-  cannot disturb — and the reducer half is designed but not built. See
-  [design/snapshot-isolation.md](design/snapshot-isolation.md).
+- **An analyzer that catches a read-modify-write inside a snapshot reducer.** Snapshot isolation
+  itself is built (see below); what is deferred is `MELANGE0023`, a *warning* on the detectable
+  common shape — `Find` by primary key, then `Update` the same row — inside a body declared
+  `Isolation.Snapshot`. Read-modify-write is undecidable in general, and a body that recomputes a row
+  it also read is legitimate, so this can never be an error and can never be complete. The other open
+  guardrails are recorded in [design/snapshot-isolation.md](design/snapshot-isolation.md).

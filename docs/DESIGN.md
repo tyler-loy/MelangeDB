@@ -166,7 +166,10 @@ appended).
 An engine has one global write lock, and `MelangeEngine.Invoke` takes it around the *entire*
 transaction: the reducer body, the commit guards, the log append and its fsync, the commit
 observers, and any automatic snapshot the commit happens to trigger. Nothing about a reducer runs
-concurrently with another reducer on the same engine.
+concurrently with another reducer on the same engine. (This is the default and it is what the rest
+of this section describes; a reducer may opt out per-reducer — see [snapshot
+isolation](#snapshot-isolation-for-the-sweep-that-windowing-cannot-save) below — and opting out is
+a decision with a correctness precondition, not a tuning knob.)
 
 So a reducer that spends 75 ms walking rows in memory before it writes anything holds every other
 transaction in the database still for 75 ms, whether or not it ends up committing much. The
@@ -188,6 +191,44 @@ scope is why windowing matters even when every row is `Resident` and the scan to
 `Telemetry:SlowReducerMs` is the alarm for this, and it is best read as *"how long is it acceptable
 to freeze the world"* rather than "how slow is too slow" — see
 [OBSERVABILITY.md](OBSERVABILITY.md).
+
+### Snapshot isolation, for the sweep that windowing cannot save
+
+Windowing works when the work divides. Some sweeps don't divide cleanly — they read widely to decide
+whether to write at all, and the reading is the expensive part. `[Reducer(Isolation =
+Isolation.Snapshot)]` runs such a body **outside** the write lock, against a read view pinned at one
+LSN, and serializes only the commit: reconcile, the guards, the append, and the post-commit fan-out.
+
+**The rule that decides whether a reducer qualifies:**
+
+> Snapshot isolation is safe for **recompute-from-scratch** and unsafe for **read-modify-write**.
+
+A body that reads state, computes a value from it, and writes that value is safe — if the state
+moved underneath, two concurrent runs each write a defensible answer and the last one wins. A body
+that reads a value, adds a delta, and writes the sum is not: two runs read the same number and one
+increment is lost, silently and permanently. There is no read-set validation and no retry. The
+declaration is the contract.
+
+Both shapes routinely live in the *same* reducer, which is why this is opt-in per reducer and never
+inferred: the compiler cannot tell a recompute from an increment, and the module author can.
+
+What the engine does do is reconcile the write set against committed state before the guards see it,
+so a body that decided against a view that has since moved still applies cleanly — an update of a
+row someone deleted becomes an insert, a delete of a row already gone drops. That fixes op *shape*,
+never op *value*. It cannot rescue a lost increment, and it is not trying to.
+
+Two smaller consequences of the body no longer being alone:
+
+- **AutoInc ids are reserved as they are allocated**, not staged until commit, because two
+  concurrent bodies staging against one sequence would hand out the same id. An aborted snapshot
+  transaction therefore leaves a gap. Ids are unique, not dense — see §1.
+- **`Telemetry:SlowReducerMs` thresholds on the locked portion**, at every isolation level. For a
+  serialized transaction that is the whole transaction, so nothing about that path changed; for a
+  snapshot one it is the commit alone, because the body stalled nobody.
+
+The full design record, including what was deliberately left out (`Isolation.ReadOnly`, optimistic
+concurrency with read-set validation, cross-tier isolation) and what remains open, is in
+[design/snapshot-isolation.md](design/snapshot-isolation.md).
 
 ## 5. The commit log is the database
 

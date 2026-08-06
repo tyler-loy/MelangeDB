@@ -11,7 +11,7 @@ internal sealed class CommittedReadView : IDbView
 {
     private readonly TransactionDb _reads;
 
-    public CommittedReadView(SchemaRegistry registry, IHotStore store, TableAccessGuard? guard = null) =>
+    public CommittedReadView(SchemaRegistry registry, IHotStoreReader store, TableAccessGuard? guard = null) =>
         _reads = new TransactionDb(registry, store, new WriteSet(), null!, guard);
 
     public TRow Insert<TRow>(TRow row)

@@ -130,7 +130,8 @@ public sealed class MelangeReducerHost
                 descriptor.Invoke(instance, context, ref reader);
             },
             connectionId,
-            parentContext);
+            parentContext,
+            descriptor.Isolation);
     }
 
     internal void SignalStopping() => _stopping = true;
@@ -163,7 +164,9 @@ public sealed class MelangeReducerHost
                 if (deleteOnFire)
                     ((TransactionDb)context.Db).DeleteExisting(timerTable, timerKey);
             },
-            ConnectionId.None);
+            ConnectionId.None,
+            parentContext: default,
+            descriptor.Isolation);
     }
 
     private void Authorize(

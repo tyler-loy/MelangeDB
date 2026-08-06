@@ -45,6 +45,35 @@ All packages ship together at one version; there is no per-package versioning. S
   that no longer describes the data. This is the groundwork for snapshot-isolated reducers
   ([docs/design/snapshot-isolation.md](docs/design/snapshot-isolation.md)); no reducer uses it yet.
 
+- **`[Reducer(Isolation = Isolation.Snapshot)]` — a reducer body that does not hold the write lock.**
+  A third axis on `[Reducer]` next to `Site` and `Policy`. The body runs against a read view pinned at
+  one LSN while other transactions commit underneath it; only reconcile, the commit guards, and the log
+  append serialize. A sweep that spends 200 ms reading and 0.2 ms writing stops charging the other
+  199.8 ms to every writer on the engine. `Isolation.Serialized` is the default and the honest name for
+  what was always happening — one global lock around the whole body *is* serializable — and nothing
+  about that path changes.
+
+  **Read the eligibility rule before declaring it: snapshot isolation is safe for
+  recompute-from-scratch and unsafe for read-modify-write.** A body that reads state, computes a value,
+  and writes it is safe — two concurrent runs each write a defensible answer and the last one wins. A
+  body that reads a value, adds a delta, and writes the sum is not: two runs read the same number and
+  one increment is lost, silently and permanently. There is no read-set validation and no retry; the
+  declaration is the contract. Both shapes routinely live in the same reducer, which is why this is
+  opt-in per reducer and **never inferred** — the compiler cannot tell them apart and the module author
+  can. The write set *is* reconciled against committed state before the guards see it, so an update of a
+  row someone deleted becomes an insert and a delete of a row already gone drops; that fixes op shape,
+  never op value, and cannot rescue a lost increment. There is a test that asserts the lost update, so
+  the hazard is a pinned-down property rather than a warning in prose.
+
+  Two consequences of a body no longer running alone. **AutoInc ids are reserved as they are allocated**
+  rather than staged until commit, because two concurrent bodies staging against one sequence hand out
+  the same id — so an aborted snapshot transaction leaves a gap, which is within the sequencer's
+  standing "unique, not dense" contract. And a store that does not implement `IReadViewSource` runs
+  these reducers **serialized, with a one-time `1004 SnapshotIsolationUnavailable` warning**: they stay
+  correct, they are just not faster. Both shipped stores offer pinned reads. Design record and the
+  guardrails still open in
+  [docs/design/snapshot-isolation.md](docs/design/snapshot-isolation.md).
+
 - **Prerelease packages from `main`.** Every push to `main` now publishes all eleven packages as
   `<VersionPrefix>-ci.<run-number>` to this repository's GitHub Packages feed, so a fix can be
   consumed before a release exists instead of only downloaded as a workflow artifact. nuget.org is
@@ -89,6 +118,15 @@ All packages ship together at one version; there is no per-package versioning. S
   in any scheduled table is now also warned about (EventId 1723).
 
 ### Changed
+
+- **`1003 SlowReducer` now thresholds on the locked portion, not the total**, at every isolation level,
+  and carries `LockedMs` and `Isolation` alongside the existing split (`melange.locked_ms` and
+  `melange.isolation` on the span event; `melange.isolation` is also a tag on the `melange.reducer` span
+  itself). **For the default `Isolation.Serialized` this changes nothing** — the clock already started
+  inside the write lock, so the locked portion and the total are the same interval. It matters for
+  snapshot-isolated reducers, whose body blocks nobody: thresholding on the total would page an operator
+  about write latency that did not happen. The message text changed to lead with the lock hold; the
+  EventId is unchanged, which is the guarantee alerts key on.
 
 - **A scheduled table declaring a `Placement` or `ShardBy` is now compile error `MELANGE0022`**
   instead of having the declaration silently discarded. `[Table(Scheduled = "...", Placement =

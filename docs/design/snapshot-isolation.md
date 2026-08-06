@@ -5,7 +5,10 @@ view *outside* the engine's write lock. Only reconcile, the commit guards, and t
 serialize. A sweep that spends 200 ms reading and 0.2 ms writing stops charging the other 199.8 ms
 to every writer on the engine.
 
-**Status:** designed, not built. Nothing below ships until the `IHotStore` contract change does.
+**Status:** **built.** The store half landed first (pinned reads in both hot stores); the reducer half —
+the `Isolation` axis, the engine's unlocked-body path, write-set reconcile, and the telemetry split — landed
+after it. The open questions in [Decisions to settle](#decisions-to-settle) are refinements and guardrails,
+not gaps in the feature: none of them block declaring `Isolation.Snapshot` on a reducer today.
 
 **Depends on:** [plan-phase-01](../road-to-0.1/plan-phase-01.md) (the write lock, the write set),
 [plan-phase-07](../road-to-0.1/plan-phase-07.md) (the store seam this changes).
@@ -99,11 +102,15 @@ this for the cluster's apply path and should be reused, run under the lock, befo
 `RunCommitGuards`. This is precedent, not new machinery — and it is the reason this feature is
 buildable rather than a rewrite.
 
-**Telemetry that tells the truth about the lock.** `1003 SlowReducer` currently thresholds on total
+**Telemetry that tells the truth about the lock.** `1003 SlowReducer` thresholded on total
 duration, which operators are told to read as global write latency
 ([OBSERVABILITY.md](../OBSERVABILITY.md)). For a snapshot reducer that reading is false — the body
 blocks nobody. So:
-- `1003` fires on the **locked portion**, not the total, for every isolation level.
+- `1003` fires on the **locked portion**, not the total, for every isolation level. Worth noting what
+  this did *not* change: a serialized transaction's clock already started inside the lock, so its locked
+  portion and its total are the same interval and that path's warnings are byte-for-byte what they were.
+  The change reads like a behaviour change to a stable EventId and is, in practice, a no-op everywhere
+  except the reducers this feature added.
 - The warning and the `melange.slow_reducer` span event carry the isolation, so a dashboard can tell
   a 500 ms serialized transaction from a 500 ms snapshot one that stalled nothing.
 - The `melange.reducer` span carries the isolation as a tag, and total duration stays reported —
@@ -234,6 +241,45 @@ path that consumes it.
   reads entirely from the pinned containers, lock-free — and a table a sweep scans hot is exactly the
   one to declare `Residency.Resident`. Giving each view its own FASTER session would lift the
   limitation; it is not done, and it is not measured.
+
+- **AutoInc ids are reserved as allocated, not staged.** *Settled during implementation; this was not in
+  the original design and is the one thing building it turned up that argument had missed.*
+
+  `AutoIncStage.Allocate` runs **in the body**. It read the sequencer's next value and consumed it only at
+  `Commit`, which is safe when a serialized transaction is the only one running and is two separate bugs when
+  it is not: concurrent read and write on a plain `Dictionary` is undefined, and — worse, because it is
+  silent — two concurrent bodies peek the same base and **allocate the same id**. That surfaces as a
+  duplicate-key insert, or, once reconcile has done its job, as one transaction's row quietly becoming an
+  update over the other's.
+
+  A snapshot transaction therefore reserves from the durable sequence as it allocates, under the sequencer's
+  own lock — not the engine's write lock, so it does not undo the feature. The price is that an aborted
+  snapshot transaction leaves a **gap**, where an aborted serialized one still consumes nothing. That is
+  within the sequencer's stated contract — ids are **unique, not dense**
+  ([plan-phase-01](../road-to-0.1/plan-phase-01.md)) — and it costs nothing durable, since the sequence is
+  rebuilt at recovery by re-observing what actually committed.
+
+  The general lesson, which applies to anything else later moved off the lock: **the write lock was doing
+  more work than the design gave it credit for.** Every piece of engine state a body touches was implicitly
+  single-threaded. The sequencer was the only one here — commit guards, the log, and the observers all run
+  under the lock still, telemetry is `Counter`/`Histogram`, and the table access guard is a stateless
+  delegate — but "only one" was a finding, not an assumption.
+
+- **A store without `IReadViewSource` degrades to serialized and says so once** (`1004
+  SnapshotIsolationUnavailable`). *Settled during implementation.* Isolation is a **latency** property, not
+  a semantic one: a body written for snapshot isolation is still correct when run serialized, just slower.
+  Refusing to start would turn a performance feature into a hard dependency on a store capability that
+  `IReadViewSource` deliberately makes optional. Degrading *silently* is the option that is actually wrong,
+  which is why this warns rather than merely not-crashing. Both shipped stores implement the capability, so
+  the path exists for third-party and future stores — and is tested through a deliberately capability-less
+  wrapper, because an untested fallback is how a fallback becomes a crash.
+
+- **The log record's timestamp is taken at append, not at body start.** *Settled during implementation.* The
+  body still gets a stable start-of-transaction clock in `ctx.Timestamp` — a scheduled sweep derives its next
+  fire from it, and deriving that from commit time would drift the cadence by however long the body happened
+  to take. But stamping the *record* with it would let a body that ran 200 ms append a record older than one
+  a serialized transaction appended meanwhile, putting the log's timestamps out of order against its own
+  LSNs.
 
 - **A residency change invalidates open views, loudly.** Promoting or demoting a table rewrites where
   its rows live, so a view pinned across one would be answering from bookkeeping that no longer

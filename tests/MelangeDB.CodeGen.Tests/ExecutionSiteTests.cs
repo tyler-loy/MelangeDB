@@ -39,9 +39,11 @@ public class ExecutionSiteTests
 
     private static string SiteOf(string generated, string reducerName)
     {
+        // The site argument is no longer last in the descriptor — `isolation:` follows it — so the
+        // terminator is a comma or a paren depending on emission order, not always a paren.
         var match = Regex.Match(
             generated,
-            $"\"{reducerName}\".*?site: global::MelangeDB\\.ReducerSite\\.(\\w+)\\)",
+            $"\"{reducerName}\".*?site: global::MelangeDB\\.ReducerSite\\.(\\w+)[,)]",
             RegexOptions.Singleline);
         Assert.True(match.Success, $"No emitted site found for reducer '{reducerName}'.");
         return match.Groups[1].Value;

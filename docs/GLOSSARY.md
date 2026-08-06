@@ -64,6 +64,29 @@ Both flow out of the commit log; they are not the same thing.
 
 Appliers are the verb; projections are the noun.
 
+### Isolation, and the two meanings of "snapshot"
+
+**Isolation** is a third axis on `[Reducer]`, alongside `Site` and `Policy`. It says how a body is
+isolated from other transactions on the same engine — not what triggers it (that is `ReducerKind`) and not
+where it runs (that is `ReducerSite`).
+
+- **`Isolation.Serialized`** — the default. The write lock covers the whole body. One global lock around the
+  whole transaction *is* serializable, and calling it so is more honest than calling it "normal".
+- **`Isolation.Snapshot`** — the body runs outside the lock against a read view pinned at one LSN; only the
+  commit serializes. A **snapshot reducer** is one declared this way.
+
+**"Snapshot" means two unrelated things in this codebase, and log lines must never say it unqualified.**
+
+| | What it is |
+| --- | --- |
+| **Durability snapshot** | A full write-out of hot-store state so the log can be truncated — `SnapshotFile`, `TakeSnapshot()`, `Snapshots:IntervalTransactions`, `1502 SnapshotWritten`. |
+| **Snapshot isolation** | The transaction isolation level above. Nothing is written out; a read view is pinned. |
+
+The collision was accepted deliberately rather than by oversight: *snapshot isolation* is the correct
+database term, and a reader who knows it knows immediately what was bought and what was given up. The
+runner-up, `Reads = Reads.Advisory`, collided with nothing but stated a claim rather than a mechanism. The
+cost of the choice is this glossary entry and the discipline of qualifying the word.
+
 ### Subscription vs. ad-hoc SQL
 
 - A **subscription** is a standing query that streams deltas as things change. Single-table, no joins, no

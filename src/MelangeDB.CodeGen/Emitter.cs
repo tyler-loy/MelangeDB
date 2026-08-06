@@ -301,7 +301,8 @@ internal static class Emitter
         builder.AppendLine("                    },");
         if (reducer.PolicyFqn is not null)
             builder.AppendLine($"                    policy: typeof({reducer.PolicyFqn}),");
-        builder.AppendLine($"                    site: global::MelangeDB.ReducerSite.{site}),");
+        builder.AppendLine($"                    site: global::MelangeDB.ReducerSite.{site},");
+        builder.AppendLine($"                    isolation: global::MelangeDB.Isolation.{reducer.Isolation}),");
     }
 
     private static void EmitArgumentRead(
