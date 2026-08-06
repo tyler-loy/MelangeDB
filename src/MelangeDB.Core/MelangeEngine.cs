@@ -31,6 +31,15 @@ public sealed partial class MelangeEngine : IDisposable
     private IReadViewSource? _readViewSource;
     private int _snapshotUnavailableReported;
     private long _commitsSinceSnapshot;
+
+    /// <summary>Set to 1 while a snapshot is writing, so two never race on the same temporary file.</summary>
+    private int _snapshotWriting;
+
+    /// <summary>
+    /// A snapshot captured by an automatic trigger under the write lock, waiting for the committing
+    /// thread to release the lock and write it.
+    /// </summary>
+    private PendingSnapshot? _deferredSnapshot;
     private Timestamp? _tailTimestamp;
     private bool _disposed;
 
@@ -242,17 +251,27 @@ public sealed partial class MelangeEngine : IDisposable
                 "Extract shared logic into a plain method both reducers call.");
         }
 
-        lock (_writeLock)
+        try
         {
-            _inReducer.Value = true;
-            try
+            lock (_writeLock)
             {
-                return InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
+                _inReducer.Value = true;
+                try
+                {
+                    return InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
+                }
+                finally
+                {
+                    _inReducer.Value = false;
+                }
             }
-            finally
-            {
-                _inReducer.Value = false;
-            }
+        }
+        finally
+        {
+            // An automatic snapshot captured under the lock is written here, with the lock released.
+            // In a finally because a capture that is never completed leaks its pin, which holds
+            // container versions alive for the life of the process.
+            CompleteDeferredSnapshot();
         }
     }
 
@@ -288,28 +307,42 @@ public sealed partial class MelangeEngine : IDisposable
 
         if (isolation == Isolation.Snapshot && ReadViewOrFallback() is { } source)
         {
-            _inReducer.Value = true;
             try
             {
-                return InvokeSnapshot(reducerName, caller, body, encodedArguments, connectionId, parentContext, source);
+                _inReducer.Value = true;
+                try
+                {
+                    return InvokeSnapshot(reducerName, caller, body, encodedArguments, connectionId, parentContext, source);
+                }
+                finally
+                {
+                    _inReducer.Value = false;
+                }
             }
             finally
             {
-                _inReducer.Value = false;
+                CompleteDeferredSnapshot();
             }
         }
 
-        lock (_writeLock)
+        try
         {
-            _inReducer.Value = true;
-            try
+            lock (_writeLock)
             {
-                return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext);
+                _inReducer.Value = true;
+                try
+                {
+                    return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext);
+                }
+                finally
+                {
+                    _inReducer.Value = false;
+                }
             }
-            finally
-            {
-                _inReducer.Value = false;
-            }
+        }
+        finally
+        {
+            CompleteDeferredSnapshot();
         }
     }
 
@@ -399,6 +432,7 @@ public sealed partial class MelangeEngine : IDisposable
         if (_inReducer.Value)
             throw new InvalidOperationException("ApplyInternal cannot run inside a reducer.");
 
+        CommitRecord record;
         lock (_writeLock)
         {
             var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
@@ -406,7 +440,7 @@ public sealed partial class MelangeEngine : IDisposable
             RunCommitGuards(reducerName, effective, CommitOrigin.Internal);
             if (effective.Count == 0 && !alwaysAppend)
                 return null;
-            var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, arguments, effective));
+            record = _log.Append(new CommitRequest(timestamp, caller, reducerName, arguments, effective));
 
             // Runtime observation mirrors what recovery replay will re-observe, so AutoInc
             // behavior is identical before and after a restart. Foreign-originator ids are
@@ -415,8 +449,10 @@ public sealed partial class MelangeEngine : IDisposable
             NotifyCommitObservers(record);
             Appliers.NotifyAppended(record);
             AfterCommit(timestamp);
-            return record;
         }
+
+        CompleteDeferredSnapshot();
+        return record;
     }
 
     /// <summary>
@@ -508,6 +544,7 @@ public sealed partial class MelangeEngine : IDisposable
         if (_inReducer.Value)
             throw new InvalidOperationException("Bulk ingestion cannot run inside a reducer.");
 
+        CommitRecord bulkRecord;
         lock (_writeLock)
         {
             using var activity = _telemetry?.StartReducer(BulkReducerName, caller, arguments: null, encodedArguments: default);
@@ -539,8 +576,11 @@ public sealed partial class MelangeEngine : IDisposable
             activity?.SetTag("melange.outcome", "commit");
             activity?.SetTag("melange.writeset.rows", ops.Count);
             _telemetry?.RecordTransaction(BulkReducerName, "commit", Elapsed(started), ops.Count);
-            return record;
+            bulkRecord = record;
         }
+
+        CompleteDeferredSnapshot();
+        return bulkRecord;
     }
 
     /// <summary>
@@ -567,19 +607,40 @@ public sealed partial class MelangeEngine : IDisposable
     /// </summary>
     public ulong? TakeSnapshot()
     {
+        PendingSnapshot? pending;
         lock (_writeLock)
         {
-            return TakeSnapshotCore();
+            pending = BeginSnapshot();
         }
+
+        return pending is null ? null : CompleteSnapshot(pending);
     }
 
-    private ulong? TakeSnapshotCore()
+    /// <summary>
+    /// The part of a snapshot that must run under the write lock: read the head LSN, capture the
+    /// header, and pin a read view at that LSN. All of it is cheap — the pin is a reference capture,
+    /// because the stores keep their containers persistent for exactly this.
+    /// <para>
+    /// Returns null when snapshots are off, when there is nothing to capture, or when another
+    /// snapshot is already writing. That last case is not a lost snapshot: the interval counter is
+    /// only reset by a snapshot that actually begins, so the next commit past the threshold tries
+    /// again.
+    /// </para>
+    /// </summary>
+    private PendingSnapshot? BeginSnapshot()
     {
         if (!_options.Snapshots.Enabled)
             return null;
         var lsn = _log.HeadLsn;
         if (lsn == 0)
             return null;
+
+        // One writer at a time, or two snapshots race on the same temporary file.
+        if (Interlocked.CompareExchange(ref _snapshotWriting, 1, 0) != 0)
+        {
+            LogMessages.SnapshotAlreadyRunning(_logger, lsn);
+            return null;
+        }
 
         var header = new SnapshotFile.Header
         {
@@ -588,13 +649,58 @@ public sealed partial class MelangeEngine : IDisposable
             Timestamp = _tailTimestamp ?? Timestamp.FromDateTimeOffset(_time.GetUtcNow()),
             Sequences = [.. _sequencer.ExportSequences()],
         };
-        SnapshotFile.Write(SnapshotPath, header, Schema.Tables.Select(t => (t.Id, HotStore.Scan(t.Id))));
+
+        // A store with no pinned-read capability has no way to give a consistent view outside the
+        // lock, so it keeps the old behaviour and writes under it. Everything else writes from a pin.
+        var view = _readViewSource?.OpenReadView();
         _commitsSinceSnapshot = 0;
-        LogMessages.SnapshotWritten(_logger, lsn, SnapshotPath);
-        if (_options.Snapshots.TruncateLog)
-            TruncateLogCore(lsn);
-        return lsn;
+        return new PendingSnapshot(lsn, header, view);
     }
+
+    /// <summary>
+    /// The expensive part, run <b>outside</b> the write lock: scan every table through the pinned
+    /// view and write the snapshot file. Commits proceed while this runs, and land after the
+    /// snapshot's LSN — the pin is what makes that safe.
+    /// <para>
+    /// Truncation re-takes the lock afterwards. Evaluating the retention floors later than the
+    /// capture is safe in the only direction that matters: floors advance, and the result is capped
+    /// by the snapshot's own LSN, so a later evaluation can never truncate more than an earlier one
+    /// would have.
+    /// </para>
+    /// </summary>
+    private ulong CompleteSnapshot(PendingSnapshot pending)
+    {
+        try
+        {
+            var tables = pending.View is { } view
+                ? Schema.Tables.Select(t => (t.Id, view.Scan(t.Id)))
+                : Schema.Tables.Select(t => (t.Id, HotStore.Scan(t.Id)));
+            SnapshotFile.Write(SnapshotPath, pending.Header, tables);
+            LogMessages.SnapshotWritten(_logger, pending.Lsn, SnapshotPath);
+
+            if (_options.Snapshots.TruncateLog)
+            {
+                lock (_writeLock)
+                {
+                    TruncateLogCore(pending.Lsn);
+                }
+            }
+
+            return pending.Lsn;
+        }
+        finally
+        {
+            pending.View?.Dispose();
+            Volatile.Write(ref _snapshotWriting, 0);
+        }
+    }
+
+    /// <summary>
+    /// A snapshot captured under the write lock and not yet written. The view pins the store at
+    /// <see cref="Lsn"/>; it is null only for a store with no pinned-read capability, which writes
+    /// under the lock as before.
+    /// </summary>
+    private sealed record PendingSnapshot(ulong Lsn, SnapshotFile.Header Header, IHotStoreReadView? View);
 
     /// <summary>
     /// The truncation floors, applied in one place so no configuration can override them: the
@@ -740,11 +846,37 @@ public sealed partial class MelangeEngine : IDisposable
             return;
         try
         {
-            TakeSnapshotCore();
+            // Only the cheap half runs here — this is under the write lock. The commit that crossed
+            // the threshold writes the file on its way out, after releasing it.
+            _deferredSnapshot = BeginSnapshot();
         }
         catch (Exception exception)
         {
             _commitsSinceSnapshot = 0; // Back off a full interval rather than failing every commit.
+            LogMessages.SnapshotFailed(_logger, exception);
+        }
+    }
+
+    /// <summary>
+    /// Writes the snapshot an automatic trigger captured, now that the write lock is released. Runs
+    /// on the committing thread rather than a background one, so a snapshot is still finished before
+    /// the call that triggered it returns — what changes is that other transactions no longer wait
+    /// for it.
+    /// <para>
+    /// A snapshot failure must never fail the transaction that triggered it: the commit is already
+    /// durable in the log, and the snapshot is only an optimisation of replay.
+    /// </para>
+    /// </summary>
+    private void CompleteDeferredSnapshot()
+    {
+        if (Interlocked.Exchange(ref _deferredSnapshot, null) is not { } pending)
+            return;
+        try
+        {
+            CompleteSnapshot(pending);
+        }
+        catch (Exception exception)
+        {
             LogMessages.SnapshotFailed(_logger, exception);
         }
     }
@@ -1247,6 +1379,17 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void SnapshotFailed(ILogger logger, Exception failure) =>
             SnapshotFailedMessage(logger, failure);
+
+        private static readonly Action<ILogger, ulong, Exception?> SnapshotAlreadyRunningMessage =
+            LoggerMessage.Define<ulong>(
+                LogLevel.Debug,
+                new EventId(1507, "SnapshotAlreadyRunning"),
+                "Snapshot at LSN {Lsn} skipped: another snapshot is still writing. Snapshots write " +
+                "outside the write lock, so an interval short enough to overlap one is the signal — " +
+                "raise Snapshots:IntervalTransactions rather than treating this as an error.");
+
+        public static void SnapshotAlreadyRunning(ILogger logger, ulong lsn) =>
+            SnapshotAlreadyRunningMessage(logger, lsn, null);
 
         private static readonly Action<ILogger, string, Guid, Guid, Exception?> StaleSnapshotIgnoredMessage =
             LoggerMessage.Define<string, Guid, Guid>(
