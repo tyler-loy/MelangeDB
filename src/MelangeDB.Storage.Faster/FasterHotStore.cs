@@ -153,14 +153,32 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
     {
+        if (!_tables.TryGetValue(table, out var state))
+        {
+            row = default;
+            return false;
+        }
+
+        // One volatile read of an immutable version. A resident table's rows are in managed memory,
+        // so answering from this version needs no lock at all — and this is the read the engine's
+        // fan-out makes per op, under the *engine* write lock, to fetch a pre-image. Taking the
+        // store lock there was contention on the one path that can least afford it.
+        //
+        // A concurrent demotion cannot make this stale: the version is captured once, and either it
+        // is the resident one (which has the rows) or it is not, in which case the paged path runs.
+        var version = state.Current;
+        if (version.IsResident)
+        {
+            var found = version.ResidentRows.TryGetValue(key, out var resident);
+            row = found ? resident : default;
+            return found;
+        }
+
+        // The paged path keeps the lock, and not for the session's sake: the hybrid log overwrites
+        // in place, so the directory probe and the record read must be atomic against a write, or a
+        // reader can hold a directory entry whose record a concurrent delete has already removed.
         lock (_lock)
         {
-            if (!_tables.TryGetValue(table, out var state))
-            {
-                row = default;
-                return false;
-            }
-
             var bytes = ReadRow(state, key);
             row = bytes;
             return bytes is not null;
@@ -206,41 +224,27 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
+    // The index lives in the table's immutable version, so collecting a key list needs no lock —
+    // only materializing the rows behind those keys does, and only for a paged table.
+
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
     {
-        RowKey[] keys;
-        lock (_lock)
-        {
-            if (!_tables.TryGetValue(table, out var state))
-                yield break;
-            keys = [.. state.Index(column).Equal(value)];
-        }
-
-        foreach (var pair in MaterializeRows(table, keys))
-            yield return pair;
+        if (!_tables.TryGetValue(table, out var state))
+            return [];
+        var version = state.Current;
+        return MaterializeRows(state, version, [.. version.Indexes[state.IndexPosition(column)].Equal(value)]);
     }
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
     {
-        var keys = new List<RowKey>();
-        lock (_lock)
-        {
-            if (!_tables.TryGetValue(table, out var state))
-                yield break;
-            keys.AddRange(state.Index(column).Range(low, high));
-        }
-
-        foreach (var pair in MaterializeRows(table, keys))
-            yield return pair;
+        if (!_tables.TryGetValue(table, out var state))
+            return [];
+        var version = state.Current;
+        return MaterializeRows(state, version, [.. version.Indexes[state.IndexPosition(column)].Range(low, high)]);
     }
 
-    public long Count(TableId table)
-    {
-        lock (_lock)
-        {
-            return _tables.TryGetValue(table, out var state) ? state.RowCount : 0;
-        }
-    }
+    public long Count(TableId table) =>
+        _tables.TryGetValue(table, out var state) ? state.Current.RowCount : 0;
 
     public IEnumerable<RowKey> ScanKeys(TableId table)
     {
@@ -530,18 +534,41 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         private readonly record struct UndoKey(TableId Table, RowKey Key);
     }
 
-    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(TableId table, IEnumerable<RowKey> keys)
+    /// <summary>
+    /// Reads the rows behind a key list. A resident version answers from managed memory with no
+    /// lock; a paged one takes the store lock per row, because the hybrid log overwrites in place
+    /// and the directory probe and record read have to be atomic against a concurrent write.
+    /// </summary>
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(
+        TableState state, TableVersion version, RowKey[] keys)
     {
+        if (version.IsResident)
+        {
+            foreach (var key in keys)
+            {
+                if (version.ResidentRows.TryGetValue(key, out var resident))
+                {
+                    state.AddRowsScanned(1);
+                    yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, resident);
+                }
+            }
+
+            yield break;
+        }
+
         foreach (var key in keys)
         {
             byte[]? bytes;
             lock (_lock)
             {
-                bytes = _tables.TryGetValue(table, out var state) ? ReadRow(state, key) : null;
+                bytes = ReadRow(state, key);
             }
 
             if (bytes is not null)
+            {
+                state.AddRowsScanned(1);
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
+            }
         }
     }
 
