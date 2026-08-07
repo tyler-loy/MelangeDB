@@ -90,10 +90,11 @@ asymmetry is on purpose — a version on nuget.org can never be deleted, only un
 
 Two jobs in `.github/workflows/ci.yml` handle packages, and the split matters:
 
-- **`pack`** runs on pushes to `main`, packs the `-ci.N` prerelease, uploads it as a workflow
-  artifact, and pushes it to **GitHub Packages**. It has **no** `environment`, so ordinary pushes
-  never wait on a reviewer, and it authenticates with the built-in `GITHUB_TOKEN` — there is no
-  secret to configure. The only setting it needs is `permissions: packages: write` on the job.
+- **`pack`** runs on `main` — a push, or a manual dispatch from that branch — packs the `-ci.N`
+  prerelease, uploads it as a workflow artifact, and pushes it to **GitHub Packages**. It has **no**
+  `environment`, so ordinary pushes never wait on a reviewer, and it authenticates with the built-in
+  `GITHUB_TOKEN` — there is no secret to configure. The only setting it needs is
+  `permissions: packages: write` on the job.
 - **`publish`** runs **only** on `release: [published]`, is gated behind the `release` environment,
   and pushes to **nuget.org** via Trusted Publishing. Both jobs need the `test` job green first,
   and both push with `--skip-duplicate` so re-running a workflow is idempotent — which matters
@@ -235,15 +236,23 @@ not to run anything you care about.
 ## CI
 
 `.github/workflows/ci.yml` is the whole pipeline. Its `test` job runs on every PR, every push to
-`main`, and every published release — **not** on a pushed tag, which triggers nothing at all, so
-don't wait for a check mark to appear on one: restore, Release build (warnings-as-errors), then the
-test suite in
+`main`, every published release, and on demand — **not** on a pushed tag, which triggers nothing at
+all, so don't wait for a check mark to appear on one: restore, Release build (warnings-as-errors),
+then the test suite in
 **both** Release and Debug. Skipped tests fail the run — the Postgres suite self-skips when
 Docker is missing, and CI treats a skip as a broken environment, not a pass. `ubuntu-latest` has
 Docker preinstalled, which is what the Testcontainers suites use.
 
 The cluster and load suites build in CI but do not execute there; they are calibrated against real
 hardware and must be run locally. See [CONTRIBUTING.md](../CONTRIBUTING.md) for that bar.
+
+**Recovering a lost run on `main`.** Actions → CI → *Run workflow*, with `main` selected. Use it
+when a run on `main` never produced a result and `Re-run jobs` will not clear it — an outage, a
+runner shortage, a run orphaned mid-re-run. Dispatching from `main` runs `test` and `pack`, so it
+produces the `-ci.N` prerelease the lost run owed; dispatching from a topic branch runs `test` only.
+Nothing about dispatch can reach nuget.org — `publish` fires on `release: [published]` and nothing
+else. This trigger exists because without it the only recovery was an empty commit on `main`,
+which is how the 2026-08-06 outage was going to have to be settled (#55).
 
 CI sets `MELANGE_TEST_TIME_SCALE=4` (a test-infra knob, not a MelangeDB option): the integration
 suites' wait-helper deadlines multiply by it so shared slow vCPUs get proportionally more wall

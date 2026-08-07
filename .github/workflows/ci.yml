@@ -3,12 +3,19 @@ name: CI
 # A v* tag on its own publishes nothing — publishing is triggered by *publishing a GitHub Release*,
 # which is a deliberate act with release notes attached, and is then gated again on approval of the
 # `release` environment. See docs/RELEASING.md.
+#
+# `workflow_dispatch` exists because every other trigger here is an event someone else owns, and a
+# run can be lost to something that is not the code: the 2026-08-06 Actions outage swallowed the
+# `main` run for #54 and left the re-run in a pre-queue state that neither `cancel` nor
+# `force-cancel` would clear. Without a manual trigger the only recovery is an empty commit on
+# `main` whose sole purpose is to make CI fire. See #55.
 on:
   pull_request:
   push:
     branches: [main]
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -87,8 +94,15 @@ jobs:
   #
   # Deliberately has no `environment`, so ordinary pushes to main never wait on a reviewer, and no
   # OIDC: GITHUB_TOKEN authenticates to GitHub's own feed. Pull requests never reach this job.
+  #
+  # Gated on the ref rather than the event, which is equivalent for every trigger that existed
+  # before `workflow_dispatch` — `push` only fires on main (the trigger's own `branches:` filter),
+  # a `pull_request` runs against a PR ref, and a `release` event's ref is the tag — while
+  # additionally letting a dispatch on main do the packing it was dispatched to do. That is the
+  # point of having a manual trigger at all: re-running the tests without producing the prerelease
+  # would not recover a lost run on main. A dispatch from a topic branch tests and skips this job.
   pack:
-    if: github.event_name == 'push'
+    if: github.ref == 'refs/heads/main'
     needs: test
     runs-on: ubuntu-latest
     permissions:

@@ -184,6 +184,12 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **CI can be triggered by hand.** `workflow_dispatch` on `ci.yml`, and the `pack` job now gates on the
+  ref being `main` rather than on the event being a push — equivalent for every trigger that existed
+  before, and it means a dispatch from `main` produces the `-ci.<run-number>` prerelease rather than
+  only re-running the tests. Recovering a run lost to an Actions outage no longer requires an empty
+  commit on `main`. Nothing about a dispatch can reach nuget.org.
+
 - **Secondary index range scans seek to their lower bound.** Both storage engines held indexes as a
   dictionary of value → nested key set, which cannot seek: a range query started at the leftmost value and
   discarded everything below its window, so a ten-row window at the far end of a large index paid for the
