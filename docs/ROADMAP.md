@@ -93,9 +93,9 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
 - **Dynamic rebalancing**, shard-level HA, and sharding the hub. Static assignment will visibly
   hotspot; the ceiling is published so the choice is informed.
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
-- **An analyzer that catches a read-modify-write inside a snapshot reducer.** Snapshot isolation
-  itself is built (see below); what is deferred is `MELANGE0023`, a *warning* on the detectable
-  common shape — `Find` by primary key, then `Update` the same row — inside a body declared
-  `Isolation.Snapshot`. Read-modify-write is undecidable in general, and a body that recomputes a row
-  it also read is legitimate, so this can never be an error and can never be complete. The other open
-  guardrails are recorded in [design/snapshot-isolation.md](design/snapshot-isolation.md).
+- **A complete read-modify-write detector for snapshot reducers.** The detectable common shape —
+  `Find`, then `Update` of the same row, inside a body declared `Isolation.Snapshot` — is built as
+  the `MELANGE0023` warning. What stays out is completeness: read-modify-write is undecidable in
+  general, and a body that recomputes a row it also read is legitimate, so the diagnostic can never
+  be an error and its silence is not proof of eligibility. The other open guardrails are recorded in
+  [design/snapshot-isolation.md](design/snapshot-isolation.md).

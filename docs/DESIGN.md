@@ -210,7 +210,11 @@ increment is lost, silently and permanently. There is no read-set validation and
 declaration is the contract.
 
 Both shapes routinely live in the *same* reducer, which is why this is opt-in per reducer and never
-inferred: the compiler cannot tell a recompute from an increment, and the module author can.
+inferred: the compiler cannot tell a recompute from an increment, and the module author can. What
+the compiler *can* see is the common shape of getting it wrong — a row read with `Find` and written
+back with `Update` inside a body declared `Snapshot` — and `MELANGE0023` warns on exactly that. A
+warning, not an error, because a body that recomputes a row it also read is legitimate; its silence
+is not proof of eligibility.
 
 What the engine does do is reconcile the write set against committed state before the guards see it,
 so a body that decided against a view that has since moved still applies cleanly — an update of a

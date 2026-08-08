@@ -27,3 +27,4 @@ MELANGE0019 | MelangeDB | Error | Client-visible enums must have unique names
 MELANGE0020 | MelangeDB | Error | Schema manifest is invalid
 MELANGE0021 | MelangeDB | Error | One project generates from one schema manifest
 MELANGE0022 | MelangeDB | Error | Scheduled tables are always Placement.Local
+MELANGE0023 | MelangeDB | Warning | Read-modify-write inside a snapshot-isolated reducer

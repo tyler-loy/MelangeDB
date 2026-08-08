@@ -4,7 +4,7 @@ namespace MelangeDB.CodeGen;
 
 /// <summary>
 /// Every diagnostic MelangeDB reports at compile time. Ids are stable public API: MELANGE0001
-/// through MELANGE0022, never renumbered, each with a fires-test and a compiles-clean test.
+/// through MELANGE0023, never renumbered, each with a fires-test and a compiles-clean test.
 /// </summary>
 public static class Diagnostics
 {
@@ -190,6 +190,17 @@ public static class Diagnostics
         "from a [Reducer(ReducerKind.Init)] reducer.",
         Category,
         DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor SnapshotReadModifyWrite = new(
+        "MELANGE0023",
+        "Read-modify-write inside a snapshot-isolated reducer",
+        "Reducer '{0}' declares Isolation.Snapshot but updates a '{1}' row it read with Find — a read-modify-write. " +
+        "The body runs outside the write lock against a view pinned at one LSN, so a transaction that committed to " +
+        "this row after the pin is silently overwritten when the write-back lands; reconcile fixes op shape, never " +
+        "op value. Recompute the row from the reducer's own inputs, or leave the reducer Serialized.",
+        Category,
+        DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(
