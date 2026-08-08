@@ -59,6 +59,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`MELANGE0023`: a warning on read-modify-write inside a snapshot-isolated reducer.** The
+  detectable common shape of getting `Isolation.Snapshot` wrong — a row obtained from a single-row
+  `Find` and written back through the table handle's `Update` — is now flagged at compile time,
+  seen through the wrappers the shape is written with (`?? throw`, `.Value`, `GetValueOrDefault()`,
+  `with`, and local copies). The write-back carries every column of a row read from a view pinned
+  at one LSN, so a concurrent commit to any other column of the same row is silently reverted —
+  a move reducer that looks like a blind position write is a read-modify-write at row granularity,
+  and the failure mode is lost writes with no error anywhere. A warning, never an error: a body
+  that recomputes a row it also read is legitimate, so silence is not proof of eligibility. Rows
+  from `Iter`/`Filter`/`First` are deliberately not tracked — updating rows mid-sweep is what the
+  isolation level's legitimate customers do every tick.
+
 - **Eight benchmark suites** in [bench/](bench/README.md), closing the seven measurement gaps the
   performance sweep left open: commit-path attribution, fan-out against subscriber count, batched apply,
   index maintenance, wire format, FASTER hash sizing, snapshot duration, and index range position. The

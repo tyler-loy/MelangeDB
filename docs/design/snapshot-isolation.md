@@ -287,6 +287,22 @@ path that consumes it.
   `Residency:AutoThresholdBytes` in case an `Auto` table is flipping under load. A plausible wrong
   answer is the worse outcome.
 
+- **The analyzer warns on the detectable read-modify-write shape** (`MELANGE0023`,
+  `SnapshotReadModifyWriteAnalyzer`). *Settled after the original design; this was "what the
+  analyzer can enforce" above.* Inside a body declared `Isolation.Snapshot`, a row obtained from a
+  generated single-row `Find` — through the wrappers the shape is written with: `?? throw`,
+  `.Value`, `GetValueOrDefault()`, `with`, and local copies to a fixpoint — and passed back to the
+  table handle's `Update` is flagged. That is `CensusApply`, and it is the move-player shape: the
+  write-back carries *every* column of a row read from a pinned view, so a concurrent commit to any
+  other column of the same row is silently reverted, which makes a reducer that looks like a blind
+  position write a read-modify-write at row granularity.
+
+  Warning, not error, exactly as argued above: a recompute of a row the body also read is
+  legitimate, so silence proves nothing and a firing may be suppressed knowingly. Deliberately
+  narrow: rows from `Iter`/`Filter`/`First` are not tracked, because updating rows mid-sweep is
+  what the feature's legitimate customers — the reference sweeps — do every tick, and drowning them
+  in warnings would teach authors to suppress the diagnostic wholesale.
+
 ## Decisions to settle
 
 - **Whether a paged read through a view should get its own FASTER session.** It would make paged
@@ -297,11 +313,6 @@ path that consumes it.
 - **Whether a long-held view should be bounded.** A pinned view keeps its versions alive, so a reducer
   that holds one for minutes retains every row those tables replaced meanwhile. Nothing enforces a
   ceiling today, and nothing reports one being held.
-- **What the analyzer can enforce.** Read-modify-write is undecidable in general, but the common
-  shape — `Find` by primary key, then `Update` the same row — is detectable, and a *warning*
-  (`MELANGE0023`, the next free id) on that shape inside a snapshot reducer would catch `CensusApply`
-  and cost little. Warning, not error: the false-positive rate is unknown and a body that recomputes
-  a row it also read is legitimate.
 - **Whether concurrent snapshot reducers writing the same row should be visible.** Last-writer-wins
   is correct for the recompute shape and silent for the read-modify-write shape. A commit guard that
   counted overlapping write sets between concurrent snapshot transactions would surface the mistake
