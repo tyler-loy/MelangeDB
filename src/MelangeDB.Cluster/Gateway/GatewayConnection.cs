@@ -187,7 +187,8 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
             Guid.NewGuid(),
             _hub.Welcome.EpochId,
             _hub.Welcome.HeadLsn,
-            _hub.Welcome.HttpProtocol), ct).ConfigureAwait(false);
+            _hub.Welcome.HttpProtocol,
+            _session!.Identity), ct).ConfigureAwait(false);
     }
 
     private async Task<UpstreamSession> ConnectUpstreamAsync(Uri uri, bool firesLifecycle, CancellationToken ct)

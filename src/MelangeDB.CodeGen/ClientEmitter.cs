@@ -123,6 +123,9 @@ internal static class ClientEmitter
         builder.AppendLine();
         builder.AppendLine("        public MelangeReducers Reducers { get; }");
         builder.AppendLine();
+        builder.AppendLine("        /// <summary>The identity this connection authenticated as — what tells my rows apart from everyone else's. Known once connected.</summary>");
+        builder.AppendLine("        public global::MelangeDB.Identity Identity => Client.Identity;");
+        builder.AppendLine();
         builder.AppendLine("        /// <summary>The schema hash these bindings were generated from — the drift detector.</summary>");
         builder.AppendLine("        public string SchemaHash => MelangeSchema.Hash;");
         builder.AppendLine("    }");

@@ -19,6 +19,19 @@ public class HandshakeTests
         Assert.Equal(host.Engine.Log.EpochId, welcome.EpochId);
         Assert.Equal(head, welcome.HeadLsn);
         Assert.NotEqual(Guid.Empty, welcome.ConnectionId);
+        // The server tells the client who it authenticated as — the client must never re-derive
+        // the identity from its own token, so the handshake is where the value crosses the wire.
+        Assert.Equal(TransportTestHost.Caller, welcome.Identity);
+    }
+
+    [Fact]
+    public async Task The_client_surfaces_the_identity_the_server_derived()
+    {
+        await using var host = await TransportTestHost.StartAsync();
+        await using var client = host.CreateClient();
+        Assert.Equal(Identity.None, client.Identity);
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(TransportTestHost.Caller, client.Identity);
     }
 
     [Fact]

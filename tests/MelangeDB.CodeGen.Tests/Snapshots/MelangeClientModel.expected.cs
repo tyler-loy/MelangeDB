@@ -66,6 +66,9 @@ namespace MelangeDB.Types
 
         public MelangeReducers Reducers { get; }
 
+        /// <summary>The identity this connection authenticated as — what tells my rows apart from everyone else's. Known once connected.</summary>
+        public global::MelangeDB.Identity Identity => Client.Identity;
+
         /// <summary>The schema hash these bindings were generated from — the drift detector.</summary>
         public string SchemaHash => MelangeSchema.Hash;
     }

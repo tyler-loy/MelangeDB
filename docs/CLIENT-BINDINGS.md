@@ -119,6 +119,7 @@ await conn.Db.Creature.ChunkId.RescopeRangeAsync(sub, 5, 15);      // the terrai
 await sub.UnsubscribeAsync();                                      // removes only rows nothing else covers
 
 var lsn = await conn.Reducers.SpawnAsync(chunkId, "wolf", stats);  // typed stub per reducer
+conn.Identity;                                                     // who this connection authenticated as
 conn.SchemaHash;                                                   // the drift detector
 ```
 
@@ -137,6 +138,32 @@ Deliberate divergences from the SpacetimeDB C# SDK, for porting hands: reducer s
 `void`; the connection wrapper is `MelangeConnection`, not `DbConnection`; non-PK lookups scan the
 local cache instead of maintaining client-side index dictionaries — client caches are
 subscription-sized, and an index that earns its keep should show up in a profile first.
+
+## What a client knows the moment ConnectAsync returns
+
+Two connect-time facts trip porting hands, one present and one absent:
+
+**Your identity is on the connection — read it, never re-derive it.** `conn.Identity` (and
+`MelangeClient.Identity` underneath) is the identity the server derived during the handshake, and it
+is what distinguishes "my rows" from everyone else's in a subscription-fed cache:
+
+```csharp
+conn.Db.PlayerState.Identity.Find(conn.Identity);   // am I spawned yet?
+if (creature.OwnerId == conn.Identity) ...          // is that tamed wolf mine?
+```
+
+The derivation (`SHA256(issuer|subject)`) belongs to the server alone. Parsing your own JWT and
+hashing its claims makes every client a second implementation of the one piece of the contract that
+must never disagree — and tells you nothing anyway once the IdP is a third party. Re-auth can never
+change the value: a token that maps to a different identity closes the connection instead.
+
+**`ConnectAsync` returning does not mean `ClientConnected` has been applied.** The lifecycle reducer
+is its own transaction. It commits before the server processes your next frame, but a subscription's
+initial set is computed from the hot store, which the applier updates behind the log — so under load,
+a row your `ClientConnected` reducer creates may arrive as a **delta moments after the initial set**
+rather than in it. The natural port shape — connect, subscribe to `PlayerState`, assert your row is
+there — passes on an idle machine and fails under load. Wait for the row (an `OnInsert` handler, or
+poll the cache) instead of assuming the initial set contains it.
 
 ## Threading
 
