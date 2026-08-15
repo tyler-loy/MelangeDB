@@ -57,6 +57,15 @@ public sealed class MelangeClusterCoordinator
 
     /// <summary>The cluster's shard ownership map: every shard, its owner, and its fencing term.</summary>
     public IReadOnlyList<ShardAssignment> OwnershipMap() => Hub.Membership.AllAssignments();
+
+    /// <summary>
+    /// The cluster's per-shard load view, fed by every node's heartbeats: which shard is hot,
+    /// where it lives, and what it weighs. The operator's "which island is busy" answer, and the
+    /// feed the rebalance loop decides from. Utilization is the busy fraction of the shard
+    /// engine's write lock over its last heartbeat interval — the resource the published hotspot
+    /// ceilings (docs/CLUSTERING.md) are ceilings on.
+    /// </summary>
+    public IReadOnlyList<ShardLoad> LoadView() => Hub.Load.Snapshot();
 }
 
 /// <summary>Registers MelangeDB clustering in the host. Call after <c>AddMelangeDb</c>.</summary>

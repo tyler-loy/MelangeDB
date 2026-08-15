@@ -221,6 +221,8 @@ Meter name: `MelangeDB`.
 | `melange.handoff.failed` | counter | `{handoff}` | `reason` | 09 |
 | `melange.shard.owned` | gauge | `{shard}` | — | 09 |
 | `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 |
+| `melange.cluster.shard.utilization` | gauge | `{ratio}` | `shard`, `node` | 13 |
+| `melange.cluster.shard.resident_bytes` | gauge | `By` | `shard`, `node` | 13 |
 
 ### The four that actually matter
 
