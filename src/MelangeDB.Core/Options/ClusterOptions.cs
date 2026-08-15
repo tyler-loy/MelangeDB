@@ -151,4 +151,41 @@ public sealed class ClusterOptions
     /// <em>wedged</em> drain, not a normal one.
     /// </summary>
     public int DrainQueueTimeoutMs { get; set; } = 60_000;
+
+    /// <summary>
+    /// The hub's rebalance loop — off means the load view and the operator drain exist, but
+    /// nothing moves a shard automatically. Off by default because a loop that relocates the
+    /// world should be a decision, not a surprise.
+    /// </summary>
+    public bool RebalanceEnabled { get; set; }
+
+    /// <summary>
+    /// The sustained-load window: the loop acts on the window's mean, never a single heartbeat
+    /// sample, and not at all until the load history actually covers the window. The first
+    /// hysteresis layer.
+    /// </summary>
+    public int RebalanceWindowSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// Sustained utilization above which a node counts as hot — the sum of its shards' write-lock
+    /// busy fractions over the window. The loop then moves the largest shard whose departure
+    /// provably lowers the pair's maximum (see the rebalance loop's decision rule); a hot node it
+    /// cannot help is logged, not churned.
+    /// </summary>
+    public double RebalanceHotUtilization { get; set; } = 0.75;
+
+    /// <summary>
+    /// The floor of the dead zone between scaling out and consolidating. In phase 13 nothing acts
+    /// on cold — the gap between the two thresholds exists so the loop never chases its own wake;
+    /// phase 14's scale-in is what eventually consumes it.
+    /// </summary>
+    public double RebalanceColdUtilization { get; set; } = 0.25;
+
+    /// <summary>
+    /// Per-shard floor between automatic moves (the <c>HandoffMinIntervalMs</c> precedent, at
+    /// fleet scale): a shard that just moved — by the loop or by an operator — is not moved again
+    /// by the loop for this long, whatever the load view says. Operator drains themselves are
+    /// never blocked by it.
+    /// </summary>
+    public int ShardMoveMinIntervalMs { get; set; } = 300_000;
 }

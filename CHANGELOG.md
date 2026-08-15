@@ -59,6 +59,20 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The cluster follows load: the rebalance loop**
+  ([road-to-0.2 phase 13](docs/road-to-0.2/plan-phase-13.md), final slice — the phase is complete).
+  With `Cluster:RebalanceEnabled` (off by default: a loop that relocates the world should be a
+  decision, not a surprise), the hub watches the load view and drains a sustained-hot node's
+  largest-load shard to the least-loaded live node — but only when the pair's maximum utilization
+  strictly improves, so relocating a whole hotspot is refused rather than churned. Hysteresis at
+  every layer: the sustained window (`Cluster:RebalanceWindowSeconds`, and no action until the
+  history covers it), the per-shard move floor (`Cluster:ShardMoveMinIntervalMs`, started by
+  operator drains too), and one automatic move in flight at a time. A hot node the rule cannot
+  help is reported, rate-limited, with EventId **1732 as the granularity guardrail**: a node whose
+  whole load lives in one shard is the ceiling no cluster size changes, and the signal the
+  strategy's split lines were drawn too coarse. This is the five-islands scenario end to end: all
+  shards on one node at 2 a.m., the hot island peeled off to another node at 2 p.m., by itself.
+
 - **A live shard can move between nodes: the planned drain**
   ([road-to-0.2 phase 13](docs/road-to-0.2/plan-phase-13.md), second slice).
   `MelangeClusterCoordinator.DrainShardAsync(shard, destination?)` is the node-death reassignment

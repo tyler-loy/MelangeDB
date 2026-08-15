@@ -77,7 +77,7 @@ reactive; prediction can layer on the same drain primitive later without new mac
 
 ## Decisions to settle
 
-### Commit-loop utilization is the load metric
+### Settled: commit-loop utilization is the load metric
 
 Leaning: the busy fraction of the engine's write lock over the window. It is the resource the
 hotspot ceiling is made of, it is cheap to measure at the source, and unlike commit rate it does
@@ -86,7 +86,13 @@ ride along as tie-breakers and diagnostics, not triggers. To settle: whether fsy
 (`OnCommit` deployments, where the lock is busy *waiting*) need the wait split out of the busy
 fraction to avoid draining a shard that a faster disk, not a second node, would fix.
 
-### The drain's queue cap is its own key
+**Settled as leaning** — `MelangeEngine.WriteLockBusyTicks`, cumulative work inside the lock,
+lock *waits* excluded (a queue is evidence of saturation, not more capacity spent). The
+fsync-wait caveat is recorded rather than built: append time — fsync included — counts as busy,
+so an `OnCommit` disk-bound shard reads hot. That is arguably honest (the ceiling it is near is
+real) and the split ships when a consumer demonstrates the misdiagnosis.
+
+### Settled: the drain's queue cap is its own key
 
 Leaning: `Cluster:DrainQueueTimeoutMs`, defaulting well above the handoff queue's patience —
 recovering a large shard is slower than importing one player, and the cap exists to bound a
@@ -94,7 +100,11 @@ recovering a large shard is slower than importing one player, and the cap exists
 would make every large-shard drain trip it. To settle: the default, once the drain-duration
 histogram exists to inform it.
 
-### Quiesce is the fencing bump, not a new freeze
+**Settled as leaning** — shipped at 60 s, and it grew a second job: the floor of the drain's
+per-step node-link timeout, because quiesce and recovery scale with shard size while the link's
+default request timeout does not. One key states the deployment's whole drain patience.
+
+### Settled: quiesce is the fencing bump, not a new freeze
 
 Leaning: reuse. The bump is already what stops a wrongly-suspected-dead node from writing, the
 refusal surface already exists (`transient`), and a second freeze mechanism would be a second thing
@@ -102,12 +112,56 @@ the reconciler must reason about. To settle: whether the origin needs a distinct
 in membership purely for legibility (operator asks "why is this shard refusing writes"), even if
 the mechanism underneath is the same token.
 
-### Destination choice is least-projected-load, not round-robin
+**Settled as leaning, with one addition the plan missed**: a node-local *draining mark* (not
+membership state — the hub's store stays a pure ownership registry). It exists because the node's
+own heartbeat would otherwise reopen a quiesced shard while the hub sits between quiesce and
+reassign — the race that puts two writers on one log. The mark clears when the assignment moves,
+on an explicit abort, or by expiry after 2 × `Cluster:FailureTimeoutMs` (EventId 1728) — the
+self-healing bound for a hub that died mid-drain, resolving the interruption in the origin's
+favour.
+
+### Settled: destination choice is least-projected-load, not round-robin
 
 Leaning: place the moved shard where the load view says it fits, using the shard's own measured
 contribution as the projection. To settle: whether resident-bytes headroom vetoes a placement the
 utilization numbers would allow — a shard that fits by CPU and not by memory is a worse outcome
 than not moving.
+
+**Settled with a stronger rule than planned.** The plan's test — projected target under the hot
+threshold — turned out to admit a degenerate move: relocating a node's single hotspot to an
+emptier node "fits" whenever the threshold is generous, and accomplishes nothing. Shipped instead:
+move the largest-load shard for which `target + shard < origin` — the pair's *maximum strictly
+improves* — which both refuses the hotspot shuffle and is threshold-free, so it cannot be
+mis-tuned. The resident-bytes veto is deferred to phase 14 with the rest of memory-aware
+placement; utilization is the only axis in 13.
+
+## Shipped notes
+
+Landed as three stacked changes — the load signal, the drain, the loop — each green on the full
+cluster and core suites before the next began. Boundaries drawn during implementation, beyond the
+settled decisions above:
+
+- **The granularity guardrail moved from registration time to runtime.** The plan wanted a warning
+  at strategy registration when one shard's extent exceeds a share of node capacity — but capacity
+  is not knowable at registration, and any registration-time number would be a guess. Shipped
+  instead as EventId 1732, fired (rate-limited) when a node is *measured* sustained-hot and owns a
+  single shard: the same trap, caught with real arithmetic at the moment it matters. Worth an
+  alert; the docs say so.
+- **The gateway mutes before the quiesce, not at the swap.** The handoff precedent mutes the
+  origin at the destination-authoritative moment; a drain's origin dies earlier — its transport
+  closes under the quiesce — so `OnMoveStarted` mutes immediately, and the closure reads as
+  machinery rather than a client-visible resync error.
+- **Mid-drain asymmetry, recorded honestly:** reducer *calls* queue (bounded by
+  `Cluster:DrainQueueTimeoutMs`); a *fresh subscription* issued mid-drain instead rides the
+  gateway's existing connect-retry window (~5 s). Calls are the hot path and the promise; new
+  subscriptions mid-drain are rare and converge.
+- **Done-when deltas.** The no-disconnect drain, the mid-drain call, the least-loaded pick, the
+  refusals, the post-quiesce fault handback, the loop's corrective move, the no-flap window, and
+  the single-shard refusal are tests. Interruption coverage is by injected fault at the
+  quiesce/reassign boundary plus the expiry design for a dead hub — a scripted kill-the-hub-mid-
+  drain test is left for the phase 14 cycle, where the reference provisioner makes process-level
+  chaos cheap. The full five-shard night-shift script is likewise subsumed piecewise (drain by
+  hand, loop spreads back out) rather than run as one scenario test.
 
 ## Done when
 
