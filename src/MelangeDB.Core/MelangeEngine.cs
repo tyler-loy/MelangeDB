@@ -78,7 +78,11 @@ public sealed partial class MelangeEngine : IDisposable
             // sequences at its LSN, then one pass over the log tail rebuilds the rest — replaying
             // re-observes every durably allocated AutoInc id, so replay never reassigns different
             // ids. The tail record's timestamp is kept as the scheduler's downtime anchor — when
-            // the world last moved.
+            // the world last moved. A store that can take the whole replay through builders does
+            // (no read view can exist yet, so a version per row would be built for nobody); the
+            // in-memory store's LoadSnapshot has its own bulk path either way.
+            var bulk = store as IBulkRecovery;
+            bulk?.BeginRecovery();
             var replayFrom = RecoverSnapshot(store);
             foreach (var record in _log.ReadFrom(replayFrom))
             {
@@ -86,6 +90,8 @@ public sealed partial class MelangeEngine : IDisposable
                 _sequencer.Observe(record, schema);
                 RecoveredTailTimestamp = record.Timestamp;
             }
+
+            bulk?.CompleteRecovery();
 
             _tailTimestamp = RecoveredTailTimestamp;
             HotStore = store;

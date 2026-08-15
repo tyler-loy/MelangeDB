@@ -182,7 +182,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
-- **A slow reducer that aborted warned about nothing.** `1003` fired only on the commit path, so a reducer
+- **FASTER recovery stopped paying for read views nobody holds.** Making the store's managed state
+  persistent containers (the pinned-reads work) made recovery measurably slower on `FasterHotStore`
+  — a consumer measured **+16.5%** (3.76 s → 4.37 s) replaying a 269 MB log ([#51](https://github.com/tyler-loy/MelangeDB/issues/51))
+  — because replay applied one op at a time, and each op paid a path copy of its table's containers
+  to publish a version no reader could observe: no read view can exist before the engine finishes
+  constructing. The engine now brackets recovery (snapshot load included) with the new optional
+  `IBulkRecovery` capability, and the FASTER store takes the whole replay through the containers'
+  builders, publishing one version per table at the end — the same trade the in-memory store's
+  snapshot load already made. Measured on a 34 MB log of sweep-shaped records (a 200k-row resident
+  indexed table seeded in 100-row commits, then 8-row update sweeps): recovery **3.12 s → 2.00 s,
+  0.64×** — the regression erased, with room to spare. Mid-replay Auto demotion runs inside the
+  builders and is pinned by a test. `1003` fired only on the commit path, so a reducer
   that spent 500 ms in its body and then threw was silent — while holding the write lock, and therefore
   every other writer, for exactly as long as one that committed. A validating reducer that does its
   expensive work before refusing, a transaction rejected by the cluster's span check, and a scheduled

@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Immutable;
+using System.Diagnostics.CodeAnalysis;
 using System.Numerics;
 using FASTER.core;
 using MelangeDB.Core;
@@ -35,7 +36,7 @@ namespace MelangeDB.Storage.Faster;
 /// proportional to <em>writes during the window</em>, not to table size: a sweep scanning a million
 /// rows while fifty change pays for fifty.</para>
 /// </summary>
-public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSource, IDisposable
+public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSource, IBulkRecovery, IDisposable
 {
     private readonly SchemaRegistry _registry;
     private readonly ILogger _logger;
@@ -127,6 +128,33 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             }
 
             AppliedLsn = lsn;
+        }
+    }
+
+    /// <summary>
+    /// Enters recovery's bulk mode — see <see cref="IBulkRecovery"/>. The managed state (resident
+    /// rows, the key directory, secondary indexes) accumulates in builders; FASTER upserts are
+    /// unchanged, since the hybrid log was never the cost. Recovery replays 269MB logs one
+    /// single-op record at a time, and each op was paying a path copy of its table's containers
+    /// for a version no reader could observe.
+    /// </summary>
+    public void BeginRecovery()
+    {
+        lock (_lock)
+        {
+            if (_openViews.Count > 0)
+                throw new InvalidOperationException("Recovery bulk mode cannot begin while a read view is open.");
+            foreach (var table in _tables.Values)
+                table.BeginBulk();
+        }
+    }
+
+    public void CompleteRecovery()
+    {
+        lock (_lock)
+        {
+            foreach (var table in _tables.Values)
+                table.CompleteBulk();
         }
     }
 
@@ -616,7 +644,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         var (main, mask, blobs) = RowBlobSplitter.Split(table.Schema, row);
 
         CapturePreImage(table, key);
-        if (table.Directory.TryGetValue(key, out var previous))
+        if (table.TryGetDirectory(key, out var previous))
         {
             table.Unindex(key, previous.IndexValues);
 
@@ -649,7 +677,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             return;
         }
 
-        if (!table.Directory.TryGetValue(key, out var entry))
+        if (!table.TryGetDirectory(key, out var entry))
             return;
         CapturePreImage(table, key);
         table.Unindex(key, entry.IndexValues);
@@ -670,7 +698,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     /// </summary>
     private void Demote(TableState table)
     {
-        var rows = table.ResidentRows;
+        var rows = table.SnapshotResidentRows();
         table.BeginPaged();
         foreach (var (key, bytes) in rows)
             PutPaged(table, key, bytes);
@@ -869,6 +897,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         private readonly string[] _indexColumns;
         private TableVersion _current;
 
+        /// <summary>
+        /// Recovery's builder state, non-null while the store is in bulk mode. Every mutator and
+        /// every write-path read routes here when set, so replay mutates owned builder nodes in
+        /// place instead of publishing a structurally shared version per row — versions built for
+        /// a reader that cannot exist yet. <see cref="Current"/> is stale until
+        /// <see cref="CompleteBulk"/> publishes.
+        /// </summary>
+        private BulkState? _bulk;
+
         public TableState(TableSchema schema, Residency declared)
         {
             var bytesColumns = schema.Columns.Count(c => c.Kind == ColumnKind.Bytes);
@@ -919,7 +956,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         public int ResidencyEpoch { get; private set; }
 
         /// <summary>Whether the table's rows are currently pinned in managed memory.</summary>
-        public bool IsResident => Current.IsResident;
+        public bool IsResident => _bulk?.IsResident ?? Current.IsResident;
 
         public ImmutableSortedDictionary<RowKey, byte[]> ResidentRows => Current.ResidentRows;
 
@@ -966,8 +1003,42 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public RowKey[] SnapshotKeys() => [.. Current.Keys];
 
+        /// <summary>A row's bytes if resident — the write path's read, so it consults the builders in bulk mode.</summary>
+        public bool TryGetResident(in RowKey key, out byte[] bytes) =>
+            _bulk is { } bulk
+                ? bulk.Rows.TryGetValue(key, out bytes!)
+                : Current.ResidentRows.TryGetValue(key, out bytes!);
+
+        /// <summary>A paged row's directory entry — the write path's read, so it consults the builders in bulk mode.</summary>
+        public bool TryGetDirectory(in RowKey key, [NotNullWhen(true)] out DirectoryEntry? entry) =>
+            _bulk is { } bulk
+                ? bulk.Directory.TryGetValue(key, out entry)
+                : Current.Directory.TryGetValue(key, out entry);
+
+        /// <summary>The resident rows materialized for a tier migration, which is about to reset them.</summary>
+        public KeyValuePair<RowKey, byte[]>[] SnapshotResidentRows() =>
+            _bulk is { } bulk ? [.. bulk.Rows] : [.. Current.ResidentRows];
+
         public void PutResident(RowKey key, byte[] bytes)
         {
+            if (_bulk is { } bulk)
+            {
+                if (bulk.Rows.TryGetValue(key, out var previousRow))
+                {
+                    Unindex(bulk.Indexes, key, EncodeIndexValues(previousRow));
+                    ResidentDataBytes -= previousRow.Length;
+                }
+                else
+                {
+                    OverheadBytes += key.Length + 32;
+                }
+
+                ResidentDataBytes += bytes.Length;
+                bulk.Rows[key] = bytes;
+                Index(bulk.Indexes, key, EncodeIndexValues(bytes));
+                return;
+            }
+
             var current = Current;
             var rows = current.ResidentRows;
             var indexes = current.Indexes;
@@ -991,6 +1062,17 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public void RemoveResident(RowKey key)
         {
+            if (_bulk is { } bulk)
+            {
+                if (!bulk.Rows.TryGetValue(key, out var previousRow))
+                    return;
+                ResidentDataBytes -= previousRow.Length;
+                OverheadBytes -= key.Length + 32;
+                bulk.Rows.Remove(key);
+                Unindex(bulk.Indexes, key, EncodeIndexValues(previousRow));
+                return;
+            }
+
             var current = Current;
             if (!current.ResidentRows.TryGetValue(key, out var previous))
                 return;
@@ -1010,6 +1092,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             else
                 OverheadBytes += key.Length + 32;
             OverheadBytes += EntryOverhead(entry);
+            if (_bulk is { } bulk)
+            {
+                bulk.Directory[key] = entry;
+                return;
+            }
+
             var current = Current;
             Current = new TableVersion(
                 current.IsResident,
@@ -1021,6 +1109,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         public void RemoveDirectory(RowKey key, DirectoryEntry entry)
         {
             OverheadBytes -= EntryOverhead(entry) + key.Length + 32;
+            if (_bulk is { } bulk)
+            {
+                bulk.Directory.Remove(key);
+                return;
+            }
+
             var current = Current;
             Current = new TableVersion(
                 current.IsResident,
@@ -1037,17 +1131,72 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         private void BeginTier(bool isResident)
         {
-            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexPositions.Count);
-            for (var i = 0; i < _indexPositions.Count; i++)
-                indexes.Add(SecondaryIndex.Empty);
             ResidentDataBytes = 0;
             OverheadBytes = 0;
             ResidencyEpoch++;
+            if (_bulk is { } bulk)
+            {
+                // An Auto demotion mid-replay: the migration restarts inside the builders, and
+                // nothing publishes until recovery completes.
+                bulk.IsResident = isResident;
+                bulk.Rows.Clear();
+                bulk.Directory.Clear();
+                for (var i = 0; i < bulk.Indexes.Length; i++)
+                    bulk.Indexes[i] = SecondaryIndex.Empty.ToBuilder();
+                return;
+            }
+
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexPositions.Count);
+            for (var i = 0; i < _indexPositions.Count; i++)
+                indexes.Add(SecondaryIndex.Empty);
             Current = new TableVersion(
                 isResident,
                 ImmutableSortedDictionary<RowKey, byte[]>.Empty,
                 ImmutableSortedDictionary<RowKey, DirectoryEntry>.Empty,
                 indexes.MoveToImmutable());
+        }
+
+        /// <summary>Enters bulk mode: mutators write builders seeded from the current version.</summary>
+        public void BeginBulk()
+        {
+            var current = Current;
+            var indexes = new SecondaryIndex.Builder[current.Indexes.Length];
+            for (var i = 0; i < indexes.Length; i++)
+                indexes[i] = current.Indexes[i].ToBuilder();
+            _bulk = new BulkState
+            {
+                IsResident = current.IsResident,
+                Rows = current.ResidentRows.ToBuilder(),
+                Directory = current.Directory.ToBuilder(),
+                Indexes = indexes,
+            };
+        }
+
+        /// <summary>Publishes one version from the builders and leaves bulk mode.</summary>
+        public void CompleteBulk()
+        {
+            if (_bulk is not { } bulk)
+                return;
+            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(bulk.Indexes.Length);
+            foreach (var builder in bulk.Indexes)
+                indexes.Add(builder.ToImmutable());
+            _bulk = null;
+            Current = new TableVersion(
+                bulk.IsResident,
+                bulk.Rows.ToImmutable(),
+                bulk.Directory.ToImmutable(),
+                indexes.MoveToImmutable());
+        }
+
+        private sealed class BulkState
+        {
+            public required bool IsResident { get; set; }
+
+            public required ImmutableSortedDictionary<RowKey, byte[]>.Builder Rows { get; init; }
+
+            public required ImmutableSortedDictionary<RowKey, DirectoryEntry>.Builder Directory { get; init; }
+
+            public required SecondaryIndex.Builder[] Indexes { get; init; }
         }
 
         /// <summary>
@@ -1082,6 +1231,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (values is null)
                 return;
+            if (_bulk is { } bulk)
+            {
+                Index(bulk.Indexes, key, values);
+                return;
+            }
+
             var current = Current;
             Current = new TableVersion(
                 current.IsResident, current.ResidentRows, current.Directory, Index(current.Indexes, key, values));
@@ -1091,9 +1246,41 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (values is null)
                 return;
+            if (_bulk is { } bulk)
+            {
+                Unindex(bulk.Indexes, key, values);
+                return;
+            }
+
             var current = Current;
             Current = new TableVersion(
                 current.IsResident, current.ResidentRows, current.Directory, Unindex(current.Indexes, key, values));
+        }
+
+        private void Index(SecondaryIndex.Builder[] indexes, RowKey key, RowKey[]? values)
+        {
+            if (values is null)
+                return;
+            for (var i = 0; i < Schema.Indexes.Count; i++)
+            {
+                var value = values[i];
+                if (value.Length == 0)
+                    continue; // A null column value is unindexed, matching the in-memory store.
+                indexes[i].Add(value, key);
+            }
+        }
+
+        private void Unindex(SecondaryIndex.Builder[] indexes, RowKey key, RowKey[]? values)
+        {
+            if (values is null)
+                return;
+            for (var i = 0; i < Schema.Indexes.Count; i++)
+            {
+                var value = values[i];
+                if (value.Length == 0)
+                    continue;
+                indexes[i].Remove(value, key);
+            }
         }
 
         private ImmutableArray<SecondaryIndex> Index(
