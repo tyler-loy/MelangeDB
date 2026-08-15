@@ -12,7 +12,7 @@ namespace MelangeDB.Transport.Tests;
 public class ChannelOrderingTests
 {
     [Fact]
-    public async Task Frames_carry_channel_tags_ordering_holds_within_a_channel_and_channels_interleave()
+    public async Task Frames_carry_channel_tags_and_ordering_holds_within_each_channel()
     {
         await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
         {
@@ -64,14 +64,11 @@ public class ChannelOrderingTests
         for (var i = 1; i < chunks.Count; i++)
             Assert.Equal(chunks[i - 1].ChunkIndex + 1, chunks[i].ChunkIndex);
 
-        // Interleaving across channels: the reducer result (and its delta) overtook the bulk
-        // stream. This doubles as the head-of-line bound — the response waited at most one chunk.
-        var resultIndex = observed.FindIndex(f => f is ReducerResultFrame);
-        var lastChunkIndex = observed.FindLastIndex(f => f is SubscriptionAppliedFrame);
-        Assert.True(resultIndex >= 0);
-        Assert.True(
-            resultIndex < lastChunkIndex,
-            "the reducer result should arrive while the initial set is still streaming");
+        // The reducer results arrived; whether they overtook the bulk stream is not asserted here,
+        // because nothing in this test holds the bulk channel open until the call is on the wire —
+        // on a fast runner the whole set can drain first, and the interleave becomes a coin flip.
+        // The cross-channel property lives in the next test, which forces the schedule.
+        Assert.Contains(observed, f => f is ReducerResultFrame);
 
         // Ordering within the data channel: LSNs never regress.
         var updates = observed.OfType<TransactionUpdateFrame>().Where(f => f.Lsn != 0).ToList();
@@ -79,45 +76,54 @@ public class ChannelOrderingTests
             Assert.True(updates[i - 1].Lsn < updates[i].Lsn);
     }
 
+    /// <summary>
+    /// The head-of-line bound, with the schedule forced rather than raced: the subscribe and the
+    /// call are sent before anything is read, so the ~16MB initial set wedges the sender against
+    /// TCP and the call is guaranteed to arrive while bulk chunks are still pending. The response
+    /// rides the calls channel past them; a sender that queued it behind the set would fail this
+    /// every time, not just under unlucky scheduling.
+    /// </summary>
     [Fact]
     public async Task A_large_initial_set_does_not_delay_a_concurrent_reducer_response()
     {
         await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
         {
-            ["MelangeDb:Transport:MaxInitialSetChunkBytes"] = "4096",
             ["MelangeDb:Subscriptions:MaxBytesPerSubscription"] = "134217728",
+            ["MelangeDb:Validation:MaxCollectionLength"] = "524288",
+            ["MelangeDb:Transport:HeartbeatTimeoutMs"] = (45_000 * TestTime.Scale).ToString(),
         });
-        host.Engine.BulkInsert(TransportTestHost.Caller, [.. Enumerable.Range(0, 800).Select(i =>
-            new Core.BulkRow("Chunk", new Dictionary<string, object?>
-            {
-                ["Id"] = (long)i,
-                ["X"] = (long)(i % 16),
-                ["Data"] = new byte[2048],
-            }))]);
 
-        var order = new List<string>();
-        await using var client = host.CreateClient(o => o.FrameInspector = (frame, _) =>
+        // ~16MB: the unread set must overflow the kernel's socket buffering (Linux loopback
+        // autotunes the send buffer to ~4MB), or the sender never wedges and the interleave below
+        // is racy instead of forced.
+        for (var i = 0; i < 64; i++)
+            host.Call("SetChunk", (long)i, (long)i, new byte[256 * 1024]);
+
+        await using var raw = new RawSocketClient();
+        await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
+
+        // Both frames are on the socket before the first read: the subscribe starts the stream,
+        // the stream fills TCP and wedges, and the call arrives while chunks are still pending.
+        await raw.SendAsync(new SubscribeFrame(1, "SELECT * FROM Chunk", null) { Channel = MelangeChannels.Data }, TestContext.Current.CancellationToken);
+        await raw.SendAsync(new CallReducerFrame(1, "Noop", ReducerArgs.Encode([]), null) { Channel = MelangeChannels.Calls }, TestContext.Current.CancellationToken);
+
+        var sawResult = false;
+        var chunks = 0;
+        while (true)
         {
-            lock (order)
+            var frame = await raw.ReceiveAsync(TestContext.Current.CancellationToken);
+            if (frame is ReducerResultFrame)
+                sawResult = true;
+            if (frame is SubscriptionAppliedFrame chunk)
             {
-                if (frame is ReducerResultFrame)
-                    order.Add("result");
-                else if (frame is SubscriptionAppliedFrame { IsLast: true })
-                    order.Add("last-chunk");
+                chunks++;
+                if (chunk.IsLast)
+                    break;
             }
-        });
-        await client.ConnectAsync(TestContext.Current.CancellationToken);
-
-        var subscribing = client.SubscribeAsync("SELECT * FROM Chunk", cancellationToken: TestContext.Current.CancellationToken);
-        await client.CallReducerAsync("Noop", null, TestContext.Current.CancellationToken);
-        await subscribing;
-
-        lock (order)
-        {
-            // The stated bound: the response is interleaved ahead of the remaining bulk chunks,
-            // so it lands before the ~1.6MB initial set finishes.
-            Assert.Equal(["result", "last-chunk"], order);
         }
+
+        Assert.True(chunks > 1, $"expected a multi-chunk initial set, got {chunks} chunk(s)");
+        Assert.True(sawResult, "the reducer result should arrive while the initial set is still streaming");
     }
 
     /// <summary>
