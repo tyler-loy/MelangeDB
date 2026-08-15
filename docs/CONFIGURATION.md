@@ -125,6 +125,14 @@ shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> Ha
 block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
 next border re-subscribe, when the owner sends a full band reset.
 
+**Planned for phases 13–14** ([road-to-0.2](road-to-0.2/README.md), the elastic-capacity work —
+design record in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)): the `Cluster:*`
+rows marked *planned* in the Cluster table below. Defaults there are provisional until each phase
+lands and verifies them against the code, per this register's planned → shipped rule. One
+deliberate absence decided at planning time: the node provisioner is a **DI registration, not a
+configuration string** (`INodeProvisioner`, the membership-store precedent) — a provisioner is a
+component with credentials, not a name.
+
 **Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
 the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid
 bearer token: bulk writes bypass every reducer and its policies, so the endpoint now follows the `Sql:*`
@@ -343,6 +351,16 @@ that were reshaped or removed when this shipped.
 | `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Spatial strategy only: how deep each shard's read-only border band reaches into its neighbours, in chunks. Deeper is smoother and costs bandwidth plus memory on every node. The default is derived (docs/CLUSTERING.md shows the derivation): margin + the distance an entity covers during one handoff window — for the reference workload `1 + ceil(8 m/s x ~1 s / 64 m) = 2`. Must be ≥ 1 and > `HandoffMarginChunks` and ≤ the block dimension — validated loudly at strategy construction; live reads clamp instead of crashing a running node. `careful` because deepening it live only fully materializes on the next border re-subscribe (the owner then sends a full band reset). |
 | `Cluster:HandoffMarginChunks` | int | `1` | live | 10 | Spatial strategy only: the hysteresis margin. An automatic handoff triggers only once an entity is *strictly more* than this many chunks past a block boundary, so after a transfer the entity must walk back through the whole margin before the reverse transfer can fire — pacing on the line triggers nothing. `0` disables the margin (creatures transfer on first crossing regardless of this setting). Must be ≥ 0 and < `BorderBandChunks`. |
 | `Cluster:HandoffMinIntervalMs` | int | `2000` | live | 10 | Rate limit on automatic (boundary-triggered) handoffs: the hub will not start a new transfer for the same entity within this window. The second half of hysteresis — even an entity oscillating deeper than the margin triggers a bounded number of transfers per unit time. Must be ≥ 0. |
+| `Cluster:RebalanceEnabled` | bool | `false` | live | 13 | **Planned.** The hub's rebalance loop — off means the load view and the operator drain exist, but nothing moves a shard automatically. Off by default because a loop that relocates the world should be a decision, not a surprise. |
+| `Cluster:RebalanceWindowSeconds` | int | `60` | live | 13 | **Planned.** The sustained-load window: the loop acts on the window's aggregate, never a single heartbeat sample. The first hysteresis layer. |
+| `Cluster:RebalanceHotUtilization` | double | `0.75` | live | 13 | **Planned.** Sustained commit-loop utilization above which a node counts as hot. The metric is the busy fraction of the engine's write lock — the resource the published hotspot ceiling is made of. |
+| `Cluster:RebalanceColdUtilization` | double | `0.25` | live | 13 | **Planned.** The floor of the dead zone. In phase 13 nothing acts on cold — the gap between the two thresholds exists so the loop never chases its own wake; phase 14's scale-in is what eventually consumes it. |
+| `Cluster:ShardMoveMinIntervalMs` | int | `300000` | live | 13 | **Planned.** Per-shard floor between automatic moves (the `HandoffMinIntervalMs` precedent, at fleet scale): a shard that just moved does not move again for this long, whatever the load view says. Operator drains are exempt. |
+| `Cluster:DrainQueueTimeoutMs` | int | `60000` | live | 13 | **Planned.** Cap on gateway call-queueing during a drain before queued callers get a retryable error. Deliberately its own key, defaulting far above the handoff queue's patience — recovering a shard is slower than importing a player, and this cap exists to bound a *wedged* drain, not a normal one. |
+| `Cluster:MaxNodes` | int | *(unset)* | live | 14 | **Planned.** Hard ceiling on fleet size; the rebalance loop never provisions past it. **Deliberately no default**: a registered `INodeProvisioner` with this unset is refused loudly at startup, because every default is wrong — low silently caps a deployment that meant to scale, high is a silent spending authorization. Irrelevant when no provisioner is registered. |
+| `Cluster:MinNodes` | int | `1` | live | 14 | **Planned.** Floor on fleet size; scale-in never drains below it. |
+| `Cluster:ScaleInEnabled` | bool | `false` | live | 14 | **Planned.** Gates consolidation and decommissioning separately from `RebalanceEnabled` — giving nodes back is the half with sharp edges, and a fleet that only grows still solves the 2 p.m. problem (just not the 2 a.m. bill). |
+| `Cluster:ProvisionTicketTimeoutMs` | int | `600000` | live | 14 | **Planned.** How long the hub waits on a `ProvisionTicket` before re-requesting — exactly once; a second expiry raises an operator alert and stops asking. Money is involved: the posture on repeated failure is *tell a human*, never *keep trying*. |
 
 ## Diagnostics
 
