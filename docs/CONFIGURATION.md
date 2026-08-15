@@ -125,14 +125,22 @@ shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> Ha
 block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
 next border re-subscribe, when the owner sends a full band reset.
 
-**Planned for phases 13–15** ([road-to-0.2](road-to-0.2/README.md)): the `Cluster:*` rows marked
-*planned* in the Cluster table below (phases 13–14, the elastic-capacity work — design record in
+**Shipped as of phase 13** ([road-to-0.2](road-to-0.2/README.md), defaults verified against
+`ClusterOptions`): `Cluster:DrainQueueTimeoutMs`, `Cluster:RebalanceEnabled`,
+`Cluster:RebalanceWindowSeconds`, `Cluster:RebalanceHotUtilization`,
+`Cluster:RebalanceColdUtilization`, and `Cluster:ShardMoveMinIntervalMs`. Two notes made when it
+shipped: (1) `Cluster:RebalanceColdUtilization` shipped **accepted-and-reserved** (the
+`GroupCommit` precedent) — phase 13's loop acts on hot only, and the key exists now so phase 14's
+scale-in can honor it without a config break; (2) the hot threshold's metric is the *sum* of a
+node's per-shard write-lock busy fractions, which can legitimately exceed 1.0 on a node running
+several busy shard engines — the row says so, because a threshold read as "percent of one CPU"
+would be tuned wrong.
+
+**Planned for phases 14–15**: the remaining `Cluster:*` rows marked *planned* in the Cluster table
+below (phase 14, provisioned capacity — design record in
 [design/elastic-rebalancing.md](design/elastic-rebalancing.md)) and the `Backup:*` rows in the
 Backup section (phase 15). Defaults there are provisional until each phase lands and verifies them
-against the code, per this register's planned → shipped rule. Phase 13 is landing in slices:
-`Cluster:DrainQueueTimeoutMs` shipped with the drain (default verified against `ClusterOptions`);
-the `Cluster:Rebalance*` and `Cluster:ShardMoveMinIntervalMs` rows stay planned until the loop
-lands. One deliberate absence decided at
+against the code, per this register's planned → shipped rule. One deliberate absence decided at
 planning time: the node provisioner is a **DI registration, not a configuration string**
 (`INodeProvisioner`, the membership-store precedent) — a provisioner is a component with
 credentials, not a name.
@@ -363,11 +371,11 @@ that were reshaped or removed when this shipped.
 | `Cluster:BorderBandChunks` | int | `2` | careful | 10 | Spatial strategy only: how deep each shard's read-only border band reaches into its neighbours, in chunks. Deeper is smoother and costs bandwidth plus memory on every node. The default is derived (docs/CLUSTERING.md shows the derivation): margin + the distance an entity covers during one handoff window — for the reference workload `1 + ceil(8 m/s x ~1 s / 64 m) = 2`. Must be ≥ 1 and > `HandoffMarginChunks` and ≤ the block dimension — validated loudly at strategy construction; live reads clamp instead of crashing a running node. `careful` because deepening it live only fully materializes on the next border re-subscribe (the owner then sends a full band reset). |
 | `Cluster:HandoffMarginChunks` | int | `1` | live | 10 | Spatial strategy only: the hysteresis margin. An automatic handoff triggers only once an entity is *strictly more* than this many chunks past a block boundary, so after a transfer the entity must walk back through the whole margin before the reverse transfer can fire — pacing on the line triggers nothing. `0` disables the margin (creatures transfer on first crossing regardless of this setting). Must be ≥ 0 and < `BorderBandChunks`. |
 | `Cluster:HandoffMinIntervalMs` | int | `2000` | live | 10 | Rate limit on automatic (boundary-triggered) handoffs: the hub will not start a new transfer for the same entity within this window. The second half of hysteresis — even an entity oscillating deeper than the margin triggers a bounded number of transfers per unit time. Must be ≥ 0. |
-| `Cluster:RebalanceEnabled` | bool | `false` | live | 13 | **Planned.** The hub's rebalance loop — off means the load view and the operator drain exist, but nothing moves a shard automatically. Off by default because a loop that relocates the world should be a decision, not a surprise. |
-| `Cluster:RebalanceWindowSeconds` | int | `60` | live | 13 | **Planned.** The sustained-load window: the loop acts on the window's aggregate, never a single heartbeat sample. The first hysteresis layer. |
-| `Cluster:RebalanceHotUtilization` | double | `0.75` | live | 13 | **Planned.** Sustained commit-loop utilization above which a node counts as hot. The metric is the busy fraction of the engine's write lock — the resource the published hotspot ceiling is made of. |
-| `Cluster:RebalanceColdUtilization` | double | `0.25` | live | 13 | **Planned.** The floor of the dead zone. In phase 13 nothing acts on cold — the gap between the two thresholds exists so the loop never chases its own wake; phase 14's scale-in is what eventually consumes it. |
-| `Cluster:ShardMoveMinIntervalMs` | int | `300000` | live | 13 | **Planned.** Per-shard floor between automatic moves (the `HandoffMinIntervalMs` precedent, at fleet scale): a shard that just moved does not move again for this long, whatever the load view says. Operator drains are exempt. |
+| `Cluster:RebalanceEnabled` | bool | `false` | live | 13 | The hub's rebalance loop — off means the load view and the operator drain exist, but nothing moves a shard automatically. Off by default because a loop that relocates the world should be a decision, not a surprise. |
+| `Cluster:RebalanceWindowSeconds` | int | `60` | live | 13 | The sustained-load window: the loop acts on the window's *mean*, never a single heartbeat sample — and not at all until the load history covers the whole window, so a freshly started hub cannot mistake its first samples for sustained load. The first hysteresis layer. |
+| `Cluster:RebalanceHotUtilization` | double | `0.75` | live | 13 | Sustained utilization above which a node counts as hot: the sum of its shards' write-lock busy fractions (`melange.cluster.shard.utilization`) over the window — the resource the published hotspot ceilings are ceilings on. Note the sum can legitimately exceed 1.0 on a node running several busy shard engines. |
+| `Cluster:RebalanceColdUtilization` | double | `0.25` | live | 13 | The floor of the dead zone. In phase 13 nothing acts on cold — the gap between the two thresholds exists so the loop never chases its own wake; phase 14's scale-in is what eventually consumes it. Binds and validates; shipped accepted-and-reserved (the `GroupCommit` precedent). |
+| `Cluster:ShardMoveMinIntervalMs` | int | `300000` | live | 13 | Per-shard floor between automatic moves (the `HandoffMinIntervalMs` precedent, at fleet scale): a shard that just moved — by the loop *or by an operator* — is not moved again by the loop for this long, whatever the load view says. Operator drains themselves are never blocked by it. Also the cadence of the loop's stuck-hot warnings (EventIds 1732/1733). |
 | `Cluster:DrainQueueTimeoutMs` | int | `60000` | live | 13 | Cap on gateway call-queueing during a drain before queued callers get a retryable error (EventId 1730). Deliberately its own key, defaulting far above the handoff queue's patience — recovering a shard is slower than importing a player, and this cap exists to bound a *wedged* drain, not a normal one. Also the floor of the drain's per-step link timeout, since quiesce and recovery scale with shard size. |
 | `Cluster:MaxNodes` | int | *(unset)* | live | 14 | **Planned.** Hard ceiling on fleet size; the rebalance loop never provisions past it. **Deliberately no default**: a registered `INodeProvisioner` with this unset is refused loudly at startup, because every default is wrong — low silently caps a deployment that meant to scale, high is a silent spending authorization. Irrelevant when no provisioner is registered. |
 | `Cluster:MinNodes` | int | `1` | live | 14 | **Planned.** Floor on fleet size; scale-in never drains below it. |

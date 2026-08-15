@@ -322,6 +322,15 @@ already records the move, so the destination opens on its own next heartbeat), a
 non-zero occurrences of this one mean drains are exceeding the deployment's stated patience and the cap or
 the shard size needs a look.
 
+The rebalance loop: `1731 RebalanceMoving` — the decision with its arithmetic: origin's sustained
+utilization, the moving shard's own, the target's — `1732 RebalanceSingleShardHot` and
+`1733 RebalanceNoFit`, the two ways a hot node the loop refuses to churn is reported (rate-limited to
+`Cluster:ShardMoveMinIntervalMs`). **1732 is the granularity guardrail** and worth an alert: it names a
+node whose whole load lives in one shard — the ceiling no cluster size changes, and the signal that the
+strategy's split lines were drawn too coarse (docs/design/elastic-rebalancing.md). `1734
+RebalanceEvaluationFailed` is a tick that threw and was skipped; recurring, it means the loop is
+effectively off and nobody turned it off.
+
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
 the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`

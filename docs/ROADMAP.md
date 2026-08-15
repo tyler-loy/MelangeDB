@@ -83,7 +83,7 @@ Phase 15 is independent operational surface over the 0.1 durability machinery.
 
 | Phase | Title | Status |
 | --- | --- | --- |
-| [13](road-to-0.2/plan-phase-13.md) | Clustering III — elastic assignment: per-shard load on heartbeats, the planned drain, the rebalance loop | Planned |
+| [13](road-to-0.2/plan-phase-13.md) | Clustering III — elastic assignment: per-shard load on heartbeats, the planned drain, the rebalance loop | **Shipped** |
 | [14](road-to-0.2/plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in: the `INodeProvisioner` seam, provision-then-reassign, drain-and-decommission | Planned |
 | [15](road-to-0.2/plan-phase-15.md) | Backup and restore: the `.mbak` archive (snapshot + log tail, per engine — the truth, not the projections), `melange backup` / `restore` / `backup verify` | Planned |
 

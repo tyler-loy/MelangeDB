@@ -229,6 +229,20 @@ section of [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
 **Domain event** — An application-level fact published from a reducer via `ctx.Publish`, delivered to
 DI-resolved handlers *after* the commit point.
 
+**Load view** — The hub's per-shard load aggregation (`MelangeClusterCoordinator.LoadView()`), fed
+by every node's heartbeats: each owned shard's write-lock busy fraction over the last beat, log
+head, resident footprint, and borrowed-row count, exported as the `melange.cluster.shard.*`
+gauges. The feed the rebalance loop decides from, and the operator's "which island is busy"
+answer. Sustained-window questions are answered only once the history covers the whole window —
+a spike is never mistaken for sustained.
+
+**Rebalance loop** — The hub's automatic consumer of the load view (`Cluster:RebalanceEnabled`,
+off by default): a sustained-hot node sheds its largest-load shard to the least-loaded live node
+via a drain, but only when the pair's maximum utilization strictly improves — relocating a whole
+hotspot is refused (EventIds 1732/1733), not churned. Hysteresis at every layer: the sustained
+window, the per-shard move floor (`Cluster:ShardMoveMinIntervalMs`), one automatic move in flight
+at a time.
+
 **Drain** — The planned move of one shard to another live node while both are up
 (`MelangeClusterCoordinator.DrainShardAsync`, road-to-0.2 phase 13): the origin takes a fresh
 snapshot and closes the shard's engine, membership moves the shard under a bumped fencing token,

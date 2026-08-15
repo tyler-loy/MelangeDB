@@ -11,7 +11,7 @@ docs one level up describe the current system. Where a plan and the code disagre
 
 | | Phase | Status |
 | --- | --- | --- |
-| [13](plan-phase-13.md) | Clustering III — elastic assignment | Planned |
+| [13](plan-phase-13.md) | Clustering III — elastic assignment | Shipped |
 | [14](plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in | Planned |
 | [15](plan-phase-15.md) | Backup and restore | Planned |
 

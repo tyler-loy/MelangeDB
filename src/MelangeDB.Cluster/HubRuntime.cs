@@ -80,6 +80,10 @@ internal sealed partial class HubRuntime : IDisposable
     private TcpListener? _listener;
     private Task? _acceptLoop;
     private ITimer? _sweepTimer;
+    private ITimer? _rebalanceTimer;
+    private int _rebalanceMoveInFlight;
+    private readonly ConcurrentDictionary<ShardKey, long> _lastShardMoveTicks = new();
+    private readonly ConcurrentDictionary<string, long> _rebalanceStuckLogTicks = new(StringComparer.Ordinal);
 
     public HubRuntime(IServiceProvider services)
     {
@@ -155,6 +159,11 @@ internal sealed partial class HubRuntime : IDisposable
 
         var sweep = TimeSpan.FromMilliseconds(Math.Max(250, cluster.FailureTimeoutMs / 2));
         _sweepTimer = _time.CreateTimer(_ => SweepDeadNodes(), null, sweep, sweep);
+
+        // Always armed, gated per tick on the live Cluster:RebalanceEnabled — hysteresis lives in
+        // the window, the per-shard floor, and the decision rule, not in the tick rate.
+        _rebalanceTimer = _time.CreateTimer(
+            _ => EvaluateRebalance(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         LogHubStarted(_logger, NodeListenPort);
     }
 
@@ -496,6 +505,10 @@ internal sealed partial class HubRuntime : IDisposable
             var openMs = Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
             ShardMoves.NotifyMoved(shard);
             Metrics.DrainEnded(completed: true);
+
+            // Every completed drain — operator or loop — starts the shard's move floor, so the
+            // loop cannot immediately re-move what an operator just placed.
+            _lastShardMoveTicks[shard] = _time.GetUtcNow().UtcTicks;
             LogDrainCompleted(_logger, shard.Value, origin, destination, next.FencingToken, quiesceMs, openMs);
         }
         catch (Exception exception)
@@ -524,6 +537,128 @@ internal sealed partial class HubRuntime : IDisposable
         {
             _drainsInFlight.TryRemove(shard, out _);
         }
+    }
+
+    /// <summary>
+    /// One rebalance tick (road-to-0.2 phase 13). The decision rule, in full: a node is hot when
+    /// the sum of its shards' sustained write-lock utilizations over
+    /// <c>Cluster:RebalanceWindowSeconds</c> exceeds <c>Cluster:RebalanceHotUtilization</c> — and
+    /// only shards whose history covers the whole window count, so a spike is never mistaken for
+    /// sustained. The move is the largest-load shard on the hottest node for which
+    /// <c>target + shard &lt; origin</c> — the pair's maximum strictly improves — sent to the
+    /// least-loaded live node. That strict inequality is the anti-flap core: relocating a whole
+    /// hotspot to an emptier node fails it, so the loop refuses moves that merely shuffle. Layered
+    /// on top: the per-shard move floor (<c>Cluster:ShardMoveMinIntervalMs</c>), one automatic
+    /// move in flight at a time, and a hot node the rule cannot help is logged (rate-limited),
+    /// never churned — the single-shard case being the granularity ceiling the design record
+    /// warns about.
+    /// </summary>
+    private void EvaluateRebalance()
+    {
+        try
+        {
+            var cluster = Cluster;
+            if (!cluster.RebalanceEnabled
+                || Interlocked.CompareExchange(ref _rebalanceMoveInFlight, 0, 0) != 0
+                || !_drainsInFlight.IsEmpty)
+            {
+                return;
+            }
+
+            var now = _time.GetUtcNow();
+            var window = TimeSpan.FromSeconds(Math.Max(1, cluster.RebalanceWindowSeconds));
+            var live = _membership.Nodes()
+                .Where(static n => n.Alive)
+                .Select(static n => n.NodeName)
+                .ToHashSet(StringComparer.Ordinal);
+            if (live.Count < 2)
+                return;
+
+            var byNode = _membership.AllAssignments()
+                .Where(a => a.NodeName is not null && live.Contains(a.NodeName))
+                .GroupBy(static a => a.NodeName!, StringComparer.Ordinal)
+                .ToDictionary(static g => g.Key, static g => g.Select(static a => a.Shard).ToList(), StringComparer.Ordinal);
+
+            var shardUtilization = new Dictionary<ShardKey, double>();
+            var nodeUtilization = live.ToDictionary(static node => node, static _ => 0d, StringComparer.Ordinal);
+            foreach (var (node, shards) in byNode)
+            {
+                foreach (var shard in shards)
+                {
+                    if (Load.SustainedUtilization(shard, window, now) is { } sustained)
+                    {
+                        shardUtilization[shard] = sustained;
+                        nodeUtilization[node] += sustained;
+                    }
+                }
+            }
+
+            var hottest = nodeUtilization.OrderByDescending(static pair => pair.Value).ThenBy(static pair => pair.Key, StringComparer.Ordinal).First();
+            if (hottest.Value <= cluster.RebalanceHotUtilization)
+                return;
+            var origin = hottest.Key;
+            var originShards = byNode.GetValueOrDefault(origin) ?? [];
+            if (originShards.Count <= 1)
+            {
+                if (ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
+                    LogRebalanceSingleShardHot(_logger, origin, hottest.Value, originShards.Count == 1 ? originShards[0].Value : 0);
+                return;
+            }
+
+            var target = nodeUtilization
+                .Where(pair => pair.Key != origin)
+                .OrderBy(static pair => pair.Value)
+                .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
+                .First();
+            var floorTicks = TimeSpan.TicksPerMillisecond * Math.Max(0, cluster.ShardMoveMinIntervalMs);
+            var candidate = originShards
+                .Where(shard => shardUtilization.GetValueOrDefault(shard) > 0)
+                .Where(shard => !_lastShardMoveTicks.TryGetValue(shard, out var moved) || now.UtcTicks - moved >= floorTicks)
+                .Where(shard => target.Value + shardUtilization[shard] < hottest.Value)
+                .OrderByDescending(shard => shardUtilization[shard])
+                .Select(static shard => (ShardKey?)shard)
+                .FirstOrDefault();
+            if (candidate is not { } moving)
+            {
+                if (ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
+                    LogRebalanceNoFit(_logger, origin, hottest.Value, target.Key, target.Value);
+                return;
+            }
+
+            LogRebalanceMoving(
+                _logger, moving.Value, origin, hottest.Value, target.Key, target.Value, shardUtilization[moving]);
+            Interlocked.Exchange(ref _rebalanceMoveInFlight, 1);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await DrainShardAsync(moving, target.Key, _stopped.Token).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // DrainShardAsync already logged the failure (1725) and handed the shard back.
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _rebalanceMoveInFlight, 0);
+                }
+            });
+        }
+        catch (Exception exception)
+        {
+            LogRebalanceEvaluationFailed(_logger, exception.Message);
+        }
+    }
+
+    /// <summary>A stuck-hot situation persists across ticks; its warning repeats on the move floor's cadence, not per second.</summary>
+    private bool ShouldLogStuck(string node, DateTimeOffset now, int minIntervalMs)
+    {
+        var cadence = TimeSpan.TicksPerMillisecond * Math.Max(1_000, minIntervalMs);
+        var last = _rebalanceStuckLogTicks.GetValueOrDefault(node);
+        if (now.UtcTicks - last < cadence)
+            return false;
+        _rebalanceStuckLogTicks[node] = now.UtcTicks;
+        return true;
     }
 
     /// <summary>The live node owning the fewest shards, excluding the drain's origin — the default destination.</summary>
@@ -906,6 +1041,7 @@ internal sealed partial class HubRuntime : IDisposable
     {
         _stopped.Cancel();
         _sweepTimer?.Dispose();
+        _rebalanceTimer?.Dispose();
         _listener?.Stop();
         foreach (var link in _linksByNode.Values)
             link.Dispose();
@@ -982,6 +1118,28 @@ internal sealed partial class HubRuntime : IDisposable
         Message = "The drain of shard {Shard} could not push assignments to destination '{Destination}' ({Reason}); membership already records the move, " +
             "so the destination opens the shard on its next heartbeat and gateway connect retries cover the gap.")]
     private static partial void LogDrainApplyPushFailed(ILogger logger, ulong shard, string destination, string reason);
+
+    [LoggerMessage(EventId = 1731, EventName = "RebalanceMoving", Level = LogLevel.Information,
+        Message = "Rebalance: node '{Origin}' is sustained-hot ({OriginUtilization:P0} over Cluster:RebalanceWindowSeconds, past Cluster:RebalanceHotUtilization); " +
+            "moving shard {Shard} (its own sustained load {ShardUtilization:P0}) to '{Target}' ({TargetUtilization:P0}) — the pair's maximum strictly improves.")]
+    private static partial void LogRebalanceMoving(
+        ILogger logger, ulong shard, string origin, double originUtilization, string target, double targetUtilization, double shardUtilization);
+
+    [LoggerMessage(EventId = 1732, EventName = "RebalanceSingleShardHot", Level = LogLevel.Warning,
+        Message = "Node '{Node}' is sustained-hot ({Utilization:P0}) but owns a single shard ({Shard}) — nothing can be shed. This is the granularity " +
+            "ceiling: the unit of elasticity is the shard, and this node's whole load lives in one. Finer split lines at strategy registration are the fix " +
+            "(docs/design/elastic-rebalancing.md); no cluster size changes this. Logged at most once per Cluster:ShardMoveMinIntervalMs.")]
+    private static partial void LogRebalanceSingleShardHot(ILogger logger, string node, double utilization, ulong shard);
+
+    [LoggerMessage(EventId = 1733, EventName = "RebalanceNoFit", Level = LogLevel.Warning,
+        Message = "Node '{Node}' is sustained-hot ({Utilization:P0}) but no move helps: every candidate shard is inside its move floor, has no sustained " +
+            "load of its own, or would leave the pair's maximum no better against '{Target}' ({TargetUtilization:P0}) — relocating a whole hotspot is not " +
+            "a rebalance. Logged at most once per Cluster:ShardMoveMinIntervalMs.")]
+    private static partial void LogRebalanceNoFit(ILogger logger, string node, double utilization, string target, double targetUtilization);
+
+    [LoggerMessage(EventId = 1734, EventName = "RebalanceEvaluationFailed", Level = LogLevel.Warning,
+        Message = "A rebalance tick failed to evaluate ({Reason}); the loop continues on its next tick.")]
+    private static partial void LogRebalanceEvaluationFailed(ILogger logger, string reason);
 
     [LoggerMessage(EventId = 1711, EventName = "ReplicaStreamBootstrapped", Level = LogLevel.Warning,
         Message = "Node '{NodeName}' subscribed replication from LSN {StaleCursor}, below the hub log's truncation base " +
