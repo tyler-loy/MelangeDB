@@ -378,9 +378,14 @@ bigger term and needs no coordination layer at all.
 - **Shard assignment and rebalancing.** Static assignment shipped in phase 09: shards are created at
   runtime, assigned least-loaded-first by the hub's membership store, and reassigned only on node death
   (fencing tokens bumped; the new owner recovers the shard from the shard's own log on shared storage).
-  Player density is wildly uneven, so fixed shards will hotspot; dynamic splitting (a quadtree subdividing
-  under load) is where the spatial strategy ends up, and it's a substantial subsystem. Instancing sidesteps
-  it — another reason it shipped first.
+  **The assignment half is design-settled, not built:** load-following ships as *fixed shard boundaries,
+  dynamic shard → node assignment* — heartbeat-carried load metrics, a hub-side rebalance loop, a graceful
+  drain (the node-death path minus the death), and a provisioner seam for obtaining capacity — see
+  [docs/design/elastic-rebalancing.md](design/elastic-rebalancing.md). Dynamic *splitting* (a quadtree
+  subdividing under load) stays deferred: it's a substantial subsystem, its customer narrows to workloads
+  whose load concentrates inside a single registered shard, and choosing fine-enough boundaries up front
+  turns "split the hot region" back into reassignment. Instancing sidesteps all of it — another reason it
+  shipped first.
 - **The hotspot ceiling is strategy-dependent, and worth telling users plainly.** Spatial partitioning
   cannot split a single crowded location; instancing can. A developer choosing a strategy is choosing
   which failure mode they get. **Measured in phase 10** (in-process, one crowded shard on a real shard node
