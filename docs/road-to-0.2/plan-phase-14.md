@@ -87,7 +87,7 @@ provably optimal packing is not worth the moves it would take to reach it.
 
 ## Decisions to settle
 
-### `Cluster:MaxNodes` has no default on purpose
+### Settled: `Cluster:MaxNodes` has no default on purpose
 
 Leaning: refuse to start the provisioning half when a provisioner is registered and the ceiling is
 unset. Every default here is wrong: low silently caps a deployment that meant to scale, high is a
@@ -95,14 +95,24 @@ silent spending authorization. The one-line refusal names the key and the reason
 whether the refusal is startup-fatal or degrades to phase 13 behaviour with a loud health check —
 leaning fatal, because a deployment that registered a provisioner meant to use it.
 
-### What `CapacityRequest` carries
+**Settled: startup-fatal, as leaned.** `HubRuntime.Start` throws with the key and the reasoning in
+the message. A companion sanity check refuses `MinNodes > MaxNodes` when scale-in is enabled.
+
+### Settled: what `CapacityRequest` carries
 
 Leaning: the hub's view of why — the sustained load summary and the shard it intends to move — so
 a provisioner can size the instance. To settle: how much of that is contract versus opaque
 diagnostic payload; a provisioner that *branches* on load numbers is coupling its instance types to
 MelangeDB's metric definitions, which the seam should discourage rather than enable.
 
-### Decommission of a node that will not drain
+**Settled: less than the leaning.** The contract is `(LiveNodes, MaxNodes, Reason)` — the fleet
+arithmetic as typed fields, the load summary as `Reason`, a human-readable diagnostic string for
+logs and tickets. The record's own doc comment tells implementers not to parse it: size instances
+from your deployment's knowledge, not the hub's metric definitions. The intended shard never made
+it in — by the time a provisioned node arrives, the loop re-decides from fresh load anyway, so a
+shard named at request time would only ever be a stale hint.
+
+### Settled: decommission of a node that will not drain
 
 A node whose shards cannot move (destination refuses, drains repeatedly wedge) blocks scale-in
 forever. Leaning: that is correct — scale-in is an optimization, and the alert (drain failures are
@@ -110,12 +120,23 @@ already loud from phase 13) is the escalation path. The alternative — force-fe
 and letting node-death reassignment clean up — converts a billing annoyance into a player-visible
 outage on purpose, which the loop should never do on its own authority.
 
-### Does consolidation prefer the newest node or the emptiest?
+**Settled: as leaned.** A failed drain aborts the consolidation session (EventId 1746) and the
+node stays; the loop never force-fences. Aborting is free by construction — a partially drained
+node is just an emptier node, and the ordinary rules take it from there.
+
+### Settled: does consolidation prefer the newest node or the emptiest?
 
 Leaning: emptiest (fewest moves, least disturbance), with the provision-cooldown exemption
 preventing the pathological case (newest is emptiest by definition). To settle: whether operators
 need a per-node `no-consolidate` pin for nodes that exist for reasons the load view cannot see —
 leaning yes, as membership metadata rather than configuration.
+
+**Settled: emptiest, with the cooldown exemption (`Cluster:ScaleInCooldownMs`), as leaned. The
+`no-consolidate` pin is deferred**, against the leaning: it needs a membership-metadata channel
+that does not exist yet (a new `IMembershipStore` surface and a Postgres migration), and every
+concrete case raised so far is covered by the cooldown, `MinNodes`, or simply not enabling
+scale-in. The first deployment with a node the load view genuinely cannot explain is the trigger
+to build it — as membership metadata, per the leaning, when it happens.
 
 ## Done when
 
@@ -150,3 +171,38 @@ leaning yes, as membership metadata rather than configuration.
 - **Seam design lock-in.** `INodeProvisioner` is public API; once a deployment implements it,
   reshaping it is a break. The reference implementation and the phase 13 load view existing first
   are what give the contract a real consumer before it freezes.
+
+## Shipped notes
+
+Shipped as three stacked changes — the seam (`INodeProvisioner`, `Cluster:MaxNodes`, the startup
+refusal), provision-then-reassign (ticket lifecycle, the `melange-capacity` health check, late
+arrivals, EventIds 1735–1743), and scale-in (consolidation sessions, EventIds 1744–1746) — with
+these deviations from the plan:
+
+- **`Cluster:ScaleInCooldownMs` is a fifth config key** the plan's list did not name. The plan's
+  "long cooldown" exempting a freshly provisioned node from consolidation needed a number; the
+  same key also spaces consecutive consolidations, so the hour-scale pacing is one explicit
+  decision rather than two implicit ones.
+- **The reference provisioner is the in-fixture `ScriptedProvisioner`, not a process-spawning
+  `ProcessNodeProvisioner`.** The fixture's provisioner starts and stops real Kestrel shard nodes
+  in-process, which exercises every lifecycle behaviour end to end (grow, ceiling, expiry, alert,
+  late arrival, decommission, floor) deterministically on CI — a process-spawner would test the
+  same contract slower and flakier. What a deployment implements is shown instead by the standby
+  sample and the contract documentation in the design record.
+- **Scale-in additionally requires a fully connected fleet** (every membership-alive node has a
+  live link). Not in the plan; found by reasoning through the decommission race: between
+  `DecommissionAsync` and the failure sweep the dying node is still membership-alive, and a second
+  consolidation session starting in that window could pick a victim and drain shards toward the
+  corpse. A linkless node means the fleet is in flux, and scale-in is the one move with no urgency.
+- **The scale-out trigger has a granularity guard the plan implied but never stated**: provisioning
+  is refused when shards no longer outnumber live nodes (EventId 1741), because a new node that
+  cannot receive a whole shard is spend without relief.
+- **Done-when deltas:** the "simulated day" flap test runs as a CI-sized equivalent — load
+  oscillating through the dead zone for several whole windows with a window longer than the
+  oscillation period, asserting zero provisions, decommissions, and drains — plus the full-curve
+  test's exact counts (one request, one decommission over the whole curve), which any flap breaks.
+  The ceiling/floor bounds are asserted by the same curve rather than a separate adversarial
+  script. Phase 13's deferred kill-the-hub-mid-drain chaos test stays deferred: with the in-memory
+  membership store the hub's death erases membership itself, so the test only means something
+  against Postgres-backed membership — it belongs to a Postgres-integration suite, recorded here
+  so it is not forgotten.

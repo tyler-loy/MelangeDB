@@ -6,14 +6,15 @@ shard running hot, obtains a second node through a provisioner seam, and moves t
 overnight the loop runs in reverse and consolidates back down to one box. Shard boundaries are drawn
 once, at strategy registration; the shard → node map is the layer that breathes.
 
-**Status:** **design settled, planned, not built** — the implementation plan is
-[road-to-0.2](../road-to-0.2/README.md) phases [13](../road-to-0.2/plan-phase-13.md) (elastic
-assignment) and [14](../road-to-0.2/plan-phase-14.md) (provisioned capacity and scale-in). [CLUSTERING.md](../CLUSTERING.md) shipped static
-assignment in phase 09 (shards created at runtime, assigned least-loaded-first, reassigned only on
-node death) and left rebalancing as an open question. This record resolves the *assignment* half of
-that question and deliberately re-defers the other half — dynamic boundary splitting — because the
-fixed-boundary version captures the load-following behaviour at a fraction of the cost. Nothing here
-blocks on new theory; every load-bearing mechanism already exists and is listed below.
+**Status:** **built** — shipped as [road-to-0.2](../road-to-0.2/README.md) phases
+[13](../road-to-0.2/plan-phase-13.md) (elastic assignment: the load signal, the drain, the
+rebalance loop) and [14](../road-to-0.2/plan-phase-14.md) (provisioned capacity and scale-in: the
+`INodeProvisioner` seam, provision-then-reassign, drain-and-decommission); each plan's Shipped
+notes record the deviations. [CLUSTERING.md](../CLUSTERING.md) shipped static assignment in phase
+09 (shards created at runtime, assigned least-loaded-first, reassigned only on node death) and
+left rebalancing as an open question. This record resolved the *assignment* half of that question
+and deliberately re-deferred the other half — dynamic boundary splitting — because the
+fixed-boundary version captures the load-following behaviour at a fraction of the cost.
 
 **Depends on:** [plan-phase-09](../road-to-0.1/plan-phase-09.md) (membership store, fencing tokens,
 node-death reassignment, per-shard logs on shared storage), [CLUSTERING.md](../CLUSTERING.md)
@@ -61,10 +62,10 @@ The trade is more shards than nodes in the common case, which is already the shi
 | Gateway holds a session's shard-routed calls, re-issues subscriptions on the new owner, flushes in order | shipped (phase 10 handoff swap) | gateway |
 | Border cursor invalidation answered with a full band reset, never silently resumed past | shipped (EventId 1715) | border stream |
 | Node → hub heartbeats | shipped (failure detection) | membership |
-| **Planned drain** — the node-death path, minus the death | missing | this record |
-| **Per-shard load metrics carried on heartbeats** | missing | this record |
-| **The rebalance loop** | missing | this record |
-| **The provisioner seam** | missing | this record |
+| **Planned drain** — the node-death path, minus the death | shipped (phase 13) | `MelangeClusterCoordinator.DrainShardAsync` |
+| **Per-shard load metrics carried on heartbeats** | shipped (phase 13) | load view (`LoadView()`, `melange.cluster.shard.*`) |
+| **The rebalance loop** | shipped (phase 13) | hub, `Cluster:RebalanceEnabled` |
+| **The provisioner seam** | shipped (phase 14) | `INodeProvisioner` + `Cluster:MaxNodes`/`MinNodes`/`ScaleInEnabled` |
 
 The load-bearing property underneath all of it: **each shard has its own log on shared storage, so
 moving a shard is an ownership transfer, not a data copy.** The new owner recovers the shard the
@@ -137,9 +138,13 @@ public interface INodeProvisioner
 
     /// <summary>Release a drained node. Called only after the hub has confirmed it owns
     /// no shards.</summary>
-    Task DecommissionAsync(NodeId node, CancellationToken ct);
+    Task DecommissionAsync(string nodeName, CancellationToken ct);
 }
 ```
+
+Shipped as sketched (phase 14), with the node identity settled as the membership node-name string
+and the ticket carrying the name the new instance will join under — the provisioner configures the
+instance's `Cluster:NodeName`, and that name is the entire correlation mechanism.
 
 Three contract clauses do the safety work:
 
@@ -157,7 +162,24 @@ Three contract clauses do the safety work:
 
 For a real game the recommended shape is **pre-warmed standbys**: a player surge is precisely when
 minutes of cold-provision latency are least affordable, and a standby that is already in membership
-(owning zero shards) turns "provision, then reassign" into just "reassign".
+(owning zero shards) turns "provision, then reassign" into just "reassign". This costs no
+machinery at all — a standby is an ordinary shard node you start ahead of time:
+
+```jsonc
+// The standby's appsettings: an ordinary shard node. It registers, owns nothing, and the
+// rebalance loop prefers assigning to it over provisioning by construction — move one is
+// always tried before the seam.
+"MelangeDb:Cluster": {
+  "Role": "Shard",
+  "NodeName": "standby-1",
+  "HubAddress": "hub.internal:7100",
+  "PublicAddress": "http://standby-1.internal:5000",
+  "ShardDataPath": "/mnt/shard-logs"   // the same shared storage as every other node
+}
+```
+
+A deployment that cannot afford provision latency at all runs its standby pool this way and
+registers no provisioner; the seam never fires and the fleet's ceiling is the pool.
 
 ## What this deliberately does not fix
 
@@ -173,6 +195,13 @@ minutes of cold-provision latency are least affordable, and a standby that is al
   exist, including freshly provisioned ones; the instancing strategy's elasticity work is zero.
 
 ## Decisions to settle
+
+All three were settled where they belonged — in the phase plans, in place: the metric is the
+write-lock busy fraction with `Cluster:RebalanceWindowSeconds` / `RebalanceHotUtilization` /
+`RebalanceColdUtilization` naming the window and the thresholds; quiesce is queue-with-timeout
+under its own cap (`Cluster:DrainQueueTimeoutMs`); and the granularity guardrail landed at runtime
+rather than registration (EventId 1732, joined in phase 14 by its capacity-shaped sibling 1741).
+The original questions, kept for the reasoning:
 
 - **The load metric and its thresholds.** Commit-loop utilization is the honest saturation signal
   (it is the ceiling that matters), but the window length, the hot/cold thresholds, and the dead
