@@ -97,6 +97,29 @@ public interface IReadViewSource
 }
 
 /// <summary>
+/// The optional capability of taking recovery's replay through bulk builders rather than one
+/// structurally shared version per row. A store holding its state in persistent containers pays a
+/// path copy per put so that a pinned read view stays coherent — but during recovery no view can
+/// exist yet, so every one of those intermediate versions is built for a reader that cannot be
+/// there. Optional in the manner of <see cref="IReadViewSource"/>: a store whose puts are cheap
+/// simply does not implement it.
+/// </summary>
+public interface IBulkRecovery
+{
+    /// <summary>
+    /// Enters bulk mode: subsequent <see cref="IHotStore.LoadSnapshot"/> and
+    /// <see cref="IHotStore.Apply"/> calls accumulate into builders. Until
+    /// <see cref="CompleteRecovery"/> publishes, reads through the store observe the state as of
+    /// this call — the caller must not read what it is replaying. Must be called before any view
+    /// is opened, on the single thread driving recovery.
+    /// </summary>
+    void BeginRecovery();
+
+    /// <summary>Publishes one version per table from the accumulated builders and leaves bulk mode.</summary>
+    void CompleteRecovery();
+}
+
+/// <summary>
 /// A read view of the hot tier pinned at one LSN. Reads through it are safe with no lock held and
 /// with <see cref="IHotStore.Apply"/> running concurrently: it observes the state as of
 /// <see cref="Lsn"/> and never a later one, however long it is held and however lazily its

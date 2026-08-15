@@ -115,6 +115,8 @@ internal sealed class SecondaryIndex
     {
         public void Add(RowKey value, RowKey key) => entries.Add(new IndexEntry(value, key));
 
+        public void Remove(RowKey value, RowKey key) => entries.Remove(new IndexEntry(value, key));
+
         public SecondaryIndex ToImmutable() => new(entries.ToImmutable());
     }
 }
