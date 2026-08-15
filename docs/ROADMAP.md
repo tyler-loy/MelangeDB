@@ -74,6 +74,17 @@ Phase 12 was numbered after 11 but landed first: the port's scoping pass
 ([#20](https://github.com/tyler-loy/MelangeDB/issues/20)) measured 459 client call sites that are
 mechanical against typed bindings and a rewrite without them.
 
+## M4 — Elastic cluster · planned
+
+Post-0.1 work, planned in [road-to-0.2/](road-to-0.2/) and implementing
+[design/elastic-rebalancing.md](design/elastic-rebalancing.md): shard boundaries stay fixed at
+strategy registration, and the elastic layer is the shard → node map — regrouping, never resizing.
+
+| Phase | Title | Status |
+| --- | --- | --- |
+| [13](road-to-0.2/plan-phase-13.md) | Clustering III — elastic assignment: per-shard load on heartbeats, the planned drain, the rebalance loop | Planned |
+| [14](road-to-0.2/plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in: the `INodeProvisioner` seam, provision-then-reassign, drain-and-decommission | Planned |
+
 ## What's left
 
 **Phase 11 is the whole remaining bar.** Everything else is implemented and tested; nothing has been
@@ -90,8 +101,10 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
   half — how column adds replay against the log — is open. See [DESIGN.md](DESIGN.md) §10.
 - **Epoch-qualified subscription anchors.** Closed behaviourally in phase 10 by the first-chunk rule;
   the protocol-level hardening is deferred, with the record kept in [plan-phase-10.md](road-to-0.1/plan-phase-10.md).
-- **Dynamic rebalancing**, shard-level HA, and sharding the hub. Static assignment will visibly
-  hotspot; the ceiling is published so the choice is informed.
+- **Dynamic *assignment* is no longer deferred** — it is M4 above, planned as phases 13–14.
+  What stays deferred: dynamic boundary *splitting* (the quadtree; its narrowed customer and
+  reopening trigger are recorded in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)),
+  shard-level HA, and sharding the hub.
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
 - **A complete read-modify-write detector for snapshot reducers.** The detectable common shape —
   `Find`, then `Update` of the same row, inside a body declared `Isolation.Snapshot` — is built as

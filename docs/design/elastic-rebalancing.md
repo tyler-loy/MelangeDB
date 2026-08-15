@@ -6,7 +6,9 @@ shard running hot, obtains a second node through a provisioner seam, and moves t
 overnight the loop runs in reverse and consolidates back down to one box. Shard boundaries are drawn
 once, at strategy registration; the shard → node map is the layer that breathes.
 
-**Status:** **design settled, not built.** [CLUSTERING.md](../CLUSTERING.md) shipped static
+**Status:** **design settled, planned, not built** — the implementation plan is
+[road-to-0.2](../road-to-0.2/README.md) phases [13](../road-to-0.2/plan-phase-13.md) (elastic
+assignment) and [14](../road-to-0.2/plan-phase-14.md) (provisioned capacity and scale-in). [CLUSTERING.md](../CLUSTERING.md) shipped static
 assignment in phase 09 (shards created at runtime, assigned least-loaded-first, reassigned only on
 node death) and left rebalancing as an open question. This record resolves the *assignment* half of
 that question and deliberately re-defers the other half — dynamic boundary splitting — because the
