@@ -59,6 +59,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The capacity seam: `INodeProvisioner`**
+  ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), first slice). The public interface
+  through which the hub will obtain one more shard node when every node it has is sustained-hot,
+  and give the emptiest one back when the fleet is cold — which cloud, rack, or stack of warm
+  processes supplies the node is the deployment's business, not MelangeDB's. A DI registration,
+  not a configuration string (the membership-store precedent); no registration means the fleet is
+  fixed and phase 13 behaviour is unchanged. The contract's safety clauses are documented on the
+  interface: fire-and-track (a provisioned node announces itself by joining membership like any
+  other node), at-least-once made safe by fencing, and shared-storage access as part of the deal.
+  With it, `Cluster:MaxNodes` — the hard fleet ceiling, deliberately without a default: a
+  registered provisioner with the ceiling unset is refused at startup, because a loop that can
+  spend money must have its bound set by a human, never by a default.
 - **The cluster follows load: the rebalance loop**
   ([road-to-0.2 phase 13](docs/road-to-0.2/plan-phase-13.md), final slice — the phase is complete).
   With `Cluster:RebalanceEnabled` (off by default: a loop that relocates the world should be a

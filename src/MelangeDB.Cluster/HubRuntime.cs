@@ -59,6 +59,7 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
     private readonly IMembershipStore _membership;
     private readonly TimeProvider _time;
+    private readonly INodeProvisioner? _provisioner;
     private readonly ILogger _logger;
     private readonly ForeignEventDispatcher _foreignEvents;
     private readonly ConcurrentDictionary<string, NodeLink> _linksByNode = new(StringComparer.Ordinal);
@@ -92,6 +93,7 @@ internal sealed partial class HubRuntime : IDisposable
         _options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
         _membership = services.GetRequiredService<IMembershipStore>();
         _time = services.GetService<TimeProvider>() ?? TimeProvider.System;
+        _provisioner = services.GetService<INodeProvisioner>();
         var loggers = services.GetService<ILoggerFactory>() ?? Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance;
         _logger = loggers.CreateLogger("MelangeDB.Cluster.Hub");
         _foreignEvents = new ForeignEventDispatcher(
@@ -132,6 +134,16 @@ internal sealed partial class HubRuntime : IDisposable
         var cluster = Cluster;
         if (string.IsNullOrEmpty(cluster.Secret))
             throw new InvalidOperationException("Cluster:Role is Hub but Cluster:Secret is empty; nodes cannot authenticate.");
+        if (_provisioner is not null && cluster.MaxNodes < 1)
+        {
+            // Startup-fatal on purpose: a deployment that registered a provisioner meant to use
+            // it, and every default ceiling is wrong — low silently caps a deployment that meant
+            // to scale, high is a silent spending authorization.
+            throw new InvalidOperationException(
+                "An INodeProvisioner is registered but Cluster:MaxNodes is not set. The provisioning loop can spend " +
+                "money, so its ceiling must be an explicit decision: set Cluster:MaxNodes to the largest fleet this " +
+                "deployment is willing to pay for, or remove the provisioner registration to keep the fleet fixed.");
+        }
 
         _engine.SetTableAccessGuard(PlacementGuards.HubAccess());
         _engine.AddCommitGuard(new HubCommitGuard(_engine.Schema));
