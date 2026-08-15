@@ -101,6 +101,9 @@ internal sealed partial class HubRuntime : IDisposable
     /// <summary>The gateway connections' view into in-flight handoffs, keyed by player identity.</summary>
     public HandoffNotifier Handoffs { get; } = new();
 
+    /// <summary>The per-shard load view, fed by every node's heartbeats; see <see cref="ClusterLoadView"/>.</summary>
+    public ClusterLoadView Load { get; } = new();
+
     public MelangeEngine Engine => _engine;
 
     public IMembershipStore Membership => _membership;
@@ -458,6 +461,8 @@ internal sealed partial class HubRuntime : IDisposable
         {
             case "heartbeat":
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
+                if (body?.Deserialize<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
+                    Load.Record(session.NodeName, heartbeat.Loads, _time.GetUtcNow());
 
                 // A node returning from a partition is alive again; shards orphaned while it was
                 // suspected dead get owners before the reply reports this node's assignments.
@@ -778,6 +783,7 @@ internal sealed partial class HubRuntime : IDisposable
         _listener?.Stop();
         foreach (var link in _linksByNode.Values)
             link.Dispose();
+        Load.Dispose();
     }
 
     [LoggerMessage(EventId = 1700, EventName = "ClusterHubStarted", Level = LogLevel.Information,

@@ -268,6 +268,40 @@ internal sealed partial class ShardRuntime : IDisposable
     /// <summary>How many read-only border copies this shard currently holds — the band's footprint in rows.</summary>
     public int BorrowedRowCount => _borrowedRows.Count;
 
+    private long _loadSampleBusyTicks;
+    private long _loadSampleTimestamp;
+    private long _residentBytes;
+    private long _residentSampledTimestamp;
+
+    /// <summary>
+    /// One heartbeat's load sample: the busy fraction of this engine's write lock since the
+    /// previous sample (zero on the first — a fraction needs an interval), the log head, and the
+    /// resident footprint. The footprint is re-read at most every ten seconds: store statistics
+    /// walk every table, the number moves slowly, and per-heartbeat sampling would tax exactly the
+    /// hot shards the signal exists to find. Called only by the node's heartbeat loop, which is
+    /// single-threaded, so the sampling state here is unsynchronized on purpose.
+    /// </summary>
+    internal ShardLoadDto SampleLoad()
+    {
+        var busy = Engine.WriteLockBusyTicks;
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        double utilization = 0;
+        if (_loadSampleTimestamp != 0 && now > _loadSampleTimestamp)
+            utilization = Math.Clamp((double)(busy - _loadSampleBusyTicks) / (now - _loadSampleTimestamp), 0, 1);
+        _loadSampleBusyTicks = busy;
+        _loadSampleTimestamp = now;
+
+        if (_residentSampledTimestamp == 0
+            || System.Diagnostics.Stopwatch.GetElapsedTime(_residentSampledTimestamp) > TimeSpan.FromSeconds(10))
+        {
+            _residentBytes = Engine.ReadConsistent(_ =>
+                Engine.HotStore.Statistics().Tables.Sum(static table => table.ResidentBytes));
+            _residentSampledTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+
+        return new ShardLoadDto(Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount);
+    }
+
     /// <summary>
     /// Applies one border batch from a neighbouring owner shard, judged per op under the
     /// ownership lock. The rules, in blast-radius order: a row this shard holds unmarked and

@@ -43,6 +43,9 @@ public sealed partial class MelangeEngine : IDisposable
     private Timestamp? _tailTimestamp;
     private bool _disposed;
 
+    /// <summary>Cumulative Stopwatch ticks of write-lock work; see <see cref="WriteLockBusyTicks"/>.</summary>
+    private long _writeLockBusyTicks;
+
     public MelangeEngine(
         MelangeDbOptions options,
         SchemaRegistry schema,
@@ -441,20 +444,28 @@ public sealed partial class MelangeEngine : IDisposable
         CommitRecord record;
         lock (_writeLock)
         {
-            var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
-            var effective = reconcile ? ReconcileOps(ops) : ops;
-            RunCommitGuards(reducerName, effective, CommitOrigin.Internal);
-            if (effective.Count == 0 && !alwaysAppend)
-                return null;
-            record = _log.Append(new CommitRequest(timestamp, caller, reducerName, arguments, effective));
+            var lockStarted = Stopwatch.GetTimestamp();
+            try
+            {
+                var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
+                var effective = reconcile ? ReconcileOps(ops) : ops;
+                RunCommitGuards(reducerName, effective, CommitOrigin.Internal);
+                if (effective.Count == 0 && !alwaysAppend)
+                    return null;
+                record = _log.Append(new CommitRequest(timestamp, caller, reducerName, arguments, effective));
 
-            // Runtime observation mirrors what recovery replay will re-observe, so AutoInc
-            // behavior is identical before and after a restart. Foreign-originator ids are
-            // filtered out by the sequencer itself.
-            _sequencer.Observe(record, Schema);
-            NotifyCommitObservers(record);
-            Appliers.NotifyAppended(record);
-            AfterCommit(timestamp);
+                // Runtime observation mirrors what recovery replay will re-observe, so AutoInc
+                // behavior is identical before and after a restart. Foreign-originator ids are
+                // filtered out by the sequencer itself.
+                _sequencer.Observe(record, Schema);
+                NotifyCommitObservers(record);
+                Appliers.NotifyAppended(record);
+                AfterCommit(timestamp);
+            }
+            finally
+            {
+                Interlocked.Add(ref _writeLockBusyTicks, Stopwatch.GetTimestamp() - lockStarted);
+            }
         }
 
         CompleteDeferredSnapshot();
@@ -518,7 +529,15 @@ public sealed partial class MelangeEngine : IDisposable
         ArgumentNullException.ThrowIfNull(read);
         lock (_writeLock)
         {
-            return read(_log.HeadLsn);
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                return read(_log.HeadLsn);
+            }
+            finally
+            {
+                Interlocked.Add(ref _writeLockBusyTicks, Stopwatch.GetTimestamp() - started);
+            }
         }
     }
 
@@ -528,8 +547,38 @@ public sealed partial class MelangeEngine : IDisposable
         ArgumentNullException.ThrowIfNull(read);
         lock (_writeLock)
         {
-            read(_log.HeadLsn);
+            var started = Stopwatch.GetTimestamp();
+            try
+            {
+                read(_log.HeadLsn);
+            }
+            finally
+            {
+                Interlocked.Add(ref _writeLockBusyTicks, Stopwatch.GetTimestamp() - started);
+            }
         }
+    }
+
+    /// <summary>
+    /// Cumulative Stopwatch ticks the write lock has been held for work: reducer transactions
+    /// (whole body under <see cref="Isolation.Serialized"/>, commit portion under
+    /// <see cref="Isolation.Snapshot"/>), internal applies, bulk ingestion, and consistent reads.
+    /// Monotonic — sample twice and divide the delta by the elapsed Stopwatch ticks for the
+    /// engine's commit-loop utilization over the interval. This is the saturation signal the
+    /// cluster's load view carries: the published hotspot ceilings (docs/CLUSTERING.md) are
+    /// ceilings on exactly this resource. Time spent <em>waiting</em> for the lock is deliberately
+    /// not counted — a queue is evidence of saturation, not more capacity spent.
+    /// </summary>
+    public long WriteLockBusyTicks => Interlocked.Read(ref _writeLockBusyTicks);
+
+    /// <summary>Accumulates into <see cref="WriteLockBusyTicks"/> from construction to disposal.</summary>
+    private BusyScope TrackWriteLockBusy() => new(this);
+
+    private readonly struct BusyScope(MelangeEngine engine) : IDisposable
+    {
+        private readonly long _started = Stopwatch.GetTimestamp();
+
+        public void Dispose() => Interlocked.Add(ref engine._writeLockBusyTicks, Stopwatch.GetTimestamp() - _started);
     }
 
     /// <summary>
@@ -553,6 +602,7 @@ public sealed partial class MelangeEngine : IDisposable
         CommitRecord bulkRecord;
         lock (_writeLock)
         {
+            using var busy = TrackWriteLockBusy();
             using var activity = _telemetry?.StartReducer(BulkReducerName, caller, arguments: null, encodedArguments: default);
             var started = Stopwatch.GetTimestamp();
             var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
@@ -914,6 +964,7 @@ public sealed partial class MelangeEngine : IDisposable
     {
         using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments, parentContext);
         activity?.SetTag("melange.isolation", "serialized");
+        using var busy = TrackWriteLockBusy(); // The whole serialized transaction runs under the lock.
         var started = Stopwatch.GetTimestamp();
         var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
         var writeSet = new WriteSet();
@@ -1078,6 +1129,7 @@ public sealed partial class MelangeEngine : IDisposable
             {
                 // Measured from inside: waiting for the lock is not holding it, and billing the wait
                 // to this transaction would blame the queue on whoever happened to be last in it.
+                using var busy = TrackWriteLockBusy();
                 lockedStarted = Stopwatch.GetTimestamp();
                 ops = ReconcileOps(ops);
                 RunCommitGuards(reducerName, ops, CommitOrigin.Reducer);

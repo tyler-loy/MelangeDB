@@ -191,7 +191,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 await Task.Delay(cluster.HeartbeatIntervalMs, ct).ConfigureAwait(false);
                 if (SuspendHeartbeats)
                     continue;
-                var beat = await link.RequestAsync("heartbeat", null, ct).ConfigureAwait(false);
+                var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(CollectLoads()), ct).ConfigureAwait(false);
                 RenewLease();
                 var assignments = beat!.Value.Deserialize<HeartbeatReply>()!.Assignments;
                 ApplyAssignments(assignments);
@@ -212,6 +212,24 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         Interlocked.Exchange(
             ref _leaseValidUntilTicks,
             _time.GetUtcNow().AddMilliseconds(Cluster.FailureTimeoutMs).UtcTicks);
+
+    /// <summary>
+    /// One load sample per owned shard, taken by the heartbeat loop (its only caller, so the
+    /// per-shard sampling state on each runtime needs no synchronization of its own).
+    /// </summary>
+    private ShardLoadDto[] CollectLoads()
+    {
+        List<ShardRuntime> owned;
+        lock (_shardsLock)
+        {
+            owned = [.. _shards.Values];
+        }
+
+        var loads = new ShardLoadDto[owned.Count];
+        for (var i = 0; i < owned.Count; i++)
+            loads[i] = owned[i].SampleLoad();
+        return loads;
+    }
 
     /// <summary>
     /// Diffs the hub's assignment list against the open shard runtimes: new shards open (their

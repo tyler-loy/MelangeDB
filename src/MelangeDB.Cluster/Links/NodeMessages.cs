@@ -37,6 +37,17 @@ internal sealed record AuthReply(string Proof, ShardAssignmentDto[] Assignments,
 
 internal sealed record HeartbeatReply(ShardAssignmentDto[] Assignments);
 
+/// <summary>
+/// One owned shard's load sample, riding the heartbeat — no new clock, no new message. The
+/// utilization is the busy fraction of the shard engine's write lock since the previous
+/// heartbeat (see <c>MelangeEngine.WriteLockBusyTicks</c>): the resource the published hotspot
+/// ceilings are ceilings on, already in [0, 1], no per-hardware calibration needed.
+/// </summary>
+internal sealed record ShardLoadDto(ulong Shard, double Utilization, ulong HeadLsn, long ResidentBytes, int BorrowedRows);
+
+/// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
+internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);
+
 internal sealed record ReplicaSubscribe(ulong FromLsn);
 
 internal sealed record ReplicaBatch(ulong[] Lsns, WireOp[][] Records);

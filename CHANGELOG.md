@@ -59,6 +59,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The hub knows which shard is hot** ([road-to-0.2 phase 13](docs/road-to-0.2/plan-phase-13.md),
+  first slice). Every shard node's heartbeat now carries one load sample per owned shard — the busy
+  fraction of that shard engine's write lock since the previous beat (the resource the published
+  hotspot ceilings are ceilings on, via the new `MelangeEngine.WriteLockBusyTicks` counter), the
+  shard log's head, the resident footprint, and the border-band row count. The hub aggregates the
+  feed into `MelangeClusterCoordinator.LoadView()` and exports it as
+  `melange.cluster.shard.utilization` / `melange.cluster.shard.resident_bytes` gauges, tagged by
+  shard and node — the operator's "which island is busy" answer, and the feed the coming rebalance
+  loop decides from. No new clock, no new message: the samples ride the heartbeat that already
+  exists.
+
 - **The client knows its own identity.** The Welcome frame now carries the identity the server
   derived during the handshake, surfaced as `MelangeClient.Identity` and `conn.Identity` on the
   generated `MelangeConnection` — the value that distinguishes "my rows" from everyone else's in a
