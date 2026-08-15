@@ -17,7 +17,7 @@ public class ProtocolTests
     public static TheoryData<Frame> Frames() => new((Frame[])
     [
         new HelloFrame(1, 3, "token") { Channel = MelangeChannels.Control },
-        new WelcomeFrame(1, Guid.NewGuid(), Guid.NewGuid(), 42UL, "HTTP/2"),
+        new WelcomeFrame(1, Guid.NewGuid(), Guid.NewGuid(), 42UL, "HTTP/2", Identity.FromIssuerSubject("iss", "sub")),
         new CallReducerFrame(7, "Greet", [1, 2, 3], "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01") { Channel = MelangeChannels.Calls },
         new ReducerResultFrame(7, true, 9UL, null, null) { Channel = MelangeChannels.Calls },
         new ReducerResultFrame(8, false, 0UL, "rejected", "PvP is off"),

@@ -408,7 +408,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             ConnectionId.Value,
             _transport.Engine.Log.EpochId,
             _transport.Engine.Log.HeadLsn,
-            _httpProtocol));
+            _httpProtocol,
+            Caller));
 
         // A completed handshake is a session start — the thing an admin query is not. Firing on
         // the read loop, before any further frame is processed, means a client's first Subscribe

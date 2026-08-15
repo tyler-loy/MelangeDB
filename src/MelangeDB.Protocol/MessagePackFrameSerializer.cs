@@ -53,12 +53,13 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 writer.WriteString(f.Token);
                 break;
             case WelcomeFrame f:
-                Header(ref writer, f, 5);
+                Header(ref writer, f, 6);
                 writer.WriteInt64(f.Version);
                 writer.WriteBinary(f.ConnectionId.ToByteArray());
                 writer.WriteBinary(f.EpochId.ToByteArray());
                 writer.WriteUInt64(f.HeadLsn);
                 writer.WriteString(f.HttpProtocol);
+                writer.WriteBinary(f.Identity.ToByteArray());
                 break;
             case CallReducerFrame f:
                 Header(ref writer, f, 4);
@@ -193,7 +194,8 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 new Guid(reader.ReadBinary()),
                 new Guid(reader.ReadBinary()),
                 reader.ReadUInt64(),
-                reader.ReadString() ?? string.Empty),
+                reader.ReadString() ?? string.Empty,
+                new Identity(reader.ReadBinary())),
             FrameType.CallReducer => new CallReducerFrame(
                 (uint)reader.ReadUInt64(),
                 reader.ReadString() ?? throw new MelangeProtocolException("CallReducer requires a reducer name."),

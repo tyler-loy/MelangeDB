@@ -110,8 +110,11 @@ public sealed record HelloFrame(int MinVersion, int MaxVersion, string? Token) :
 /// The server's handshake reply. <see cref="HttpProtocol"/> reports what was actually negotiated
 /// (for example <c>HTTP/2</c>), because a client must never assume it got the transport it asked
 /// for. <see cref="EpochId"/> names the commit log incarnation resume cursors count against.
+/// <see cref="Identity"/> is the identity the connection authenticated as, told to the client by
+/// the party that computes it — a client must never re-derive it from its own token, because the
+/// derivation is the one piece of the contract that must never disagree.
 /// </summary>
-public sealed record WelcomeFrame(int Version, Guid ConnectionId, Guid EpochId, ulong HeadLsn, string HttpProtocol) : Frame
+public sealed record WelcomeFrame(int Version, Guid ConnectionId, Guid EpochId, ulong HeadLsn, string HttpProtocol, Identity Identity) : Frame
 {
     public override FrameType Type => FrameType.Welcome;
 }

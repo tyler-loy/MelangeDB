@@ -64,6 +64,17 @@ public sealed class MelangeClient : IAsyncDisposable
     /// <summary>The server's connection id for this socket.</summary>
     public Guid ConnectionId { get; private set; }
 
+    /// <summary>
+    /// The identity this connection authenticated as, as the server derived it during the
+    /// handshake. This is the value that distinguishes "my rows" from everyone else's in a
+    /// subscription-fed cache — read it from here rather than re-deriving it from the token,
+    /// because the derivation belongs to the server alone and a second implementation of it is
+    /// the one disagreement the contract cannot survive. <see cref="Identity.None"/> until the
+    /// first successful connect; re-auth can never change it (an identity change closes the
+    /// connection instead).
+    /// </summary>
+    public Identity Identity { get; private set; }
+
     /// <summary>The commit log epoch this client's resume cursor counts against.</summary>
     public Guid LogEpochId { get; private set; }
 
@@ -324,6 +335,7 @@ public sealed class MelangeClient : IAsyncDisposable
         ConnectionId = welcome.ConnectionId;
         LogEpochId = welcome.EpochId;
         NegotiatedHttpProtocol = welcome.HttpProtocol;
+        Identity = welcome.Identity;
         if (token is not null)
             await _options.TokenStore.SaveAsync(token, cancellationToken).ConfigureAwait(false);
     }

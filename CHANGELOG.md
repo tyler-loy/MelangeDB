@@ -59,6 +59,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The client knows its own identity.** The Welcome frame now carries the identity the server
+  derived during the handshake, surfaced as `MelangeClient.Identity` and `conn.Identity` on the
+  generated `MelangeConnection` — the value that distinguishes "my rows" from everyone else's in a
+  subscription-fed cache. Clients previously had to re-derive it from their own token (a second
+  implementation of the one derivation that must never disagree, and no option at all once the IdP
+  is a third party) or be told it by an issuance endpoint that isn't the party computing it.
+  Alongside it, [docs/CLIENT-BINDINGS.md](docs/CLIENT-BINDINGS.md) now records what a client knows
+  the moment `ConnectAsync` returns — including that a row created by a `ClientConnected` reducer
+  may arrive as a delta just after the initial set rather than in it. (#30)
+
 - **`MELANGE0023`: a warning on read-modify-write inside a snapshot-isolated reducer.** The
   detectable common shape of getting `Isolation.Snapshot` wrong — a row obtained from a single-row
   `Find` and written back through the table handle's `Update` — is now flagged at compile time,
