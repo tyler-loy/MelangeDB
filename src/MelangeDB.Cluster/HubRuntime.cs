@@ -86,6 +86,21 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly ConcurrentDictionary<ShardKey, long> _lastShardMoveTicks = new();
     private readonly ConcurrentDictionary<string, long> _rebalanceStuckLogTicks = new(StringComparer.Ordinal);
 
+    /// <summary>A ticket the hub is waiting on, with when it asked and which attempt this is.</summary>
+    private sealed record OutstandingTicket(ProvisionTicket Ticket, DateTimeOffset RequestedAt, int Attempt);
+
+    // Capacity state (road-to-0.2 phase 14), guarded by _capacityLock: the rebalance tick and
+    // node registrations race, and ticket state is money-shaped — it must never double-spend.
+    private readonly Lock _capacityLock = new();
+    private OutstandingTicket? _ticket;
+    private int _provisionAttempts;
+    private bool _provisionGaveUp;
+    private int _provisionCallInFlight;
+    private readonly Dictionary<string, string> _expiredTickets = new(StringComparer.Ordinal);
+    private readonly System.Diagnostics.Metrics.Meter _capacityMeter = new("MelangeDB");
+    private readonly System.Diagnostics.Metrics.Histogram<double> _provisionLatency;
+    private readonly System.Diagnostics.Metrics.Counter<long> _decommissions;
+
     public HubRuntime(IServiceProvider services)
     {
         _services = services;
@@ -101,6 +116,30 @@ internal sealed partial class HubRuntime : IDisposable
             services.GetRequiredService<IServiceScopeFactory>(),
             _options,
             _logger);
+        _provisionLatency = _capacityMeter.CreateHistogram<double>(
+            "melange.cluster.provision.latency",
+            unit: "ms",
+            description: "Time from a provision request to the ticket's named node joining membership.");
+        _decommissions = _capacityMeter.CreateCounter<long>(
+            "melange.cluster.decommissions",
+            unit: "{node}",
+            description: "DecommissionAsync calls this hub issued — scale-in and expired-ticket late arrivals alike.");
+        _capacityMeter.CreateObservableGauge(
+            "melange.cluster.nodes",
+            () => (long)_membership.Nodes().Count(static n => n.Alive),
+            unit: "{node}",
+            description: "Live shard nodes in membership — the fleet size the capacity loop steers.");
+        _capacityMeter.CreateObservableGauge(
+            "melange.cluster.provision.outstanding",
+            () =>
+            {
+                lock (_capacityLock)
+                {
+                    return _ticket is null ? 0L : 1L;
+                }
+            },
+            unit: "{ticket}",
+            description: "Provision tickets outstanding — 0 or 1 by construction.");
     }
 
     public ClusterMetrics Metrics { get; } = new();
@@ -116,6 +155,37 @@ internal sealed partial class HubRuntime : IDisposable
 
     /// <summary>Test hook: awaited before each named drain step ("reassign", "apply").</summary>
     internal Func<string, Task>? DrainStepHook { get; set; }
+
+    /// <summary>Whether a node provisioner is registered — the capacity seam's on/off fact.</summary>
+    internal bool HasProvisioner => _provisioner is not null;
+
+    /// <summary>The provision ticket the hub is currently waiting on, if any.</summary>
+    internal ProvisionTicket? OutstandingProvision
+    {
+        get
+        {
+            lock (_capacityLock)
+            {
+                return _ticket?.Ticket;
+            }
+        }
+    }
+
+    /// <summary>
+    /// True once two provision attempts failed or expired: the loop has stopped asking (EventId
+    /// 1738, the <c>melange-capacity</c> health check) and a human must intervene. Cleared when a
+    /// ticket-named node finally joins.
+    /// </summary>
+    internal bool ProvisionHasGivenUp
+    {
+        get
+        {
+            lock (_capacityLock)
+            {
+                return _provisionGaveUp;
+            }
+        }
+    }
 
     public MelangeEngine Engine => _engine;
 
@@ -570,6 +640,12 @@ internal sealed partial class HubRuntime : IDisposable
         try
         {
             var cluster = Cluster;
+            var now = _time.GetUtcNow();
+
+            // Ticket bookkeeping never freezes: an expiry must be noticed even while a move is in
+            // flight or the loop has been toggled off mid-episode.
+            SweepProvisionTicket(cluster, now);
+
             if (!cluster.RebalanceEnabled
                 || Interlocked.CompareExchange(ref _rebalanceMoveInFlight, 0, 0) != 0
                 || !_drainsInFlight.IsEmpty)
@@ -577,13 +653,12 @@ internal sealed partial class HubRuntime : IDisposable
                 return;
             }
 
-            var now = _time.GetUtcNow();
             var window = TimeSpan.FromSeconds(Math.Max(1, cluster.RebalanceWindowSeconds));
             var live = _membership.Nodes()
                 .Where(static n => n.Alive)
                 .Select(static n => n.NodeName)
                 .ToHashSet(StringComparer.Ordinal);
-            if (live.Count < 2)
+            if (live.Count == 0)
                 return;
 
             var byNode = _membership.AllAssignments()
@@ -607,54 +682,69 @@ internal sealed partial class HubRuntime : IDisposable
 
             var hottest = nodeUtilization.OrderByDescending(static pair => pair.Value).ThenBy(static pair => pair.Key, StringComparer.Ordinal).First();
             if (hottest.Value <= cluster.RebalanceHotUtilization)
+            {
+                // Episode over: the pressure receded without (or after) provisioning. A fresh
+                // episode gets a fresh attempt budget; an outstanding ticket keeps its count.
+                lock (_capacityLock)
+                {
+                    if (_ticket is null && !_provisionGaveUp)
+                        _provisionAttempts = 0;
+                }
+
                 return;
+            }
+
             var origin = hottest.Key;
             var originShards = byNode.GetValueOrDefault(origin) ?? [];
-            if (originShards.Count <= 1)
+            if (live.Count >= 2 && originShards.Count > 1)
             {
-                if (ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
-                    LogRebalanceSingleShardHot(_logger, origin, hottest.Value, originShards.Count == 1 ? originShards[0].Value : 0);
-                return;
-            }
+                var target = nodeUtilization
+                    .Where(pair => pair.Key != origin)
+                    .OrderBy(static pair => pair.Value)
+                    .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
+                    .First();
+                var floorTicks = TimeSpan.TicksPerMillisecond * Math.Max(0, cluster.ShardMoveMinIntervalMs);
+                var candidate = originShards
+                    .Where(shard => shardUtilization.GetValueOrDefault(shard) > 0)
+                    .Where(shard => !_lastShardMoveTicks.TryGetValue(shard, out var moved) || now.UtcTicks - moved >= floorTicks)
+                    .Where(shard => target.Value + shardUtilization[shard] < hottest.Value)
+                    .OrderByDescending(shard => shardUtilization[shard])
+                    .Select(static shard => (ShardKey?)shard)
+                    .FirstOrDefault();
+                if (candidate is { } moving)
+                {
+                    LogRebalanceMoving(
+                        _logger, moving.Value, origin, hottest.Value, target.Key, target.Value, shardUtilization[moving]);
+                    Interlocked.Exchange(ref _rebalanceMoveInFlight, 1);
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await DrainShardAsync(moving, target.Key, _stopped.Token).ConfigureAwait(false);
+                        }
+                        catch (Exception)
+                        {
+                            // DrainShardAsync already logged the failure (1725) and handed the shard back.
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref _rebalanceMoveInFlight, 0);
+                        }
+                    });
+                    return;
+                }
 
-            var target = nodeUtilization
-                .Where(pair => pair.Key != origin)
-                .OrderBy(static pair => pair.Value)
-                .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
-                .First();
-            var floorTicks = TimeSpan.TicksPerMillisecond * Math.Max(0, cluster.ShardMoveMinIntervalMs);
-            var candidate = originShards
-                .Where(shard => shardUtilization.GetValueOrDefault(shard) > 0)
-                .Where(shard => !_lastShardMoveTicks.TryGetValue(shard, out var moved) || now.UtcTicks - moved >= floorTicks)
-                .Where(shard => target.Value + shardUtilization[shard] < hottest.Value)
-                .OrderByDescending(shard => shardUtilization[shard])
-                .Select(static shard => (ShardKey?)shard)
-                .FirstOrDefault();
-            if (candidate is not { } moving)
-            {
                 if (ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
                     LogRebalanceNoFit(_logger, origin, hottest.Value, target.Key, target.Value);
-                return;
+            }
+            else if (live.Count >= 2 && ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
+            {
+                LogRebalanceSingleShardHot(_logger, origin, hottest.Value, originShards.Count == 1 ? originShards[0].Value : 0);
             }
 
-            LogRebalanceMoving(
-                _logger, moving.Value, origin, hottest.Value, target.Key, target.Value, shardUtilization[moving]);
-            Interlocked.Exchange(ref _rebalanceMoveInFlight, 1);
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await DrainShardAsync(moving, target.Key, _stopped.Token).ConfigureAwait(false);
-                }
-                catch (Exception)
-                {
-                    // DrainShardAsync already logged the failure (1725) and handed the shard back.
-                }
-                finally
-                {
-                    Interlocked.Exchange(ref _rebalanceMoveInFlight, 0);
-                }
-            });
+            // The loop's first move — rearranging the nodes it has — is unavailable this tick.
+            // The second move exists only behind the capacity seam.
+            EvaluateScaleOut(cluster, live, byNode, nodeUtilization, hottest.Value, now);
         }
         catch (Exception exception)
         {
@@ -671,6 +761,240 @@ internal sealed partial class HubRuntime : IDisposable
             return false;
         _rebalanceStuckLogTicks[node] = now.UtcTicks;
         return true;
+    }
+
+    /// <summary>
+    /// The loop's second move (road-to-0.2 phase 14): obtain one more node through the capacity
+    /// seam. Taken only when the first move is unavailable — every live node sustained-hot — and
+    /// bounded twice over: never past <c>Cluster:MaxNodes</c>, and never while a ticket is already
+    /// outstanding or the loop has given up (EventId 1738). A fleet where shards no longer
+    /// outnumber nodes is refused too: a new node that cannot receive a whole shard is spend
+    /// without relief, the granularity ceiling wearing its capacity face.
+    /// </summary>
+    private void EvaluateScaleOut(
+        ClusterOptions cluster,
+        HashSet<string> live,
+        Dictionary<string, List<ShardKey>> byNode,
+        Dictionary<string, double> nodeUtilization,
+        double hottestUtilization,
+        DateTimeOffset now)
+    {
+        if (_provisioner is null)
+            return;
+        if (nodeUtilization.Count == 0 || nodeUtilization.Values.Any(utilization => utilization <= cluster.RebalanceHotUtilization))
+            return;
+
+        var totalShards = byNode.Values.Sum(static shards => shards.Count);
+        if (totalShards <= live.Count)
+        {
+            if (ShouldLogStuck("(capacity-granularity)", now, cluster.ShardMoveMinIntervalMs))
+                LogProvisionSkippedGranularity(_logger, live.Count, totalShards);
+            return;
+        }
+
+        if (live.Count >= cluster.MaxNodes)
+        {
+            if (ShouldLogStuck("(capacity-ceiling)", now, cluster.ShardMoveMinIntervalMs))
+                LogProvisionAtCeiling(_logger, live.Count, cluster.MaxNodes, hottestUtilization);
+            return;
+        }
+
+        int attempt;
+        lock (_capacityLock)
+        {
+            if (_provisionGaveUp || _ticket is not null || _provisionCallInFlight != 0 || _provisionAttempts >= 2)
+                return;
+            _provisionCallInFlight = 1;
+            attempt = _provisionAttempts + 1;
+        }
+
+        var request = new CapacityRequest(
+            live.Count,
+            cluster.MaxNodes,
+            $"every live node sustained-hot over Cluster:RebalanceWindowSeconds ({cluster.RebalanceWindowSeconds}s), " +
+            $"hottest at {hottestUtilization:P0}; fleet {live.Count} of Cluster:MaxNodes {cluster.MaxNodes}");
+        _ = Task.Run(() => RequestNodeIsolatedAsync(request, attempt, cluster.ProvisionTicketTimeoutMs));
+    }
+
+    /// <summary>
+    /// The provisioner call, isolated: never on the loop's tick thread, bounded by the ticket
+    /// timeout, and a throw counts as a spent attempt — user code on this seam can degrade the
+    /// fleet to fixed, never the hub to dead.
+    /// </summary>
+    private async Task RequestNodeIsolatedAsync(CapacityRequest request, int attempt, int timeoutMs)
+    {
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_stopped.Token);
+            cts.CancelAfter(Math.Max(1_000, timeoutMs));
+            var ticket = await _provisioner!.RequestNodeAsync(request, cts.Token).ConfigureAwait(false);
+            lock (_capacityLock)
+            {
+                _provisionAttempts = attempt;
+                _ticket = new OutstandingTicket(ticket, _time.GetUtcNow(), attempt);
+            }
+
+            Metrics.ProvisionRequested();
+            LogProvisionTicketIssued(_logger, ticket.TicketId, ticket.NodeName, attempt, request.Reason);
+        }
+        catch (Exception exception)
+        {
+            bool gaveUp;
+            lock (_capacityLock)
+            {
+                _provisionAttempts = attempt;
+                gaveUp = _provisionGaveUp = attempt >= 2;
+            }
+
+            LogProvisionerCallFailed(_logger, "RequestNodeAsync", exception.Message);
+            if (gaveUp)
+                LogProvisionGaveUp(_logger, attempt);
+        }
+        finally
+        {
+            lock (_capacityLock)
+            {
+                _provisionCallInFlight = 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Expires an outstanding ticket whose named node never joined. The first expiry leaves the
+    /// attempt budget open, so the loop re-requests exactly once if the pressure persists; the
+    /// second latches the give-up alert — money is involved, and the posture on repeated failure
+    /// is <em>tell a human</em>, never <em>keep trying</em>. The expired name is remembered: an
+    /// instance limping in later is surplus, not capacity (see <see cref="OnNodeRegistered"/>).
+    /// </summary>
+    private void SweepProvisionTicket(ClusterOptions cluster, DateTimeOffset now)
+    {
+        OutstandingTicket? outstanding;
+        lock (_capacityLock)
+        {
+            outstanding = _ticket;
+        }
+
+        if (outstanding is null)
+            return;
+
+        // Fulfillment by membership, not only by the registration hook: the node may have joined
+        // in the instant between the provisioner returning its ticket and the hub recording it —
+        // registration would have checked the slot before the slot existed. The tick notices.
+        if (_membership.Nodes().Any(n => n.Alive && n.NodeName == outstanding.Ticket.NodeName))
+        {
+            var fulfilled = false;
+            lock (_capacityLock)
+            {
+                if (ReferenceEquals(_ticket, outstanding))
+                {
+                    _ticket = null;
+                    _provisionAttempts = 0;
+                    _provisionGaveUp = false;
+                    fulfilled = true;
+                }
+            }
+
+            if (fulfilled)
+            {
+                var latencyMs = (now - outstanding.RequestedAt).TotalMilliseconds;
+                _provisionLatency.Record(latencyMs);
+                Metrics.ProvisionFulfilled();
+                LogProvisionFulfilled(_logger, outstanding.Ticket.NodeName, outstanding.Ticket.TicketId, latencyMs);
+            }
+
+            return;
+        }
+
+        if (now - outstanding.RequestedAt <= TimeSpan.FromMilliseconds(Math.Max(1_000, cluster.ProvisionTicketTimeoutMs)))
+            return;
+
+        var expired = false;
+        var gaveUp = false;
+        lock (_capacityLock)
+        {
+            if (ReferenceEquals(_ticket, outstanding))
+            {
+                _ticket = null;
+                _expiredTickets[outstanding.Ticket.NodeName] = outstanding.Ticket.TicketId;
+                gaveUp = _provisionGaveUp = outstanding.Attempt >= 2;
+                expired = true;
+            }
+        }
+
+        if (!expired)
+            return;
+        Metrics.ProvisionExpired();
+        LogProvisionTicketExpired(
+            _logger, outstanding.Ticket.TicketId, outstanding.Ticket.NodeName, cluster.ProvisionTicketTimeoutMs, outstanding.Attempt);
+        if (gaveUp)
+            LogProvisionGaveUp(_logger, outstanding.Attempt);
+    }
+
+    /// <summary>
+    /// Capacity bookkeeping on every node registration. A node fulfilling the outstanding ticket
+    /// clears the whole episode — attempts, give-up latch — and records the provision latency. A
+    /// node named by an <em>expired</em> ticket is the at-least-once contract's surplus: if
+    /// registration handed it nothing it is decommissioned (fencing already guarantees it can
+    /// write nothing it was never assigned); if unowned shards existed and registration gave it
+    /// some, capacity arrived late but arrived, and it stays.
+    /// </summary>
+    private void OnNodeRegistered(string nodeName)
+    {
+        OutstandingTicket? fulfilled;
+        string? expiredTicketId = null;
+        lock (_capacityLock)
+        {
+            if (_ticket is { } ticket && ticket.Ticket.NodeName == nodeName)
+            {
+                fulfilled = ticket;
+                _ticket = null;
+                _provisionAttempts = 0;
+                _provisionGaveUp = false;
+            }
+            else
+            {
+                fulfilled = null;
+                _expiredTickets.Remove(nodeName, out expiredTicketId);
+            }
+        }
+
+        if (fulfilled is { } issued)
+        {
+            var latencyMs = (_time.GetUtcNow() - issued.RequestedAt).TotalMilliseconds;
+            _provisionLatency.Record(latencyMs);
+            Metrics.ProvisionFulfilled();
+            LogProvisionFulfilled(_logger, nodeName, issued.Ticket.TicketId, latencyMs);
+            return;
+        }
+
+        if (expiredTicketId is null)
+            return;
+
+        if (_membership.AssignmentsFor(nodeName).Count > 0)
+        {
+            LogProvisionLateArrivalKept(_logger, nodeName, expiredTicketId);
+            return;
+        }
+
+        LogProvisionLateArrivalDecommissioned(_logger, nodeName, expiredTicketId);
+        _ = Task.Run(() => DecommissionIsolatedAsync(nodeName));
+    }
+
+    /// <summary>The decommission call, isolated the same way as the request call.</summary>
+    private async Task DecommissionIsolatedAsync(string nodeName)
+    {
+        Metrics.DecommissionRequested();
+        _decommissions.Add(1);
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_stopped.Token);
+            cts.CancelAfter(Math.Max(1_000, Cluster.ProvisionTicketTimeoutMs));
+            await _provisioner!.DecommissionAsync(nodeName, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            LogProvisionerCallFailed(_logger, "DecommissionAsync", exception.Message);
+        }
     }
 
     /// <summary>The live node owning the fewest shards, excluding the drain's origin — the default destination.</summary>
@@ -834,6 +1158,7 @@ internal sealed partial class HubRuntime : IDisposable
         _membership.RegisterNode(request.NodeName, request.PublicAddress, _time.GetUtcNow());
         _membership.AssignUnowned(_time.GetUtcNow());
         LogNodeRegistered(_logger, request.NodeName, request.PublicAddress);
+        OnNodeRegistered(request.NodeName);
         return new AuthReply(
             LinkProof.Compute(cluster.Secret, request.NodeNonce, "hub"),
             AssignmentsDto(request.NodeName),
@@ -1058,6 +1383,7 @@ internal sealed partial class HubRuntime : IDisposable
         foreach (var link in _linksByNode.Values)
             link.Dispose();
         Load.Dispose();
+        _capacityMeter.Dispose();
     }
 
     [LoggerMessage(EventId = 1700, EventName = "ClusterHubStarted", Level = LogLevel.Information,
@@ -1148,6 +1474,52 @@ internal sealed partial class HubRuntime : IDisposable
             "load of its own, or would leave the pair's maximum no better against '{Target}' ({TargetUtilization:P0}) — relocating a whole hotspot is not " +
             "a rebalance. Logged at most once per Cluster:ShardMoveMinIntervalMs.")]
     private static partial void LogRebalanceNoFit(ILogger logger, string node, double utilization, string target, double targetUtilization);
+
+    [LoggerMessage(EventId = 1735, EventName = "ProvisionTicketIssued", Level = LogLevel.Information,
+        Message = "Capacity: provision ticket '{TicketId}' issued for node '{NodeName}' (attempt {Attempt}): {Reason}. " +
+                  "Waiting Cluster:ProvisionTicketTimeoutMs for it to join membership.")]
+    private static partial void LogProvisionTicketIssued(ILogger logger, string ticketId, string nodeName, int attempt, string reason);
+
+    [LoggerMessage(EventId = 1736, EventName = "ProvisionFulfilled", Level = LogLevel.Information,
+        Message = "Capacity: node '{NodeName}' joined membership, fulfilling ticket '{TicketId}' after {LatencyMs:F0}ms; " +
+                  "the rebalance loop spreads onto it from here.")]
+    private static partial void LogProvisionFulfilled(ILogger logger, string nodeName, string ticketId, double latencyMs);
+
+    [LoggerMessage(EventId = 1737, EventName = "ProvisionTicketExpired", Level = LogLevel.Warning,
+        Message = "Capacity: ticket '{TicketId}' expired — node '{NodeName}' did not join within Cluster:ProvisionTicketTimeoutMs " +
+                  "({TimeoutMs}ms). This was attempt {Attempt}; should it still arrive, it will be decommissioned unless shards were waiting for it.")]
+    private static partial void LogProvisionTicketExpired(ILogger logger, string ticketId, string nodeName, int timeoutMs, int attempt);
+
+    [LoggerMessage(EventId = 1738, EventName = "ProvisionGaveUp", Level = LogLevel.Error,
+        Message = "Capacity: {Attempts} provision attempts failed or expired; the loop has stopped asking and the " +
+                  "melange-capacity health check is now unhealthy. Money is involved, so repeated failure means a human: " +
+                  "fix the provisioner (or add a node by hand) — a ticket-named node joining clears this.")]
+    private static partial void LogProvisionGaveUp(ILogger logger, int attempts);
+
+    [LoggerMessage(EventId = 1739, EventName = "ProvisionLateArrivalDecommissioned", Level = LogLevel.Warning,
+        Message = "Capacity: node '{NodeName}' arrived after its ticket '{TicketId}' expired and owns nothing; " +
+                  "decommissioning the surplus. At-least-once provisioning made safe by fencing — a cost, never a correctness problem.")]
+    private static partial void LogProvisionLateArrivalDecommissioned(ILogger logger, string nodeName, string ticketId);
+
+    [LoggerMessage(EventId = 1740, EventName = "ProvisionerCallFailed", Level = LogLevel.Warning,
+        Message = "Capacity: the provisioner's {Operation} threw: {Reason}")]
+    private static partial void LogProvisionerCallFailed(ILogger logger, string operation, string reason);
+
+    [LoggerMessage(EventId = 1741, EventName = "ProvisionSkippedGranularity", Level = LogLevel.Warning,
+        Message = "Capacity: every one of the {LiveNodes} live node(s) is sustained-hot, but only {TotalShards} shard(s) exist — " +
+                  "a new node could not receive a whole shard, so provisioning is refused. The granularity ceiling: " +
+                  "relief needs more shards (finer boundaries at strategy registration), not more nodes.")]
+    private static partial void LogProvisionSkippedGranularity(ILogger logger, int liveNodes, int totalShards);
+
+    [LoggerMessage(EventId = 1742, EventName = "ProvisionAtCeiling", Level = LogLevel.Warning,
+        Message = "Capacity: every one of the {LiveNodes} live node(s) is sustained-hot (hottest {HottestUtilization:P0}) and the " +
+                  "fleet is at Cluster:MaxNodes ({MaxNodes}). The ceiling is doing its job; raising it is a spending decision, so it is yours.")]
+    private static partial void LogProvisionAtCeiling(ILogger logger, int liveNodes, int maxNodes, double hottestUtilization);
+
+    [LoggerMessage(EventId = 1743, EventName = "ProvisionLateArrivalKept", Level = LogLevel.Information,
+        Message = "Capacity: node '{NodeName}' arrived after its ticket '{TicketId}' expired, but registration assigned it " +
+                  "shards that were waiting for an owner — capacity arrived late but arrived, so it stays.")]
+    private static partial void LogProvisionLateArrivalKept(ILogger logger, string nodeName, string ticketId);
 
     [LoggerMessage(EventId = 1734, EventName = "RebalanceEvaluationFailed", Level = LogLevel.Warning,
         Message = "A rebalance tick failed to evaluate ({Reason}); the loop continues on its next tick.")]

@@ -105,6 +105,7 @@ public static class MelangeClusterServiceCollectionExtensions
             provider, provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>()));
         services.AddHostedService<ClusterRuntimeHost>();
         services.TryAddSingleton<MelangeShardHealthCheck>();
+        services.TryAddSingleton<MelangeCapacityHealthCheck>();
         services.Configure<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckServiceOptions>(static options =>
         {
             if (options.Registrations.All(static r => r.Name != "melange-shard"))
@@ -112,6 +113,15 @@ public static class MelangeClusterServiceCollectionExtensions
                 options.Registrations.Add(new Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckRegistration(
                     "melange-shard",
                     static provider => provider.GetRequiredService<MelangeShardHealthCheck>(),
+                    failureStatus: null,
+                    tags: null));
+            }
+
+            if (options.Registrations.All(static r => r.Name != "melange-capacity"))
+            {
+                options.Registrations.Add(new Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckRegistration(
+                    "melange-capacity",
+                    static provider => provider.GetRequiredService<MelangeCapacityHealthCheck>(),
                     failureStatus: null,
                     tags: null));
             }

@@ -178,6 +178,23 @@ internal sealed class ClusterFixture : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Starts a brand-new shard node mid-test — the fixture's half of a scripted provisioner:
+    /// the "cloud" spinning up an instance that then announces itself to the hub by ordinary
+    /// registration, exactly as the capacity seam's fire-and-track contract expects.
+    /// </summary>
+    public async Task<ClusterNode> AddNodeAsync(string name)
+    {
+        var node = new ClusterNode { Name = name, HttpPort = 0 };
+        node.App = await WithFreshPortsRetryAsync(() =>
+        {
+            node.HttpPort = FreePort();
+            return StartAppAsync(name, ClusterRole.Shard, node.HttpPort);
+        });
+        Nodes.Add(node);
+        return node;
+    }
+
     public async Task StartNodeAsync(string name)
     {
         // A revived node need not keep its old port: it announces Cluster:PublicAddress on every
