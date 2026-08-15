@@ -259,6 +259,9 @@ public class ClusterAcceptanceTests
         }
 
         Assert.NotNull(duringTransfer);
+        // Typed as transient (#22): the freeze window is designed behaviour, so the refusal must
+        // surface as a retry-next-tick rejection, never as an internal fault.
+        Assert.IsType<TransientRejectionException>(duringTransfer);
         Assert.Contains("frozen mid-handoff", duringTransfer!.Message);
 
         var destination = _cluster.ShardOf(31);

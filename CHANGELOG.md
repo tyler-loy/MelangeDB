@@ -206,6 +206,19 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **Mid-handoff write refusals are a typed transient rejection, not an internal error.** The
+  conditions the cluster itself designed — a row frozen mid-handoff, a write routed to a border
+  copy just after the shard map flips, a fenced node awaiting re-registration — reached the client
+  as `internal` ("The reducer failed; see the server logs") with a full server error log per
+  unlucky crossing, which at seam-walking scale is log noise for the product working as designed.
+  They now surface as the new wire code **`transient`** carrying the precise reason, and the
+  server logs nothing; the HTTP call endpoint answers 409 rather than 500. The retry contract is
+  named on the client as `MelangeCallException.IsTransient`: retry the call unchanged on the next
+  tick. For module and host code, `ShardFencedException` and `BorderReadOnlyException` now derive
+  from the new `TransientRejectionException` (itself an `InvalidOperationException`, so existing
+  catches still hold), and the frozen-row guard throws it directly. `rejected` stays reserved for
+  what reducer code itself decided. (#22)
+
 - **CI can be triggered by hand.** `workflow_dispatch` on `ci.yml`, and the `pack` job now gates on the
   ref being `main` rather than on the event being a push — equivalent for every trigger that existed
   before, and it means a dispatch from `main` produces the `-ci.<run-number>` prerelease rather than

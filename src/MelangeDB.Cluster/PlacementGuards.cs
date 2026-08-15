@@ -8,9 +8,10 @@ namespace MelangeDB.Cluster;
 /// Thrown when a node writes a shard it no longer holds a live lease for — the self-fencing half
 /// of failure handling. A node that cannot reach the hub within <c>Cluster:FailureTimeoutMs</c>
 /// must assume its shards were reassigned and stop writing them, because the hub assumed exactly
-/// that about the node.
+/// that about the node. Transient: the node re-registers, or the client's session moves with the
+/// shard — either way "the reducer failed" is the wrong report.
 /// </summary>
-public sealed class ShardFencedException(string message) : InvalidOperationException(message);
+public sealed class ShardFencedException(string message) : TransientRejectionException(message);
 
 /// <summary>
 /// Thrown when a transaction's write set spans shard keys — the one contract the developer must
@@ -23,8 +24,10 @@ public sealed class ShardSpanException(string message) : InvalidOperationExcepti
 /// Thrown when a reducer writes a border-band copy — a row this node holds read-only because a
 /// neighbouring shard owns it. Always enforced, never debug-only: a violated read-only invariant
 /// is silent state divergence between the copy and its owner, which no test would ever see.
+/// Transient from the caller's seat: the common trigger is a write routed to a copy just after
+/// the shard map flips, which the next tick's routing resolves.
 /// </summary>
-public sealed class BorderReadOnlyException(string message) : InvalidOperationException(message);
+public sealed class BorderReadOnlyException(string message) : TransientRejectionException(message);
 
 /// <summary>Resolves whether the shard-span check runs, per <c>Cluster:ShardSpanCheck</c>.</summary>
 public static class ShardSpanCheck
@@ -184,7 +187,7 @@ internal sealed class ShardCommitGuard : ICommitGuard
                 if (frozen.Contains((op.Table, op.Key)))
                 {
                     var name = _schema.TryGet(op.Table, out var table) ? table.Name : op.Table.ToString();
-                    throw new InvalidOperationException(
+                    throw new TransientRejectionException(
                         $"'{reducerName}' writes a row of '{name}' that is frozen mid-handoff; the player is being " +
                         "transferred to another shard and is writable nowhere until the transfer completes.");
                 }
