@@ -74,16 +74,18 @@ Phase 12 was numbered after 11 but landed first: the port's scoping pass
 ([#20](https://github.com/tyler-loy/MelangeDB/issues/20)) measured 459 client call sites that are
 mechanical against typed bindings and a rewrite without them.
 
-## M4 — Elastic cluster · planned
+## M4 — 0.2: elastic capacity and operations · planned
 
-Post-0.1 work, planned in [road-to-0.2/](road-to-0.2/) and implementing
+Post-0.1 work, planned in [road-to-0.2/](road-to-0.2/). Phases 13–14 implement
 [design/elastic-rebalancing.md](design/elastic-rebalancing.md): shard boundaries stay fixed at
 strategy registration, and the elastic layer is the shard → node map — regrouping, never resizing.
+Phase 15 is independent operational surface over the 0.1 durability machinery.
 
 | Phase | Title | Status |
 | --- | --- | --- |
 | [13](road-to-0.2/plan-phase-13.md) | Clustering III — elastic assignment: per-shard load on heartbeats, the planned drain, the rebalance loop | Planned |
 | [14](road-to-0.2/plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in: the `INodeProvisioner` seam, provision-then-reassign, drain-and-decommission | Planned |
+| [15](road-to-0.2/plan-phase-15.md) | Backup and restore: the `.mbak` archive (snapshot + log tail, per engine — the truth, not the projections), `melange backup` / `restore` / `backup verify` | Planned |
 
 ## What's left
 
