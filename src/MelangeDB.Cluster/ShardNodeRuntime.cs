@@ -27,6 +27,16 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private readonly MelangeSessions _sessions;
     private readonly Lock _shardsLock = new();
     private readonly Dictionary<ShardKey, ShardRuntime> _shards = [];
+
+    /// <summary>
+    /// Shards this node quiesced for a planned drain, with when. While marked, an assignment
+    /// still naming this node does not reopen the shard — the hub is between quiesce and
+    /// reassign, and reopening would race the destination onto one log. The mark clears when the
+    /// assignment moves elsewhere, when the hub abandons the drain (<c>shard-drain-abort</c>), or
+    /// by expiry (2 x Cluster:FailureTimeoutMs) — the self-healing bound for a hub that died
+    /// mid-drain, after which the shard reopens on the next heartbeat.
+    /// </summary>
+    private readonly Dictionary<ShardKey, DateTimeOffset> _draining = [];
     private readonly Dictionary<ShardKey, EventForwarder> _forwarders = [];
     private readonly Dictionary<ShardKey, BorderPublisher> _borderPublishers = [];
     private readonly Dictionary<ShardKey, BoundaryMonitor> _boundaryMonitors = [];
@@ -265,9 +275,19 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 }
             }
 
+            // Draining marks whose shard the hub has since moved elsewhere (or dropped) are done;
+            // the ones still naming this node are checked for expiry below.
+            foreach (var draining in _draining.Keys.ToList())
+            {
+                if (!assigned.ContainsKey(draining))
+                    _draining.Remove(draining);
+            }
+
             foreach (var assignment in assigned.Values)
             {
                 if (_shards.ContainsKey(assignment.Shard))
+                    continue;
+                if (IsDrainingLocked(assignment.Shard))
                     continue;
                 var directory = Path.Combine(Cluster.ShardDataPath, $"shard-{assignment.Shard.Value}");
                 Directory.CreateDirectory(directory);
@@ -327,6 +347,50 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
         foreach (var runtime in closed)
             runtime.Dispose();
+    }
+
+    /// <summary>Whether the shard is drain-quiesced, clearing an expired mark on the way past. Caller holds <see cref="_shardsLock"/>.</summary>
+    private bool IsDrainingLocked(ShardKey shard)
+    {
+        if (!_draining.TryGetValue(shard, out var since))
+            return false;
+        if (_time.GetUtcNow() - since <= TimeSpan.FromMilliseconds(2L * Math.Max(1, Cluster.FailureTimeoutMs)))
+            return true;
+        _draining.Remove(shard);
+        LogDrainMarkExpired(_logger, shard.Value, NodeName);
+        return false;
+    }
+
+    /// <summary>
+    /// The node half of a planned drain: verify the term, mark the shard draining (so this node's
+    /// own heartbeat cannot reopen it while the hub is between quiesce and reassign), close it
+    /// exactly the way a reassignment closes it, take a fresh snapshot so the destination's
+    /// recovery tail is short, and report the head the destination will recover to. The snapshot
+    /// and close run outside the shard-set lock — the node's other shards must keep serving.
+    /// </summary>
+    private ShardDrainReply QuiesceShard(ShardDrain drain)
+    {
+        var shard = new ShardKey(drain.Shard);
+        ShardRuntime runtime;
+        lock (_shardsLock)
+        {
+            runtime = RequireShard(shard, drain.FencingToken);
+            _draining[shard] = _time.GetUtcNow();
+            _shards.Remove(shard);
+            if (_forwarders.Remove(shard, out var forwarder))
+                forwarder.Dispose();
+            if (_borderPublishers.Remove(shard, out var publisher))
+                publisher.Dispose();
+            if (_boundaryMonitors.Remove(shard, out var monitor))
+                monitor.Dispose();
+            _replicaSubscribedFrom = ulong.MaxValue;
+        }
+
+        runtime.Engine.TakeSnapshot();
+        var head = runtime.Engine.Log.HeadLsn;
+        runtime.Dispose();
+        LogShardQuiesced(_logger, shard.Value, NodeName, head);
+        return new ShardDrainReply(head);
     }
 
     private void KickForwarders()
@@ -454,6 +518,26 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 return Task.FromResult<object?>(null);
             }
 
+            case "shard-drain":
+                return Task.FromResult<object?>(QuiesceShard(body!.Value.Deserialize<ShardDrain>()!));
+            case "shard-drain-abort":
+            {
+                var abort = body!.Value.Deserialize<ShardDrainAbort>()!;
+                lock (_shardsLock)
+                {
+                    _draining.Remove(new ShardKey(abort.Shard));
+                }
+
+                LogDrainAborted(_logger, abort.Shard, NodeName);
+                return Task.FromResult<object?>(null);
+            }
+
+            case "assignments-apply":
+                // The drain's fast path: the hub pushes the destination's assignments instead of
+                // waiting out the heartbeat clock, and the reply doubles as "the shard is open"
+                // because ApplyAssignments recovers synchronously.
+                ApplyAssignments(body!.Value.Deserialize<AssignmentsApply>()!.Assignments);
+                return Task.FromResult<object?>(null);
             case "shard-execute":
             {
                 var execute = body!.Value.Deserialize<ShardExecute>()!;
@@ -770,4 +854,18 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     [LoggerMessage(EventId = 1709, EventName = "HubLinkLost", Level = LogLevel.Warning,
         Message = "The hub link failed ({Reason}); reconnecting. If Cluster:FailureTimeoutMs passes first, this node self-fences its shards.")]
     private static partial void LogHubLinkLost(ILogger logger, string reason);
+
+    [LoggerMessage(EventId = 1726, EventName = "ShardQuiesced", Level = LogLevel.Information,
+        Message = "Shard {Shard} quiesced on node '{NodeName}' for a planned drain: snapshot taken, engine closed at LSN {HeadLsn}. " +
+            "The shard reopens here only if the hub abandons the drain or dies mid-drain (the draining mark expires after 2x Cluster:FailureTimeoutMs).")]
+    private static partial void LogShardQuiesced(ILogger logger, ulong shard, string nodeName, ulong headLsn);
+
+    [LoggerMessage(EventId = 1727, EventName = "ShardDrainAborted", Level = LogLevel.Warning,
+        Message = "The hub abandoned the drain of shard {Shard}; node '{NodeName}' cleared the draining mark and reopens the shard on its next heartbeat.")]
+    private static partial void LogDrainAborted(ILogger logger, ulong shard, string nodeName);
+
+    [LoggerMessage(EventId = 1728, EventName = "ShardDrainMarkExpired", Level = LogLevel.Warning,
+        Message = "Shard {Shard}'s draining mark on node '{NodeName}' outlived 2x Cluster:FailureTimeoutMs with the assignment still naming this node — " +
+            "the hub likely died between quiesce and reassign. The mark expired and the shard reopens; the interrupted drain healed itself in favour of the origin.")]
+    private static partial void LogDrainMarkExpired(ILogger logger, ulong shard, string nodeName);
 }

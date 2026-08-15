@@ -24,7 +24,7 @@ namespace MelangeDB.Cluster;
 /// around the player (the terrain and entities just behind them), the client observes no gap, no
 /// missing terrain, and no disconnect.
 /// </summary>
-internal sealed partial class GatewayConnection : IPlayerHandoffObserver
+internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShardMoveObserver
 {
     private const int MaxHeldCalls = 256;
 
@@ -46,6 +46,10 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
     private bool _queueShardCalls;
     private bool _handshaken;
     private IDisposable? _handoffRegistration;
+    private IDisposable? _moveRegistration;
+
+    /// <summary>Bumped whenever queueing starts or resolves, so a stale drain-queue timeout task disarms itself.</summary>
+    private int _queueGeneration;
 
     public GatewayConnection(WebSocket client, GatewayRuntime gateway)
     {
@@ -93,6 +97,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
         {
             _closed.Cancel();
             _handoffRegistration?.Dispose();
+            _moveRegistration?.Dispose();
             if (_hub is { } hub)
                 await hub.DisposeAsync().ConfigureAwait(false);
             if (_shard is { } shard)
@@ -181,6 +186,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
         // head LSNs are the hub's.
         _hub = await ConnectUpstreamAsync(_gateway.HubSocketUri(), firesLifecycle: true, ct).ConfigureAwait(false);
         _handoffRegistration = _gateway.Hub.Handoffs.Register(_session!.Identity, this);
+        _moveRegistration = _gateway.Hub.ShardMoves.Register(this);
         _handshaken = true;
         await SendToClientAsync(new WelcomeFrame(
             MessagePackFrameSerializer.ProtocolVersion,
@@ -457,8 +463,18 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
     /// <summary>Closure: on success the swap already ran; on abort, release the held calls back to the origin.</summary>
     public void OnClosed(ShardKey from, ShardKey to, bool success)
     {
-        if (success)
-            return;
+        if (!success)
+            ReleaseHeldCalls();
+    }
+
+    /// <summary>
+    /// Stops queueing and flushes the held calls to whatever node currently owns the session's
+    /// shard — the origin after an aborted transfer or a failed drain, the destination after a
+    /// drain the swap missed. <see cref="EnsureShardUpstreamAsync"/> re-resolves ownership per
+    /// call, so this is correct in every one of those endings.
+    /// </summary>
+    private void ReleaseHeldCalls()
+    {
         _ = Task.Run(async () =>
         {
             List<(byte[] Bytes, uint RequestId)> held;
@@ -466,6 +482,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
             {
                 _muted = null;
                 _queueShardCalls = false;
+                _queueGeneration++;
                 held = [.. _heldCalls];
                 _heldCalls.Clear();
             }
@@ -487,7 +504,81 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
         });
     }
 
-    private async Task SwapToAsync(ShardKey to)
+    // ---- IShardMoveObserver: a planned drain of a whole shard; see ShardMoveNotifier for ordering. ----
+
+    /// <summary>
+    /// A drain of this connection's shard started. Mute the origin attachment first — its
+    /// transport is about to close under the quiesce, and that closure must read as machinery,
+    /// never as a client-visible resync — then queue the shard's calls, bounded by
+    /// Cluster:DrainQueueTimeoutMs so a wedged drain answers callers with a retryable error
+    /// instead of holding them forever.
+    /// </summary>
+    public void OnMoveStarted(ShardKey shard)
+    {
+        int generation;
+        lock (_stateLock)
+        {
+            if (_shardKey != shard)
+                return;
+            if (_shard is { } origin)
+                _muted = origin;
+            _queueShardCalls = true;
+            generation = ++_queueGeneration;
+        }
+
+        var timeoutMs = Math.Max(1, _gateway.Options.CurrentValue.Cluster.DrainQueueTimeoutMs);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(timeoutMs, _closed.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            bool wedged;
+            lock (_stateLock)
+            {
+                wedged = _queueShardCalls && _queueGeneration == generation;
+            }
+
+            if (wedged)
+            {
+                LogDrainQueueTimedOut(_gateway.Logger, shard.Value, timeoutMs);
+                ReleaseHeldCalls();
+            }
+        });
+    }
+
+    /// <summary>The destination owns the drained shard: reconnect there, re-scope, flush — the forced swap.</summary>
+    public void OnMoved(ShardKey shard)
+    {
+        bool affected;
+        lock (_stateLock)
+        {
+            affected = _shardKey == shard;
+        }
+
+        if (affected)
+            _ = Task.Run(() => SwapToAsync(shard, force: true));
+    }
+
+    /// <summary>The drain failed; the origin keeps the shard. Flush the queue back to it.</summary>
+    public void OnMoveFailed(ShardKey shard)
+    {
+        bool affected;
+        lock (_stateLock)
+        {
+            affected = _shardKey == shard;
+        }
+
+        if (affected)
+            ReleaseHeldCalls();
+    }
+
+    private async Task SwapToAsync(ShardKey to, bool force = false)
     {
         try
         {
@@ -501,8 +592,11 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
         UpstreamSession? retired = null;
         try
         {
-            if (_shardKey == to && _shard is { IsAlive: true })
-                return; // Already there (a duplicate notification after a reconciler resolution).
+            // "Already there" short-circuits a duplicate handoff notification — but never a
+            // drain's swap, where the shard key is unchanged by design and the whole point is
+            // reconnecting the same shard on its new node.
+            if (!force && _shardKey == to && _shard is { IsAlive: true })
+                return;
 
             Task<UpstreamSession>? preopened;
             lock (_stateLock)
@@ -525,6 +619,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
                 held = [.. _heldCalls];
                 _heldCalls.Clear();
                 _queueShardCalls = false;
+                _queueGeneration++;
             }
 
             // Re-scope every shard subscription on the destination: the fresh initial set
@@ -619,4 +714,9 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver
     [LoggerMessage(EventId = 1720, EventName = "GatewayHandoffQueueOverflow", Level = LogLevel.Warning,
         Message = "A client queued more than {Cap} reducer calls during one transfer; further calls are refused with a retryable error until the transfer resolves.")]
     private static partial void LogHandoffQueueOverflow(ILogger logger, int cap);
+
+    [LoggerMessage(EventId = 1730, EventName = "GatewayDrainQueueTimedOut", Level = LogLevel.Warning,
+        Message = "A client's calls stayed queued past Cluster:DrainQueueTimeoutMs ({TimeoutMs}ms) during the drain of shard {Shard} — the drain is wedged. " +
+            "The queue was flushed to the shard's current owner; calls that cannot be delivered answer with a retryable error.")]
+    private static partial void LogDrainQueueTimedOut(ILogger logger, ulong shard, int timeoutMs);
 }

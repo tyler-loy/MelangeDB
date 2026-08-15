@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
@@ -103,6 +104,12 @@ internal sealed partial class HubRuntime : IDisposable
 
     /// <summary>The per-shard load view, fed by every node's heartbeats; see <see cref="ClusterLoadView"/>.</summary>
     public ClusterLoadView Load { get; } = new();
+
+    /// <summary>The gateway connections' view into in-flight shard drains; see <see cref="ShardMoveNotifier"/>.</summary>
+    public ShardMoveNotifier ShardMoves { get; } = new();
+
+    /// <summary>Test hook: awaited before each named drain step ("reassign", "apply").</summary>
+    internal Func<string, Task>? DrainStepHook { get; set; }
 
     public MelangeEngine Engine => _engine;
 
@@ -413,6 +420,125 @@ internal sealed partial class HubRuntime : IDisposable
                 Convert.ToBase64String(ReducerArguments.Encode(arguments))),
             ct).ConfigureAwait(false);
         return reply!.Value.Deserialize<ShardExecuteReply>()!.Lsn;
+    }
+
+    private readonly ConcurrentDictionary<ShardKey, byte> _drainsInFlight = new();
+
+    /// <summary>
+    /// The planned drain — the node-death reassignment path made polite (road-to-0.2 phase 13).
+    /// In order: gateways start queueing the shard's calls (and mute their origin attachments, so
+    /// the quiesce's socket closures never surface as client errors); the origin quiesces the
+    /// shard — fresh snapshot, engine closed — under its current fencing token; membership moves
+    /// the shard to the destination under a bumped token; the destination is pushed its
+    /// assignments and opens the shard by ordinary recovery (the push is a fast path — the
+    /// membership record is already the truth, and a missed push means the destination opens on
+    /// its own next heartbeat); gateways swap, re-scope subscriptions, and flush. On any failure
+    /// before the reassign, the origin is told to abandon the drain and reopens; a hub death
+    /// mid-drain heals by the origin's draining-mark expiry. The shard is writable on at most one
+    /// node at every instant: it is closed on the origin before the destination ever learns of it.
+    /// </summary>
+    public async Task DrainShardAsync(ShardKey shard, string? destinationNode = null, CancellationToken ct = default)
+    {
+        var assignment = _membership.GetAssignment(shard)
+            ?? throw new InvalidOperationException($"{shard} was never created; nothing to drain.");
+        if (assignment.NodeName is not { } origin)
+            throw new InvalidOperationException($"{shard} has no owner; it needs assignment, not a drain.");
+        var destination = destinationNode
+            ?? LeastLoadedNodeExcept(origin)
+            ?? throw new InvalidOperationException($"No live node other than '{origin}' can take {shard}.");
+        if (destination == origin)
+            throw new InvalidOperationException($"{shard} already lives on '{destination}'; a drain to the current owner is refused rather than silently done.");
+        if (!_membership.Nodes().Any(n => n.NodeName == destination && n.Alive))
+            throw new InvalidOperationException($"Node '{destination}' is not registered and alive; a drain must never assign to a corpse.");
+        var originLink = LinkOf(origin)
+            ?? throw new InvalidOperationException(
+                $"No live link to '{origin}', the owner of {shard}. A planned drain needs a cooperative origin — a dead origin is the failure detector's job, not the drain's.");
+        if (!_drainsInFlight.TryAdd(shard, 0))
+            throw new InvalidOperationException($"A drain of {shard} is already in flight; one shard, one drain at a time.");
+
+        Metrics.DrainStarted();
+        ShardMoves.NotifyStarted(shard);
+        var quiesced = false;
+        try
+        {
+            // Quiesce and recovery scale with shard size; the link's default request timeout does
+            // not. The queue cap is the deployment's statement of drain patience, so borrow it.
+            var stepTimeoutMs = Math.Max(30_000, Cluster.DrainQueueTimeoutMs);
+            var quiesceStarted = Stopwatch.GetTimestamp();
+            await originLink.RequestAsync(
+                "shard-drain", new ShardDrain(shard.Value, assignment.FencingToken), ct, stepTimeoutMs).ConfigureAwait(false);
+            quiesced = true;
+            var quiesceMs = Stopwatch.GetElapsedTime(quiesceStarted).TotalMilliseconds;
+
+            if (DrainStepHook is { } beforeReassign)
+                await beforeReassign("reassign").ConfigureAwait(false);
+            var next = _membership.Reassign(shard, destination, _time.GetUtcNow());
+
+            if (DrainStepHook is { } beforeApply)
+                await beforeApply("apply").ConfigureAwait(false);
+            var openStarted = Stopwatch.GetTimestamp();
+            if (LinkOf(destination) is { } destinationLink)
+            {
+                try
+                {
+                    await destinationLink.RequestAsync(
+                        "assignments-apply", new AssignmentsApply(AssignmentsDto(destination)), ct, stepTimeoutMs).ConfigureAwait(false);
+                }
+                catch (Exception exception)
+                {
+                    // Fast path only: membership already records the move, so the destination
+                    // opens the shard on its own next heartbeat and the gateways' connect
+                    // retries ride out the gap.
+                    LogDrainApplyPushFailed(_logger, shard.Value, destination, exception.Message);
+                }
+            }
+
+            var openMs = Stopwatch.GetElapsedTime(openStarted).TotalMilliseconds;
+            ShardMoves.NotifyMoved(shard);
+            Metrics.DrainEnded(completed: true);
+            LogDrainCompleted(_logger, shard.Value, origin, destination, next.FencingToken, quiesceMs, openMs);
+        }
+        catch (Exception exception)
+        {
+            if (quiesced)
+            {
+                // Quiesced but never reassigned: hand the shard back. Best effort — if this
+                // notify is lost too, the origin's draining mark expires and the shard reopens on
+                // an ordinary heartbeat, which is the same conclusion arrived at slower.
+                try
+                {
+                    await originLink.NotifyAsync(
+                        "shard-drain-abort", new ShardDrainAbort(shard.Value), CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                }
+            }
+
+            ShardMoves.NotifyFailed(shard);
+            Metrics.DrainEnded(completed: false);
+            LogDrainFailed(_logger, shard.Value, origin, destination, exception.Message);
+            throw;
+        }
+        finally
+        {
+            _drainsInFlight.TryRemove(shard, out _);
+        }
+    }
+
+    /// <summary>The live node owning the fewest shards, excluding the drain's origin — the default destination.</summary>
+    private string? LeastLoadedNodeExcept(string origin)
+    {
+        var counts = _membership.AllAssignments()
+            .Where(static a => a.NodeName is not null)
+            .GroupBy(static a => a.NodeName!, StringComparer.Ordinal)
+            .ToDictionary(static g => g.Key, static g => g.Count(), StringComparer.Ordinal);
+        return _membership.Nodes()
+            .Where(n => n.Alive && n.NodeName != origin)
+            .OrderBy(n => counts.GetValueOrDefault(n.NodeName))
+            .ThenBy(static n => n.NodeName, StringComparer.Ordinal)
+            .Select(static n => n.NodeName)
+            .FirstOrDefault();
     }
 
     private NodeLink? LinkOf(string nodeName) =>
@@ -840,6 +966,22 @@ internal sealed partial class HubRuntime : IDisposable
         Message = "IShardTransferListener '{Listener}' threw for player {Player}; the transfer itself is durable, but the " +
             "application's session map may be stale until the listener is invoked again (it is idempotent by contract).")]
     private static partial void LogTransferListenerFailed(ILogger logger, string listener, string player, Exception exception);
+
+    [LoggerMessage(EventId = 1724, EventName = "ShardDrainCompleted", Level = LogLevel.Information,
+        Message = "Shard {Shard} drained from node '{Origin}' to node '{Destination}' under fencing token {FencingToken}: " +
+            "quiesce (snapshot + close) {QuiesceMs:F0}ms, destination open (recovery) {OpenMs:F0}ms. Gateways swapped; clients observed a pause, not a disconnect.")]
+    private static partial void LogDrainCompleted(
+        ILogger logger, ulong shard, string origin, string destination, long fencingToken, double quiesceMs, double openMs);
+
+    [LoggerMessage(EventId = 1725, EventName = "ShardDrainFailed", Level = LogLevel.Warning,
+        Message = "The drain of shard {Shard} from node '{Origin}' to node '{Destination}' failed ({Reason}). " +
+            "If the shard was already quiesced it was handed back to the origin (or reopens there when the draining mark expires); queued gateway calls flushed to the current owner.")]
+    private static partial void LogDrainFailed(ILogger logger, ulong shard, string origin, string destination, string reason);
+
+    [LoggerMessage(EventId = 1729, EventName = "ShardDrainApplyPushFailed", Level = LogLevel.Warning,
+        Message = "The drain of shard {Shard} could not push assignments to destination '{Destination}' ({Reason}); membership already records the move, " +
+            "so the destination opens the shard on its next heartbeat and gateway connect retries cover the gap.")]
+    private static partial void LogDrainApplyPushFailed(ILogger logger, ulong shard, string destination, string reason);
 
     [LoggerMessage(EventId = 1711, EventName = "ReplicaStreamBootstrapped", Level = LogLevel.Warning,
         Message = "Node '{NodeName}' subscribed replication from LSN {StaleCursor}, below the hub log's truncation base " +

@@ -121,6 +121,21 @@ public sealed class InMemoryMembershipStore : IMembershipStore
         }
     }
 
+    public ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(toNode);
+        lock (_lock)
+        {
+            if (!_shards.TryGetValue(shard, out var assignment))
+                throw new InvalidOperationException($"{shard} was never created; nothing to reassign.");
+            if (!_nodes.TryGetValue(toNode, out var node) || !node.Alive)
+                throw new InvalidOperationException($"Node '{toNode}' is not registered and alive; a drain must never assign to a corpse.");
+            var next = assignment with { NodeName = toNode, FencingToken = assignment.FencingToken + 1 };
+            _shards[shard] = next;
+            return next;
+        }
+    }
+
     private string? LeastLoadedNode(string? except = null)
     {
         var candidates = _nodes.Values

@@ -48,6 +48,31 @@ internal sealed record ShardLoadDto(ulong Shard, double Utilization, ulong HeadL
 /// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
 internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);
 
+/// <summary>
+/// The hub asking a shard's owner to quiesce it for a planned drain: take a fresh snapshot (so
+/// the destination's recovery tail is short), close the shard's engine, and stop serving it. The
+/// fencing token proves the request is from the current term; the reply's head LSN is where the
+/// destination's recovery will land. The owner marks the shard as draining so its own heartbeat
+/// cannot reopen it while the hub is between quiesce and reassign — an entry that outlives
+/// 2 x Cluster:FailureTimeoutMs expires and the shard reopens, which is the self-healing bound
+/// for a hub that died mid-drain.
+/// </summary>
+internal sealed record ShardDrain(ulong Shard, long FencingToken);
+
+internal sealed record ShardDrainReply(ulong HeadLsn);
+
+/// <summary>The hub abandoning a drain after quiesce: the owner clears the draining mark and reopens.</summary>
+internal sealed record ShardDrainAbort(ulong Shard);
+
+/// <summary>
+/// The hub pushing a node's full assignment list outside the heartbeat clock — sent to a drain's
+/// destination so it opens the moved shard now rather than up to one heartbeat later. The reply
+/// waits for the open (recovery included), which is how the hub knows the shard is serving before
+/// it swaps the gateways. Always the full list, because assignment application is a diff against
+/// it: a partial list would close every shard it omitted.
+/// </summary>
+internal sealed record AssignmentsApply(ShardAssignmentDto[] Assignments);
+
 internal sealed record ReplicaSubscribe(ulong FromLsn);
 
 internal sealed record ReplicaBatch(ulong[] Lsns, WireOp[][] Records);

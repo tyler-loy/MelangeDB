@@ -229,6 +229,15 @@ section of [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
 **Domain event** — An application-level fact published from a reducer via `ctx.Publish`, delivered to
 DI-resolved handlers *after* the commit point.
 
+**Drain** — The planned move of one shard to another live node while both are up
+(`MelangeClusterCoordinator.DrainShardAsync`, road-to-0.2 phase 13): the origin takes a fresh
+snapshot and closes the shard's engine, membership moves the shard under a bumped fencing token,
+the destination recovers it from the shard's own log on shared storage, and the gateways swap
+attached clients — calls queue (bounded by `Cluster:DrainQueueTimeoutMs`) and flush in order,
+subscriptions re-scope. An ownership transfer, not a data copy; the node-death reassignment path
+made polite. Distinct from a *handoff*, which moves one entity's rows between shards — a drain
+moves a whole shard between nodes and no row changes shard.
+
 **Engine (`MelangeEngine`)** — The phase-01 composition root: opens the commit log, rebuilds projections and
 AutoInc sequences from it, and dispatches reducers. Phase 02's `AddMelangeDb` wraps it; application code
 stops meeting it directly at that point.

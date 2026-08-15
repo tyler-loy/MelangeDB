@@ -116,6 +116,29 @@ public sealed class ClusterMetrics
         else
             Interlocked.Increment(ref _handoffsAborted);
     }
+
+    private long _drainsStarted;
+    private long _drainsCompleted;
+    private long _drainsFailed;
+
+    /// <summary>Planned shard drains this hub started.</summary>
+    public long DrainsStarted => Interlocked.Read(ref _drainsStarted);
+
+    /// <summary>Drains whose destination took ownership and the gateways swapped.</summary>
+    public long DrainsCompleted => Interlocked.Read(ref _drainsCompleted);
+
+    /// <summary>Drains that failed; the origin kept (or reopens) the shard.</summary>
+    public long DrainsFailed => Interlocked.Read(ref _drainsFailed);
+
+    internal void DrainStarted() => Interlocked.Increment(ref _drainsStarted);
+
+    internal void DrainEnded(bool completed)
+    {
+        if (completed)
+            Interlocked.Increment(ref _drainsCompleted);
+        else
+            Interlocked.Increment(ref _drainsFailed);
+    }
 }
 
 /// <summary>

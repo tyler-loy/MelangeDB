@@ -143,4 +143,12 @@ public sealed class ClusterOptions
     /// number of transfers per unit time, never one per step.
     /// </summary>
     public int HandoffMinIntervalMs { get; set; } = 2_000;
+
+    /// <summary>
+    /// How long the gateway queues a drained shard's reducer calls before answering queued
+    /// callers with a retryable error. Deliberately far above the handoff queue's patience:
+    /// recovering a shard is slower than importing one player, and this cap exists to bound a
+    /// <em>wedged</em> drain, not a normal one.
+    /// </summary>
+    public int DrainQueueTimeoutMs { get; set; } = 60_000;
 }

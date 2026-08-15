@@ -233,6 +233,29 @@ public sealed class PostgresMembershipStore : IMembershipStore
         return changed;
     }
 
+    public ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(toNode);
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+        LockShards(connection, transaction);
+        var assignment = ReadAssignment(connection, transaction, shard)
+            ?? throw new InvalidOperationException($"{shard} was never created; nothing to reassign.");
+        using (var alive = connection.CreateCommand())
+        {
+            alive.Transaction = transaction;
+            alive.CommandText = $"SELECT alive FROM {Schema}.melange_cluster_nodes WHERE node_name = @name";
+            alive.Parameters.AddWithValue("name", toNode);
+            if (alive.ExecuteScalar() is not true)
+                throw new InvalidOperationException($"Node '{toNode}' is not registered and alive; a drain must never assign to a corpse.");
+        }
+
+        var next = assignment with { NodeName = toNode, FencingToken = assignment.FencingToken + 1 };
+        WriteAssignment(connection, transaction, next);
+        transaction.Commit();
+        return next;
+    }
+
     private void LockShards(NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         using var command = connection.CreateCommand();
