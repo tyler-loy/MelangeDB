@@ -125,13 +125,14 @@ shows the arithmetic), validated loudly at strategy construction (`≥ 1`, `> Ha
 block dimension) and clamped on live reads — `careful` because deepening it only fully materializes on the
 next border re-subscribe, when the owner sends a full band reset.
 
-**Planned for phases 13–14** ([road-to-0.2](road-to-0.2/README.md), the elastic-capacity work —
-design record in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)): the `Cluster:*`
-rows marked *planned* in the Cluster table below. Defaults there are provisional until each phase
-lands and verifies them against the code, per this register's planned → shipped rule. One
-deliberate absence decided at planning time: the node provisioner is a **DI registration, not a
-configuration string** (`INodeProvisioner`, the membership-store precedent) — a provisioner is a
-component with credentials, not a name.
+**Planned for phases 13–15** ([road-to-0.2](road-to-0.2/README.md)): the `Cluster:*` rows marked
+*planned* in the Cluster table below (phases 13–14, the elastic-capacity work — design record in
+[design/elastic-rebalancing.md](design/elastic-rebalancing.md)) and the `Backup:*` rows in the
+Backup section (phase 15). Defaults there are provisional until each phase lands and verifies them
+against the code, per this register's planned → shipped rule. One deliberate absence decided at
+planning time: the node provisioner is a **DI registration, not a configuration string**
+(`INodeProvisioner`, the membership-store precedent) — a provisioner is a component with
+credentials, not a name.
 
 **Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
 the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid
@@ -251,6 +252,14 @@ authorization boundary" does not hold — it bypasses all reducers at once, so a
 token (which, in a game, every player holds) must not be enough. `Transport:HttpEndpointsEnabled` still
 turns off all plain-HTTP endpoints together; these keys gate bulk independently, so a host can serve `/sql`
 to its admin console without also serving unauthenticated-in-effect bulk writes to its players.
+
+## Backup
+
+| Key | Type | Default | Reload | Phase | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `Backup:Enabled` | bool | `false` | live | 15 | **Planned.** Gates the `/melange/backup` endpoint — the online form of `melange backup`; off answers `403 backup_disabled`. Off by default per the `Sql:*`/`Bulk:*` posture: backup reads **everything**, every table, every row, no policy — a deployment that never opted in should not be exposing that. The offline form (`melange backup <data-dir>` against a stopped server's files) needs no configuration at all. |
+| `Backup:OwnerRole` | string | `melange-backup-owner` | live | 15 | **Planned.** The role claim that authorizes a caller on `/melange/backup`, per the `Sql:OwnerRole` precedent (the IdP is the gate). Deliberately its own key — read-everything-as-archive, read-everything-as-queries, and write-anything are three capabilities; an operator who wants one god-role sets the keys to one value. A caller without it is refused (`403 owner_required`), never silently downgraded. Empty makes the endpoint unusable by everyone. |
+| `Backup:StreamStallTimeoutMs` | int | `60000` | live | 15 | **Planned.** How long the backup stream tolerates a stalled client before aborting and releasing the truncation pin. The pin is what makes an online backup consistent, and like every truncation pin (saga markers, subscriber checkpoints) it must be bounded — a wedged backup client must not become a full disk. |
 
 ## Transport and subscriptions
 

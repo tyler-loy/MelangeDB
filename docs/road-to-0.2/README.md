@@ -13,12 +13,18 @@ docs one level up describe the current system. Where a plan and the code disagre
 | --- | --- | --- |
 | [13](plan-phase-13.md) | Clustering III — elastic assignment | Planned |
 | [14](plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in | Planned |
+| [15](plan-phase-15.md) | Backup and restore | Planned |
 
-Both implement [design/elastic-rebalancing.md](../design/elastic-rebalancing.md): fixed shard
-boundaries, dynamic shard → node assignment. Phase 13 makes the shard map follow load across the
-nodes that exist; phase 14 makes the set of nodes itself follow load. The split is deliberate —
-13 has no external dependency and delivers value alone (an operator can rebalance by hand the day
-it ships), while 14 involves a capacity seam, money, and the genuinely harder scale-in half.
+Phases 13 and 14 implement [design/elastic-rebalancing.md](../design/elastic-rebalancing.md):
+fixed shard boundaries, dynamic shard → node assignment. Phase 13 makes the shard map follow load
+across the nodes that exist; phase 14 makes the set of nodes itself follow load. The split is
+deliberate — 13 has no external dependency and delivers value alone (an operator can rebalance by
+hand the day it ships), while 14 involves a capacity seam, money, and the genuinely harder
+scale-in half.
+
+Phase 15 is independent of both: `melange backup` / `restore` / `backup verify`, the operational
+surface the commit-log-as-truth design has owed its operators since 0.1. It can land before,
+between, or after 13–14.
 
 The standing conventions hold here exactly as they did for 0.1: every configuration item goes in
 [CONFIGURATION.md](../CONFIGURATION.md) in the change that introduces it, every noun in
