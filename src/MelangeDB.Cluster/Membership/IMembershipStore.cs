@@ -60,4 +60,12 @@ public interface IMembershipStore
     /// Called when a node registers. Returns the assignments that changed.
     /// </summary>
     IReadOnlyList<ShardAssignment> AssignUnowned(DateTimeOffset now);
+
+    /// <summary>
+    /// Moves one shard to a named live node, bumping its fencing token — the planned drain's
+    /// membership step. The caller (the hub's drain) guarantees the previous owner has already
+    /// quiesced the shard; this method only records the new term. Throws for an unknown shard or
+    /// a node that is not registered and alive — a drain must never assign to a corpse.
+    /// </summary>
+    ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now);
 }

@@ -59,6 +59,20 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **A live shard can move between nodes: the planned drain**
+  ([road-to-0.2 phase 13](docs/road-to-0.2/plan-phase-13.md), second slice).
+  `MelangeClusterCoordinator.DrainShardAsync(shard, destination?)` is the node-death reassignment
+  path made polite: the origin takes a fresh snapshot and closes the shard (so the destination's
+  recovery tail is short), membership moves it under a bumped fencing token, the destination
+  recovers it from the shard's own log on shared storage — an ownership transfer, not a data copy —
+  and the gateways swap attached clients invisibly: calls issued during the window queue (bounded
+  by the new `Cluster:DrainQueueTimeoutMs`) and flush in order on the destination, and
+  subscriptions re-scope so each client's cache is atomically replaced. The drained shard's writes
+  pause for the handover window; every other shard is untouched. A failed drain hands the shard
+  back to its origin, and a hub death mid-drain self-heals: the origin's draining mark expires
+  after `2 × Cluster:FailureTimeoutMs` and the shard reopens where it was. Null destination picks
+  the live node owning the fewest shards. EventIds 1724–1730 narrate every ending.
+
 - **The hub knows which shard is hot** ([road-to-0.2 phase 13](docs/road-to-0.2/plan-phase-13.md),
   first slice). Every shard node's heartbeat now carries one load sample per owned shard — the busy
   fraction of that shard engine's write lock since the previous beat (the resource the published

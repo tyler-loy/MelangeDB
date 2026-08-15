@@ -59,6 +59,22 @@ public sealed class MelangeClusterCoordinator
     public IReadOnlyList<ShardAssignment> OwnershipMap() => Hub.Membership.AllAssignments();
 
     /// <summary>
+    /// Moves one shard to another live node while both are up — the planned drain (road-to-0.2
+    /// phase 13), an operator-facing primitive in its own right. The origin takes a fresh
+    /// snapshot and closes the shard, membership moves it under a bumped fencing token, the
+    /// destination recovers it from the shard's own log on shared storage, and the gateways swap
+    /// attached clients invisibly: calls issued during the window are queued (bounded by
+    /// <c>Cluster:DrainQueueTimeoutMs</c>) and flush in order on the destination; subscriptions
+    /// re-scope, so each client's cache is atomically replaced with the destination's state. The
+    /// shard's writes pause for the handover window; every other shard is untouched.
+    /// <paramref name="destinationNode"/> null picks the live node owning the fewest shards.
+    /// Throws when the shard, its owner, or the destination is not in a drainable state — a
+    /// failed drain leaves the shard where it was.
+    /// </summary>
+    public Task DrainShardAsync(ShardKey shard, string? destinationNode = null, CancellationToken ct = default) =>
+        Hub.DrainShardAsync(shard, destinationNode, ct);
+
+    /// <summary>
     /// The cluster's per-shard load view, fed by every node's heartbeats: which shard is hot,
     /// where it lives, and what it weighs. The operator's "which island is busy" answer, and the
     /// feed the rebalance loop decides from. Utilization is the busy fraction of the shard

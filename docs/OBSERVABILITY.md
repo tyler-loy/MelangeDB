@@ -309,6 +309,19 @@ last one is worth an alert in a world whose shards are created by players arrivi
 otherwise completely silent, because a shard with no timers serves reads and writes perfectly and simply
 never ticks.
 
+The planned drain (road-to-0.2 phase 13): `1724 ShardDrainCompleted` — the receipt, with the two step
+durations that matter: quiesce (snapshot + close) and destination open (recovery) — `1725 ShardDrainFailed`
+(the shard stayed with, or returned to, its origin; queued gateway calls flushed to the current owner),
+`1726 ShardQuiesced` (node-side: the origin's half done, closed at which LSN), `1727 ShardDrainAborted`
+(the hub abandoned a drain after quiesce; the origin reopens on its next heartbeat),
+`1728 ShardDrainMarkExpired` — the self-healing bound for a hub that died between quiesce and reassign:
+the origin's draining mark outlived `2 × Cluster:FailureTimeoutMs` and the shard reopened —
+`1729 ShardDrainApplyPushFailed` (the fast-path assignments push to the destination failed; membership
+already records the move, so the destination opens on its own next heartbeat), and
+`1730 GatewayDrainQueueTimedOut`, a wedged drain's queue flushed after `Cluster:DrainQueueTimeoutMs` —
+non-zero occurrences of this one mean drains are exceeding the deployment's stated patience and the cap or
+the shard size needs a look.
+
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
 the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`
