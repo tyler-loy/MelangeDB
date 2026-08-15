@@ -58,6 +58,12 @@ internal static class MelangeHttpEndpoints
         {
             await WriteErrorAsync(context, StatusCodes.Status400BadRequest, MelangeErrorCodes.Rejected, exception.Message).ConfigureAwait(false);
         }
+        catch (TransientRejectionException exception)
+        {
+            // A self-clearing refusal (handoff freeze, border-copy routing, a fenced node):
+            // 409, retry unchanged — not a server fault, so nothing is logged.
+            await WriteErrorAsync(context, StatusCodes.Status409Conflict, MelangeErrorCodes.Transient, exception.Message).ConfigureAwait(false);
+        }
         catch (RateLimitedException exception)
         {
             await WriteErrorAsync(context, StatusCodes.Status429TooManyRequests, MelangeErrorCodes.RateLimited, exception.Message).ConfigureAwait(false);

@@ -53,6 +53,15 @@ public static class MelangeErrorCodes
     public const string UnknownReducer = "unknown_reducer";
     public const string InvalidArguments = "invalid_args";
     public const string Rejected = "rejected";
+
+    /// <summary>
+    /// The call was refused for a condition the system designed and expects to clear — a row
+    /// frozen mid-handoff, a border copy just after the shard map flips, a fenced node awaiting
+    /// re-registration. The retry contract: try again next tick, unchanged. Distinct from
+    /// <see cref="Rejected"/>, which is reserved for what reducer code itself decided.
+    /// </summary>
+    public const string Transient = "transient";
+
     public const string Internal = "internal";
     public const string UnknownTable = "unknown_table";
     public const string UnknownColumn = "unknown_column";

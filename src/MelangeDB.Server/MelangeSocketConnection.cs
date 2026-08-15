@@ -491,6 +491,10 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             {
                 ReducerArgumentException => (MelangeErrorCodes.InvalidArguments, exception.Message),
                 RejectedException => (MelangeErrorCodes.Rejected, exception.Message),
+                // Expected, self-clearing conditions (handoff freezes, border-copy routing, a
+                // fenced node): the precise reason goes to the client, and nothing is logged —
+                // a seam walker crossing shards is the product working, not an error per crossing.
+                TransientRejectionException => (MelangeErrorCodes.Transient, exception.Message),
                 RateLimitedException => (MelangeErrorCodes.RateLimited, exception.Message),
                 ReducerDeniedException => (MelangeErrorCodes.Denied, exception.Message),
                 ArgumentException => (MelangeErrorCodes.UnknownReducer, $"No reducer named '{call.Reducer}' is registered."),

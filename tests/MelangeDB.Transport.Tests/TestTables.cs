@@ -240,6 +240,11 @@ public sealed class PolicyReducers
         ctx.Db.Creature.Update(creature with { NextThinkAt = nextThinkAt });
     }
 
+    /// <summary>Stands in for a commit guard's transient refusal (a handoff freeze, a border copy).</summary>
+    [Reducer]
+    public void RefuseTransiently(ReducerContext ctx) =>
+        throw new TransientRejectionException("a row is frozen mid-handoff (test stand-in)");
+
     [Reducer(Policy = typeof(AdminOnly))]
     public void ClearCreatures(ReducerContext ctx)
     {

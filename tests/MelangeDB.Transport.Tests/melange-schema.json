@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "0.1.2.0",
-  "schemaHash": "0b1c6f29c1ef17b4549b9122e9cfc59c8a76d9a82acecf4d40d1713159bbaf09",
+  "schemaHash": "a5358172461a853178652d94fbe56f0d865a49da9bd0709666a9eac6805a5136",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -493,6 +493,10 @@
           "isArray": false
         }
       ]
+    },
+    {
+      "name": "RefuseTransiently",
+      "params": []
     },
     {
       "name": "SetChunk",

@@ -95,6 +95,14 @@ public sealed class MelangeCallException : Exception
         => Code = code;
 
     public string Code { get; }
+
+    /// <summary>
+    /// The retry contract, named: the call was refused for a condition the server designed and
+    /// expects to clear (a handoff freeze window, a border copy just after the shard map flips,
+    /// a fenced node) — retry it unchanged on the next tick. Nothing else about the call needs
+    /// to change, and nothing went wrong on the server.
+    /// </summary>
+    public bool IsTransient => Code == MelangeErrorCodes.Transient;
 }
 
 /// <summary>Thrown when the server rejects a subscription; <see cref="Code"/> is a <see cref="MelangeErrorCodes"/> value.</summary>

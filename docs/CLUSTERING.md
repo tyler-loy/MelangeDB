@@ -236,6 +236,14 @@ because each is the answer to a specific failure mode:
   player is already there) atomically replaces the client's cache. No disconnect, no resync error, no gap.
   The trade: those calls wait out the transfer window, and a wedged transfer caps the queue with a retryable
   error.
+- **Expected refusals are typed `transient`, never `internal`** (settled: [#22](https://github.com/tyler-loy/MelangeDB/issues/22)).
+  The guards that fire for conditions the cluster itself designed — a row frozen mid-handoff, a write routed
+  to a border copy just after the shard map flips, a fenced node awaiting re-registration — reach the client
+  as error code `transient` carrying the precise reason, and the server logs nothing: a seam walker crossing
+  shards is the product working, and an error log per unlucky crossing is noise that trains operators to
+  ignore the log. The retry contract is named on the client as `MelangeCallException.IsTransient`: retry the
+  call unchanged on the next tick. `rejected` stays reserved for what reducer code itself decided; `internal`
+  for genuine faults, which still log.
 - **Stale origins cannot transfer** (defense in depth, each independently sufficient for its case): the hub
   drops a request whose sender is not the entity's recorded owner (1722); a freeze refuses to collect
   borrowed rows and aborts on an empty transfer set; the monitor never signals frozen or borrowed rows. A
