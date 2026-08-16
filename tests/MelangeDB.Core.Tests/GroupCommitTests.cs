@@ -96,15 +96,13 @@ public class GroupCommitTests : IDisposable
             log.Append(MakeRequest("Durable"));
             log.WaitDurable(1);
 
+            // All three records are appended before any waiter runs: the first elected flusher
+            // poisons the log, and an append racing in after that would be refused rather than
+            // covered — a different (also correct) outcome than the one this test pins.
             log.FlushFaultInjection = () => throw new IOException("injected: cache flush failed");
-            using var appended = new CountdownEvent(3);
-            var doomed = Enumerable.Range(0, 3).Select(i => Task.Run(() =>
-            {
-                var lsn = log.Append(MakeRequest($"Doomed{i}")).Lsn;
-                appended.Signal();
-                return Assert.Throws<InvalidOperationException>(() => log.WaitDurable(lsn));
-            }, ct)).ToArray();
-            Assert.True(appended.Wait(TimeSpan.FromSeconds(30), ct), "the doomed commits appended");
+            var lsns = Enumerable.Range(0, 3).Select(i => log.Append(MakeRequest($"Doomed{i}")).Lsn).ToArray();
+            var doomed = lsns.Select(lsn => Task.Run(
+                () => Assert.Throws<InvalidOperationException>(() => log.WaitDurable(lsn)), ct)).ToArray();
             var failures = await Task.WhenAll(doomed).WaitAsync(TimeSpan.FromSeconds(30), ct);
 
             // One failure answers for the whole range, with the original fault attached to each.
