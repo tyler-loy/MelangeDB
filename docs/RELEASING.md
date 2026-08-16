@@ -22,7 +22,8 @@ Three packages are not plain class libraries:
   `PrivateAssets="all"` by default — the generator runs at the consumer's compile time and never
   flows further.
 - **`MelangeDB.Cli`** ships as a .NET tool (`dotnet tool install --global MelangeDB.Cli`), providing
-  the `melange` command that exports a schema manifest. See
+  the `melange` command: `schema` exports a schema manifest, and `backup` / `backup verify` /
+  `restore` are the operational verbs over the `.mbak` archive (docs/BACKUP.md). See
   [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
 - **Symbols are embedded** in every assembly rather than shipped as separate `.snupkg` packages, so
   there is no symbol server to be reachable and nothing to publish twice. SourceLink is on (it ships

@@ -260,11 +260,11 @@ internal sealed partial class HubRuntime : IDisposable
     }
 
     /// <summary>Mints the internal identity assertion the gateway attaches to upstream sessions.</summary>
-    public string MintAssertion(Identity identity, bool isGuest, bool isSqlOwner, bool isBulkOwner, DateTimeOffset tokenExpiresAt, bool firesLifecycle)
+    public string MintAssertion(Identity identity, bool isGuest, bool isSqlOwner, bool isBulkOwner, DateTimeOffset tokenExpiresAt, bool firesLifecycle, bool isBackupOwner = false)
     {
         var ttlCap = _time.GetUtcNow().AddSeconds(Cluster.AssertionTtlSeconds);
         var expires = tokenExpiresAt < ttlCap ? tokenExpiresAt : ttlCap;
-        return InternalIdentityAssertion.Mint(Cluster.Secret, identity, isGuest, isSqlOwner, isBulkOwner, expires, firesLifecycle);
+        return InternalIdentityAssertion.Mint(Cluster.Secret, identity, isGuest, isSqlOwner, isBulkOwner, expires, firesLifecycle, isBackupOwner);
     }
 
     /// <summary>

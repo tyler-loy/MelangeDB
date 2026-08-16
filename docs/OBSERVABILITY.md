@@ -227,6 +227,8 @@ Meter name: `MelangeDB`.
 | `melange.cluster.provision.outstanding` | gauge | `{ticket}` | — | 14 |
 | `melange.cluster.provision.latency` | histogram | `ms` | — | 14 |
 | `melange.cluster.decommissions` | counter | `{node}` | — | 14 |
+| `melange.backup.bytes` | counter | `By` | `outcome` | 15 |
+| `melange.backup.duration` | histogram | `ms` | `outcome` | 15 |
 
 ### The four that actually matter
 
@@ -355,6 +357,19 @@ owns nothing and the fleet is still cold — and `1746 ScaleInAborted` is any co
 short (the fleet warmed, a drain failed, the re-check refused): the node stays and nothing was
 lost, so an occasional 1746 is the hysteresis working, while a *recurring* one means the fleet
 hovers at the cold boundary and the thresholds deserve a look.
+
+The online backup (phase 15): `1801 BackupStreamStarted` and `1802 BackupStreamCompleted` (bytes,
+duration, and the fenced LSN) bracket a normal stream; the duration doubles as the truncation
+pin's hold time — `melange.backup.duration` is the same number as a histogram, and a growing one
+means archives are outgrowing the window the snapshot interval leaves them. **`1803
+BackupStreamAborted`** is the bound doing its job: a client stalled past
+`Backup:StreamStallTimeoutMs` (or disconnected) and the connection was cut with the pin released —
+a wedged backup client must not become a full disk. On the restore side, **`1608
+PostgresCheckpointAhead`** joins 1605: the applier's checkpoint sits past the log's head within
+one epoch — a data directory swapped for an older copy that kept its epoch — refused loudly with
+the remediation in the message, exactly as the epoch-mismatch refusal (which is what an actual
+`melange restore` produces, since restore always mints a fresh epoch). Both are the events an
+operator greps for at 3 a.m. after a restore; both messages print the way out.
 
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when

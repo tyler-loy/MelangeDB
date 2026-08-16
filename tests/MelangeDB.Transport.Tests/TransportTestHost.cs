@@ -97,17 +97,30 @@ internal sealed class TransportTestHost : IAsyncDisposable
     /// <summary>
     /// Kills the server (no goodbyes to clients) and starts a fresh one on the same ports.
     /// <paramref name="freshLog"/> wipes the data directory — a different log incarnation, so a
-    /// new epoch; otherwise the log and its epoch survive.
+    /// new epoch; otherwise the log and its epoch survive. <paramref name="whileStopped"/> runs
+    /// between stop and start with every file handle closed — where an offline backup or restore
+    /// belongs — and <paramref name="settings"/> overrides carry into the new incarnation (e.g.
+    /// repointing <c>CommitLog:Path</c> at a restored directory).
     /// </summary>
-    public async Task RestartAsync(bool freshLog = false)
+    public async Task RestartAsync(bool freshLog = false, Action? whileStopped = null, Dictionary<string, string?>? settings = null)
     {
         await _app!.StopAsync();
         await _app.DisposeAsync();
         _app = null;
         if (freshLog)
             Directory.Delete(_root, recursive: true);
+        whileStopped?.Invoke();
+        if (settings is not null)
+        {
+            foreach (var (key, value) in settings)
+                _settings[key] = value;
+        }
+
         await StartAppAsync();
     }
+
+    /// <summary>The data root; backup tests point offline captures at <c>{Root}/log</c>.</summary>
+    public string Root => _root;
 
     public async ValueTask DisposeAsync()
     {

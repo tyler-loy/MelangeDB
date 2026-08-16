@@ -124,6 +124,8 @@ reducer code. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) rather than lef
 - **[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md)** — what a server can enforce against an untrusted client,
   and what it deliberately doesn't. (To *report* a vulnerability, see [SECURITY.md](SECURITY.md).)
 - **[docs/CLIENT-BINDINGS.md](docs/CLIENT-BINDINGS.md)** — the typed-binding surface and how generation works.
+- **[docs/BACKUP.md](docs/BACKUP.md)** — the `.mbak` archive and the `melange backup` / `restore` /
+  `backup verify` verbs. An unverified backup is a hope, not a backup.
 - **[docs/LOAD-TESTING.md](docs/LOAD-TESTING.md)** — the load rig, what it measures, and the recorded numbers.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — what shipped in each phase, the decisions each one settled, and
   what's left.

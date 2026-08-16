@@ -13,7 +13,7 @@ docs one level up describe the current system. Where a plan and the code disagre
 | --- | --- | --- |
 | [13](plan-phase-13.md) | Clustering III — elastic assignment | Shipped |
 | [14](plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in | Shipped |
-| [15](plan-phase-15.md) | Backup and restore | Planned |
+| [15](plan-phase-15.md) | Backup and restore | Shipped |
 
 Phases 13 and 14 implement [design/elastic-rebalancing.md](../design/elastic-rebalancing.md):
 fixed shard boundaries, dynamic shard → node assignment. Phase 13 makes the shard map follow load

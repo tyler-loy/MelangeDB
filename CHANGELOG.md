@@ -59,6 +59,60 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The cluster archive**
+  ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), final slice — the phase is
+  complete). On a hub, `/melange/backup` fans out: the hub's own engine plus every shard engine
+  under `Cluster:ShardDataPath` over shared storage, one fenced LSN per engine, under one
+  manifest keyed by shard — **per-shard consistent, not globally consistent**, because there is
+  no global total order to capture and the archive does not pretend otherwise. Shard engines
+  stream handle-consistently while their owners keep serving them (ordered handle opens, a
+  dense-chain check, bounded retry — no remote pin, no quiesce, no player-visible pause); border
+  registries ride along and restore under each shard's fresh epoch. `melange restore`
+  materializes the deployment layout (`hub/` + `shards/shard-k/`), and the round trip is a test:
+  hub plus two shards out through the live endpoint, verified, restored, booted, serving — with
+  the per-shard skew asserted rather than assumed away. Decisions settled in the
+  [phase plan](docs/road-to-0.2/plan-phase-15.md): replacement-not-cloning, no quiesced mode,
+  structural verify, and where the endpoint lives. See [docs/BACKUP.md](docs/BACKUP.md).
+
+- **The online backup: `/melange/backup` and `melange backup <url>`**
+  ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), second slice). A running server
+  streams the archive at a **fenced LSN** while commits continue, holding a truncation pin for
+  exactly the stream's duration — and the pin is bounded like every truncation pin: a client that
+  stalls past `Backup:StreamStallTimeoutMs` is cut off with the pin released (EventId 1803),
+  because a wedged backup client must not become a full disk. Gated per the `Sql:*`/`Bulk:*`
+  posture: off by default (`Backup:Enabled`), owner-role-gated when on (`Backup:OwnerRole`, its
+  own key — read-everything-as-archive is its own capability, and internal identity assertions
+  carry it additively and fail-closed). The CLI's URL form takes `--token` (or `MELANGE_TOKEN`);
+  in-process schedulers get `MelangeBackup.CreateOnline`. On the restore side the Postgres tier
+  now names both refusals: the fresh-epoch mismatch a real restore produces (EventId 1605, its
+  message now stating the restore remediation) and the same-epoch checkpoint-ahead swap
+  (EventId 1608, new) — both tested to recover when the printed remediation is followed
+  literally. New metrics `melange.backup.bytes` and `melange.backup.duration` (also the pin's
+  hold time). See [docs/BACKUP.md](docs/BACKUP.md).
+
+- **Backup, restore, and verify: the `.mbak` archive and the offline verbs**
+  ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), first slice). The commit log is the
+  source of truth and every store is a projection of it, so a backup is the truth, not the
+  projections: one versioned, CRC-framed archive carrying the snapshot rows, the log tail above
+  the snapshot LSN, and the sidecars — no FASTER files, no Postgres dump, and therefore
+  store-engine agnostic (a FASTER-written archive restores under the in-memory engine and vice
+  versa; both directions are tests). `melange backup <data-dir>` captures a stopped server's
+  directory and refuses a live one; `melange restore <archive> -o <dir>` materializes a directory
+  ordinary recovery boots — under a fresh epoch, always, so pre-restore resume cursors full-resync
+  instead of resuming into history that no longer happened — and removes everything it wrote on
+  any failure; `melange backup verify <archive>` CRC-walks every frame and dry-replays the archive
+  into an in-memory projection (every single-bit flip fails it, exhaustively tested). The same API
+  is public as `MelangeBackup` in `MelangeDB.Core` for operators' own tooling. The online form
+  (`/melange/backup`) and the cluster archive land in the following slices. See
+  [docs/BACKUP.md](docs/BACKUP.md).
+
+- **`melange.lock`: the data directory's liveness lock.** A live server holds this empty sidecar
+  exclusively for its lifetime; the offline backup probes it to refuse capturing a live directory,
+  and a second server pointed at an already-open directory now refuses at boot instead of
+  corrupting it. The lock exists because share modes on the log file itself are only enforced on
+  Windows — Unix maps only `FileShare.None` onto a real (advisory) lock, so the liveness signal
+  needs a file whose sole job is to be held that way.
+
 - **The 2 a.m. bill: scale-in**
   ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), final slice — the phase is
   complete, and with it the whole elastic-capacity design record is built). Behind its own switch

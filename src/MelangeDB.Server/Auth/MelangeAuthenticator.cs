@@ -15,7 +15,8 @@ namespace MelangeDB.Server;
 /// <c>Auth:GuestRole</c> claim — a guest is an ordinary identity policies may treat differently.
 /// <see cref="IsSqlOwner"/> is the <c>Sql:OwnerRole</c> claim — what authorizes a caller when
 /// ad-hoc SQL runs in owner mode. <see cref="IsBulkOwner"/> is the <c>Bulk:OwnerRole</c> claim —
-/// what authorizes a caller on the bulk ingestion endpoint.
+/// what authorizes a caller on the bulk ingestion endpoint. <see cref="IsBackupOwner"/> is the
+/// <c>Backup:OwnerRole</c> claim — what authorizes a caller on the online backup endpoint.
 /// </summary>
 internal sealed record AuthResult(
     Identity Identity,
@@ -24,7 +25,8 @@ internal sealed record AuthResult(
     bool IsSqlOwner = false,
     bool IsBulkOwner = false,
     bool IsInternal = false,
-    bool FiresLifecycle = true)
+    bool FiresLifecycle = true,
+    bool IsBackupOwner = false)
 {
     /// <summary>A validation failure, carrying a reason safe to send to the client.</summary>
     public static AuthFailure Failure(string reason) => new(reason);
@@ -47,6 +49,7 @@ internal sealed class MelangeAuthenticator
     private readonly Func<AuthOptions> _options;
     private readonly Func<SqlOptions> _sqlOptions;
     private readonly Func<BulkOptions> _bulkOptions;
+    private readonly Func<BackupOptions> _backupOptions;
     private readonly Func<ClusterOptions>? _clusterOptions;
     private readonly TimeProvider _time;
 
@@ -56,12 +59,14 @@ internal sealed class MelangeAuthenticator
         Func<SqlOptions>? sqlOptions = null,
         Func<BulkOptions>? bulkOptions = null,
         Func<ClusterOptions>? clusterOptions = null,
-        TimeProvider? time = null)
+        TimeProvider? time = null,
+        Func<BackupOptions>? backupOptions = null)
     {
         _services = services;
         _options = options;
         _sqlOptions = sqlOptions ?? (static () => new SqlOptions());
         _bulkOptions = bulkOptions ?? (static () => new BulkOptions());
+        _backupOptions = backupOptions ?? (static () => new BackupOptions());
         _clusterOptions = clusterOptions;
         _time = time ?? TimeProvider.System;
     }
@@ -103,7 +108,7 @@ internal sealed class MelangeAuthenticator
                 return AuthResult.Failure(reason ?? "The assertion is invalid.");
             return new AuthResult(
                 valid.Identity, valid.IsGuest, valid.ExpiresAt, valid.IsSqlOwner, valid.IsBulkOwner,
-                IsInternal: true, FiresLifecycle: valid.FiresLifecycle);
+                IsInternal: true, FiresLifecycle: valid.FiresLifecycle, IsBackupOwner: valid.IsBackupOwner);
         }
 
         var options = _services.GetRequiredService<IOptionsMonitor<JwtBearerOptions>>().Get(_options().Scheme);
@@ -143,7 +148,8 @@ internal sealed class MelangeAuthenticator
             HasRole(result.ClaimsIdentity, _options().GuestRole),
             expires,
             HasRole(result.ClaimsIdentity, _sqlOptions().OwnerRole),
-            HasRole(result.ClaimsIdentity, _bulkOptions().OwnerRole));
+            HasRole(result.ClaimsIdentity, _bulkOptions().OwnerRole),
+            IsBackupOwner: HasRole(result.ClaimsIdentity, _backupOptions().OwnerRole));
     }
 
     private static bool HasRole(ClaimsIdentity? claims, string role)

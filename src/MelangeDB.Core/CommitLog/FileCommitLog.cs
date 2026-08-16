@@ -14,16 +14,30 @@ namespace MelangeDB.Core;
 /// </summary>
 public sealed class FileCommitLog : ICommitLog
 {
-    private const uint Magic = 0x474F4C4Du; // "MLOG"
-    private const ushort FileFormatVersion = 1;
-    private const int HeaderSize = 8;
-    private const int FrameSize = 8; // u32 payload length + u32 crc
-    private const uint MaxRecordBytes = 256 * 1024 * 1024;
+    // Shared with the backup archive's read-only walker and restore's materializer, which speak
+    // this file format without constructing a FileCommitLog — construction runs recovery, and
+    // recovery mutates the file (mints epochs, truncates torn tails), which a backup must never do.
+    internal const uint Magic = 0x474F4C4Du; // "MLOG"
+    internal const ushort FileFormatVersion = 1;
+    internal const int HeaderSize = 8;
+    internal const int FrameSize = 8; // u32 payload length + u32 crc
+    internal const uint MaxRecordBytes = 256 * 1024 * 1024;
+
+    /// <summary>
+    /// The liveness-lock sidecar's file name. Windows enforces <see cref="FileShare"/> natively,
+    /// but Unix maps only <see cref="FileShare.None"/> onto an advisory lock — the log's own
+    /// Read|Delete handle excludes nothing there. This empty sidecar, held exclusively for the
+    /// log's lifetime, is the cross-platform "this directory is live" signal: a second open of the
+    /// same directory refuses here, and the offline backup probes the same file so that capturing
+    /// a live directory refuses instead of producing a torn archive.
+    /// </summary>
+    internal const string LockFileName = "melange.lock";
 
     private readonly CommitLogOptions _options;
     private readonly ILogger _logger;
     private readonly EngineTelemetry? _telemetry;
     private FileStream _stream;
+    private readonly FileStream _lockFile;
     private readonly Lock _lock = new();
     private Timer? _flushTimer;
     private ulong _headLsn;
@@ -46,10 +60,33 @@ public sealed class FileCommitLog : ICommitLog
         FilePath = System.IO.Path.Combine(options.Path, "melange.log");
         EpochFilePath = System.IO.Path.Combine(options.Path, "melange.epoch");
         BaseFilePath = System.IO.Path.Combine(options.Path, "melange.base");
-        // FileShare.Delete throughout: log compaction atomically replaces the file, and every open
-        // handle must permit that or a concurrent lazy reader would make truncation fail.
-        _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
-        Recover();
+        try
+        {
+            _lockFile = new FileStream(
+                System.IO.Path.Combine(options.Path, LockFileName),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidOperationException(
+                $"'{options.Path}' is already open — by a live server or an in-progress backup. " +
+                "Two processes must never share a data directory; stop the other one and retry.",
+                exception);
+        }
+
+        try
+        {
+            // FileShare.Delete throughout: log compaction atomically replaces the file, and every open
+            // handle must permit that or a concurrent lazy reader would make truncation fail.
+            _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+            Recover();
+        }
+        catch
+        {
+            _stream?.Dispose();
+            _lockFile.Dispose();
+            throw;
+        }
     }
 
     /// <summary>The full path of the log file.</summary>
@@ -212,6 +249,20 @@ public sealed class FileCommitLog : ICommitLog
         }
     }
 
+    /// <summary>
+    /// Makes buffered appends visible to a reader opening the file directly — what
+    /// <see cref="ReadFrom"/> does for its own read handle, exposed for the online backup, which
+    /// walks the file bytes itself because it wants verbatim record payloads, not decoded records.
+    /// </summary>
+    internal void FlushBuffers()
+    {
+        lock (_lock)
+        {
+            if (!_disposed && _failure is null)
+                _stream.Flush();
+        }
+    }
+
     public IEnumerable<CommitRecord> ReadFrom(ulong firstLsn)
     {
         lock (_lock)
@@ -253,6 +304,7 @@ public sealed class FileCommitLog : ICommitLog
             if (_failure is null)
                 _stream.Flush(flushToDisk: true);
             _stream.Dispose();
+            _lockFile.Dispose();
         }
     }
 

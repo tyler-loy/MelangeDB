@@ -86,9 +86,12 @@ internal sealed class ClusterFixture : IAsyncDisposable
         int failureTimeoutMs = 10_000,
         bool spatial = false,
         IReadOnlyDictionary<string, string?>? extraSettings = null,
-        Action<IServiceCollection>? configureHub = null)
+        Action<IServiceCollection>? configureHub = null,
+        string? dataRoot = null)
     {
-        var root = Directory.CreateTempSubdirectory("melange-cluster-").FullName;
+        // A caller-provided root is how the restore tests boot a cluster over materialized
+        // directories: hub data pre-placed at {root}/hub/log, shard data at {root}/shards.
+        var root = dataRoot ?? Directory.CreateTempSubdirectory("melange-cluster-").FullName;
 
         // The failure timeout dilates with the wait deadlines (MELANGE_TEST_TIME_SCALE), and for
         // the same reason: on starved shared vCPUs a heartbeat can stall long enough for the hub

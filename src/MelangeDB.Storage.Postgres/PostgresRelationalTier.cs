@@ -250,6 +250,13 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         if (checkpointEpoch != epoch)
             throw new PostgresEpochMismatchException(checkpointEpoch.Value, epoch, checkpointLsn);
 
+        // Same epoch, checkpoint past the head: the relational tier holds a future the log no
+        // longer contains. A restore cannot produce this (it always mints a new epoch, which is
+        // the mismatch above); this is the manual version — a data directory swapped for an older
+        // copy with its epoch kept — and it is refused just as loudly.
+        if (checkpointLsn > _engine.Log.HeadLsn)
+            throw new PostgresCheckpointAheadException(checkpointLsn, _engine.Log.HeadLsn);
+
         if (checkpointLsn < _engine.Log.BaseLsn)
         {
             throw new InvalidOperationException(
@@ -464,6 +471,9 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             case PostgresEpochMismatchException mismatch:
                 LogMessages.EpochMismatch(_logger, mismatch.CheckpointEpoch, mismatch.LogEpoch, mismatch.CheckpointLsn, lag);
                 break;
+            case PostgresCheckpointAheadException ahead:
+                LogMessages.CheckpointAhead(_logger, ahead.CheckpointLsn, ahead.HeadLsn);
+                break;
             default:
                 LogMessages.Stalled(_logger, lag, AppliedLsn, failures, exception);
                 break;
@@ -572,11 +582,26 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 "The Postgres checkpoint belongs to log epoch {CheckpointEpoch} at LSN {CheckpointLsn}, but the current " +
                 "log's epoch is {LogEpoch}; LSNs are meaningless across epochs, so the applier is stalled {Lag} " +
                 "transaction(s) behind rather than guessing. Clear the Postgres schema to re-bootstrap from current " +
-                "state, or restore the log this projection belongs to.")
+                "state, or restore the log this projection belongs to. After `melange restore` this is the expected " +
+                "refusal when the old projection is still present — a restore is a rewind, the relational tier holds " +
+                "a future the restored log does not contain, and the clean path is an empty schema, which bootstrap " +
+                "refills from the restored log.")
             ;
 
         public static void EpochMismatch(ILogger logger, Guid checkpointEpoch, Guid logEpoch, ulong checkpointLsn, long lag) =>
             EpochMismatchMessage(logger, checkpointEpoch, logEpoch, checkpointLsn, lag, null);
+
+        private static readonly Action<ILogger, ulong, ulong, Exception?> CheckpointAheadMessage =
+            LoggerMessage.Define<ulong, ulong>(
+                LogLevel.Error,
+                new EventId(1608, "PostgresCheckpointAhead"),
+                "The Postgres applier checkpoint (LSN {CheckpointLsn}) is ahead of the log's head ({HeadLsn}): the " +
+                "relational tier holds a future this log does not contain. This happens when a data directory is " +
+                "replaced by an older copy that kept its epoch. Clear the Postgres schema to re-bootstrap from this " +
+                "log, or restore the newer log this projection belongs to.");
+
+        public static void CheckpointAhead(ILogger logger, ulong checkpointLsn, ulong headLsn) =>
+            CheckpointAheadMessage(logger, checkpointLsn, headLsn, null);
 
         private static readonly Action<ILogger, int, ulong, Exception?> BootstrappedMessage =
             LoggerMessage.Define<int, ulong>(
@@ -591,6 +616,22 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 }
 
 /// <summary>Thrown when the Postgres checkpoint names a different log epoch than the current log.</summary>
+/// <summary>
+/// The applier's checkpoint sits past the log's head within one epoch: the projection recorded
+/// history the log does not hold. Refused loudly (EventId 1608) rather than re-anchored, because
+/// destructive disagreement is never automatic — the <c>AutoMigrate</c> posture.
+/// </summary>
+public sealed class PostgresCheckpointAheadException(ulong checkpointLsn, ulong headLsn)
+    : Exception(
+        $"The Postgres applier checkpoint (LSN {checkpointLsn}) is ahead of the log's head ({headLsn}): the relational " +
+        "tier holds a future this log does not contain. Clear the Postgres schema to re-bootstrap from this log, or " +
+        "restore the newer log this projection belongs to.")
+{
+    public ulong CheckpointLsn { get; } = checkpointLsn;
+
+    public ulong HeadLsn { get; } = headLsn;
+}
+
 public sealed class PostgresEpochMismatchException : Exception
 {
     public PostgresEpochMismatchException(Guid checkpointEpoch, Guid logEpoch, ulong checkpointLsn)

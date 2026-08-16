@@ -18,6 +18,8 @@ internal sealed class ServerTelemetry : IDisposable
     private readonly Counter<long> _deltaRows;
     private readonly Counter<long> _rejected;
     private readonly Counter<long> _rowsFiltered;
+    private readonly Counter<long> _backupBytes;
+    private readonly Histogram<double> _backupDuration;
 
     public ServerTelemetry(
         Func<TelemetryOptions> options,
@@ -29,6 +31,8 @@ internal sealed class ServerTelemetry : IDisposable
         _deltaRows = _meter.CreateCounter<long>("melange.subscription.delta_rows", "{row}", "Row deltas emitted to subscribed clients.");
         _rejected = _meter.CreateCounter<long>("melange.subscription.rejected", "{sub}", "Subscriptions rejected before execution.");
         _rowsFiltered = _meter.CreateCounter<long>("melange.policy.rows_filtered", "{row}", "Rows a row policy hid from a subscribed client.");
+        _backupBytes = _meter.CreateCounter<long>("melange.backup.bytes", "By", "Archive bytes streamed by the online backup endpoint.");
+        _backupDuration = _meter.CreateHistogram<double>("melange.backup.duration", "ms", "Online backup stream duration — also the truncation pin's hold time, which is why it is worth watching.");
         _meter.CreateObservableGauge("melange.connections.active", () => (long)activeConnections(), "{conn}", "Live websocket connections.");
         _meter.CreateObservableGauge(
             "melange.subscriptions.active",
@@ -69,6 +73,13 @@ internal sealed class ServerTelemetry : IDisposable
 
     public void RecordRowsFiltered(string table, int rows) =>
         _rowsFiltered.Add(rows, new KeyValuePair<string, object?>("table", table));
+
+    /// <summary>One finished (or aborted) online backup stream; outcome is bounded: completed/aborted.</summary>
+    public void RecordBackupStream(long bytes, double milliseconds, string outcome)
+    {
+        _backupBytes.Add(bytes, new KeyValuePair<string, object?>("outcome", outcome));
+        _backupDuration.Record(milliseconds, new KeyValuePair<string, object?>("outcome", outcome));
+    }
 
     public void Dispose() => _meter.Dispose();
 }

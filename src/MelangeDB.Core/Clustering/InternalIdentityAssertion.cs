@@ -17,9 +17,10 @@ public static class InternalIdentityAssertion
     /// <summary>The token prefix marking an assertion; anything else is an ordinary bearer JWT.</summary>
     public const string Prefix = "mliassert1.";
 
-    // B (bulk owner) is additive and fail-closed: an assertion minted before the field existed
-    // deserializes it to false, so an old token can never confer the new capability.
-    private sealed record Payload(string I, bool G, long E, bool O, bool L, bool B);
+    // B (bulk owner) and K (backup owner) are additive and fail-closed: an assertion minted
+    // before either field existed deserializes it to false, so an old token can never confer the
+    // new capability.
+    private sealed record Payload(string I, bool G, long E, bool O, bool L, bool B, bool K = false);
 
     /// <summary>
     /// Mints an assertion for one identity, valid until <paramref name="expiresAt"/>.
@@ -34,11 +35,12 @@ public static class InternalIdentityAssertion
         bool isSqlOwner,
         bool isBulkOwner,
         DateTimeOffset expiresAt,
-        bool firesLifecycle = false)
+        bool firesLifecycle = false,
+        bool isBackupOwner = false)
     {
         ArgumentException.ThrowIfNullOrEmpty(secret);
         var payload = JsonSerializer.SerializeToUtf8Bytes(
-            new Payload(identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle, isBulkOwner));
+            new Payload(identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle, isBulkOwner, isBackupOwner));
         var signature = HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), payload);
         return Prefix + Convert.ToBase64String(payload) + "." + Convert.ToBase64String(signature);
     }
@@ -52,7 +54,7 @@ public static class InternalIdentityAssertion
     /// a reason on any failure — a tampered or expired assertion must read as "not authenticated",
     /// never as a different identity.
     /// </summary>
-    public static (Identity Identity, bool IsGuest, bool IsSqlOwner, bool IsBulkOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle)? Validate(
+    public static (Identity Identity, bool IsGuest, bool IsSqlOwner, bool IsBulkOwner, bool IsBackupOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle)? Validate(
         string secret,
         string token,
         DateTimeOffset now,
@@ -117,6 +119,6 @@ public static class InternalIdentityAssertion
             return null;
         }
 
-        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, expiresAt, parsed.L);
+        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, parsed.K, expiresAt, parsed.L);
     }
 }

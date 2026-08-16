@@ -5,11 +5,18 @@
     <OutputType>Exe</OutputType>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>melange</ToolCommandName>
-    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest to melange-schema.json — from a built module assembly, or fetched from a running development server's schema endpoint. The manifest is what the client binding generator consumes. See docs/CLIENT-BINDINGS.md.</Description>
+    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md).</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The backup verbs speak the log, snapshot, and archive formats, which live in Core beside
+         the machinery that writes them — the CLI must never grow a second implementation of a
+         format the engine owns. `schema` still depends on nothing but the BCL. -->
+    <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
   </ItemGroup>
 
 </Project>
