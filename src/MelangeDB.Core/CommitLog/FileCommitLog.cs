@@ -193,6 +193,13 @@ public sealed class FileCommitLog : ICommitLog
     internal long FsyncCount => Interlocked.Read(ref _fsyncCount);
 
     /// <summary>
+    /// The egress gate, without the engine's cost attribution: same wait, discarded measurement.
+    /// Only meaningful under <see cref="FsyncPolicy.OnCommit"/> — the internal overload documents
+    /// why the other policies return immediately.
+    /// </summary>
+    void ICommitLog.WaitDurable(ulong lsn) => WaitDurable(lsn);
+
+    /// <summary>
     /// Test-only fault injection, invoked after a record's bytes are written but before the flush —
     /// the window where a real disk-full failure lands.
     /// </summary>

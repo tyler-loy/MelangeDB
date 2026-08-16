@@ -15,6 +15,9 @@
     <InternalsVisibleTo Include="MelangeDB.Core.Tests" />
     <InternalsVisibleTo Include="MelangeDB.Host.Tests" />
     <InternalsVisibleTo Include="MelangeDB.Storage.Faster.Tests" />
+    <!-- The transport's durability-gate test holds a group flush hostage through the commit
+         log's flush fault-injection seam; it asserts on no other internals. -->
+    <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
     <!-- The cluster package starts and stops per-shard schedulers and reads the engine's live
          options instance when composing per-shard engines. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />

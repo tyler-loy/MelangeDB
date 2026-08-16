@@ -33,6 +33,17 @@ public interface ICommitLog : IDisposable
     ulong DurableLsn => HeadLsn;
 
     /// <summary>
+    /// Blocks until the record at <paramref name="lsn"/> is durable — the gate an egress path
+    /// takes right before an LSN leaves the process, when waiting briefly beats not serving.
+    /// Bounded in practice: under deferred durability every appended record has a committer
+    /// driving its flush. Default no-op, matching the <see cref="DurableLsn"/> default: a log
+    /// with no deferred durability has nothing to wait for.
+    /// </summary>
+    void WaitDurable(ulong lsn)
+    {
+    }
+
+    /// <summary>
     /// Appends one committed transaction, assigns the next LSN, and makes it durable per the
     /// configured fsync policy. Returns the record as written. A durability discipline that
     /// defers the flush (group commit) completes it after this returns; <see cref="DurableLsn"/>
