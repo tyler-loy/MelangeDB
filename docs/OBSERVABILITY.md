@@ -223,6 +223,10 @@ Meter name: `MelangeDB`.
 | `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 |
 | `melange.cluster.shard.utilization` | gauge | `{ratio}` | `shard`, `node` | 13 |
 | `melange.cluster.shard.resident_bytes` | gauge | `By` | `shard`, `node` | 13 |
+| `melange.cluster.nodes` | gauge | `{node}` | — | 14 |
+| `melange.cluster.provision.outstanding` | gauge | `{ticket}` | — | 14 |
+| `melange.cluster.provision.latency` | histogram | `ms` | — | 14 |
+| `melange.cluster.decommissions` | counter | `{node}` | — | 14 |
 
 ### The four that actually matter
 
@@ -331,6 +335,19 @@ strategy's split lines were drawn too coarse (docs/design/elastic-rebalancing.md
 RebalanceEvaluationFailed` is a tick that threw and was skipped; recurring, it means the loop is
 effectively off and nobody turned it off.
 
+The capacity seam (phase 14): `1735 ProvisionTicketIssued` and `1736 ProvisionFulfilled` bracket a
+normal scale-out, the latter carrying the provision latency the histogram records. `1737
+ProvisionTicketExpired` is one strike; **`1738 ProvisionGaveUp` is the operator alert** — two
+attempts failed or expired, the loop has deliberately stopped asking (money is involved), and the
+`melange-capacity` health check goes unhealthy until a ticket-named node joins. `1739
+ProvisionLateArrivalDecommissioned` / `1743 ProvisionLateArrivalKept` are the at-least-once
+contract's two endings for a node that arrives after its ticket expired. `1740
+ProvisionerCallFailed` is the seam's user code throwing (isolated — the fleet degrades to fixed,
+never the hub to dead). `1741 ProvisionSkippedGranularity` is 1732's capacity-shaped sibling —
+every node hot but shards no longer outnumber nodes, so a new node could receive nothing — and
+`1742 ProvisionAtCeiling` is `Cluster:MaxNodes` doing its job while every node is hot: the two
+rate-limited "provisioning will not help / is not allowed" reports, both worth an operator's eyes.
+
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
 the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`
@@ -361,6 +378,7 @@ host to register into, so the first one landed with phase 02's host integration 
 | `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
 | `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form | 08 |
 | `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
+| `melange-capacity` | Two provision attempts failed or expired and the loop has stopped asking (**shipped, 14**) — EventId 1738 in health-endpoint form, cleared when a ticket-named node joins. Degraded while a ticket is outstanding; healthy off the hub or with no provisioner registered. | 14 |
 
 ## Standing requirement
 

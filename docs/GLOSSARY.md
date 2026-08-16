@@ -250,6 +250,13 @@ the provisioned node announces itself through ordinary membership registration �
 special path. No registration means the fleet is fixed; a registered provisioner requires
 `Cluster:MaxNodes` set explicitly, or the hub refuses to start.
 
+**Provision ticket** — The provisioner's promise that a node is on its way (`ProvisionTicket`):
+the ticket names the node the new instance will join membership under, and that name is the entire
+correlation mechanism — the hub watches membership for it and never talks to the instance any
+other way. One outstanding at a time; expiry (`Cluster:ProvisionTicketTimeoutMs`) triggers exactly
+one re-request, a second expiry latches the operator alert (EventId 1738), and a node arriving
+after its ticket expired is surplus — decommissioned unless shards were genuinely waiting for it.
+
 **Drain** — The planned move of one shard to another live node while both are up
 (`MelangeClusterCoordinator.DrainShardAsync`, road-to-0.2 phase 13): the origin takes a fresh
 snapshot and closes the shard's engine, membership moves the shard under a bumped fencing token,

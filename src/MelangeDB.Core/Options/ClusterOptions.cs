@@ -197,4 +197,14 @@ public sealed class ClusterOptions
     /// authorization. Irrelevant when no provisioner is registered.
     /// </summary>
     public int MaxNodes { get; set; }
+
+    /// <summary>
+    /// How long the hub waits for a provision ticket's named node to join membership before
+    /// declaring the ticket expired. An expiry triggers exactly one re-request — and a second
+    /// expiry raises an operator alert (EventId 1738, the <c>melange-capacity</c> health check)
+    /// and stops asking. Money is involved: the posture on repeated failure is
+    /// <em>tell a human</em>, never <em>keep trying</em>. Also bounds each individual provisioner
+    /// call, so user code on this seam can stall neither the loop nor the hub.
+    /// </summary>
+    public int ProvisionTicketTimeoutMs { get; set; } = 600_000;
 }

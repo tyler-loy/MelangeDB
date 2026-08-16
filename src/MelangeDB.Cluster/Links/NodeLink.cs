@@ -139,6 +139,31 @@ public sealed class ClusterMetrics
         else
             Interlocked.Increment(ref _drainsFailed);
     }
+
+    private long _provisionsRequested;
+    private long _provisionsFulfilled;
+    private long _provisionsExpired;
+    private long _decommissionsRequested;
+
+    /// <summary>Provision tickets this hub obtained from its node provisioner.</summary>
+    public long ProvisionsRequested => Interlocked.Read(ref _provisionsRequested);
+
+    /// <summary>Tickets whose named node joined membership before the ticket expired.</summary>
+    public long ProvisionsFulfilled => Interlocked.Read(ref _provisionsFulfilled);
+
+    /// <summary>Tickets whose named node never arrived within Cluster:ProvisionTicketTimeoutMs.</summary>
+    public long ProvisionsExpired => Interlocked.Read(ref _provisionsExpired);
+
+    /// <summary>DecommissionAsync calls this hub issued (scale-in and late arrivals alike).</summary>
+    public long DecommissionsRequested => Interlocked.Read(ref _decommissionsRequested);
+
+    internal void ProvisionRequested() => Interlocked.Increment(ref _provisionsRequested);
+
+    internal void ProvisionFulfilled() => Interlocked.Increment(ref _provisionsFulfilled);
+
+    internal void ProvisionExpired() => Interlocked.Increment(ref _provisionsExpired);
+
+    internal void DecommissionRequested() => Interlocked.Increment(ref _decommissionsRequested);
 }
 
 /// <summary>

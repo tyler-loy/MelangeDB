@@ -59,6 +59,21 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The fleet follows load: provision-then-reassign**
+  ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), second slice). The rebalance loop's
+  second move, taken only when the first is unavailable: every live node sustained-hot, no shard
+  move that helps. The hub asks its registered `INodeProvisioner` for one node, records the
+  ticket, and moves on — the new instance announces itself by joining membership, the loop
+  spreads a shard onto it by the ordinary phase 13 rule, and nothing special stays behind to keep
+  correct. Bounded the way money must be: never past `Cluster:MaxNodes`, one outstanding ticket at
+  a time, one re-request on expiry (`Cluster:ProvisionTicketTimeoutMs`), and on the second failure
+  an operator alert (EventId 1738, the new `melange-capacity` health check) — the loop stops
+  asking, because the posture on repeated failure is *tell a human*, never *keep trying*. A node
+  arriving after its ticket expired is the at-least-once contract's surplus: decommissioned
+  without ever owning a shard, unless shards were genuinely waiting for an owner, in which case
+  capacity arrived late but arrived. New observability: `melange.cluster.nodes`,
+  `melange.cluster.provision.outstanding`, `melange.cluster.provision.latency`,
+  `melange.cluster.decommissions`, EventIds 1735–1743.
 - **The capacity seam: `INodeProvisioner`**
   ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), first slice). The public interface
   through which the hub will obtain one more shard node when every node it has is sustained-hot,
