@@ -254,7 +254,10 @@ Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01);
 also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flush, and
 `SlowReducerAborted` when the transaction did not commit, both under the same id —
 `1004 SnapshotIsolationUnavailable`, once per engine when a store offers no pinned reads,
-`1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`, `1203 HeartbeatTimeout`,
+`1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`,
+`1006 ShapeMigrated` — an additive schema migration at boot: the changes, the rebuild, and the
+marker LSN the new shape governs from; Warning-level because automatic must never mean silent
+(road-to-0.2 phase 16, [MIGRATION.md](MIGRATION.md)) — `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
 `1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,
 `1403 SubscriberCheckpointEvicted` — the loud eviction the expiry design promises — and

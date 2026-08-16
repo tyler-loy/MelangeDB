@@ -59,6 +59,26 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Hot-tier schema migration: add a column, redeploy, boot**
+  ([road-to-0.2 phase 16](docs/road-to-0.2/plan-phase-16.md), first slice). Row format v1 is
+  positional — a row is its columns' bytes in declaration order — so until now the engine could
+  not even *detect* a schema change against an existing log; it would replay old bytes under new
+  expectations. Now a `melange.shape` sidecar persists each table's shape as an LSN-fenced
+  history, and boot compares it against the code: **additive changes migrate automatically and
+  loudly** (EventId 1006) — recovery re-encodes every old-shape row to the new shape *by column
+  name*, so added and reordered columns are both fine wherever they land in the struct; new
+  columns fill with their kind's zero value, the phase 08 backfill rule one tier down — while
+  **destructive changes refuse boot** with every reason named (`SchemaShapeException`: removed
+  table or column, changed kind, moved `[PrimaryKey]`, and therefore also renames). An empty
+  marker record opens the new shape's reign in the log's own timeline and the migration seals
+  itself with an immediate snapshot; correctness never depends on the seal, because every reader
+  decodes records under the shape governing their LSN (lagging appliers included — pipeline
+  appliers automatically, decoupled readers via `MelangeEngine.TransformToCurrentShape`). The
+  sidecar rides into `.mbak` archives, so newer code boots a restored directory through an
+  ordinary migration boot. One upgrade rule: the first boot that creates the sidecar adopts the
+  booting schema, so never combine the MelangeDB upgrade itself with a schema change. See
+  [docs/MIGRATION.md](docs/MIGRATION.md).
+
 - **The cluster archive**
   ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), final slice — the phase is
   complete). On a hub, `/melange/backup` fans out: the hub's own engine plus every shard engine

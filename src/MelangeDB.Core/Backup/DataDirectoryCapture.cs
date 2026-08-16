@@ -158,6 +158,9 @@ internal static class DataDirectoryCapture
         var eventsPath = Path.Combine(Path.GetDirectoryName(logPath)!, "melange.events.json");
         if (File.Exists(eventsPath))
             WriteSidecarFrame(writer, "melange.events.json", File.ReadAllBytes(eventsPath));
+        var shapePath = Path.Combine(Path.GetDirectoryName(logPath)!, ShapeHistory.FileName);
+        if (File.Exists(shapePath))
+            WriteSidecarFrame(writer, ShapeHistory.FileName, File.ReadAllBytes(shapePath));
         foreach (var (name, content) in extraSidecars?.Invoke(headLsn) ?? [])
             WriteSidecarFrame(writer, name, content);
 

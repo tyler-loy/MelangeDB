@@ -167,6 +167,12 @@ internal static class ArchiveRestore
                 case "melange.events.json":
                     File.WriteAllBytes(Path.Combine(engineDirectory, name), ClampEventCheckpoints(content, identity.HeadLsn));
                     break;
+                case ShapeHistory.FileName:
+                    // The shape history is LSN-keyed and epoch-independent; restore changes no
+                    // LSNs, so it restores verbatim — it is what lets newer code boot the
+                    // restored directory through an ordinary migration boot.
+                    File.WriteAllBytes(Path.Combine(engineDirectory, name), content);
+                    break;
                 case "borrowed.sidecar" when isShard:
                     // The border registry lives in the shard root, one level above the log
                     // directory, and names an epoch — rewritten to the fresh one so recovery

@@ -101,7 +101,7 @@ for free is the design working, not a separate deliverable to build.
 
 ## Decisions to settle
 
-### Open: what identifies a column across deployments
+### Settled: what identifies a column across deployments
 
 By-name mapping makes the column's name its identity, which makes **rename indistinguishable from
 drop-plus-add** — refused as destructive. That is honest but will annoy someone eventually.
@@ -109,6 +109,10 @@ Leaning: ship with rename-is-destructive and record the demand; if it bites, the
 declared rename (`[RenamedFrom("OldName")]` consumed once by the migration path), not stable
 column ids — SpacetimeDB-style ordinal identity is exactly what makes declaration order load-bearing
 and reorders destructive, the trap this design exists to avoid.
+
+**Settled as the leaning.** The name is the identity; the refusal message says "if this is a
+rename, rename it back" so the accident case self-diagnoses. `[RenamedFrom]` is recorded here as
+the answer if real demand arrives; nothing in the shape format precludes it.
 
 ### Open: where the shape history lives
 
@@ -120,6 +124,20 @@ schema, which every reader (backup's walker, verify's dry-replay) would then nee
 To settle by writing the sidecar's compaction rule down and checking it against the applier's
 lowest checkpoint, not just the truncation base.
 
+**Settled as the leaning, with one addition the plan did not foresee: the marker record.** The
+sidecar alone left a real ambiguity — a snapshot's rows are written by the *running code*, not
+by the shape governing the snapshot's LSN, so a snapshot taken at exactly the pre-migration head
+could be either shape and recovery could not tell (a genuine corruption window when the
+migration's sealing snapshot overwrote a pre-deploy one at the same LSN). The fix is one empty
+write-set record appended at migration: the new reign begins at the marker's LSN, the sealing
+snapshot lands *at* the marker, and "a snapshot's shape is the shape governing its own LSN"
+becomes unconditionally true. It also puts the migration into the log's own timeline, which is
+where a system whose log is the source of truth wants its history recorded. The compaction rule
+settled simpler than the plan feared: the truncation base alone suffices, because everything
+that reads records — appliers, subscribers, the resume window — already floors truncation, so no
+reader can hold a cursor below the base; a reign whose successor began at or below the base has
+no readable records left and dies at the next boot.
+
 ### Open: is there any knob at all
 
 Leaning: no. Additive migration is automatic-with-loud-log rather than gated behind an
@@ -130,3 +148,9 @@ to boot on any schema change" is a foot-gun with no story. The asymmetry with ph
 gets a paragraph in the docs rather than a flag. To settle: whether a `--dry-run` style report
 (print what a migration boot *would* do, then exit) is worth shipping alongside — leaning yes,
 it is nearly free and it is what a cautious operator actually wants before a deploy.
+
+**Settled as the leaning: no knob, and CONFIGURATION.md gains no rows.** The dry-run shipped as
+API rather than verb: `ShapeHistory.Load` and `ShapeCompatibility.Compare` are public, so a host
+can answer "what would this deploy's boot do" in three lines without booting; a CLI spelling
+would need the application's schema and therefore belongs to the host anyway (the same
+schema-lives-in-the-host reasoning as phase 19's check verb).
