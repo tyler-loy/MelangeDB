@@ -79,13 +79,20 @@ mechanical against typed bindings and a rewrite without them.
 Post-0.1 work, planned in [road-to-0.2/](road-to-0.2/). Phases 13–14 implement
 [design/elastic-rebalancing.md](design/elastic-rebalancing.md): shard boundaries stay fixed at
 strategy registration, and the elastic layer is the shard → node map — regrouping, never resizing.
-Phase 15 is independent operational surface over the 0.1 durability machinery.
+Phase 15 is independent operational surface over the 0.1 durability machinery. Phases 16–19 were
+planned together after those three shipped and the reference port went live: schema evolution,
+the throughput lever, retention observability, and the backup verbs phase 15's decision record
+deferred — mutually independent, in any order.
 
 | Phase | Title | Status |
 | --- | --- | --- |
 | [13](road-to-0.2/plan-phase-13.md) | Clustering III — elastic assignment: per-shard load on heartbeats, the planned drain, the rebalance loop | **Shipped** |
 | [14](road-to-0.2/plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in: the `INodeProvisioner` seam, provision-then-reassign, drain-and-decommission | **Shipped** |
 | [15](road-to-0.2/plan-phase-15.md) | Backup and restore: the `.mbak` archive (snapshot + log tail, per engine — the truth, not the projections), `melange backup` / `restore` / `backup verify` | **Shipped** |
+| [16](road-to-0.2/plan-phase-16.md) | Hot-tier schema migration: the shape sidecar, additive changes replay by name-mapped rebuild, destructive changes refuse loudly — DESIGN.md §10's open half | Planned |
+| [17](road-to-0.2/plan-phase-17.md) | Group commit: coalesced fsyncs at unchanged `OnCommit` semantics — the hotspot ceiling re-measured | Planned |
+| [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Planned |
+| [19](road-to-0.2/plan-phase-19.md) | Backup, second pass: `restore --check` (the boot-proof), `melange clone` (explicitly a different world), `restore --at-lsn` | Planned |
 
 ## What's left
 
@@ -99,8 +106,9 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
   audit of a real 82-table game found **zero** subscriptions using one.
 - **Unreliable/UDP transport — permanently.** A reducer is a transaction; a client must know whether
   it committed. Rate limiting plus client-side interpolation is the supported answer.
-- **Schema migration against an existing log.** The relational half settled in phase 08; the hot-tier
-  half — how column adds replay against the log — is open. See [DESIGN.md](DESIGN.md) §10.
+- **Schema migration against an existing log is no longer deferred** — the relational half settled
+  in phase 08, and the hot-tier half — how column adds replay against the log — is planned as
+  [phase 16](road-to-0.2/plan-phase-16.md). See [DESIGN.md](DESIGN.md) §10.
 - **Epoch-qualified subscription anchors.** Closed behaviourally in phase 10 by the first-chunk rule;
   the protocol-level hardening is deferred, with the record kept in [plan-phase-10.md](road-to-0.1/plan-phase-10.md).
 - **Dynamic *assignment* is no longer deferred** — it is M4 above, planned as phases 13–14.
