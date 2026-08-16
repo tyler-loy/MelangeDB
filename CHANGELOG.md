@@ -59,6 +59,22 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Backup, restore, and verify: the `.mbak` archive and the offline verbs**
+  ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), first slice). The commit log is the
+  source of truth and every store is a projection of it, so a backup is the truth, not the
+  projections: one versioned, CRC-framed archive carrying the snapshot rows, the log tail above
+  the snapshot LSN, and the sidecars — no FASTER files, no Postgres dump, and therefore
+  store-engine agnostic (a FASTER-written archive restores under the in-memory engine and vice
+  versa; both directions are tests). `melange backup <data-dir>` captures a stopped server's
+  directory and refuses a live one; `melange restore <archive> -o <dir>` materializes a directory
+  ordinary recovery boots — under a fresh epoch, always, so pre-restore resume cursors full-resync
+  instead of resuming into history that no longer happened — and removes everything it wrote on
+  any failure; `melange backup verify <archive>` CRC-walks every frame and dry-replays the archive
+  into an in-memory projection (every single-bit flip fails it, exhaustively tested). The same API
+  is public as `MelangeBackup` in `MelangeDB.Core` for operators' own tooling. The online form
+  (`/melange/backup`) and the cluster archive land in the following slices. See
+  [docs/BACKUP.md](docs/BACKUP.md).
+
 - **The 2 a.m. bill: scale-in**
   ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), final slice — the phase is
   complete, and with it the whole elastic-capacity design record is built). Behind its own switch

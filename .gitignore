@@ -286,6 +286,8 @@ Generated_Code/
 # because we have git ;-)
 _UpgradeReport_Files/
 Backup*/
+# ...but the backup feature's own source directory is very much needed.
+!src/MelangeDB.Core/Backup/
 UpgradeLog*.XML
 UpgradeLog*.htm
 ServiceFabricBackup/

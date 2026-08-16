@@ -14,11 +14,14 @@ namespace MelangeDB.Core;
 /// </summary>
 public sealed class FileCommitLog : ICommitLog
 {
-    private const uint Magic = 0x474F4C4Du; // "MLOG"
-    private const ushort FileFormatVersion = 1;
-    private const int HeaderSize = 8;
-    private const int FrameSize = 8; // u32 payload length + u32 crc
-    private const uint MaxRecordBytes = 256 * 1024 * 1024;
+    // Shared with the backup archive's read-only walker and restore's materializer, which speak
+    // this file format without constructing a FileCommitLog — construction runs recovery, and
+    // recovery mutates the file (mints epochs, truncates torn tails), which a backup must never do.
+    internal const uint Magic = 0x474F4C4Du; // "MLOG"
+    internal const ushort FileFormatVersion = 1;
+    internal const int HeaderSize = 8;
+    internal const int FrameSize = 8; // u32 payload length + u32 crc
+    internal const uint MaxRecordBytes = 256 * 1024 * 1024;
 
     private readonly CommitLogOptions _options;
     private readonly ILogger _logger;
