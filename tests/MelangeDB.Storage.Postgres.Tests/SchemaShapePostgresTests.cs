@@ -56,7 +56,10 @@ public class SchemaShapePostgresTests
         await harness.RestartAsync();
         await harness.WaitAppliedAsync(harness.Engine.Log.HeadLsn);
 
-        Assert.Equal(5L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Id\" >= 1000"));
+        // Four, not five: the checkpoint means "applied through LSN 1", and LSN 1 is the first
+        // insert, so it is rightly never re-read — the other four re-apply transformed. Without
+        // the transform this count is zero (the re-applied rows are byte-identical upserts).
+        Assert.Equal(4L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Id\" >= 1000"));
     }
 
     private static void SwapStatColumns(string dataDirectory)
