@@ -305,6 +305,20 @@ resume cursors full-resync instead of resuming into history that no longer happe
 must be empty, and any failure removes everything written. The Postgres projection is not in the
 archive and is refused loudly (EventIds 1605/1608) rather than silently overwritten.
 
+**Shape (`melange.shape`)** — The persisted meaning of a table's row bytes: its key column and
+its ordered (name, kind) column list. Row format v1 is positional, so the bytes alone cannot say
+what they mean; the shape sidecar beside the log says it — as a *history*, each entry fenced by
+the LSN it governs from, because log records outlive deployments. The booting engine compares
+the newest entry against the code's schema: identical is the fast path, additive is a migration
+boot, destructive refuses (`SchemaShapeException`). See [MIGRATION.md](MIGRATION.md).
+
+**Migration boot** — A boot whose schema differs additively from the directory's shape: recovery
+re-encodes every old-shape row to the new shape *by column name*, an empty marker record opens
+the new shape's reign in the log's own timeline, and an immediate snapshot seals the rebuild so
+the cost is paid once (EventId 1006). Additive means every persisted column survives with its
+name and kind and the key stays put; anything else — removed column or table, changed kind,
+moved key, and therefore also a rename — refuses at boot with every reason named.
+
 **Engine (`MelangeEngine`)** — The phase-01 composition root: opens the commit log, rebuilds projections and
 AutoInc sequences from it, and dispatches reducers. Phase 02's `AddMelangeDb` wraps it; application code
 stops meeting it directly at that point.

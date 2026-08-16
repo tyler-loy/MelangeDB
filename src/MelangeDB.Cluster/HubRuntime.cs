@@ -1403,7 +1403,11 @@ internal sealed partial class HubRuntime : IDisposable
                         foreach (var record in _engine.Log.ReadFrom(cursor + 1))
                         {
                             scanned = record.Lsn;
-                            var replicated = ReplicatedOps(record);
+
+                            // A node whose replica cursor lagged across an additive schema
+                            // migration must receive current-shape rows — its engine stores what
+                            // this stream sends verbatim.
+                            var replicated = ReplicatedOps(_engine.TransformToCurrentShape(record));
                             if (replicated.Length > 0)
                             {
                                 lsns.Add(record.Lsn);

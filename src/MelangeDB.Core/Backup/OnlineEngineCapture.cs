@@ -92,6 +92,11 @@ internal static class OnlineEngineCapture
             if (File.Exists(eventsPath))
                 DataDirectoryCapture.WriteSidecarFrame(writer, "melange.events.json", File.ReadAllBytes(eventsPath));
 
+            // The shape history is LSN-keyed and epoch-independent, so the live engine's copy is
+            // exactly what the archive needs — and entries only ever append at boot, so a live
+            // read races nothing.
+            DataDirectoryCapture.WriteSidecarFrame(writer, ShapeHistory.FileName, engine.Shapes.History.ToBytes());
+
             writer.WriteFrame(
                 ArchiveFrameType.EngineEnd,
                 JsonSerializer.SerializeToUtf8Bytes(new ArchiveEngineFooter { SnapshotRows = snapshotRows, TailRecords = tailRecords }));

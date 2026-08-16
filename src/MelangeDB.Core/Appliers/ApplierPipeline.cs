@@ -9,6 +9,7 @@ public sealed class ApplierPipeline
 {
     private readonly ICommitLog _log;
     private readonly EngineTelemetry? _telemetry;
+    private readonly Func<CommitRecord, CommitRecord>? _transform;
     private readonly List<Entry> _entries = [];
     private readonly Lock _lock = new();
 
@@ -17,11 +18,12 @@ public sealed class ApplierPipeline
     {
     }
 
-    internal ApplierPipeline(ICommitLog log, EngineTelemetry? telemetry)
+    internal ApplierPipeline(ICommitLog log, EngineTelemetry? telemetry, Func<CommitRecord, CommitRecord>? transform = null)
     {
         ArgumentNullException.ThrowIfNull(log);
         _log = log;
         _telemetry = telemetry;
+        _transform = transform;
     }
 
     public IReadOnlyList<ILogApplier> Appliers
@@ -136,8 +138,14 @@ public sealed class ApplierPipeline
         if (entry.Applier.AppliedLsn >= _log.HeadLsn)
             return;
         using var activity = _telemetry?.StartApply(entry.Applier.Name);
+
+        // Catch-up reads may reach below the current shape's reign (a checkpoint that lagged
+        // across a migration boot), so records go through the shape transform here — the freshly
+        // appended records in NotifyAppended are current-shape by construction and skip it.
+        // Decoupled appliers read the log themselves and own the same obligation; see
+        // MelangeEngine.TransformToCurrentShape.
         foreach (var record in _log.ReadFrom(entry.Applier.AppliedLsn + 1))
-            entry.Applier.Apply(record);
+            entry.Applier.Apply(_transform is null ? record : _transform(record));
     }
 
     private Entry Find(string name) =>

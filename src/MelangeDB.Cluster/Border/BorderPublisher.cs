@@ -201,7 +201,10 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
         foreach (var record in _engine.Log.ReadFrom(cursor + 1))
         {
             scanned = record.Lsn;
-            CollectBorderOps(record, observerKey, stream, ops);
+
+            // An observer whose border cursor lagged across an additive schema migration must
+            // receive current-shape rows — its engine stores borrowed copies verbatim.
+            CollectBorderOps(_engine.TransformToCurrentShape(record), observerKey, stream, ops);
             if (++records >= MaxRecordsPerBatch)
                 break;
         }

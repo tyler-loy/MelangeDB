@@ -18,6 +18,7 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly ILogger _logger;
     private readonly FileCommitLog _log;
     private readonly AutoIncSequencer _sequencer;
+    private readonly ShapeResolution _shapes;
     private readonly EngineTelemetry? _telemetry;
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
@@ -75,6 +76,11 @@ public sealed partial class MelangeEngine : IDisposable
             _log = new FileCommitLog(options.CommitLog, loggers.CreateLogger<FileCommitLog>(), _telemetry);
             _sequencer = new AutoIncSequencer(originator);
             SnapshotPath = Path.Combine(options.CommitLog.Path, SnapshotFile.FileName);
+
+            // Shape governance before any row byte is interpreted: load (or adopt) the shape
+            // sidecar, refuse a destructive schema change, and hold the additive transform that
+            // recovery routes every snapshot row and tail record through. See ShapeGuard.
+            _shapes = ShapeGuard.Resolve(options.CommitLog.Path, schema, _log.BaseLsn);
             var store = CreateStore(options, schema, hotStoreProvider, loggers);
             _storeLifetime = store as IDisposable;
 
@@ -90,9 +96,10 @@ public sealed partial class MelangeEngine : IDisposable
             var replayFrom = RecoverSnapshot(store);
             foreach (var record in _log.ReadFrom(replayFrom))
             {
-                store.Apply(record);
-                _sequencer.Observe(record, schema);
-                RecoveredTailTimestamp = record.Timestamp;
+                var replay = _shapes.TransformRecord(record);
+                store.Apply(replay);
+                _sequencer.Observe(replay, schema);
+                RecoveredTailTimestamp = replay.Timestamp;
             }
 
             bulk?.CompleteRecovery();
@@ -100,12 +107,13 @@ public sealed partial class MelangeEngine : IDisposable
             _tailTimestamp = RecoveredTailTimestamp;
             HotStore = store;
             _readViewSource = store as IReadViewSource;
-            Appliers = new ApplierPipeline(_log, _telemetry);
+            Appliers = new ApplierPipeline(_log, _telemetry, _shapes.TransformRecord);
             Appliers.Register(new HotStoreApplier(store));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
             _truncationFloors.Add(PinnedTruncationFloor);
             if (options.Residency.ReportOnStartup)
                 ReportResidency(store);
+            CompleteShapeMigration(store);
         }
         catch
         {
@@ -150,6 +158,64 @@ public sealed partial class MelangeEngine : IDisposable
     }
 
     /// <summary>
+    /// Finishes an additive schema migration after recovery has rebuilt the projections under the
+    /// booting schema. The order is the crash-safety argument: an empty-write-set <em>marker
+    /// record</em> is appended first, so the new shape's reign begins at an LSN no existing row
+    /// was written under; the sidecar entry is saved second (a crash between the two leaves a
+    /// harmless empty record and the next boot simply re-migrates); the immediate snapshot comes
+    /// last and lands <em>at</em> the marker's LSN, which is what makes every snapshot's shape
+    /// unambiguously the one governing its own LSN — without the marker, a snapshot taken at
+    /// exactly the pre-migration head could be either shape and recovery could not tell.
+    /// </summary>
+    private void CompleteShapeMigration(IHotStore store)
+    {
+        if (!_shapes.MigrationPending)
+            return;
+
+        var request = new CommitRequest(
+            Timestamp.FromDateTimeOffset(_time.GetUtcNow()),
+            ShapeMarkerCaller,
+            ShapeMarkerReducer,
+            ReadOnlyMemory<byte>.Empty,
+            WriteSet: []);
+        CommitRecord marker;
+        lock (_writeLock)
+        {
+            marker = _log.Append(request);
+            store.Apply(marker);
+        }
+
+        _shapes.History.Append(ShapeHistory.EntryOf(Schema, marker.Lsn));
+        _shapes.History.Save(_shapes.SidecarPath);
+        LogMessages.ShapeMigrated(_logger, string.Join("; ", _shapes.Changes), marker.Lsn);
+
+        // Seal the migration so the transform never runs for these rows again. Correctness does
+        // not depend on it — every boot decodes by LSN through the history — so a disabled
+        // snapshotter or a snapshot failure just means the next boot transforms again.
+        TakeSnapshot();
+    }
+
+    /// <summary>What a shape-migration marker record runs as; the melange/init precedent.</summary>
+    internal static Identity ShapeMarkerCaller { get; } = Identity.Hash("melange/shape");
+
+    /// <summary>The marker's reducer name — metadata for audit, never replayed, like every reducer name.</summary>
+    internal const string ShapeMarkerReducer = "__melange/shape";
+
+    /// <summary>The shape history and transform, for readers that decode records below the current reign.</summary>
+    internal ShapeResolution Shapes => _shapes;
+
+    /// <summary>
+    /// Re-encodes a record's rows to the booting schema's shape, or returns it unchanged when its
+    /// shape already matches — one LSN compare in the common case. Every reader that decodes row
+    /// bytes from records it did not just watch commit (a lagging applier's own catch-up loop, a
+    /// resume replay) must route records through this: a record written before the last additive
+    /// schema migration carries its columns in the old order, and decoding it under the current
+    /// schema without this call reads plausible garbage. Pipeline-driven appliers get it
+    /// automatically; decoupled readers call it themselves.
+    /// </summary>
+    public CommitRecord TransformToCurrentShape(CommitRecord record) => _shapes.TransformRecord(record);
+
+    /// <summary>
     /// Loads the snapshot if a valid one exists, returning the LSN log replay resumes from. A
     /// snapshot from another log epoch is stale and ignored — unless the log has been truncated,
     /// in which case state below the base is gone and recovery must fail loudly rather than
@@ -191,7 +257,7 @@ public sealed partial class MelangeEngine : IDisposable
                 $"LSN {_log.BaseLsn}; records between the two are gone. Restore from backup.");
         }
 
-        store.LoadSnapshot(header.Lsn, reader.Rows());
+        store.LoadSnapshot(header.Lsn, _shapes.TransformSnapshotRows(header.Lsn, reader.Rows()));
         foreach (var (table, next) in header.Sequences)
             _sequencer.RestoreSequence(table, next);
         RecoveredTailTimestamp = header.Timestamp;
@@ -1448,6 +1514,16 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void CommitObserverFailed(ILogger logger, ulong lsn, Exception failure) =>
             CommitObserverFailedMessage(logger, lsn, failure);
+
+        private static readonly Action<ILogger, string, ulong, Exception?> ShapeMigratedMessage =
+            LoggerMessage.Define<string, ulong>(
+                LogLevel.Warning,
+                new EventId(1006, "ShapeMigrated"),
+                "Additive schema migration: {Changes}. Existing rows were rebuilt under the new shape; " +
+                "the new shape governs from LSN {MarkerLsn}. Automatic must never mean silent — this is that line.");
+
+        public static void ShapeMigrated(ILogger logger, string changes, ulong markerLsn) =>
+            ShapeMigratedMessage(logger, changes, markerLsn, null);
 
         private static readonly Action<ILogger, int, long, long, long, long, string, Exception?> ResidencyReportMessage =
             LoggerMessage.Define<int, long, long, long, long, string>(
