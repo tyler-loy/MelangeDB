@@ -59,6 +59,22 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The online backup: `/melange/backup` and `melange backup <url>`**
+  ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), second slice). A running server
+  streams the archive at a **fenced LSN** while commits continue, holding a truncation pin for
+  exactly the stream's duration — and the pin is bounded like every truncation pin: a client that
+  stalls past `Backup:StreamStallTimeoutMs` is cut off with the pin released (EventId 1803),
+  because a wedged backup client must not become a full disk. Gated per the `Sql:*`/`Bulk:*`
+  posture: off by default (`Backup:Enabled`), owner-role-gated when on (`Backup:OwnerRole`, its
+  own key — read-everything-as-archive is its own capability, and internal identity assertions
+  carry it additively and fail-closed). The CLI's URL form takes `--token` (or `MELANGE_TOKEN`);
+  in-process schedulers get `MelangeBackup.CreateOnline`. On the restore side the Postgres tier
+  now names both refusals: the fresh-epoch mismatch a real restore produces (EventId 1605, its
+  message now stating the restore remediation) and the same-epoch checkpoint-ahead swap
+  (EventId 1608, new) — both tested to recover when the printed remediation is followed
+  literally. New metrics `melange.backup.bytes` and `melange.backup.duration` (also the pin's
+  hold time). See [docs/BACKUP.md](docs/BACKUP.md).
+
 - **Backup, restore, and verify: the `.mbak` archive and the offline verbs**
   ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), first slice). The commit log is the
   source of truth and every store is a projection of it, so a backup is the truth, not the

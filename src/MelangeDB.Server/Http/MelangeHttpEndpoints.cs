@@ -364,7 +364,7 @@ internal static class MelangeHttpEndpoints
     }
 
     /// <summary>Validates the request's bearer token, or writes 401 and returns null.</summary>
-    private static async Task<AuthResult?> AuthenticateAsync(HttpContext context, MelangeTransport transport)
+    internal static async Task<AuthResult?> AuthenticateAsync(HttpContext context, MelangeTransport transport)
     {
         var token = MelangeEndpointRouteBuilderExtensions.BearerToken(context);
         switch (await transport.Authenticator.ValidateAsync(token).ConfigureAwait(false))
@@ -452,7 +452,7 @@ internal static class MelangeHttpEndpoints
         }
     }
 
-    private static Task WriteErrorAsync(HttpContext context, int status, string code, string message) =>
+    internal static Task WriteErrorAsync(HttpContext context, int status, string code, string message) =>
         WriteJsonAsync(context, status, writer =>
         {
             writer.WriteString("error", code);

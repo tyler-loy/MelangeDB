@@ -30,6 +30,8 @@ public sealed class MelangeDbOptions
 
     public BulkOptions Bulk { get; set; } = new();
 
+    public BackupOptions Backup { get; set; } = new();
+
     public SchedulerOptions Scheduler { get; set; } = new();
 
     public EventsOptions Events { get; set; } = new();
@@ -424,6 +426,38 @@ public sealed class BulkOptions
     /// never silently downgraded. Empty makes bulk ingestion unusable by everyone.
     /// </summary>
     public string OwnerRole { get; set; } = "melange-bulk-owner";
+}
+
+/// <summary>Online backup options (<c>MelangeDb:Backup:*</c>).</summary>
+public sealed class BackupOptions
+{
+    /// <summary>
+    /// Whether <c>{path}/backup</c> answers at all — the online form of <c>melange backup</c>,
+    /// streaming the archive from a running server. Off by default per the <c>Sql:*</c>/
+    /// <c>Bulk:*</c> posture: backup reads <b>everything</b>, every table, every row, no policy,
+    /// and a deployment that never opted in should not be exposing that. The offline form
+    /// (<c>melange backup &lt;data-dir&gt;</c> against a stopped server's files) needs no
+    /// configuration at all.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// The role claim that authorizes a caller on <c>{path}/backup</c>, following the
+    /// <c>Sql:OwnerRole</c> precedent: the IdP is the gate, and backup capability is a claim it
+    /// issues, not a list MelangeDB keeps. Its own key per the read-everything ≠ write-anything
+    /// precedent — and backup is read-<em>everything</em> by definition, policies included. A
+    /// caller without this role is refused outright, never silently downgraded. Empty makes the
+    /// endpoint unusable by everyone.
+    /// </summary>
+    public string OwnerRole { get; set; } = "melange-backup-owner";
+
+    /// <summary>
+    /// How long the backup stream tolerates making no progress toward a stalled client before
+    /// aborting and releasing the truncation pin. The pin is what makes an online backup
+    /// consistent, and like every truncation pin (saga markers, subscriber checkpoints) it must
+    /// be bounded — a wedged backup client must not become a full disk.
+    /// </summary>
+    public int StreamStallTimeoutMs { get; set; } = 60_000;
 }
 
 /// <summary>Options for the websocket and HTTP transport (<c>MelangeDb:Transport:*</c>).</summary>

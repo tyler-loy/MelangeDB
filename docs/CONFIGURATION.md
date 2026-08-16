@@ -145,9 +145,11 @@ at planning time stands: the node provisioner is a **DI registration, not a conf
 (`INodeProvisioner`, the membership-store precedent) — a provisioner is a component with
 credentials, not a name.
 
-**Planned for phase 15**: the `Backup:*` rows in the Backup section. Defaults there are
-provisional until the phase lands and verifies them against the code, per this register's
-planned → shipped rule.
+**Shipped as of phase 15** (defaults verified against `BackupOptions`): `Backup:Enabled`,
+`Backup:OwnerRole`, and `Backup:StreamStallTimeoutMs` — the online backup gate. The offline verbs
+(`melange backup <data-dir>`, `melange backup verify`, `melange restore`) deliberately have no
+configuration at all: they act on files, and the archive format is versioned in the file, not in
+options. See [BACKUP.md](BACKUP.md).
 
 **Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
 the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid
@@ -272,9 +274,9 @@ to its admin console without also serving unauthenticated-in-effect bulk writes 
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Backup:Enabled` | bool | `false` | live | 15 | **Planned.** Gates the `/melange/backup` endpoint — the online form of `melange backup`; off answers `403 backup_disabled`. Off by default per the `Sql:*`/`Bulk:*` posture: backup reads **everything**, every table, every row, no policy — a deployment that never opted in should not be exposing that. The offline form (`melange backup <data-dir>` against a stopped server's files) needs no configuration at all. |
-| `Backup:OwnerRole` | string | `melange-backup-owner` | live | 15 | **Planned.** The role claim that authorizes a caller on `/melange/backup`, per the `Sql:OwnerRole` precedent (the IdP is the gate). Deliberately its own key — read-everything-as-archive, read-everything-as-queries, and write-anything are three capabilities; an operator who wants one god-role sets the keys to one value. A caller without it is refused (`403 owner_required`), never silently downgraded. Empty makes the endpoint unusable by everyone. |
-| `Backup:StreamStallTimeoutMs` | int | `60000` | live | 15 | **Planned.** How long the backup stream tolerates a stalled client before aborting and releasing the truncation pin. The pin is what makes an online backup consistent, and like every truncation pin (saga markers, subscriber checkpoints) it must be bounded — a wedged backup client must not become a full disk. |
+| `Backup:Enabled` | bool | `false` | live | 15 | Gates the `/melange/backup` endpoint — the online form of `melange backup`; off answers `403 backup_disabled`. Off by default per the `Sql:*`/`Bulk:*` posture: backup reads **everything**, every table, every row, no policy — a deployment that never opted in should not be exposing that. The offline form (`melange backup <data-dir>` against a stopped server's files) needs no configuration at all. |
+| `Backup:OwnerRole` | string | `melange-backup-owner` | live | 15 | The role claim that authorizes a caller on `/melange/backup`, per the `Sql:OwnerRole` precedent (the IdP is the gate). Deliberately its own key — read-everything-as-archive, read-everything-as-queries, and write-anything are three capabilities; an operator who wants one god-role sets the keys to one value. A caller without it is refused (`403 owner_required`), never silently downgraded. Empty makes the endpoint unusable by everyone. |
+| `Backup:StreamStallTimeoutMs` | int | `60000` | live | 15 | How long the backup stream tolerates a stalled client before aborting and releasing the truncation pin. The pin is what makes an online backup consistent, and like every truncation pin (saga markers, subscriber checkpoints) it must be bounded — a wedged backup client must not become a full disk. |
 
 ## Transport and subscriptions
 

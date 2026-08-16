@@ -24,6 +24,7 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly List<ICommitObserver> _commitObservers = [];
     private readonly List<ICommitGuard> _commitGuards = [];
     private readonly List<Func<ulong?>> _truncationFloors = [];
+    private readonly List<TruncationPin> _truncationPins = [];
     private TableAccessGuard? _tableGuard;
     private readonly IDisposable? _storeLifetime;
     // Null when the configured hot store does not offer pinned reads. Snapshot-isolated reducers
@@ -102,6 +103,7 @@ public sealed partial class MelangeEngine : IDisposable
             Appliers = new ApplierPipeline(_log, _telemetry);
             Appliers.Register(new HotStoreApplier(store));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
+            _truncationFloors.Add(PinnedTruncationFloor);
             if (options.Residency.ReportOnStartup)
                 ReportResidency(store);
         }
@@ -199,6 +201,13 @@ public sealed partial class MelangeEngine : IDisposable
     public SchemaRegistry Schema { get; }
 
     public ICommitLog Log => _log;
+
+    /// <summary>
+    /// The log as the file it is — path, buffer flush, base sidecar — for the online backup's
+    /// direct file walk. Internal on purpose: <see cref="Log"/> is the abstraction everything
+    /// else programs against.
+    /// </summary>
+    internal FileCommitLog LogFile => _log;
 
     /// <summary>The full path of the current snapshot file, beside the log.</summary>
     public string SnapshotPath { get; }
@@ -651,6 +660,50 @@ public sealed partial class MelangeEngine : IDisposable
         lock (_writeLock)
         {
             _truncationFloors.Add(floor);
+        }
+    }
+
+    /// <summary>
+    /// Pins log truncation at the current base for the lifetime of the returned handle: while any
+    /// pin is held, compaction removes nothing beyond where it already stood. This is the bounded
+    /// counterpart to <see cref="AddTruncationFloor"/> — a floor is a permanent registration whose
+    /// provider decides per tick, a pin is a scoped lease with an explicit release — and it exists
+    /// for the online backup, which must stream a snapshot and the records above it while commits
+    /// continue. Taken under the write lock so no truncation can interleave between reading the
+    /// base and pinning it.
+    /// </summary>
+    public IDisposable PinTruncation()
+    {
+        lock (_writeLock)
+        {
+            var pin = new TruncationPin(this, _log.BaseLsn);
+            _truncationPins.Add(pin);
+            return pin;
+        }
+    }
+
+    /// <summary>The pins' collective floor; registered in the constructor beside the other floors.</summary>
+    private ulong? PinnedTruncationFloor()
+    {
+        // Callers hold the write lock: floors are only evaluated inside TruncateLogCore.
+        if (_truncationPins.Count == 0)
+            return null;
+        var floor = ulong.MaxValue;
+        foreach (var pin in _truncationPins)
+            floor = Math.Min(floor, pin.BaseLsn);
+        return floor;
+    }
+
+    private sealed class TruncationPin(MelangeEngine engine, ulong baseLsn) : IDisposable
+    {
+        public ulong BaseLsn { get; } = baseLsn;
+
+        public void Dispose()
+        {
+            lock (engine._writeLock)
+            {
+                engine._truncationPins.Remove(this);
+            }
         }
     }
 

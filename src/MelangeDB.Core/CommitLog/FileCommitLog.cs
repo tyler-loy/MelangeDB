@@ -249,6 +249,20 @@ public sealed class FileCommitLog : ICommitLog
         }
     }
 
+    /// <summary>
+    /// Makes buffered appends visible to a reader opening the file directly — what
+    /// <see cref="ReadFrom"/> does for its own read handle, exposed for the online backup, which
+    /// walks the file bytes itself because it wants verbatim record payloads, not decoded records.
+    /// </summary>
+    internal void FlushBuffers()
+    {
+        lock (_lock)
+        {
+            if (!_disposed && _failure is null)
+                _stream.Flush();
+        }
+    }
+
     public IEnumerable<CommitRecord> ReadFrom(ulong firstLsn)
     {
         lock (_lock)

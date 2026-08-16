@@ -201,7 +201,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     {
         var session = _session!;
         var assertion = _gateway.Hub.MintAssertion(
-            session.Identity, session.IsGuest, session.IsSqlOwner, session.IsBulkOwner, session.TokenExpiresAt, firesLifecycle);
+            session.Identity, session.IsGuest, session.IsSqlOwner, session.IsBulkOwner, session.TokenExpiresAt, firesLifecycle, session.IsBackupOwner);
         UpstreamSession? self = null;
         var connected = await UpstreamSession.ConnectAsync(
             uri,
@@ -664,13 +664,13 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 if (_hub is { IsAlive: true } hub)
                 {
                     await hub.SendFrameAsync(new ReauthenticateFrame(_gateway.Hub.MintAssertion(
-                        next.Identity, next.IsGuest, next.IsSqlOwner, next.IsBulkOwner, next.TokenExpiresAt, firesLifecycle: true)), ct).ConfigureAwait(false);
+                        next.Identity, next.IsGuest, next.IsSqlOwner, next.IsBulkOwner, next.TokenExpiresAt, firesLifecycle: true, next.IsBackupOwner)), ct).ConfigureAwait(false);
                 }
 
                 if (_shard is { IsAlive: true } shard)
                 {
                     await shard.SendFrameAsync(new ReauthenticateFrame(_gateway.Hub.MintAssertion(
-                        next.Identity, next.IsGuest, next.IsSqlOwner, next.IsBulkOwner, next.TokenExpiresAt, firesLifecycle: false)), ct).ConfigureAwait(false);
+                        next.Identity, next.IsGuest, next.IsSqlOwner, next.IsBulkOwner, next.TokenExpiresAt, firesLifecycle: false, next.IsBackupOwner)), ct).ConfigureAwait(false);
                 }
 
                 await SendToClientAsync(new ReauthenticateResultFrame(true, null), ct).ConfigureAwait(false);

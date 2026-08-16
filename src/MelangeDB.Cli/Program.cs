@@ -6,12 +6,15 @@ using MelangeDB.Core;
 //   melange schema path/to/Module.dll [-o melange-schema.json]
 //   melange schema http://localhost:5310 [-o melange-schema.json]
 //   melange backup ./data/log [-o world.mbak]
+//   melange backup https://game.example.com --token <jwt> [-o world.mbak]
 //   melange backup verify world.mbak
 //   melange restore world.mbak -o ./data/log
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
 // its URL form fetches from a running server's schema endpoint. `backup` captures a stopped
-// server's data directory into a .mbak archive; `verify` CRC-walks and dry-replays one; `restore`
+// server's data directory into a .mbak archive — or, in its URL form, streams one from a running
+// server's backup endpoint (Backup:Enabled, and the token must carry the server's
+// Backup:OwnerRole claim); `verify` CRC-walks and dry-replays one; `restore`
 // materializes a data directory a server boots from — with a fresh epoch, always, because a
 // restore is a rewind and stale resume cursors must full-resync rather than resume into history
 // that no longer happened. An unverified backup is a hope, not a backup.
@@ -25,14 +28,14 @@ return args[0] switch
 {
     "schema" => await RunSchemaAsync(args.AsSpan(1).ToArray()),
     "backup" when args.Length >= 2 && args[1] == "verify" => RunVerify(args.AsSpan(2).ToArray()),
-    "backup" => RunBackup(args.AsSpan(1).ToArray()),
+    "backup" => await RunBackupAsync(args.AsSpan(1).ToArray()),
     "restore" => RunRestore(args.AsSpan(1).ToArray()),
     _ => Usage(),
 };
 
 static async Task<int> RunSchemaAsync(string[] rest)
 {
-    if (!ParseSourceAndOutput(rest, "melange-schema.json", out var source, out var output))
+    if (!ParseSourceAndOutput(rest, "melange-schema.json", out var source, out var output, out _))
         return Usage();
     try
     {
@@ -53,19 +56,27 @@ static async Task<int> RunSchemaAsync(string[] rest)
     }
 }
 
-static int RunBackup(string[] rest)
+static async Task<int> RunBackupAsync(string[] rest)
 {
-    if (!ParseSourceAndOutput(rest, "world.mbak", out var source, out var output))
+    if (!ParseSourceAndOutput(rest, "world.mbak", out var source, out var output, out var token))
         return Usage();
     try
     {
+        if (source.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || source.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            var bytes = await BackupFetcher.FetchAsync(new Uri(source), output, token);
+            Console.WriteLine($"Wrote {output} ({bytes} bytes) from {source}. Verify it: melange backup verify {output}");
+            return 0;
+        }
+
         var summary = MelangeBackup.Create(source, output);
         foreach (var engine in summary.Engines)
             Console.WriteLine($"Captured {engine.Key}: LSNs {engine.SnapshotLsn}..{engine.HeadLsn}, {engine.SnapshotRows} snapshot rows + {engine.TailRecords} log records.");
         Console.WriteLine($"Wrote {output} ({summary.TotalBytes} bytes). Verify it: melange backup verify {output}");
         return 0;
     }
-    catch (Exception exception) when (IsHandled(exception))
+    catch (Exception exception) when (IsHandled(exception) || exception is HttpRequestException or UriFormatException)
     {
         Console.Error.WriteLine(exception.Message);
         return 1;
@@ -99,7 +110,7 @@ static int RunVerify(string[] rest)
 
 static int RunRestore(string[] rest)
 {
-    if (!ParseSourceAndOutput(rest, null, out var archive, out var target))
+    if (!ParseSourceAndOutput(rest, null, out var archive, out var target, out _))
         return Usage();
     try
     {
@@ -116,12 +127,15 @@ static int RunRestore(string[] rest)
     }
 }
 
-// The shared argument shape: one positional source, one -o/--output. A null default output makes
-// -o required (restore refuses to guess where a world should land).
-static bool ParseSourceAndOutput(string[] rest, string? defaultOutput, out string source, out string output)
+// The shared argument shape: one positional source, one -o/--output, and --token for the
+// privileged URL form. A null default output makes -o required (restore refuses to guess where a
+// world should land). --token falls back to the MELANGE_TOKEN environment variable, which keeps
+// the JWT out of shell history and process listings in scripts.
+static bool ParseSourceAndOutput(string[] rest, string? defaultOutput, out string source, out string output, out string? token)
 {
     source = "";
     output = defaultOutput ?? "";
+    token = Environment.GetEnvironmentVariable("MELANGE_TOKEN");
     var sawSource = false;
     var sawOutput = false;
     for (var i = 0; i < rest.Length; i++)
@@ -131,6 +145,9 @@ static bool ParseSourceAndOutput(string[] rest, string? defaultOutput, out strin
             case "-o" or "--output" when i + 1 < rest.Length:
                 output = rest[++i];
                 sawOutput = true;
+                break;
+            case "--token" when i + 1 < rest.Length:
+                token = rest[++i];
                 break;
             case "-h" or "--help":
                 return false;
@@ -157,7 +174,7 @@ static int Usage()
 static void PrintUsage()
 {
     Console.Error.WriteLine("usage: melange schema <module.dll | http(s)://host[:port][/path]> [-o melange-schema.json]");
-    Console.Error.WriteLine("       melange backup <data-dir> [-o world.mbak]");
+    Console.Error.WriteLine("       melange backup <data-dir | http(s)://host[:port][/path]> [-o world.mbak] [--token <jwt>]");
     Console.Error.WriteLine("       melange backup verify <archive>");
     Console.Error.WriteLine("       melange restore <archive> -o <data-dir>");
 }

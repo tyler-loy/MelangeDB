@@ -31,10 +31,11 @@ materialized copy in between.
 
 The offline form: point it at the directory `CommitLog:Path` names, on a **stopped** server. It
 refuses a directory whose log is open by a live process — that refusal is the point, because
-copying a live directory is exactly how backups go subtly wrong — and it refuses a directory that
-recovery itself would refuse to boot, because archiving damaged history as if it were good would
-turn a bad day into a silent one. The archive is written to a temp file and swapped in atomically,
-so an interrupted backup never leaves a plausible-looking partial archive.
+copying a live directory is exactly how backups go subtly wrong; against a running server, use
+the online form below — and it refuses a directory that recovery itself would refuse to boot,
+because archiving damaged history as if it were good would turn a bad day into a silent one. The
+archive is written to a temp file and swapped in atomically, so an interrupted backup never
+leaves a plausible-looking partial archive.
 
 The refusal works through `melange.lock`, an empty sidecar every live server holds exclusively
 for its lifetime; the backup takes the same lock for the capture's duration, so a live server
@@ -43,6 +44,30 @@ including those whose filesystems do not enforce Windows-style share modes. The 
 two servers pointed at one data directory refuse at boot rather than corrupt each other.
 
 The same operation is available programmatically as `MelangeBackup.Create` in `MelangeDB.Core`.
+
+## `melange backup <url> --token <jwt> [-o world.mbak]`
+
+The online form: streams the archive from a running server's `/melange/backup` endpoint while
+commits continue. The capture is consistent at a **fenced LSN** — the head at the moment the
+stream begins — and the server holds a **truncation pin** for exactly the stream's duration, so
+the snapshot and every record above it stay readable while they stream. Writes that land after
+the fence are simply not in this archive; they are in the next one.
+
+The endpoint is gated like the other privileged HTTP surfaces (`Sql:*`, `Bulk:*`): off by default
+(`Backup:Enabled` — off answers `403 backup_disabled`), and owner-role-gated when on
+(`Backup:OwnerRole`, its own key on purpose — read-everything-as-queries, write-anything, and
+read-everything-as-archive are three capabilities). The token can also come from the
+`MELANGE_TOKEN` environment variable, which keeps it out of shell history in scripts.
+
+The pin is bounded, like every truncation pin: a client that stops reading is cut off after
+`Backup:StreamStallTimeoutMs` with the pin released (EventId 1803), because a wedged backup
+client must not become a full disk. The aborted partial download fails `verify`, which is the
+point of verify. Watch `melange.backup.duration` — it is also the pin's hold time; archives that
+stream for long enough to matter are the cue to back up right after a snapshot, when the tail
+riding along is smallest.
+
+In-process schedulers can take the same capture without HTTP: `MelangeBackup.CreateOnline` in
+`MelangeDB.Core`.
 
 ## `melange restore <archive> -o <data-dir>`
 
@@ -62,9 +87,13 @@ every restart runs. Three semantics are the design, not incidental behavior:
   be its own feature; it is deliberately not a flag on restore.
 
 The Postgres tier is not in the archive and is not silently overwritten: on first boot after a
-restore, an applier checkpoint that disagrees with the restored log is refused loudly with the
-remediation printed. The clean path is an empty schema, which the bootstrap machinery fills from
-the restored log.
+restore, the applier's checkpoint belongs to an epoch the restored log has never seen, and the
+tier refuses loudly (EventId 1605) with the remediation printed rather than projecting history
+that no longer happened — the `AutoMigrate` posture: destructive disagreement is never automatic.
+The clean path is an empty schema, which the bootstrap machinery fills from the restored log; the
+refusal's same-epoch cousin — a checkpoint ahead of the log's head, the hand-rolled directory
+swap — is EventId 1608. Both refusals' remediations are tested to recover when followed
+literally.
 
 After restoring, point `CommitLog:Path` at the restored directory (or place it where your
 configuration already points). The hot-store directory is scratch and is rebuilt on boot.
@@ -91,8 +120,5 @@ snapshot (or on a quiet fleet) and the log tail riding along stays small — `Sn
 
 ## What's coming in this phase
 
-The online form — `melange backup <url>` against `/melange/backup` on a running server, streaming
-at a fenced LSN under a bounded truncation pin (`Backup:Enabled`, `Backup:OwnerRole`,
-`Backup:StreamStallTimeoutMs` in [CONFIGURATION.md](CONFIGURATION.md)) — and the cluster archive
-(hub plus every shard under one manifest, per-shard consistent) land in the remaining phase 15
-slices. This page grows with them.
+The cluster archive — hub plus every shard under one manifest, per-shard consistent — lands in
+the closing phase 15 slice. This page grows with it.

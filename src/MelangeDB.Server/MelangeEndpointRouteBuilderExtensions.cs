@@ -16,7 +16,9 @@ public static class MelangeEndpointRouteBuilderExtensions
     /// Maps the MelangeDB websocket endpoint at <paramref name="path"/> (default
     /// <c>Transport:Path</c>, <c>/melange</c>) plus the HTTP endpoints
     /// <c>{path}/call/{reducer}</c>, <c>{path}/bulk</c>, <c>{path}/sql</c>, and
-    /// <c>{path}/ticket</c> when <c>Transport:HttpEndpointsEnabled</c> is on.
+    /// <c>{path}/ticket</c> when <c>Transport:HttpEndpointsEnabled</c> is on — plus
+    /// <c>{path}/schema</c> and <c>{path}/backup</c>, mapped always and gated per request by
+    /// their own live options.
     /// <para>
     /// Every connection authenticates — <b>the IdP is the gate</b>. Tokens are validated against
     /// the host's own JWT bearer scheme (<c>Auth:Scheme</c>), presented as an
@@ -44,7 +46,8 @@ public static class MelangeEndpointRouteBuilderExtensions
             () => options.CurrentValue.Sql,
             () => options.CurrentValue.Bulk,
             () => options.CurrentValue.Cluster,
-            services.GetService<TimeProvider>());
+            services.GetService<TimeProvider>(),
+            () => options.CurrentValue.Backup);
         authenticator.EnsureSchemeConfigured();
         var transport = new MelangeTransport(
             engine,
@@ -78,6 +81,10 @@ public static class MelangeEndpointRouteBuilderExtensions
         var environment = services.GetService<IHostEnvironment>();
         var manifests = services.GetService<SchemaManifests>();
         endpoints.MapGet(basePath + "/schema", context => ServeSchemaAsync(context, options, environment, manifests));
+
+        // The online backup, likewise mapped unconditionally and gated per request: Backup:Enabled
+        // is live-reloadable, and while off the endpoint answers 403 backup_disabled.
+        endpoints.MapGet(basePath + "/backup", context => MelangeBackupEndpoint.BackupAsync(context, transport));
 
         return socket;
     }

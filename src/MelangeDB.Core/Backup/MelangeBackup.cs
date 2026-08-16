@@ -65,6 +65,32 @@ public static class MelangeBackup
     }
 
     /// <summary>
+    /// The online backup: streams a live engine into <paramref name="destination"/> at a fenced
+    /// LSN while commits continue, holding a truncation pin for exactly the stream's duration.
+    /// This is what <c>/melange/backup</c> serves; it is public so in-process tooling (a
+    /// scheduled job inside the host, say) can take the same capture without HTTP in between.
+    /// </summary>
+    public static BackupSummary CreateOnline(MelangeEngine engine, Stream destination)
+    {
+        ArgumentNullException.ThrowIfNull(engine);
+        ArgumentNullException.ThrowIfNull(destination);
+        var writer = new ArchiveFrameWriter(destination);
+        writer.WriteHeader();
+        writer.WriteFrame(
+            ArchiveFrameType.Manifest,
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new ArchiveManifest
+            {
+                CapturedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Engines = [ArchiveFormat.SingleNodeEngineKey],
+            }));
+        var summary = OnlineEngineCapture.Capture(engine, ArchiveFormat.SingleNodeEngineKey, writer);
+        writer.WriteFrame(
+            ArchiveFrameType.ArchiveEnd,
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new ArchiveFooter { Engines = 1 }));
+        return new BackupSummary([summary], writer.BytesWritten);
+    }
+
+    /// <summary>
     /// Materializes data directories from <paramref name="archivePath"/> into an empty
     /// <paramref name="targetDirectory"/> — a rewind, for replacement, not cloning: a fresh epoch
     /// is always minted, so clients holding pre-restore resume cursors are refused resume and

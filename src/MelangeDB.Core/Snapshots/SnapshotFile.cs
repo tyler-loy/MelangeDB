@@ -127,9 +127,19 @@ internal sealed class SnapshotReader : IDisposable
     private uint _crc;
 
     public SnapshotReader(string path)
+        : this(path, new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+    {
+    }
+
+    /// <summary>
+    /// Reads through a caller-opened handle. The online backup opens the snapshot with write and
+    /// delete sharing so a concurrent snapshot completion can atomically replace the file mid-read
+    /// — the open handle keeps the old, complete content, the log's lazy-reader convention.
+    /// </summary>
+    internal SnapshotReader(string path, FileStream stream)
     {
         _path = path;
-        _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        _stream = stream;
         try
         {
             _crc = Crc32.Begin();
