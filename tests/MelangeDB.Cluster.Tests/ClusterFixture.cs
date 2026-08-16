@@ -46,17 +46,20 @@ internal sealed class ClusterFixture : IAsyncDisposable
     private readonly int _failureTimeoutMs;
     private readonly bool _spatial;
     private readonly IReadOnlyDictionary<string, string?>? _extraSettings;
+    private readonly Action<IServiceCollection>? _configureHub;
     private int _hubHttpPort;
     private int _nodeListenPort;
 
     private ClusterFixture(
-        string root, int heartbeatMs, int failureTimeoutMs, bool spatial, IReadOnlyDictionary<string, string?>? extraSettings)
+        string root, int heartbeatMs, int failureTimeoutMs, bool spatial, IReadOnlyDictionary<string, string?>? extraSettings,
+        Action<IServiceCollection>? configureHub)
     {
         _root = root;
         _heartbeatMs = heartbeatMs;
         _failureTimeoutMs = failureTimeoutMs;
         _spatial = spatial;
         _extraSettings = extraSettings;
+        _configureHub = configureHub;
     }
 
     public WebApplication HubApp { get; private set; } = null!;
@@ -82,7 +85,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
         int heartbeatMs = 200,
         int failureTimeoutMs = 10_000,
         bool spatial = false,
-        IReadOnlyDictionary<string, string?>? extraSettings = null)
+        IReadOnlyDictionary<string, string?>? extraSettings = null,
+        Action<IServiceCollection>? configureHub = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-cluster-").FullName;
 
@@ -91,7 +95,7 @@ internal sealed class ClusterFixture : IAsyncDisposable
         // to declare a healthy node dead mid-test, which is the environment failing, not the
         // cluster. Ratios are preserved — failover tests that provoke detection still see it well
         // inside their equally-dilated deadlines — and at scale 1 nothing changes.
-        var fixture = new ClusterFixture(root, heartbeatMs, TestTime.Scale * failureTimeoutMs, spatial, extraSettings);
+        var fixture = new ClusterFixture(root, heartbeatMs, TestTime.Scale * failureTimeoutMs, spatial, extraSettings, configureHub);
         fixture.HubApp = await WithFreshPortsRetryAsync(() =>
         {
             fixture._hubHttpPort = FreePort();
@@ -319,6 +323,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
         }
 
         builder.Services.AddMelangeCluster();
+        if (role == ClusterRole.Hub)
+            _configureHub?.Invoke(builder.Services);
 
         var app = builder.Build();
         app.UseWebSockets();

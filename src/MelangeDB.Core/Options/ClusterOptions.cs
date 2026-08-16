@@ -188,4 +188,13 @@ public sealed class ClusterOptions
     /// never blocked by it.
     /// </summary>
     public int ShardMoveMinIntervalMs { get; set; } = 300_000;
+
+    /// <summary>
+    /// Hub only: the hard ceiling on fleet size — the rebalance loop never provisions past it.
+    /// <b>Deliberately unset by default</b> (0): when a node provisioner is registered this must
+    /// be set explicitly or the hub refuses to start, because every default is wrong — a low one
+    /// silently caps a deployment that meant to scale, a high one is a silent spending
+    /// authorization. Irrelevant when no provisioner is registered.
+    /// </summary>
+    public int MaxNodes { get; set; }
 }

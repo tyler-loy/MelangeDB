@@ -243,6 +243,13 @@ hotspot is refused (EventIds 1732/1733), not churned. Hysteresis at every layer:
 window, the per-shard move floor (`Cluster:ShardMoveMinIntervalMs`), one automatic move in flight
 at a time.
 
+**Capacity seam (`INodeProvisioner`)** — The DI-registered interface (road-to-0.2 phase 14)
+through which the hub obtains one more shard node when every node is sustained-hot and gives the
+emptiest back when the fleet is cold. Fire-and-track: a ticket names the node that will join, and
+the provisioned node announces itself through ordinary membership registration — there is no
+special path. No registration means the fleet is fixed; a registered provisioner requires
+`Cluster:MaxNodes` set explicitly, or the hub refuses to start.
+
 **Drain** — The planned move of one shard to another live node while both are up
 (`MelangeClusterCoordinator.DrainShardAsync`, road-to-0.2 phase 13): the origin takes a fresh
 snapshot and closes the shard's engine, membership moves the shard under a bumped fencing token,
