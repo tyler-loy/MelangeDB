@@ -221,6 +221,14 @@ archive — with the decisions above settled in place. Deviations and additions,
   bytes — so the archive predates not only the projection choice but the snapshot and log *file*
   format choices too; restore rewrites the snapshot under the fresh epoch through the ordinary
   writer rather than patching bytes.
+- **The live-directory refusal grew a lock file.** The first cut probed the log with a write
+  request, counting on the live log handle's Read|Delete share to refuse it — which is
+  Windows-only enforcement, and CI's Linux runner proved it by not refusing. Unix maps only
+  `FileShare.None` onto a real (advisory) lock, so every live `FileCommitLog` now holds an empty
+  `melange.lock` sidecar exclusively and the offline capture takes the same lock for the
+  capture's duration. The by-product is a genuine double-open guard: two servers pointed at one
+  data directory now refuse at boot on every platform, which Unix previously did not detect at
+  all.
 - **The shared-storage shard capture is handle-consistent, not pinned.** The plan said the hub
   "streams each shard's engine over shared storage" without saying how consistency is had with
   no channel to the owner. The answer shipped: ordered opens (base sidecar → snapshot handle →
