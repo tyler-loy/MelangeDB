@@ -100,7 +100,7 @@ provide.
 
 ## Decisions to settle
 
-### Restore is for replacement, not cloning
+### Settled: restore is for replacement, not cloning
 
 A restored archive booted *beside* the deployment that produced it is two live worlds sharing an
 originator id — AutoInc ranges collide with every id the original allocated after the capture, and
@@ -110,7 +110,12 @@ new Postgres schema, explicitly a different world) is a real feature with a real
 (staging environments seeded from production) but it is its own decision, not a flag that falls
 out of restore. To settle: whether clone ships in this phase or is recorded as the next verb.
 
-### Whether a cluster backup offers a quiesced, globally-consistent mode
+**Settled as the leaning.** Restore is replacement: epoch minted always, empty target required,
+no keep-epoch and no clone flag. Clone is recorded here as the next verb when a deployment states
+the staging-seeded-from-production need; it will be its own command with its own semantics (new
+originator, new Postgres schema), not an option on restore.
+
+### Settled: no quiesced, globally-consistent mode
 
 Per-shard consistency is the default and the honest one. A `--quiesce` mode — brief fence of every
 shard to capture one fleet-wide instant — is buildable from phase 13's drain quiesce, but it is a
@@ -118,7 +123,14 @@ deliberate world-wide write pause with a player-visible cost, taken for a proper
 instant) the data model explicitly does not promise elsewhere. Leaning: do not build it until a
 consumer states the need; record the refusal reasoning if it stays out.
 
-### Verify's replay depth
+**Settled as the leaning — not built, refusal recorded.** The data model promises no global total
+order anywhere else (CLUSTERING.md); a backup mode that pauses the world to capture a property
+nothing in the system otherwise has would make the backup the most invasive operation in the
+product. The cluster archive is per-shard consistent, the docs say so plainly, and the round-trip
+test asserts shards captured at different LSNs restore to a working world rather than pretending
+the skew away.
+
+### Settled: verify's replay depth is structural
 
 The dry replay proves the records parse and apply in order, without the module DLL. What it cannot
 prove without the schema is index consistency and residency shape — projections of declarations
@@ -127,7 +139,13 @@ the archive does not carry. Leaning: structural replay plus row counts is the ve
 check; feeding verify a `melange-schema.json` for deeper checks is possible but doubles the verb's
 input surface for a check staging does better.
 
-### Where the online endpoint lives on a shard node
+**Settled as the leaning.** Verify takes one input — the archive — and its contract is: every
+frame intact (every single-bit flip is caught, exhaustively tested), the record chain contiguous
+from snapshot to declared head, every record parseable, counts honest, per-table live-key counts
+reported. BACKUP.md ranks the checks explicitly: verify in CI on every archive, a staged boot on
+a schedule, so the green checkmark never stands in for the drill.
+
+### Settled: the online endpoint lives where the client socket lives
 
 The hub fans out for the cluster archive, but a single shard node also has engines an operator
 might want individually (one shard's archive, for surgical restore). Leaning: the endpoint exists
@@ -135,6 +153,15 @@ on any node with `Backup:Enabled`, scoped to the engines that node owns; the hub
 offers the whole-cluster form. Single-shard *restore* into a live cluster (a surgical rollback of
 one shard while the rest of the world runs) interacts with fencing and border streams and is
 deliberately deferred — restore targets a stopped deployment in this phase.
+
+**Settled, adjusted from the leaning.** The endpoint maps with `MapMelangeSocket` — single-node
+servers and the hub — because that is where the HTTP surface and its JWT gate already live; shard
+nodes map only internal shard sockets and grew no client-facing HTTP surface for this. The hub's
+form covers every shard engine over shared storage with no per-node endpoint needed, and the
+capture is handle-consistent (base → snapshot → log handle ordering, gap detection, bounded
+retry) rather than remotely pinned — no hub→shard pin channel exists and none was built. A
+per-shard-node endpoint for surgical single-shard archives is recorded as the follow-on if a
+deployment states the need; single-shard restore into a live cluster stays deferred as planned.
 
 ## Done when
 
@@ -174,3 +201,45 @@ deliberately deferred — restore targets a stopped deployment in this phase.
 - **False confidence from verify.** A structural verify that passes is not a booted world; the
   docs must rank the checks (verify in CI, staged boot before you need it) rather than letting the
   green checkmark stand in for the drill.
+
+## Shipped notes
+
+Shipped as three stacked PRs — the archive and the offline verbs, the online form, the cluster
+archive — with the decisions above settled in place. Deviations and additions, recorded:
+
+- **The frame CRC covers the frame's own type and length bytes**, not just the payload — a
+  strengthening over the log's convention it borrows from, because "every corruption a flipped
+  bit can cause fails verify with the frame named" is tested literally, at every byte offset,
+  and header bits had to be inside the contract for that sentence to be true.
+- **`melange.events.json` rides along**, a sidecar the plan's list did not name. Subscriber
+  checkpoints are part of the truth — what has been delivered — so dropping them would turn a
+  restore into silent redelivery for every subscriber. Restore clamps any checkpoint above the
+  restored head to the head: a checkpoint pointing past a rewind would make its subscriber
+  silently skip everything committed after the restore, and clamping turns that into the
+  at-least-once redelivery the bus already permits.
+- **The archive's contents are logical** — snapshot rows and verbatim record payloads, never file
+  bytes — so the archive predates not only the projection choice but the snapshot and log *file*
+  format choices too; restore rewrites the snapshot under the fresh epoch through the ordinary
+  writer rather than patching bytes.
+- **The shared-storage shard capture is handle-consistent, not pinned.** The plan said the hub
+  "streams each shard's engine over shared storage" without saying how consistency is had with
+  no channel to the owner. The answer shipped: ordered opens (base sidecar → snapshot handle →
+  log handle), both walk passes over one handle, a dense-chain check that turns any raced
+  truncation into a loud retry (bounded at three) instead of an archived hole. No remote pin
+  exists and none was needed.
+- **The restored cluster layout** is `hub/` plus `shards/shard-k/` under the target — point the
+  hub's `CommitLog:Path` at the former and every node's `Cluster:ShardDataPath` at the latter's
+  parent. Node-level engines (replicated projections) are deliberately not in the archive; fresh
+  nodes re-sync through the replica stream's reset machinery, which is the projections-rebuild
+  rule applied one level up.
+- **The Postgres refusal is two refusals.** A real restore always lands in the epoch-mismatch
+  stall (1605) because restore always mints — its message now states the restore remediation.
+  The plan's literal "checkpoint ahead of the restored head" case can only occur same-epoch (a
+  hand-rolled directory swap that kept `melange.epoch`), and that got its own typed refusal and
+  EventId 1608. Both remediations are tested to recover when followed literally.
+- **The truncation pin is a new scoped engine primitive** (`MelangeEngine.PinTruncation`), not a
+  floor registration — `AddTruncationFloor` registrations are deliberately permanent, and a
+  per-request registration would have leaked one closure per backup for the life of the engine.
+- The kill-of-the-verify-depth question left one residual honest: verify's per-table counts are
+  keyed by numeric table id, because the archive carries no schema and inventing names would
+  imply knowledge it does not have.

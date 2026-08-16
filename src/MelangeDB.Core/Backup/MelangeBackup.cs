@@ -91,6 +91,51 @@ public static class MelangeBackup
     }
 
     /// <summary>
+    /// The cluster backup: the hub's own engine plus every shard engine found under
+    /// <paramref name="shardDataPath"/> on shared storage, under one manifest keyed by shard.
+    /// One fenced LSN per engine — the archive is <b>per-shard consistent, not globally
+    /// consistent</b>, because there is no global total order to capture; cross-shard skew is
+    /// bounded by the capture window. The hub's engine streams under a truncation pin; shard
+    /// engines stream handle-consistently over shared storage while their owners keep serving
+    /// them, with no remote pin and no quiesce. Restore materializes <c>hub/</c> (point the
+    /// hub's <c>CommitLog:Path</c> there) and <c>shards/shard-k/</c> (point every node's
+    /// <c>Cluster:ShardDataPath</c> at <c>shards/</c>).
+    /// </summary>
+    public static BackupSummary CreateClusterOnline(MelangeEngine hubEngine, string shardDataPath, Stream destination)
+    {
+        ArgumentNullException.ThrowIfNull(hubEngine);
+        ArgumentNullException.ThrowIfNull(destination);
+        var shardDirectories = Directory.Exists(shardDataPath)
+            ? Directory.EnumerateDirectories(shardDataPath, ArchiveFormat.ShardEngineKeyPrefix + "*")
+                .Where(static dir => File.Exists(Path.Combine(dir, "log", "melange.log")))
+                .OrderBy(static dir => Path.GetFileName(dir), StringComparer.Ordinal)
+                .ToList()
+            : [];
+
+        var writer = new ArchiveFrameWriter(destination);
+        writer.WriteHeader();
+        writer.WriteFrame(
+            ArchiveFrameType.Manifest,
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new ArchiveManifest
+            {
+                CapturedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Engines = [ArchiveFormat.HubEngineKey, .. shardDirectories.Select(static dir => Path.GetFileName(dir)!)],
+            }));
+
+        var engines = new List<BackupEngineSummary>
+        {
+            OnlineEngineCapture.Capture(hubEngine, ArchiveFormat.HubEngineKey, writer),
+        };
+        foreach (var directory in shardDirectories)
+            engines.Add(SharedStorageCapture.Capture(directory, Path.GetFileName(directory)!, writer));
+
+        writer.WriteFrame(
+            ArchiveFrameType.ArchiveEnd,
+            System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(new ArchiveFooter { Engines = engines.Count }));
+        return new BackupSummary(engines, writer.BytesWritten);
+    }
+
+    /// <summary>
     /// Materializes data directories from <paramref name="archivePath"/> into an empty
     /// <paramref name="targetDirectory"/> — a rewind, for replacement, not cloning: a fresh epoch
     /// is always minted, so clients holding pre-restore resume cursors are refused resume and

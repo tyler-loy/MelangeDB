@@ -39,6 +39,12 @@ internal static class ArchiveFormat
 
     /// <summary>The engine key a single-node archive uses; cluster archives use hub/shard keys.</summary>
     public const string SingleNodeEngineKey = "node";
+
+    /// <summary>A cluster archive's first engine: the hub's own (Global and Replicated tables).</summary>
+    public const string HubEngineKey = "hub";
+
+    /// <summary>Cluster archives key shard engines as <c>shard-{k}</c> — the shard directory's own name.</summary>
+    public const string ShardEngineKeyPrefix = "shard-";
 }
 
 internal enum ArchiveFrameType : byte

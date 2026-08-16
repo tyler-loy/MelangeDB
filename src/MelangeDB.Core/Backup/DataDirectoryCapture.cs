@@ -68,70 +68,104 @@ internal static class DataDirectoryCapture
                     "This directory would not boot, so it cannot be backed up as-is; restore from an earlier backup.");
             }
 
-            var snapshotLsn = snapshot?.Header.Lsn ?? 0;
-
-            // First pass: the head is part of the identity frame, which streams before the tail.
-            var headLsn = Math.Max(baseLsn, snapshotLsn);
-            long tailRecords = 0;
-            foreach (var record in LogFileFormat.WalkRecords(log, logPath))
-            {
-                headLsn = Math.Max(headLsn, record.Lsn);
-                if (record.Lsn > snapshotLsn)
-                    tailRecords++;
-            }
-
-            var identity = new ArchiveEngineIdentity
-            {
-                Key = engineKey,
-                SourceEpoch = epoch,
-                BaseLsn = baseLsn,
-                SnapshotLsn = snapshotLsn,
-                HeadLsn = headLsn,
-                SnapshotTimestampMicros = snapshot?.Header.Timestamp.UnixTimeMicroseconds ?? 0,
-                Sequences = snapshot is null
-                    ? []
-                    : [.. snapshot.Header.Sequences.Select(pair => new ArchiveSequence { Table = pair.Key.Value, Next = pair.Value })],
-            };
-            writer.WriteFrame(ArchiveFrameType.EngineBegin, JsonSerializer.SerializeToUtf8Bytes(identity));
-
-            long snapshotRows = 0;
-            if (snapshot is not null)
-            {
-                foreach (var row in snapshot.Rows())
-                {
-                    WriteSnapshotRowFrame(writer, row);
-                    snapshotRows++;
-                }
-            }
-
-            // Second pass streams the tail. The write-excluding handle is held across both passes,
-            // so the file cannot have changed between the count and the stream.
-            long streamed = 0;
-            foreach (var record in LogFileFormat.WalkRecords(log, logPath))
-            {
-                if (record.Lsn <= snapshotLsn)
-                    continue;
-                writer.WriteFrame(ArchiveFrameType.LogRecord, record.Payload);
-                streamed++;
-            }
-
-            if (streamed != tailRecords)
-                throw new InvalidOperationException($"'{directory}': the log changed during the backup ({tailRecords} tail records counted, {streamed} streamed).");
-
-            var eventsPath = Path.Combine(directory, "melange.events.json");
-            if (File.Exists(eventsPath))
-                WriteSidecarFrame(writer, "melange.events.json", File.ReadAllBytes(eventsPath));
-
-            writer.WriteFrame(
-                ArchiveFrameType.EngineEnd,
-                JsonSerializer.SerializeToUtf8Bytes(new ArchiveEngineFooter { SnapshotRows = snapshotRows, TailRecords = tailRecords }));
-
-            return new BackupEngineSummary(engineKey, epoch, baseLsn, snapshotLsn, headLsn, snapshotRows, tailRecords);
+            return CaptureCore(engineKey, writer, log, logPath, directory, snapshot, epoch, baseLsn, extraSidecars: null);
         }
         finally
         {
             snapshot?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Streams one engine section from an already-opened log handle: the identity frame (whose
+    /// head LSN the first pass computes), the snapshot rows, the log tail, the sidecars, the
+    /// counted end frame. Both passes walk the same handle, so the view cannot change between the
+    /// count and the stream — for the offline capture because the handle excludes writers, for
+    /// the shared-storage capture because an appended-to file only grows and a compaction swap
+    /// leaves the old content under the old handle. The tail is checked dense from the snapshot
+    /// LSN up: a gap means the walk raced a truncation (possible only in the shared-storage
+    /// case), thrown for the caller to retry with fresh handles rather than archived as a hole.
+    /// </summary>
+    internal static BackupEngineSummary CaptureCore(
+        string engineKey,
+        ArchiveFrameWriter writer,
+        Stream log,
+        string logPath,
+        string engineDirectory,
+        SnapshotReader? snapshot,
+        Guid epoch,
+        ulong baseLsn,
+        Func<ulong, IEnumerable<(string Name, byte[] Content)>>? extraSidecars)
+    {
+        var snapshotLsn = snapshot?.Header.Lsn ?? 0;
+
+        // First pass: the head is part of the identity frame, which streams before the tail.
+        var headLsn = Math.Max(baseLsn, snapshotLsn);
+        long tailRecords = 0;
+        var expected = snapshotLsn;
+        foreach (var record in LogFileFormat.WalkRecords(log, logPath))
+        {
+            headLsn = Math.Max(headLsn, record.Lsn);
+            if (record.Lsn <= snapshotLsn)
+                continue;
+            expected++;
+            if (record.Lsn != expected)
+            {
+                throw new InvalidOperationException(
+                    $"'{engineDirectory}': the log's records jump from LSN {expected - 1} to {record.Lsn} above the snapshot ({snapshotLsn}); " +
+                    "a truncation raced this capture.");
+            }
+
+            tailRecords++;
+        }
+
+        var identity = new ArchiveEngineIdentity
+        {
+            Key = engineKey,
+            SourceEpoch = epoch,
+            BaseLsn = baseLsn,
+            SnapshotLsn = snapshotLsn,
+            HeadLsn = headLsn,
+            SnapshotTimestampMicros = snapshot?.Header.Timestamp.UnixTimeMicroseconds ?? 0,
+            Sequences = snapshot is null
+                ? []
+                : [.. snapshot.Header.Sequences.Select(pair => new ArchiveSequence { Table = pair.Key.Value, Next = pair.Value })],
+        };
+        writer.WriteFrame(ArchiveFrameType.EngineBegin, JsonSerializer.SerializeToUtf8Bytes(identity));
+
+        long snapshotRows = 0;
+        if (snapshot is not null)
+        {
+            foreach (var row in snapshot.Rows())
+            {
+                WriteSnapshotRowFrame(writer, row);
+                snapshotRows++;
+            }
+        }
+
+        long streamed = 0;
+        foreach (var record in LogFileFormat.WalkRecords(log, logPath))
+        {
+            if (record.Lsn <= snapshotLsn || record.Lsn > headLsn)
+                continue;
+            writer.WriteFrame(ArchiveFrameType.LogRecord, record.Payload);
+            streamed++;
+        }
+
+        if (streamed != tailRecords)
+            throw new InvalidOperationException($"'{engineDirectory}': the log changed during the backup ({tailRecords} tail records counted, {streamed} streamed).");
+
+        var eventsPath = Path.Combine(Path.GetDirectoryName(logPath)!, "melange.events.json");
+        if (File.Exists(eventsPath))
+            WriteSidecarFrame(writer, "melange.events.json", File.ReadAllBytes(eventsPath));
+        foreach (var (name, content) in extraSidecars?.Invoke(headLsn) ?? [])
+            WriteSidecarFrame(writer, name, content);
+
+        writer.WriteFrame(
+            ArchiveFrameType.EngineEnd,
+            JsonSerializer.SerializeToUtf8Bytes(new ArchiveEngineFooter { SnapshotRows = snapshotRows, TailRecords = tailRecords }));
+
+        return new BackupEngineSummary(engineKey, epoch, baseLsn, snapshotLsn, headLsn, snapshotRows, tailRecords);
     }
 
     internal static void WriteSnapshotRowFrame(ArchiveFrameWriter writer, SnapshotRow row)

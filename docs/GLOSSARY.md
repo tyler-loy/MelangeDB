@@ -285,6 +285,26 @@ subscriptions re-scope. An ownership transfer, not a data copy; the node-death r
 made polite. Distinct from a *handoff*, which moves one entity's rows between shards — a drain
 moves a whole shard between nodes and no row changes shard.
 
+**Backup archive (`.mbak`)** — One versioned, CRC-framed file holding a deployment's committed
+history (road-to-0.2 phase 15): per engine, its identity, its snapshot rows, its log tail above
+the snapshot LSN, and its sidecars. The truth, not the projections — no store files, no Postgres
+dump — which is why an archive is store-engine agnostic and small in proportion to state, not to
+deployment. A cluster archive is the hub engine plus every shard engine under one manifest,
+**per-shard consistent, not globally consistent** — there is no global total order to capture.
+See [BACKUP.md](BACKUP.md).
+
+**Backup** — The verbs over the archive: `melange backup <data-dir>` (offline, refuses a live
+directory), `melange backup <url>` (online: `/melange/backup` streams at a fenced LSN under a
+bounded truncation pin — `Backup:Enabled`, `Backup:OwnerRole`), and `melange backup verify`,
+which CRC-walks every frame and dry-replays the archive into an in-memory projection. An
+unverified backup is a hope, not a backup.
+
+**Restore** — `melange restore <archive> -o <dir>`: materializes data directories ordinary
+recovery boots. A rewind, for replacement, not cloning: a fresh epoch is minted always (stale
+resume cursors full-resync instead of resuming into history that no longer happened), the target
+must be empty, and any failure removes everything written. The Postgres projection is not in the
+archive and is refused loudly (EventIds 1605/1608) rather than silently overwritten.
+
 **Engine (`MelangeEngine`)** — The phase-01 composition root: opens the commit log, rebuilds projections and
 AutoInc sequences from it, and dispatches reducers. Phase 02's `AddMelangeDb` wraps it; application code
 stops meeting it directly at that point.

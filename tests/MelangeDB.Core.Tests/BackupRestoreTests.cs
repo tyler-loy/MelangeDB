@@ -11,7 +11,7 @@ namespace MelangeDB.Core.Tests;
 /// </summary>
 public class BackupRestoreTests : IDisposable
 {
-    private readonly EngineHarness _harness = new(tables: [typeof(Player), typeof(InventoryItem), typeof(TerrainChunk)]);
+    private readonly EngineHarness _harness = new(tables: [typeof(Player), typeof(InventoryItem), typeof(TerrainChunk), typeof(DecayTimer)]);
     private readonly List<string> _extraRoots = [];
 
     public void Dispose()
@@ -45,7 +45,7 @@ public class BackupRestoreTests : IDisposable
             CommitLog = { Path = restoredDir },
             HotStore = { Path = Path.Combine(TempDir(), "hot") },
         };
-        return new MelangeEngine(options, EngineHarness.GeneratedRegistry(typeof(Player), typeof(InventoryItem), typeof(TerrainChunk)));
+        return new MelangeEngine(options, EngineHarness.GeneratedRegistry(typeof(Player), typeof(InventoryItem), typeof(TerrainChunk), typeof(DecayTimer)));
     }
 
     private static List<string> Dump(MelangeEngine engine)
@@ -70,6 +70,10 @@ public class BackupRestoreTests : IDisposable
             ctx.Db.Insert(new InventoryItem { Owner = Identity.Hash("alice"), ItemName = "sword", Quantity = 1 });
             ctx.Db.Insert(new InventoryItem { Owner = Identity.Hash("alice"), ItemName = "shield", Quantity = 1 });
             ctx.Db.Insert(new TerrainChunk { ChunkId = 7, Data = [1, 2, 3, 4, 5], Kind = ChunkKind.Ore });
+
+            // A scheduled row: a timer whose row is state like any other, and whose survival is
+            // what makes a restored world's simulation tick instead of standing still.
+            ctx.Db.Insert(new DecayTimer { ScheduledAt = ScheduleAt.Interval(TimeSpan.FromMinutes(5)), Target = "ore-7" });
         });
 
         // Retention floor at zero so the snapshot genuinely truncates: the archive must round-trip

@@ -45,16 +45,12 @@ internal static class ArchiveRestore
             reader.ReadHeader();
 
             var manifest = ReadJsonFrame<ArchiveManifest>(reader, ArchiveFrameType.Manifest, archivePath);
-            if (manifest.Engines.Count != 1)
-            {
-                throw new NotSupportedException(
-                    $"'{archivePath}' is a cluster archive ({manifest.Engines.Count} engines); this build restores " +
-                    "single-engine archives. Cluster restore ships with the cluster backup form.");
-            }
+            if (manifest.Engines.Count == 0)
+                throw new InvalidDataException($"'{archivePath}': the manifest names no engines; the archive is corrupt.");
 
             var engines = new List<RestoredEngineSummary>();
-            foreach (var _ in manifest.Engines)
-                engines.Add(RestoreEngine(reader, target, archivePath));
+            foreach (var key in manifest.Engines)
+                engines.Add(RestoreEngine(reader, DirectoryFor(manifest, key, target, archivePath), key, archivePath));
 
             var footer = ReadJsonFrame<ArchiveFooter>(reader, ArchiveFrameType.ArchiveEnd, archivePath);
             if (footer.Engines != manifest.Engines.Count)
@@ -91,9 +87,34 @@ internal static class ArchiveRestore
         }
     }
 
-    private static RestoredEngineSummary RestoreEngine(ArchiveFrameReader reader, string engineDirectory, string source)
+    /// <summary>
+    /// The restored layout: a single-node archive materializes straight into the target (point
+    /// <c>CommitLog:Path</c> there); a cluster archive materializes <c>hub/</c> and
+    /// <c>shards/shard-k/</c> (point the hub's <c>CommitLog:Path</c> at <c>hub/</c> and every
+    /// node's <c>Cluster:ShardDataPath</c> at <c>shards/</c>).
+    /// </summary>
+    private static string DirectoryFor(ArchiveManifest manifest, string key, string target, string source)
+    {
+        if (key == ArchiveFormat.SingleNodeEngineKey)
+        {
+            return manifest.Engines.Count == 1
+                ? target
+                : throw new InvalidDataException($"'{source}': a single-node engine inside a multi-engine manifest; the archive is corrupt.");
+        }
+
+        if (key == ArchiveFormat.HubEngineKey)
+            return Path.Combine(target, "hub");
+        if (key.StartsWith(ArchiveFormat.ShardEngineKeyPrefix, StringComparison.Ordinal) && key.Length > ArchiveFormat.ShardEngineKeyPrefix.Length)
+            return Path.Combine(target, "shards", key, "log");
+        throw new InvalidDataException($"'{source}': unknown engine key '{key}' in a version-{ArchiveFormat.FormatVersion} archive; the archive is corrupt.");
+    }
+
+    private static RestoredEngineSummary RestoreEngine(ArchiveFrameReader reader, string engineDirectory, string engineKey, string source)
     {
         var identity = ReadJsonFrame<ArchiveEngineIdentity>(reader, ArchiveFrameType.EngineBegin, source);
+        if (identity.Key != engineKey)
+            throw new InvalidDataException($"'{source}': engine '{identity.Key}' arrived where the manifest promised '{engineKey}'; the archive is corrupt.");
+        var isShard = engineKey.StartsWith(ArchiveFormat.ShardEngineKeyPrefix, StringComparison.Ordinal);
         var newEpoch = Guid.NewGuid();
         Directory.CreateDirectory(engineDirectory);
 
@@ -146,8 +167,16 @@ internal static class ArchiveRestore
                 case "melange.events.json":
                     File.WriteAllBytes(Path.Combine(engineDirectory, name), ClampEventCheckpoints(content, identity.HeadLsn));
                     break;
+                case "borrowed.sidecar" when isShard:
+                    // The border registry lives in the shard root, one level above the log
+                    // directory, and names an epoch — rewritten to the fresh one so recovery
+                    // trusts it instead of falling back to the loud full-scan rebuild.
+                    File.WriteAllBytes(
+                        Path.Combine(Directory.GetParent(engineDirectory)!.FullName, name),
+                        RewriteSidecarEpoch(content, newEpoch));
+                    break;
                 default:
-                    throw new InvalidDataException($"'{source}': unknown sidecar '{name}' in a version-{ArchiveFormat.FormatVersion} archive; the archive is corrupt.");
+                    throw new InvalidDataException($"'{source}': unknown sidecar '{name}' for engine '{engineKey}' in a version-{ArchiveFormat.FormatVersion} archive; the archive is corrupt.");
             }
         }
 
@@ -226,6 +255,27 @@ internal static class ArchiveRestore
             throw new InvalidDataException($"'{source}': a sidecar frame's name overruns the frame; the archive is corrupt.");
         var name = Encoding.UTF8.GetString(payload, 2, nameLength);
         return (name, payload.AsSpan(2 + nameLength).ToArray());
+    }
+
+    /// <summary>
+    /// Rewrites the border-registry sidecar's epoch to the restored engine's fresh one. The
+    /// sidecar's LSN stays: recovery seeds the registry from it and replays only the records
+    /// above it, exactly as after any restart. An unparseable sidecar passes through verbatim —
+    /// recovery's rebuild-from-content path is the loud safety net for that.
+    /// </summary>
+    internal static byte[] RewriteSidecarEpoch(byte[] content, Guid newEpoch)
+    {
+        try
+        {
+            if (System.Text.Json.Nodes.JsonNode.Parse(content) is not { } node)
+                return content;
+            node["Epoch"] = newEpoch.ToString();
+            return System.Text.Encoding.UTF8.GetBytes(node.ToJsonString());
+        }
+        catch (JsonException)
+        {
+            return content;
+        }
     }
 
     /// <summary>

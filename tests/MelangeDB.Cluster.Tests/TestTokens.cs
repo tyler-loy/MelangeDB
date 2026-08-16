@@ -19,12 +19,15 @@ internal static class TestTokens
 
     public static string Default { get; } = For(DefaultSubject);
 
-    public static string For(string subject, DateTimeOffset? expires = null)
+    public static string For(string subject, DateTimeOffset? expires = null, string? role = null)
     {
+        var claims = new Dictionary<string, object> { ["sub"] = subject };
+        if (role is not null)
+            claims["role"] = role;
         return new JsonWebTokenHandler().CreateToken(new SecurityTokenDescriptor
         {
             Issuer = Issuer,
-            Claims = new Dictionary<string, object> { ["sub"] = subject },
+            Claims = claims,
             Expires = (expires ?? DateTimeOffset.UtcNow.AddHours(1)).UtcDateTime,
             SigningCredentials = new SigningCredentials(Key, SecurityAlgorithms.HmacSha256),
         });

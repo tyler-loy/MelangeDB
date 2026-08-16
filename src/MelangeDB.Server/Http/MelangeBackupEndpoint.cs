@@ -72,7 +72,13 @@ internal static class MelangeBackupEndpoint
 
         try
         {
-            var summary = MelangeBackup.CreateOnline(transport.Engine, guard);
+            // On a hub the endpoint fans out: its own engine plus every shard engine under
+            // Cluster:ShardDataPath, over shared storage, one fenced LSN per engine — the whole
+            // cluster under one manifest, per-shard consistent.
+            var cluster = transport.Options.Cluster;
+            var summary = cluster.Role == ClusterRole.Hub
+                ? MelangeBackup.CreateClusterOnline(transport.Engine, cluster.ShardDataPath, guard)
+                : MelangeBackup.CreateOnline(transport.Engine, guard);
             await context.Response.Body.FlushAsync(context.RequestAborted).ConfigureAwait(false);
             var elapsed = transport.Time.GetElapsedTime(started).TotalMilliseconds;
             LogMessages.BackupStreamCompleted(transport.Logger, summary.TotalBytes, elapsed, summary.Engines[0].HeadLsn);

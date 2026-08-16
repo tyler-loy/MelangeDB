@@ -59,6 +59,21 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The cluster archive**
+  ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), final slice — the phase is
+  complete). On a hub, `/melange/backup` fans out: the hub's own engine plus every shard engine
+  under `Cluster:ShardDataPath` over shared storage, one fenced LSN per engine, under one
+  manifest keyed by shard — **per-shard consistent, not globally consistent**, because there is
+  no global total order to capture and the archive does not pretend otherwise. Shard engines
+  stream handle-consistently while their owners keep serving them (ordered handle opens, a
+  dense-chain check, bounded retry — no remote pin, no quiesce, no player-visible pause); border
+  registries ride along and restore under each shard's fresh epoch. `melange restore`
+  materializes the deployment layout (`hub/` + `shards/shard-k/`), and the round trip is a test:
+  hub plus two shards out through the live endpoint, verified, restored, booted, serving — with
+  the per-shard skew asserted rather than assumed away. Decisions settled in the
+  [phase plan](docs/road-to-0.2/plan-phase-15.md): replacement-not-cloning, no quiesced mode,
+  structural verify, and where the endpoint lives. See [docs/BACKUP.md](docs/BACKUP.md).
+
 - **The online backup: `/melange/backup` and `melange backup <url>`**
   ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), second slice). A running server
   streams the archive at a **fenced LSN** while commits continue, holding a truncation pin for

@@ -118,7 +118,27 @@ tools than ours exist; the archive file is the primitive they compose. Take back
 snapshot (or on a quiet fleet) and the log tail riding along stays small — `Snapshots:*` in
 [CONFIGURATION.md](CONFIGURATION.md) already bounds it.
 
-## What's coming in this phase
+## The cluster archive
 
-The cluster archive — hub plus every shard under one manifest, per-shard consistent — lands in
-the closing phase 15 slice. This page grows with it.
+On a hub, `/melange/backup` fans out: the hub's own engine (Global and Replicated tables) plus
+every shard engine found under `Cluster:ShardDataPath` on shared storage, one fenced LSN per
+engine, under one manifest keyed by shard. Stated honestly: a cluster archive is **per-shard
+consistent, not globally consistent** — there is no global total order to capture
+([CLUSTERING.md](CLUSTERING.md)), so cross-shard skew is bounded by the capture window, which
+games tolerate and ledgers should not be running on this database anyway.
+
+The hub's engine streams under its truncation pin; shard engines stream handle-consistently over
+shared storage while their owners keep serving them — no remote pin, no quiesce, no
+player-visible pause. Shard border registries (`borrowed.sidecar`) ride along and are rewritten
+under each shard's fresh epoch at restore. Node-level engines — the replicated projections shard
+nodes hold — are deliberately not in the archive: fresh nodes re-sync them from the restored hub
+through the ordinary replica-stream reset machinery, the projections-rebuild rule applied one
+level up.
+
+`melange restore cluster.mbak -o <target>` materializes `<target>/hub/` and
+`<target>/shards/shard-k/`: point the hub's `CommitLog:Path` at `hub/`, every node's
+`Cluster:ShardDataPath` at `shards/`, and boot — shards open through ordinary assignment, each
+recovering from its restored log. Every engine gets its own fresh epoch. Restore targets a
+stopped deployment; surgically restoring one shard into a live cluster is deliberately deferred
+(it interacts with fencing and border streams), as is a per-shard-node backup endpoint — the
+hub's whole-cluster form covers every shard engine without either.
