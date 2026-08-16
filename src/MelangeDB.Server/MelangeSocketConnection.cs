@@ -670,7 +670,12 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         {
             if (record.Lsn > resumeHead)
                 break;
-            var updates = SubscriptionEngine.ComputeReplayUpdates(registered, record);
+
+            // A cursor from before an additive schema migration replays records whose rows carry
+            // the old column order; the wire descriptor these subscriptions declared is the new
+            // one, so the rows are re-encoded first — a pass-through LSN compare after the reign.
+            var replay = engine.TransformToCurrentShape(record);
+            var updates = SubscriptionEngine.ComputeReplayUpdates(registered, replay);
             if (updates.Count == 0)
                 continue;
             EnqueueMeasured(new TransactionUpdateFrame(record.Lsn, updates) { Channel = MelangeChannels.Data });

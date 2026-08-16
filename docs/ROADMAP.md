@@ -89,7 +89,7 @@ deferred — mutually independent, in any order.
 | [13](road-to-0.2/plan-phase-13.md) | Clustering III — elastic assignment: per-shard load on heartbeats, the planned drain, the rebalance loop | **Shipped** |
 | [14](road-to-0.2/plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in: the `INodeProvisioner` seam, provision-then-reassign, drain-and-decommission | **Shipped** |
 | [15](road-to-0.2/plan-phase-15.md) | Backup and restore: the `.mbak` archive (snapshot + log tail, per engine — the truth, not the projections), `melange backup` / `restore` / `backup verify` | **Shipped** |
-| [16](road-to-0.2/plan-phase-16.md) | Hot-tier schema migration: the shape sidecar, additive changes replay by name-mapped rebuild, destructive changes refuse loudly — DESIGN.md §10's open half | Planned |
+| [16](road-to-0.2/plan-phase-16.md) | Hot-tier schema migration: the shape sidecar, additive changes replay by name-mapped rebuild, destructive changes refuse loudly — DESIGN.md §10's open half | **Shipped** |
 | [17](road-to-0.2/plan-phase-17.md) | Group commit: coalesced fsyncs at unchanged `OnCommit` semantics — the hotspot ceiling re-measured | Planned |
 | [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Planned |
 | [19](road-to-0.2/plan-phase-19.md) | Backup, second pass: `restore --check` (the boot-proof), `melange clone` (explicitly a different world), `restore --at-lsn` | Planned |
@@ -107,8 +107,9 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
 - **Unreliable/UDP transport — permanently.** A reducer is a transaction; a client must know whether
   it committed. Rate limiting plus client-side interpolation is the supported answer.
 - **Schema migration against an existing log is no longer deferred** — the relational half settled
-  in phase 08, and the hot-tier half — how column adds replay against the log — is planned as
-  [phase 16](road-to-0.2/plan-phase-16.md). See [DESIGN.md](DESIGN.md) §10.
+  in phase 08, and the hot-tier half shipped as
+  [phase 16](road-to-0.2/plan-phase-16.md): additive automatic and loud, destructive refused and
+  manual, both tiers one rule. See [MIGRATION.md](MIGRATION.md).
 - **Epoch-qualified subscription anchors.** Closed behaviourally in phase 10 by the first-chunk rule;
   the protocol-level hardening is deferred, with the record kept in [plan-phase-10.md](road-to-0.1/plan-phase-10.md).
 - **Dynamic *assignment* is no longer deferred** — it is M4 above, planned as phases 13–14.

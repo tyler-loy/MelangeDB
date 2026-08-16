@@ -463,17 +463,18 @@ samples/                        worker-service host + console client
   decode, with the bytes a comparatively minor 1.18–1.40×. Reducer arguments and parameter maps are
   still MessagePack values and are the remaining half. See
   [design/performance-sweep.md](design/performance-sweep.md).
-- **Schema migration** — how tier changes and column adds replay against an existing log. Worth
-  designing for early: in SpacetimeDB every schema change means republish plus regenerating bindings
-  for every client tree, and stale-schema clients simply break. **The relational tier's half settled
-  in phase 08:** additive changes (create table, add column) are automatic under
-  `Postgres:AutoMigrate` — an added NOT NULL column backfills existing rows with its kind's zero
-  value, so an additive migration never drops or nulls data — while anything destructive (changed
-  type, dropped column) is refused loudly with the pending DDL in the log, and stays a manual,
-  deliberate migration; with AutoMigrate off (the default) the applier validates, stalls, and prints
-  the exact DDL an operator would run. Columns present in Postgres but absent from the schema are
-  left untouched. The hot-tier half — how column adds replay against an existing *log* — remains
-  open. See [plan-phase-08.md](road-to-0.1/plan-phase-08.md).
+- ~~**Schema migration**~~ — **Settled in phases 08 and 16; both tiers follow one rule: additive is
+  automatic and loud, destructive is refused and manual.** The relational half (phase 08): additive
+  DDL under `Postgres:AutoMigrate`, destructive refused with the pending DDL printed. The hot-tier
+  half (road-to-0.2 phase 16): the `melange.shape` sidecar persists each table's shape as an
+  LSN-fenced history; a boot with an additive difference rebuilds the world by re-encoding every
+  old-shape row to the new shape *by column name* (position is irrelevant — declaration order is
+  the byte order, so a mid-class add is byte-wise a reorder), marks the new reign with an empty
+  log record, and seals with a snapshot; a destructive difference (removed table/column, changed
+  kind, moved key, hence renames) refuses boot with every reason named. Every reader that decodes
+  records below the current reign — recovery, lagging appliers, resume replay, replica and border
+  streams — routes through the same transform. See [MIGRATION.md](MIGRATION.md) and
+  [plan-phase-16.md](road-to-0.2/plan-phase-16.md).
 - ~~**Log compaction / snapshots**~~ — **Settled in phase 07: full snapshot + truncate.** Snapshot at an
   LSN beside the log, truncate behind it, never past the slowest applier, the slowest live event
   subscriber, or the Resume retention window; restart is snapshot plus tail replay. See

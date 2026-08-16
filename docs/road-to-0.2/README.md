@@ -14,7 +14,7 @@ docs one level up describe the current system. Where a plan and the code disagre
 | [13](plan-phase-13.md) | Clustering III — elastic assignment | Shipped |
 | [14](plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in | Shipped |
 | [15](plan-phase-15.md) | Backup and restore | Shipped |
-| [16](plan-phase-16.md) | Hot-tier schema migration | Planned |
+| [16](plan-phase-16.md) | Hot-tier schema migration | **Shipped** |
 | [17](plan-phase-17.md) | Group commit | Planned |
 | [18](plan-phase-18.md) | Truncation-floor observability | Planned |
 | [19](plan-phase-19.md) | Backup, second pass — check, clone, point-in-time | Planned |

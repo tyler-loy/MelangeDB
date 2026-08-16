@@ -114,7 +114,7 @@ and reorders destructive, the trap this design exists to avoid.
 rename, rename it back" so the accident case self-diagnoses. `[RenamedFrom]` is recorded here as
 the answer if real demand arrives; nothing in the shape format precludes it.
 
-### Open: where the shape history lives
+### Settled: where the shape history lives
 
 Leaning: the `melange.shape` sidecar as described — it needs no snapshot-header version bump
 (MSNP v1 stays v1, phase 15's archives stay readable), it rides the existing sidecar machinery
@@ -138,7 +138,7 @@ that reads records — appliers, subscribers, the resume window — already floo
 reader can hold a cursor below the base; a reign whose successor began at or below the base has
 no readable records left and dies at the next boot.
 
-### Open: is there any knob at all
+### Settled: is there any knob at all
 
 Leaning: no. Additive migration is automatic-with-loud-log rather than gated behind an
 `AutoMigrate`-style default-off switch, because the tiers differ in kind: Postgres could stall
@@ -154,3 +154,35 @@ API rather than verb: `ShapeHistory.Load` and `ShapeCompatibility.Compare` are p
 can answer "what would this deploy's boot do" in three lines without booting; a CLI spelling
 would need the application's schema and therefore belongs to the host anyway (the same
 schema-lives-in-the-host reasoning as phase 19's check verb).
+
+## Shipped notes
+
+Shipped as two stacked PRs — the sidecar and the migration boot; the reader transforms — with the
+decisions above settled in place. Deviations and additions, recorded:
+
+- **The marker record** (detailed under the shape-history decision): the plan's sidecar alone
+  left a snapshot at exactly the pre-migration head ambiguous between shapes; the empty
+  marker record makes "a snapshot's shape is the shape governing its own LSN" unconditionally
+  true, puts the migration into the log's own timeline, and makes crash-anywhere re-migration
+  the only recovery path — there is deliberately no migrated flag, because decode is by LSN,
+  always.
+- **The reader inventory was the second slice's real work.** The plan said "every reader picks
+  the shape governing that row's LSN"; the sweep of `ReadFrom` call sites found five that decode
+  or forward row bytes and could hold a cursor below a migration: pipeline applier catch-up
+  (transforms centrally), the Postgres applier's own dispatch loop, resume replay, the hub's
+  replica stream, and the border publisher (each one explicit call to
+  `MelangeEngine.TransformToCurrentShape`). The sites that read only events, arguments, or
+  timestamps — the event bus, cluster event forwarding, handoff-marker recovery, truncation's
+  retention scan — were checked and left alone, and backup deliberately streams verbatim bytes.
+- **Doctored-sidecar tests.** Proving the resume and Postgres paths transform requires two
+  deployments' schemas in test processes whose model is fixed by the source generator; the tests
+  stage the migration by rewriting the sidecar to claim two same-kind columns were stored in
+  each other's positions — structurally an additive reorder, and unmistakable in assertions,
+  because the columns' values trade places. The transport test was verified to fail with the
+  transform removed.
+- **Compaction settled simpler than planned** (see the shape-history decision): the truncation
+  base alone bounds reign lifetime, because everything that reads records already floors
+  truncation.
+- **Rolling deploys are stop-the-fleet for schema changes**, stated in MIGRATION.md: shard
+  engines migrate independently at open, but border and replica streams exchange current-shape
+  rows, so mixed-schema fleets are unsupported.

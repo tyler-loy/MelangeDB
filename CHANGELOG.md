@@ -60,7 +60,7 @@ All packages ship together at one version; there is no per-package versioning. S
 ### Added
 
 - **Hot-tier schema migration: add a column, redeploy, boot**
-  ([road-to-0.2 phase 16](docs/road-to-0.2/plan-phase-16.md), first slice). Row format v1 is
+  ([road-to-0.2 phase 16](docs/road-to-0.2/plan-phase-16.md)). Row format v1 is
   positional — a row is its columns' bytes in declaration order — so until now the engine could
   not even *detect* a schema change against an existing log; it would replay old bytes under new
   expectations. Now a `melange.shape` sidecar persists each table's shape as an LSN-fenced
@@ -75,9 +75,12 @@ All packages ship together at one version; there is no per-package versioning. S
   decodes records under the shape governing their LSN (lagging appliers included — pipeline
   appliers automatically, decoupled readers via `MelangeEngine.TransformToCurrentShape`). The
   sidecar rides into `.mbak` archives, so newer code boots a restored directory through an
-  ordinary migration boot. One upgrade rule: the first boot that creates the sidecar adopts the
-  booting schema, so never combine the MelangeDB upgrade itself with a schema change. See
-  [docs/MIGRATION.md](docs/MIGRATION.md).
+  ordinary migration boot. Every reader that can reach records below the current reign routes
+  through the same transform: pipeline applier catch-up, the Postgres applier's own dispatch
+  loop, resume replay to reconnecting clients, and the cluster's replica and border streams —
+  each a pass-through LSN compare once the reign is current. One upgrade rule: the first boot
+  that creates the sidecar adopts the booting schema, so never combine the MelangeDB upgrade
+  itself with a schema change. See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 - **The cluster archive**
   ([road-to-0.2 phase 15](docs/road-to-0.2/plan-phase-15.md), final slice — the phase is

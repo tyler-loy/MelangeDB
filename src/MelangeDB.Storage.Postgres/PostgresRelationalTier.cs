@@ -317,7 +317,11 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             var batch = new List<CommitRecord>(batchSize);
             foreach (var record in _engine.Log.ReadFrom(applied + 1))
             {
-                batch.Add(record);
+                // A checkpoint that lagged across an additive schema migration reads records whose
+                // rows carry the old column order; decoding them under the current schema without
+                // this re-encode writes plausible garbage to Postgres. The decoupled-applier half
+                // of the contract on MelangeEngine.TransformToCurrentShape.
+                batch.Add(_engine.TransformToCurrentShape(record));
                 if (batch.Count >= batchSize)
                     break;
             }
