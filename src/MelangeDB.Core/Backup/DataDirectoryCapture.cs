@@ -27,7 +27,8 @@ internal static class DataDirectoryCapture
                 "Point the backup at the directory CommitLog:Path names (or the shard's log directory).");
         }
 
-        using var log = OpenLogExcludingWriters(logPath);
+        using var liveGuard = ExcludeLiveWriters(directory, logPath);
+        using var log = OpenLogForRead(logPath);
 
         var epoch = ReadEpoch(Path.Combine(directory, "melange.epoch"));
         var baseLsn = ReadBaseLsn(Path.Combine(directory, "melange.base"));
@@ -157,20 +158,43 @@ internal static class DataDirectoryCapture
     }
 
     /// <summary>
-    /// Opens the log requesting write access — not to write, but because a live
-    /// <see cref="FileCommitLog"/> shares only read and delete, so requesting write is the probe
-    /// that distinguishes a stopped server from a running one. The handle is held for the whole
-    /// capture, which also stops a server from <em>starting</em> against the directory mid-backup.
-    /// A directory on read-only media cannot have a live writer, so that case falls back to a
-    /// plain read handle instead of failing.
+    /// Takes the directory's liveness lock — the same <c>melange.lock</c> a live
+    /// <see cref="FileCommitLog"/> holds exclusively — so that a running server refuses the
+    /// capture and a stopped one grants it, on every platform. (A share-mode probe on the log
+    /// itself is not enough: Unix maps only <see cref="FileShare.None"/> onto a real lock.) The
+    /// lock is held for the whole capture, which also stops a server from <em>starting</em>
+    /// against the directory mid-backup. A directory on read-only media cannot have a live
+    /// writer, so that case proceeds without the guard instead of failing.
     /// </summary>
-    private static FileStream OpenLogExcludingWriters(string logPath)
+    private static FileStream? ExcludeLiveWriters(string directory, string logPath)
     {
         try
         {
-            return new FileStream(logPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+            return new FileStream(
+                Path.Combine(directory, FileCommitLog.LockFileName),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         }
         catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidOperationException(
+                $"'{logPath}' is open by a live process. The offline backup reads a stopped server's files — " +
+                "stop the server and retry. (This refusal is the point: copying a live directory is how backups go subtly wrong.)",
+                exception);
+        }
+    }
+
+    /// <summary>
+    /// Opens the log for reading, after <see cref="ExcludeLiveWriters"/> has proven no writer
+    /// holds it. The share mode still excludes writers, so on platforms that enforce share modes
+    /// natively a live writer that somehow bypassed the lock file trips the same refusal here.
+    /// </summary>
+    private static FileStream OpenLogForRead(string logPath)
+    {
+        try
         {
             return new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
         }

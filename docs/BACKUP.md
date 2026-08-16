@@ -36,6 +36,12 @@ recovery itself would refuse to boot, because archiving damaged history as if it
 turn a bad day into a silent one. The archive is written to a temp file and swapped in atomically,
 so an interrupted backup never leaves a plausible-looking partial archive.
 
+The refusal works through `melange.lock`, an empty sidecar every live server holds exclusively
+for its lifetime; the backup takes the same lock for the capture's duration, so a live server
+refuses the capture and a capture in flight refuses a starting server — on every platform,
+including those whose filesystems do not enforce Windows-style share modes. The same lock makes
+two servers pointed at one data directory refuse at boot rather than corrupt each other.
+
 The same operation is available programmatically as `MelangeBackup.Create` in `MelangeDB.Core`.
 
 ## `melange restore <archive> -o <data-dir>`

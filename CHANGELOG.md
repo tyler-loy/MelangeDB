@@ -75,6 +75,13 @@ All packages ship together at one version; there is no per-package versioning. S
   (`/melange/backup`) and the cluster archive land in the following slices. See
   [docs/BACKUP.md](docs/BACKUP.md).
 
+- **`melange.lock`: the data directory's liveness lock.** A live server holds this empty sidecar
+  exclusively for its lifetime; the offline backup probes it to refuse capturing a live directory,
+  and a second server pointed at an already-open directory now refuses at boot instead of
+  corrupting it. The lock exists because share modes on the log file itself are only enforced on
+  Windows — Unix maps only `FileShare.None` onto a real (advisory) lock, so the liveness signal
+  needs a file whose sole job is to be held that way.
+
 - **The 2 a.m. bill: scale-in**
   ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), final slice — the phase is
   complete, and with it the whole elastic-capacity design record is built). Behind its own switch

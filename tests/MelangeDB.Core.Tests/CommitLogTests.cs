@@ -221,6 +221,32 @@ public class CommitLogTests : IDisposable
         }
     }
 
+    [Fact]
+    public void A_second_log_on_the_same_directory_is_refused_until_the_first_is_disposed()
+    {
+        var root = Directory.CreateTempSubdirectory("melange-log-lock-").FullName;
+        try
+        {
+            var options = new CommitLogOptions { Path = root };
+            var first = new FileCommitLog(options);
+            first.Append(MakeRequest("First"));
+
+            // The refusal must hold within one process too: on Unix the share modes on the log
+            // file itself enforce nothing, so this exercises the melange.lock sidecar — the same
+            // signal the offline backup probes to refuse a live directory.
+            var refused = Assert.Throws<InvalidOperationException>(() => new FileCommitLog(options));
+            Assert.Contains("already open", refused.Message);
+
+            first.Dispose();
+            using var second = new FileCommitLog(options);
+            Assert.Equal(1UL, second.HeadLsn);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     private static CommitRequest MakeRequest(string reducerName)
     {
         var op = new RowOp(RowOpKind.Insert, TableId.FromName("Whatever"), new RowKey([1, 2, 3]), new byte[] { 4, 5, 6 });

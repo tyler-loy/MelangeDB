@@ -159,8 +159,10 @@ public class BackupRestoreTests : IDisposable
     {
         _harness.Invoke("Seed", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("dan"), RoomId = 1, X = 0, Y = 0, Name = "dan" }));
 
-        // The engine is live: its log handle shares read but not write, and the backup probes with
-        // a write request precisely to be refused here.
+        // The engine is live: it holds the directory's melange.lock exclusively, and the backup
+        // probes that same lock precisely to be refused here. (The lock file exists because a
+        // share-mode probe on the log itself only works on Windows; Unix maps only
+        // FileShare.None onto a real lock, so this test would pass there and fail on CI.)
         var exception = Assert.Throws<InvalidOperationException>(
             () => MelangeBackup.Create(LogDir, Path.Combine(TempDir(), "world.mbak")));
         Assert.Contains("live process", exception.Message);

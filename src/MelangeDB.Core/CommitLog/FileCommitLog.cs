@@ -23,10 +23,21 @@ public sealed class FileCommitLog : ICommitLog
     internal const int FrameSize = 8; // u32 payload length + u32 crc
     internal const uint MaxRecordBytes = 256 * 1024 * 1024;
 
+    /// <summary>
+    /// The liveness-lock sidecar's file name. Windows enforces <see cref="FileShare"/> natively,
+    /// but Unix maps only <see cref="FileShare.None"/> onto an advisory lock — the log's own
+    /// Read|Delete handle excludes nothing there. This empty sidecar, held exclusively for the
+    /// log's lifetime, is the cross-platform "this directory is live" signal: a second open of the
+    /// same directory refuses here, and the offline backup probes the same file so that capturing
+    /// a live directory refuses instead of producing a torn archive.
+    /// </summary>
+    internal const string LockFileName = "melange.lock";
+
     private readonly CommitLogOptions _options;
     private readonly ILogger _logger;
     private readonly EngineTelemetry? _telemetry;
     private FileStream _stream;
+    private readonly FileStream _lockFile;
     private readonly Lock _lock = new();
     private Timer? _flushTimer;
     private ulong _headLsn;
@@ -49,10 +60,33 @@ public sealed class FileCommitLog : ICommitLog
         FilePath = System.IO.Path.Combine(options.Path, "melange.log");
         EpochFilePath = System.IO.Path.Combine(options.Path, "melange.epoch");
         BaseFilePath = System.IO.Path.Combine(options.Path, "melange.base");
-        // FileShare.Delete throughout: log compaction atomically replaces the file, and every open
-        // handle must permit that or a concurrent lazy reader would make truncation fail.
-        _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
-        Recover();
+        try
+        {
+            _lockFile = new FileStream(
+                System.IO.Path.Combine(options.Path, LockFileName),
+                FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidOperationException(
+                $"'{options.Path}' is already open — by a live server or an in-progress backup. " +
+                "Two processes must never share a data directory; stop the other one and retry.",
+                exception);
+        }
+
+        try
+        {
+            // FileShare.Delete throughout: log compaction atomically replaces the file, and every open
+            // handle must permit that or a concurrent lazy reader would make truncation fail.
+            _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+            Recover();
+        }
+        catch
+        {
+            _stream?.Dispose();
+            _lockFile.Dispose();
+            throw;
+        }
     }
 
     /// <summary>The full path of the log file.</summary>
@@ -256,6 +290,7 @@ public sealed class FileCommitLog : ICommitLog
             if (_failure is null)
                 _stream.Flush(flushToDisk: true);
             _stream.Dispose();
+            _lockFile.Dispose();
         }
     }
 
