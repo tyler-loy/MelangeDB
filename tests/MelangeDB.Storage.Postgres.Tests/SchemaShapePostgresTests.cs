@@ -35,7 +35,7 @@ public class SchemaShapePostgresTests
         var applied = 0UL;
         for (var i = 0; i < 5; i++)
         {
-            var value = i;
+            var value = 1000L + i;
             applied = harness.Invoke("RecordStat", ctx =>
                 ctx.Db.Stat.Insert(new Stat { Metric = "world", Value = value, At = ctx.Timestamp }));
         }
@@ -43,9 +43,9 @@ public class SchemaShapePostgresTests
         await harness.WaitAppliedAsync(applied);
         await harness.StopTierAsync();
 
-        // AutoInc ids are originator-composed — far above 4 — so "an Id at most 4" can only mean
-        // a row whose Id column carries what was committed as Value: the transform's fingerprint.
-        Assert.Equal(0L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Id\" <= 4"));
+        // Five inserts allocate ids nowhere near 1000, so "an Id of 1000 or more" can only mean a
+        // row whose Id column carries what was committed as Value: the transform's fingerprint.
+        Assert.Equal(0L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Id\" >= 1000"));
 
         // Stage the lag-across-migration: the checkpoint rewinds to 1, and the sidecar claims the
         // records it will re-read were written with Id and Value in each other's positions.
@@ -56,7 +56,7 @@ public class SchemaShapePostgresTests
         await harness.RestartAsync();
         await harness.WaitAppliedAsync(harness.Engine.Log.HeadLsn);
 
-        Assert.Equal(5L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Id\" <= 4"));
+        Assert.Equal(5L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Id\" >= 1000"));
     }
 
     private static void SwapStatColumns(string dataDirectory)
