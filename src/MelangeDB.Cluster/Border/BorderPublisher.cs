@@ -190,7 +190,10 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
             return true;
         }
 
-        var head = _engine.Log.HeadLsn;
+        // Durable, not head: ReadFrom serves nothing beyond the durability watermark, so judging
+        // availability by the head would report more-to-do through a gap the scan cannot reach yet
+        // and drain-until-done would spin through it.
+        var head = _engine.Log.DurableLsn;
         if (cursor >= head)
             return false;
 

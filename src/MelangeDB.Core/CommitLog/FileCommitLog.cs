@@ -2,15 +2,28 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Win32.SafeHandles;
 
 namespace MelangeDB.Core;
 
 /// <summary>
 /// The append-only local commit log: one CRC-guarded, version-tagged record per transaction. On
-/// open it scans the file, and a torn trailing record — a crash mid-append — is truncated to the
-/// last intact LSN rather than being fatal. Corruption anywhere before the tail is fatal, because
+/// open it scans the file, and a torn tail — everything from the first invalid record to the end,
+/// which after a crash may span several records and even hold intact-looking ones, because the OS
+/// persists buffered pages in no particular order — is truncated to the last intact LSN rather
+/// than being fatal. Corruption of a record the durable floor proves was fsynced is fatal, because
 /// it means committed history was damaged. The fsync policy is read per operation, so a changed
 /// options value takes effect on the next commit.
+/// <para>
+/// Under <see cref="FsyncPolicy.OnCommit"/> the commit is split in two — the group-commit design:
+/// <see cref="Append"/> writes the record buffered and returns, and <see cref="WaitDurable"/>
+/// completes durability, with whoever finds the flusher idle fsyncing everything buffered so far.
+/// Batches form from contention itself: a lone caller fsyncs immediately and pays exactly the old
+/// inline latency, while concurrent callers park behind the in-flight fsync and are covered
+/// together by the next one. A committed transaction is durable when <em>its</em>
+/// <see cref="WaitDurable"/> returns — which is why the engine calls it before any commit returns
+/// to its caller.
+/// </para>
 /// </summary>
 public sealed class FileCommitLog : ICommitLog
 {
@@ -33,12 +46,32 @@ public sealed class FileCommitLog : ICommitLog
     /// </summary>
     internal const string LockFileName = "melange.lock";
 
+    /// <summary>The epoch sidecar's file name; see <see cref="EpochFilePath"/>.</summary>
+    internal const string EpochFileName = "melange.epoch";
+
     private readonly CommitLogOptions _options;
     private readonly ILogger _logger;
     private readonly EngineTelemetry? _telemetry;
+    private readonly ulong _durableFloor;
     private FileStream _stream;
     private readonly FileStream _lockFile;
     private readonly Lock _lock = new();
+
+    // Serializes fsyncs against each other and against every swap or disposal of _stream, so the
+    // group flusher can fsync through the file handle while _lock is free for appends — which is
+    // the entire point: the fsync must not be what the next append waits behind. Lock order where
+    // both are taken is always _fsyncLock before _lock; nothing holding either takes _flushGate
+    // first except FlushBatch's watermark read, and nothing holding _flushGate takes _fsyncLock,
+    // so no cycle exists.
+    private readonly Lock _fsyncLock = new();
+
+    // Durability waiters park here; guards the durable watermark and the flusher election.
+    private readonly object _flushGate = new();
+    private ulong _durableLsn;
+    private long _durableLength;
+    private bool _flusherActive;
+    private long _fsyncCount;
+
     private Timer? _flushTimer;
     private ulong _headLsn;
     private ulong _baseLsn;
@@ -50,15 +83,16 @@ public sealed class FileCommitLog : ICommitLog
     {
     }
 
-    internal FileCommitLog(CommitLogOptions options, ILogger? logger, EngineTelemetry? telemetry)
+    internal FileCommitLog(CommitLogOptions options, ILogger? logger, EngineTelemetry? telemetry, ulong durableFloor = 0)
     {
         ArgumentNullException.ThrowIfNull(options);
         _options = options;
         _logger = logger ?? NullLogger.Instance;
         _telemetry = telemetry;
+        _durableFloor = durableFloor;
         Directory.CreateDirectory(options.Path);
         FilePath = System.IO.Path.Combine(options.Path, "melange.log");
-        EpochFilePath = System.IO.Path.Combine(options.Path, "melange.epoch");
+        EpochFilePath = System.IO.Path.Combine(options.Path, EpochFileName);
         BaseFilePath = System.IO.Path.Combine(options.Path, "melange.base");
         try
         {
@@ -80,6 +114,11 @@ public sealed class FileCommitLog : ICommitLog
             // handle must permit that or a concurrent lazy reader would make truncation fail.
             _stream = new FileStream(FilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
             Recover();
+
+            // Everything that survived recovery is durable: the file's intact prefix is what the
+            // disk actually held, and recovery fsyncs its own truncations.
+            _durableLsn = _headLsn;
+            _durableLength = _stream.Length;
         }
         catch
         {
@@ -125,10 +164,46 @@ public sealed class FileCommitLog : ICommitLog
     }
 
     /// <summary>
+    /// The newest LSN the configured fsync policy promises will survive a crash. Under
+    /// <see cref="FsyncPolicy.OnCommit"/> this is the fsynced watermark the group flusher advances;
+    /// under <see cref="FsyncPolicy.Interval"/> and <see cref="FsyncPolicy.OsBuffered"/> it is
+    /// <see cref="HeadLsn"/>, because those policies promise nothing beyond the OS's own writeback
+    /// and gating a reader on a promise never made would only add the timer's latency. This is the
+    /// ceiling anything that leaves the process — a subscription delta, a replica stream, a
+    /// relational-tier apply — must stay under: an LSN served beyond it could be untold by a crash.
+    /// </summary>
+    public ulong DurableLsn => _options.FsyncPolicy == FsyncPolicy.OnCommit ? FsyncedLsn : HeadLsn;
+
+    /// <summary>
+    /// The raw fsynced watermark, whatever the policy — what the snapshot path checks before it
+    /// writes a file whose LSN would otherwise be a durability claim the log has not yet made.
+    /// </summary>
+    internal ulong FsyncedLsn
+    {
+        get
+        {
+            lock (_flushGate)
+            {
+                return _durableLsn;
+            }
+        }
+    }
+
+    /// <summary>Fsyncs performed over this log's lifetime — the group-commit tests' observable.</summary>
+    internal long FsyncCount => Interlocked.Read(ref _fsyncCount);
+
+    /// <summary>
     /// Test-only fault injection, invoked after a record's bytes are written but before the flush —
     /// the window where a real disk-full failure lands.
     /// </summary>
     internal Action<FileStream>? AppendFaultInjection { get; set; }
+
+    /// <summary>
+    /// Test-only fault injection, invoked by the group flusher immediately before the fsync — the
+    /// window where a batch-wide durability failure lands, and (as a blocking delegate) the hook
+    /// that holds a flush hostage so a test can force a batch to form behind it.
+    /// </summary>
+    internal Action? FlushFaultInjection { get; set; }
 
     /// <summary>
     /// The failure that poisoned the log, or null while it is writable. A poisoned log rejects
@@ -145,29 +220,24 @@ public sealed class FileCommitLog : ICommitLog
         }
     }
 
-    /// <summary>
-    /// Milliseconds spent in the fsync inside the most recent <see cref="Append"/>, or null when
-    /// that append did not fsync in line — <see cref="FsyncPolicy.Interval"/> flushes on a timer
-    /// thread and <see cref="FsyncPolicy.OsBuffered"/> never flushes explicitly, so under either
-    /// there is no durability cost to charge to the appending transaction, and the honest answer is
-    /// "none" rather than "zero".
-    /// <para>
-    /// Read it on the thread that just returned from the <see cref="Append"/> whose cost is wanted:
-    /// appends are serialized by the engine's write lock, so that thread is the only one that can
-    /// have written the value it reads.
-    /// </para>
-    /// </summary>
-    internal double? LastAppendFsyncMilliseconds { get; private set; }
-
     /// <summary>Forces buffered appends to stable storage regardless of the fsync policy.</summary>
     public void FlushToDisk()
     {
-        lock (_lock)
+        ulong head;
+        long length;
+        lock (_fsyncLock)
         {
-            if (_disposed || _failure is not null)
-                return;
-            _stream.Flush(flushToDisk: true);
+            lock (_lock)
+            {
+                if (_disposed || _failure is not null)
+                    return;
+                _stream.Flush(flushToDisk: true);
+                head = _headLsn;
+                length = _stream.Length;
+            }
         }
+
+        AdvanceDurable(head, length);
     }
 
     public ulong HeadLsn
@@ -181,6 +251,12 @@ public sealed class FileCommitLog : ICommitLog
         }
     }
 
+    /// <summary>
+    /// Appends one committed transaction and assigns the next LSN. Under
+    /// <see cref="FsyncPolicy.OnCommit"/> the record is buffered to the OS and durability is
+    /// completed by <see cref="WaitDurable"/> — the group-commit split; a caller for whom the
+    /// commit point matters must call it before acting on the returned record.
+    /// </summary>
     public CommitRecord Append(in CommitRequest request)
     {
         ArgumentException.ThrowIfNullOrEmpty(request.ReducerName);
@@ -209,7 +285,7 @@ public sealed class FileCommitLog : ICommitLog
                 BinaryPrimitives.WriteUInt32LittleEndian(frame, (uint)length);
                 BinaryPrimitives.WriteUInt32LittleEndian(frame[4..], Crc32.Compute(payload));
 
-                // The append is atomic or it is nothing: if the flush fails (disk full being the
+                // The append is atomic or it is nothing: if the write fails (disk full being the
                 // realistic case), the written bytes are rolled back so a later append can neither
                 // land after an orphaned record of an aborted transaction nor re-mint its LSN.
                 var previousLength = _stream.Length;
@@ -219,7 +295,29 @@ public sealed class FileCommitLog : ICommitLog
                     _stream.Write(frame);
                     _stream.Write(payload);
                     AppendFaultInjection?.Invoke(_stream);
-                    LastAppendFsyncMilliseconds = Flush(onCommit: true);
+
+                    // Buffer to the OS unconditionally: a lazy reader must see every appended
+                    // byte, and the group flusher's fsync covers only what the stream has handed
+                    // over. Durability itself is the policy's business — OnCommit completes it in
+                    // WaitDurable, Interval on the timer, OsBuffered never.
+                    _stream.Flush();
+                    if (_options.FsyncPolicy == FsyncPolicy.Interval)
+                    {
+                        EnsureFlushTimer();
+                    }
+                    else if (_options.FsyncPolicy == FsyncPolicy.OnCommit && !_options.GroupCommit)
+                    {
+                        // CommitLog:GroupCommit = false restores the phase-01 inline fsync:
+                        // durability completes here, under both locks, and WaitDurable finds the
+                        // watermark already advanced. A failure takes the rollback path below —
+                        // the single-append contract, exactly as before the split.
+                        using var fsync = _telemetry?.StartFsync();
+                        var fsyncStarted = Stopwatch.GetTimestamp();
+                        _stream.Flush(flushToDisk: true);
+                        _telemetry?.RecordFsyncDuration(Stopwatch.GetElapsedTime(fsyncStarted).TotalMilliseconds);
+                        Interlocked.Increment(ref _fsyncCount);
+                        AdvanceDurable(lsn, _stream.Length);
+                    }
                 }
                 catch
                 {
@@ -250,6 +348,203 @@ public sealed class FileCommitLog : ICommitLog
     }
 
     /// <summary>
+    /// Blocks until the record at <paramref name="lsn"/> is durable, returning the milliseconds
+    /// this caller actually waited — the honest per-commit durability cost under a shared fsync —
+    /// or null immediately when the policy makes no on-commit promise
+    /// (<see cref="FsyncPolicy.Interval"/> flushes on its timer, <see cref="FsyncPolicy.OsBuffered"/>
+    /// never explicitly), so under either there is no durability cost to charge and the honest
+    /// answer is "none" rather than "zero".
+    /// <para>
+    /// Sync piggybacking: if no flush is in flight the caller performs one itself, covering
+    /// everything buffered so far; otherwise it parks, and the flush that just finished elects the
+    /// next flusher from whoever is still uncovered. A failed fsync fails every commit in the
+    /// covered range — each waiter throws, with the original failure inner — and poisons the log;
+    /// see <see cref="FlushBatch"/>.
+    /// </para>
+    /// </summary>
+    internal double? WaitDurable(ulong lsn)
+    {
+        if (_options.FsyncPolicy != FsyncPolicy.OnCommit)
+            return null;
+
+        // A wait for an unwritten LSN would elect no-op flushers forever; only appended records
+        // have a durability to wait for.
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(lsn, HeadLsn);
+        var started = Stopwatch.GetTimestamp();
+        while (true)
+        {
+            var flush = false;
+            lock (_flushGate)
+            {
+                if (_durableLsn >= lsn)
+                    return Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                if (_flusherActive)
+                    Monitor.Wait(_flushGate);
+                else
+                {
+                    _flusherActive = true;
+                    flush = true;
+                }
+            }
+
+            if (flush)
+                FlushBatch();
+
+            // Woken (or just flushed): either the watermark now covers this record and the next
+            // pass returns, or the batch failed and this throw is how every covered commit fails.
+            ThrowIfUnwritable();
+        }
+    }
+
+    /// <summary>
+    /// One group flush: capture the buffered head under the append lock, fsync through the file
+    /// handle with the append lock <em>free</em> — appends proceeding during the fsync are what
+    /// forms the next batch — then advance the watermark and wake every parked waiter. Never
+    /// throws: a failure poisons the log (batch-wide, with the file rolled back to the last
+    /// durable length) and the waiters' own <see cref="ThrowIfUnwritable"/> checks deliver it.
+    /// </summary>
+    private void FlushBatch()
+    {
+        ulong target = 0;
+        long targetLength = 0;
+        ulong covered = 0;
+        var flushed = false;
+        double elapsed = 0;
+        try
+        {
+            lock (_fsyncLock)
+            {
+                SafeFileHandle? handle = null;
+                lock (_lock)
+                {
+                    if (!_disposed && _failure is null)
+                    {
+                        target = _headLsn;
+                        targetLength = _stream.Length;
+                        handle = _stream.SafeFileHandle;
+                    }
+                }
+
+                if (handle is not null)
+                {
+                    ulong durableBefore;
+                    lock (_flushGate)
+                    {
+                        durableBefore = _durableLsn;
+                    }
+
+                    if (target > durableBefore)
+                    {
+                        using var fsync = _telemetry?.StartFsync();
+                        var fsyncStarted = Stopwatch.GetTimestamp();
+                        FlushFaultInjection?.Invoke();
+                        RandomAccess.FlushToDisk(handle);
+                        elapsed = Stopwatch.GetElapsedTime(fsyncStarted).TotalMilliseconds;
+                        covered = target - durableBefore;
+                        flushed = true;
+                    }
+                }
+            }
+        }
+        catch (Exception failure)
+        {
+            PoisonBatch(failure);
+            lock (_flushGate)
+            {
+                _flusherActive = false;
+                Monitor.PulseAll(_flushGate);
+            }
+
+            return;
+        }
+
+        if (flushed)
+        {
+            Interlocked.Increment(ref _fsyncCount);
+            _telemetry?.RecordFsyncDuration(elapsed);
+            _telemetry?.RecordGroupCommitBatch((long)covered);
+        }
+
+        lock (_flushGate)
+        {
+            if (flushed && target > _durableLsn)
+            {
+                _durableLsn = target;
+                _durableLength = targetLength;
+            }
+
+            _flusherActive = false;
+            Monitor.PulseAll(_flushGate);
+        }
+    }
+
+    /// <summary>
+    /// A group fsync failed, so every record above the durable watermark is a commit that will be
+    /// reported failed — the bytes must not outlive the report. The file is rolled back to the
+    /// last durable length (were they left in place, the OS could persist them later and a
+    /// "failed" transaction would materialize at the next boot), and the log poisons so no append
+    /// can land after the rollback point until restart.
+    /// </summary>
+    private void PoisonBatch(Exception failure)
+    {
+        long durableLength;
+        lock (_flushGate)
+        {
+            durableLength = _durableLength;
+        }
+
+        lock (_lock)
+        {
+            if (_disposed || _failure is not null)
+                return;
+            try
+            {
+                _stream.SetLength(durableLength);
+                _stream.Flush(flushToDisk: true);
+            }
+            catch
+            {
+                // The disk is failing; recovery truncates whatever survives at the next open.
+            }
+
+            _failure = failure;
+            LogMessages.GroupFlushFailed(_logger, FilePath, failure);
+        }
+    }
+
+    private void ThrowIfUnwritable()
+    {
+        lock (_lock)
+        {
+            if (_failure is not null)
+            {
+                throw new InvalidOperationException(
+                    "The commit log could not make appended records durable: a batch fsync failed, " +
+                    "so every commit it covered has been failed and rolled back, and the log rejects " +
+                    "further appends until restart. See the inner exception for the original failure.",
+                    _failure);
+            }
+
+            ObjectDisposedException.ThrowIf(_disposed, this);
+        }
+    }
+
+    /// <summary>Advances the durable watermark (never backwards) and wakes parked waiters.</summary>
+    private void AdvanceDurable(ulong lsn, long length)
+    {
+        lock (_flushGate)
+        {
+            if (lsn > _durableLsn)
+            {
+                _durableLsn = lsn;
+                _durableLength = length;
+            }
+
+            Monitor.PulseAll(_flushGate);
+        }
+    }
+
+    /// <summary>
     /// Makes buffered appends visible to a reader opening the file directly — what
     /// <see cref="ReadFrom"/> does for its own read handle, exposed for the online backup, which
     /// walks the file bytes itself because it wants verbatim record payloads, not decoded records.
@@ -263,7 +558,27 @@ public sealed class FileCommitLog : ICommitLog
         }
     }
 
-    public IEnumerable<CommitRecord> ReadFrom(ulong firstLsn)
+    /// <summary>
+    /// Reads records in LSN order from <paramref name="firstLsn"/>, up to <see cref="DurableLsn"/>:
+    /// a record beyond the policy's durability promise is never served, because every consumer of
+    /// this enumeration forwards records somewhere a crash cannot untell them — a lagging applier's
+    /// projection, a resume replay, a replica stream. The cap is re-read per record, so an
+    /// enumeration racing the flusher simply stops at the promise as of that moment; the next
+    /// catch-up pass sees further.
+    /// </summary>
+    public IEnumerable<CommitRecord> ReadFrom(ulong firstLsn) => Read(firstLsn, capAtDurable: true);
+
+    /// <summary>
+    /// Reads records with no durability cap — for in-process projections only, which the applier
+    /// pipeline drives under the write lock: a projection rebuilt from the log at boot loses an
+    /// un-durable record together with the log, so applying it early is crash-consistent, and
+    /// capping here would starve a catching-up applier of the record whose commit is still parked
+    /// in <see cref="WaitDurable"/>. Anything whose effects leave the process must use
+    /// <see cref="ReadFrom"/>.
+    /// </summary>
+    internal IEnumerable<CommitRecord> ReadUncapped(ulong firstLsn) => Read(firstLsn, capAtDurable: false);
+
+    private IEnumerable<CommitRecord> Read(ulong firstLsn, bool capAtDurable)
     {
         lock (_lock)
         {
@@ -287,6 +602,8 @@ public sealed class FileCommitLog : ICommitLog
             if (Crc32.Compute(payload) != expectedCrc)
                 yield break;
             var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + length));
+            if (capAtDurable && record.Lsn > DurableLsn)
+                yield break;
             if (record.Lsn >= firstLsn)
                 yield return record;
         }
@@ -294,17 +611,42 @@ public sealed class FileCommitLog : ICommitLog
 
     public void Dispose()
     {
-        lock (_lock)
+        ulong head = 0;
+        long length = 0;
+        var flushed = false;
+        lock (_fsyncLock)
         {
-            if (_disposed)
-                return;
-            _disposed = true;
-            _flushTimer?.Dispose();
-            _flushTimer = null;
-            if (_failure is null)
-                _stream.Flush(flushToDisk: true);
-            _stream.Dispose();
-            _lockFile.Dispose();
+            lock (_lock)
+            {
+                if (_disposed)
+                    return;
+                _disposed = true;
+                _flushTimer?.Dispose();
+                _flushTimer = null;
+                if (_failure is null)
+                {
+                    _stream.Flush(flushToDisk: true);
+                    head = _headLsn;
+                    length = _stream.Length;
+                    flushed = true;
+                }
+
+                _stream.Dispose();
+                _lockFile.Dispose();
+            }
+        }
+
+        if (flushed)
+        {
+            AdvanceDurable(head, length);
+        }
+        else
+        {
+            // A poisoned close still wakes parked waiters, whose unwritable check fails them.
+            lock (_flushGate)
+            {
+                Monitor.PulseAll(_flushGate);
+            }
         }
     }
 
@@ -319,7 +661,9 @@ public sealed class FileCommitLog : ICommitLog
         {
             // The partial record could not be removed; appending after it would risk making an
             // aborted transaction's record durable. Poison the log so every subsequent append
-            // fails loudly; recovery at next open truncates the torn tail.
+            // fails loudly; recovery at next open truncates the torn tail. Parked durability
+            // waiters need no wake here: waiters only park behind an active flusher, and its
+            // completion wakes them into the unwritable check.
             _failure = rollbackFailure;
             LogMessages.AppendRollbackFailed(_logger, FilePath, rollbackFailure);
         }
@@ -370,7 +714,7 @@ public sealed class FileCommitLog : ICommitLog
                 break;
             if (position + FrameSize > length)
             {
-                TruncateTorn(position, "torn frame header");
+                TruncateTornOrThrow(position, "torn frame header");
                 break;
             }
 
@@ -383,13 +727,13 @@ public sealed class FileCommitLog : ICommitLog
                 // A record payload is never empty, and a zero-filled torn tail would otherwise
                 // pass the CRC check: CRC32 of zero bytes is zero, exactly what the zeroed frame
                 // declares.
-                TruncateTorn(position, "zero-length record in torn tail");
+                TruncateTornOrThrow(position, "zero-length record in torn tail");
                 break;
             }
 
             if (payloadLength > MaxRecordBytes || position + FrameSize + payloadLength > length)
             {
-                TruncateTorn(position, "record extends past end of file");
+                TruncateTornOrThrow(position, "record extends past end of file");
                 break;
             }
 
@@ -397,15 +741,10 @@ public sealed class FileCommitLog : ICommitLog
             _stream.ReadExactly(payload);
             if (Crc32.Compute(payload) != expectedCrc)
             {
-                if (position + FrameSize + payloadLength == length)
-                {
-                    TruncateTorn(position, "CRC mismatch on trailing record");
-                    break;
-                }
-
-                throw new InvalidDataException(
-                    $"'{FilePath}': CRC mismatch at offset {position} with intact records after it. " +
-                    "The log is corrupt beyond a torn tail; restore from backup.");
+                TruncateTornOrThrow(position, position + FrameSize + payloadLength == length
+                    ? "CRC mismatch on trailing record"
+                    : "CRC mismatch inside the unflushed tail");
+                break;
             }
 
             var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + payloadLength));
@@ -418,61 +757,100 @@ public sealed class FileCommitLog : ICommitLog
     }
 
     /// <summary>
+    /// Decides what an invalid record means. Records are sequential, so the record at the tear —
+    /// were it intact — is the one after the last intact LSN. If the durable floor (the newest
+    /// snapshot's LSN, and a snapshot forces the log durable through its LSN before the file is
+    /// written) covers that LSN, the record provably survived an fsync and this is damaged
+    /// committed history: fatal, restore from backup. Above the floor it is a torn tail — under
+    /// buffered group commit a crash's tail can span several records, and the OS's writeback order
+    /// means intact-looking records can sit <em>beyond</em> the tear; every one of them belongs to
+    /// a commit whose caller never got an acknowledgment, so truncating them all is the correct
+    /// (and loudly logged) recovery. The residual risk is deliberate: damage to a not-yet-floored
+    /// record is indistinguishable from a tear and truncates with it — the floor lags by at most
+    /// one snapshot interval, and tightening it further would mean fsyncing a watermark on every
+    /// flush, which is the cost group commit exists to remove.
+    /// </summary>
+    private void TruncateTornOrThrow(long position, string reason)
+    {
+        var tornLsn = Math.Max(_headLsn, _baseLsn) + 1;
+        if (tornLsn <= _durableFloor)
+        {
+            throw new InvalidDataException(
+                $"'{FilePath}': {reason} at offset {position}, but LSN {tornLsn} was durable — the " +
+                $"snapshot at LSN {_durableFloor} proves it. The log is corrupt beyond a torn tail; " +
+                "restore from backup.");
+        }
+
+        TruncateTorn(position, reason);
+    }
+
+    /// <summary>
     /// Removes every record at or below <paramref name="upToLsn"/> — log compaction's physical
     /// half. The caller (the engine's snapshot path) is responsible for the floors: a snapshot
     /// must cover the removed range, and no applier, live event subscriber, or resume-retention
     /// window may still need it. Atomic against a crash: the compacted file is fully written and
     /// flushed before it replaces the live one, and the base sidecar is written first, so a crash
-    /// at any point leaves either the old log or a consistent truncated one.
+    /// at any point leaves either the old log or a consistent truncated one. The rewrite is also a
+    /// full fsync of every surviving record, so the durable watermark advances to the head behind
+    /// it — a compaction can complete parked durability waiters.
     /// </summary>
     internal void TruncateBefore(ulong upToLsn)
     {
-        lock (_lock)
+        ulong head;
+        long newLength;
+        lock (_fsyncLock)
         {
-            if (_disposed || _failure is not null)
-                return;
-            upToLsn = Math.Min(upToLsn, _headLsn);
-            if (upToLsn <= _baseLsn)
-                return;
-
-            _stream.Flush();
-            var tempPath = FilePath + ".compact";
-            using (var compact = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            lock (_lock)
             {
-                Span<byte> header = stackalloc byte[HeaderSize];
-                BinaryPrimitives.WriteUInt32LittleEndian(header, Magic);
-                BinaryPrimitives.WriteUInt16LittleEndian(header[4..], FileFormatVersion);
-                BinaryPrimitives.WriteUInt16LittleEndian(header[6..], 0);
-                compact.Write(header);
+                if (_disposed || _failure is not null)
+                    return;
+                upToLsn = Math.Min(upToLsn, _headLsn);
+                if (upToLsn <= _baseLsn)
+                    return;
 
-                var frame = new byte[FrameSize];
-                _stream.Seek(HeaderSize, SeekOrigin.Begin);
-                while (_stream.Position + FrameSize <= _stream.Length)
+                _stream.Flush();
+                var tempPath = FilePath + ".compact";
+                using (var compact = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    _stream.ReadExactly(frame);
-                    var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
-                    if (length == 0 || length > MaxRecordBytes || _stream.Position + length > _stream.Length)
-                        break;
-                    var payload = new byte[length];
-                    _stream.ReadExactly(payload);
-                    var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + length));
-                    if (record.Lsn > upToLsn)
+                    Span<byte> header = stackalloc byte[HeaderSize];
+                    BinaryPrimitives.WriteUInt32LittleEndian(header, Magic);
+                    BinaryPrimitives.WriteUInt16LittleEndian(header[4..], FileFormatVersion);
+                    BinaryPrimitives.WriteUInt16LittleEndian(header[6..], 0);
+                    compact.Write(header);
+
+                    var frame = new byte[FrameSize];
+                    _stream.Seek(HeaderSize, SeekOrigin.Begin);
+                    while (_stream.Position + FrameSize <= _stream.Length)
                     {
-                        compact.Write(frame);
-                        compact.Write(payload);
+                        _stream.ReadExactly(frame);
+                        var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+                        if (length == 0 || length > MaxRecordBytes || _stream.Position + length > _stream.Length)
+                            break;
+                        var payload = new byte[length];
+                        _stream.ReadExactly(payload);
+                        var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + length));
+                        if (record.Lsn > upToLsn)
+                        {
+                            compact.Write(frame);
+                            compact.Write(payload);
+                        }
                     }
+
+                    compact.Flush(flushToDisk: true);
                 }
 
-                compact.Flush(flushToDisk: true);
+                WriteBaseLsn(upToLsn);
+                _stream.Dispose();
+                File.Move(tempPath, FilePath, overwrite: true);
+                _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+                _stream.Seek(0, SeekOrigin.End);
+                _baseLsn = upToLsn;
+                head = _headLsn;
+                newLength = _stream.Length;
             }
-
-            WriteBaseLsn(upToLsn);
-            _stream.Dispose();
-            File.Move(tempPath, FilePath, overwrite: true);
-            _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
-            _stream.Seek(0, SeekOrigin.End);
-            _baseLsn = upToLsn;
         }
+
+        AdvanceDurable(head, newLength);
     }
 
     private ulong ReadBaseLsn()
@@ -518,37 +896,6 @@ public sealed class FileCommitLog : ICommitLog
         _stream.Flush(flushToDisk: true);
     }
 
-    /// <summary>
-    /// Flushes per the configured policy, returning the milliseconds spent in an in-line fsync or
-    /// null when this policy does not fsync in line.
-    /// </summary>
-    private double? Flush(bool onCommit)
-    {
-        switch (_options.FsyncPolicy)
-        {
-            case FsyncPolicy.OnCommit:
-                using (var fsync = _telemetry?.StartFsync())
-                {
-                    var started = Stopwatch.GetTimestamp();
-                    _stream.Flush(flushToDisk: true);
-                    var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-                    _telemetry?.RecordFsyncDuration(elapsed);
-                    return elapsed;
-                }
-
-            case FsyncPolicy.Interval:
-                _stream.Flush();
-                if (onCommit)
-                    EnsureFlushTimer();
-                return null;
-            case FsyncPolicy.OsBuffered:
-                _stream.Flush();
-                return null;
-            default:
-                throw new InvalidOperationException($"Unknown fsync policy {_options.FsyncPolicy}.");
-        }
-    }
-
     private void EnsureFlushTimer()
     {
         var interval = TimeSpan.FromMilliseconds(_options.FsyncIntervalMs);
@@ -557,16 +904,27 @@ public sealed class FileCommitLog : ICommitLog
 
     private void FlushTimerTick()
     {
-        lock (_lock)
+        ulong head;
+        long length;
+        double elapsed;
+        lock (_fsyncLock)
         {
-            if (_flushTimer is null)
-                return;
-            if (_options.FsyncPolicy != FsyncPolicy.Interval)
-                return;
-            var started = Stopwatch.GetTimestamp();
-            _stream.Flush(flushToDisk: true);
-            _telemetry?.RecordFsyncDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            lock (_lock)
+            {
+                if (_flushTimer is null || _disposed || _failure is not null)
+                    return;
+                if (_options.FsyncPolicy != FsyncPolicy.Interval)
+                    return;
+                var started = Stopwatch.GetTimestamp();
+                _stream.Flush(flushToDisk: true);
+                elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                head = _headLsn;
+                length = _stream.Length;
+            }
         }
+
+        _telemetry?.RecordFsyncDuration(elapsed);
+        AdvanceDurable(head, length);
     }
 
     private static class LogMessages
@@ -588,5 +946,14 @@ public sealed class FileCommitLog : ICommitLog
 
         public static void AppendRollbackFailed(ILogger logger, string path, Exception failure) =>
             AppendRollbackFailedMessage(logger, path, failure);
+
+        private static readonly Action<ILogger, string, Exception?> GroupFlushFailedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Critical,
+                new EventId(1007, "GroupFlushFailed"),
+                "Commit log '{Path}': a group fsync failed; every commit it covered is failed and rolled back, and the log rejects further appends until restart.");
+
+        public static void GroupFlushFailed(ILogger logger, string path, Exception failure) =>
+            GroupFlushFailedMessage(logger, path, failure);
     }
 }

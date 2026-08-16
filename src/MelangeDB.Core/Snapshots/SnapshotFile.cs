@@ -18,6 +18,35 @@ internal static class SnapshotFile
 
     public const string FileName = "melange.snapshot";
 
+    /// <summary>
+    /// The durable floor a data directory's snapshot proves: the snapshot's LSN when one exists
+    /// and counts against the directory's current epoch, else zero. Sound because the snapshot
+    /// path forces the log durable through the pending LSN before this file is written — so a
+    /// record at or below the returned LSN provably survived an fsync, which is what lets log
+    /// recovery tell damaged committed history (fatal) from a crash's torn tail (truncated).
+    /// Zero on any doubt: a missing or unreadable snapshot or epoch just makes recovery lenient,
+    /// never wrong in the fatal direction.
+    /// </summary>
+    public static ulong DurableFloor(string logDirectory)
+    {
+        var snapshotPath = System.IO.Path.Combine(logDirectory, FileName);
+        var epochPath = System.IO.Path.Combine(logDirectory, FileCommitLog.EpochFileName);
+        if (!File.Exists(snapshotPath) || !File.Exists(epochPath))
+            return 0;
+        try
+        {
+            var epochBytes = File.ReadAllBytes(epochPath);
+            if (epochBytes.Length != 16)
+                return 0;
+            using var reader = new SnapshotReader(snapshotPath);
+            return reader.Header.Epoch == new Guid(epochBytes) ? reader.Header.Lsn : 0;
+        }
+        catch (Exception exception) when (exception is IOException or InvalidDataException)
+        {
+            return 0;
+        }
+    }
+
     /// <summary>What a snapshot carries besides rows: identity, position, and sequencer state.</summary>
     public sealed class Header
     {

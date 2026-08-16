@@ -73,9 +73,18 @@ public sealed partial class MelangeEngine : IDisposable
             : null;
         try
         {
-            _log = new FileCommitLog(options.CommitLog, loggers.CreateLogger<FileCommitLog>(), _telemetry);
-            _sequencer = new AutoIncSequencer(originator);
             SnapshotPath = Path.Combine(options.CommitLog.Path, SnapshotFile.FileName);
+
+            // The snapshot's LSN is the log's durable floor: recovery uses it to tell damaged
+            // committed history (fatal) from a crash's torn tail (truncated) — under buffered
+            // group commit a tail can span several records. Peeked before the log opens because
+            // recovery is where the distinction is drawn.
+            _log = new FileCommitLog(
+                options.CommitLog,
+                loggers.CreateLogger<FileCommitLog>(),
+                _telemetry,
+                SnapshotFile.DurableFloor(options.CommitLog.Path));
+            _sequencer = new AutoIncSequencer(originator);
 
             // Shape governance before any row byte is interpreted: load (or adopt) the shape
             // sidecar, refuse a destructive schema change, and hold the additive transform that
@@ -107,7 +116,7 @@ public sealed partial class MelangeEngine : IDisposable
             _tailTimestamp = RecoveredTailTimestamp;
             HotStore = store;
             _readViewSource = store as IReadViewSource;
-            Appliers = new ApplierPipeline(_log, _telemetry, _shapes.TransformRecord);
+            Appliers = new ApplierPipeline(_log, _telemetry, _shapes.TransformRecord, _log.ReadUncapped);
             Appliers.Register(new HotStoreApplier(store));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
             _truncationFloors.Add(PinnedTruncationFloor);
@@ -185,6 +194,10 @@ public sealed partial class MelangeEngine : IDisposable
             store.Apply(marker);
         }
 
+        // The sidecar must never claim a reign whose marker a crash could untell: durable first,
+        // then the entry. (The reverse crash order — marker durable, sidecar unsaved — is the
+        // harmless one the design already accepts: an empty record, and the next boot re-migrates.)
+        _log.WaitDurable(marker.Lsn);
         _shapes.History.Append(ShapeHistory.EntryOf(Schema, marker.Lsn));
         _shapes.History.Save(_shapes.SidecarPath);
         LogMessages.ShapeMigrated(_logger, string.Join("; ", _shapes.Changes), marker.Lsn);
@@ -312,11 +325,14 @@ public sealed partial class MelangeEngine : IDisposable
     /// <paramref name="arguments"/> are recorded as log metadata for audit; the write set is the
     /// authoritative payload. Nested invocations are forbidden and throw.
     /// <para>
-    /// The engine's single write lock is held across the entire call — body, commit guards,
-    /// append and fsync, commit observers, and any automatic snapshot the commit triggers — so time
-    /// spent in the body is global write latency: no other transaction on this engine can start
-    /// until it returns. Readers are unaffected (<see cref="CommittedView"/> takes no lock). Window
-    /// long sweeps across many short transactions rather than running one long one.
+    /// The engine's single write lock is held across body, commit guards, the buffered append,
+    /// commit observers, and the store apply — so time spent in the body is global write latency:
+    /// no other transaction on this engine can start until it commits. The durability wait runs
+    /// <em>after</em> the lock releases, which is what lets concurrent commits share fsyncs under
+    /// <see cref="FsyncPolicy.OnCommit"/> (group commit) — while this call still returns only once
+    /// its record is durable, exactly as before. Readers are unaffected
+    /// (<see cref="CommittedView"/> takes no lock). Window long sweeps across many short
+    /// transactions rather than running one long one.
     /// </para>
     /// </summary>
     public ulong Invoke(
@@ -337,17 +353,14 @@ public sealed partial class MelangeEngine : IDisposable
 
         try
         {
-            lock (_writeLock)
+            _inReducer.Value = true;
+            try
             {
-                _inReducer.Value = true;
-                try
-                {
-                    return InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
-                }
-                finally
-                {
-                    _inReducer.Value = false;
-                }
+                return InvokeCore(reducerName, caller, body, arguments, ArgsCodec.Encode(arguments), connectionId);
+            }
+            finally
+            {
+                _inReducer.Value = false;
             }
         }
         finally
@@ -411,17 +424,14 @@ public sealed partial class MelangeEngine : IDisposable
 
         try
         {
-            lock (_writeLock)
+            _inReducer.Value = true;
+            try
             {
-                _inReducer.Value = true;
-                try
-                {
-                    return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext);
-                }
-                finally
-                {
-                    _inReducer.Value = false;
-                }
+                return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext);
+            }
+            finally
+            {
+                _inReducer.Value = false;
             }
         }
         finally
@@ -543,6 +553,8 @@ public sealed partial class MelangeEngine : IDisposable
             }
         }
 
+        // The commit point, outside the lock — the group-commit split; see InvokeCore.
+        _log.WaitDurable(record.Lsn);
         CompleteDeferredSnapshot();
         return record;
     }
@@ -710,6 +722,8 @@ public sealed partial class MelangeEngine : IDisposable
             bulkRecord = record;
         }
 
+        // The commit point, outside the lock — the group-commit split; see InvokeCore.
+        _log.WaitDurable(bulkRecord.Lsn);
         CompleteDeferredSnapshot();
         return bulkRecord;
     }
@@ -847,6 +861,22 @@ public sealed partial class MelangeEngine : IDisposable
     {
         try
         {
+            // A snapshot file at LSN N is a durability claim about N: recovery trusts it as the
+            // log's durable floor, and a crash after the file lands but before the log's N is on
+            // disk would boot a snapshot ahead of its own log and re-mint LSNs the snapshot
+            // already holds. So the log goes durable through N first — under every policy, which
+            // also closes the same (pre-existing) window for Interval and OsBuffered at the cost
+            // of one fsync per snapshot. If the log cannot promise it (poisoned mid-flush), the
+            // snapshot is abandoned rather than written ahead of durability.
+            if (_log.FsyncedLsn < pending.Lsn)
+                _log.FlushToDisk();
+            if (_log.FsyncedLsn < pending.Lsn)
+            {
+                throw new InvalidOperationException(
+                    $"The snapshot at LSN {pending.Lsn} was abandoned: the commit log could not be " +
+                    "made durable through it. See the melange-log health check for the log's failure.");
+            }
+
             var tables = pending.View is { } view
                 ? Schema.Tables.Select(t => (t.Id, view.Scan(t.Id)))
                 : Schema.Tables.Select(t => (t.Id, HotStore.Scan(t.Id)));
@@ -1083,62 +1113,69 @@ public sealed partial class MelangeEngine : IDisposable
     {
         using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments, parentContext);
         activity?.SetTag("melange.isolation", "serialized");
-        using var busy = TrackWriteLockBusy(); // The whole serialized transaction runs under the lock.
-        var started = Stopwatch.GetTimestamp();
-        var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
-        var writeSet = new WriteSet();
-        var stage = _sequencer.BeginStage();
-        var random = new Random(unchecked((int)timestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
-        var events = new EventStage(_options.Events);
-        var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events);
-
-        IReadOnlyList<RowOp> ops;
-        // Measured directly rather than as (total - commit): everything after the append — commit
-        // observers, applier notification, an automatic snapshot — is inside the same span, and
-        // subtracting would charge all of it to the module's reducer body. Declared out here so the
-        // abort path can report it too; null there means the body itself is what threw.
-        var bodyStarted = Stopwatch.GetTimestamp();
-        double? bodyMs = null;
-        try
-        {
-            body(context);
-            bodyMs = Elapsed(bodyStarted);
-            ops = writeSet.ToOps();
-            RunCommitGuards(reducerName, ops, CommitOrigin.Reducer);
-        }
-        catch (Exception exception)
-        {
-            // Abort: nothing was appended, the write set is discarded, and the allocation stage
-            // was never committed — zero trace, no consumed AutoInc value. The write lock was still
-            // held for the whole of it, so a slow abort is reported exactly like a slow commit.
-            var outcome = exception is RejectedException ? "rejected" : "abort";
-            // The part before the whole: reading the body's clock after the transaction's would let
-            // the work between the two readings push a trivial abort's body past its own duration.
-            var abortedBodyMs = bodyMs ?? Elapsed(bodyStarted);
-            var abortedAfter = Elapsed(started);
-            activity?.SetTag("melange.outcome", outcome);
-            activity?.SetTag("melange.writeset.rows", 0);
-            activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
-            _telemetry?.RecordTransaction(reducerName, outcome, abortedAfter, 0);
-            // The whole of a serialized transaction is the locked portion: `started` is read inside
-            // the lock, so this duration and the lock hold are the same interval.
-            if (abortedAfter > _options.Telemetry.SlowReducerMs)
-                WarnSlowAbort(activity, reducerName, outcome, abortedAfter, abortedBodyMs, abortedAfter, Isolation.Serialized);
-            throw;
-        }
-
         ulong committedLsn = 0;
         var commitMs = 0d;
-        double? fsyncMs = null;
         var postCommitMs = 0d;
-        if (ops.Count > 0 || events.Events is { Count: > 0 })
+        double committedBodyMs;
+        double lockedMs;
+        long started;
+        int rowCount;
+        lock (_writeLock)
         {
-            using (var commit = _telemetry?.StartCommit())
+            using var busy = TrackWriteLockBusy();
+            // Read inside the lock: waiting for the lock is not holding it, and billing the wait
+            // to this transaction would blame the queue on whoever happened to be last in it.
+            started = Stopwatch.GetTimestamp();
+            var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
+            var writeSet = new WriteSet();
+            var stage = _sequencer.BeginStage();
+            var random = new Random(unchecked((int)timestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
+            var events = new EventStage(_options.Events);
+            var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events);
+
+            IReadOnlyList<RowOp> ops;
+            // Measured directly rather than as (total - commit): everything after the append —
+            // commit observers, applier notification, an automatic snapshot — is inside the same
+            // span, and subtracting would charge all of it to the module's reducer body. Declared
+            // out here so the abort path can report it too; null there means the body itself is
+            // what threw.
+            var bodyStarted = Stopwatch.GetTimestamp();
+            double? bodyMs = null;
+            try
             {
+                body(context);
+                bodyMs = Elapsed(bodyStarted);
+                ops = writeSet.ToOps();
+                RunCommitGuards(reducerName, ops, CommitOrigin.Reducer);
+            }
+            catch (Exception exception)
+            {
+                // Abort: nothing was appended, the write set is discarded, and the allocation stage
+                // was never committed — zero trace, no consumed AutoInc value. The write lock was
+                // still held for the whole of it, so a slow abort is reported exactly like a slow
+                // commit.
+                var outcome = exception is RejectedException ? "rejected" : "abort";
+                // The part before the whole: reading the body's clock after the transaction's would
+                // let the work between the two readings push a trivial abort's body past its own
+                // duration.
+                var abortedBodyMs = bodyMs ?? Elapsed(bodyStarted);
+                var abortedAfter = Elapsed(started);
+                activity?.SetTag("melange.outcome", outcome);
+                activity?.SetTag("melange.writeset.rows", 0);
+                activity?.SetStatus(ActivityStatusCode.Error, exception.Message);
+                _telemetry?.RecordTransaction(reducerName, outcome, abortedAfter, 0);
+                // An abort has no durability wait, so its whole is its locked portion.
+                if (abortedAfter > _options.Telemetry.SlowReducerMs)
+                    WarnSlowAbort(activity, reducerName, outcome, abortedAfter, abortedBodyMs, abortedAfter, Isolation.Serialized);
+                throw;
+            }
+
+            if (ops.Count > 0 || events.Events is { Count: > 0 })
+            {
+                using var commit = _telemetry?.StartCommit();
                 var commitStarted = Stopwatch.GetTimestamp();
                 var record = _log.Append(new CommitRequest(timestamp, caller, reducerName, encodedArguments, ops, events.Events));
                 commitMs = Elapsed(commitStarted);
-                fsyncMs = _log.LastAppendFsyncMilliseconds;
                 _telemetry?.RecordCommitDuration(commitMs);
                 commit?.SetTag("melange.lsn", (long)record.Lsn);
                 commit?.SetTag("melange.writeset.bytes", record.SerializedLength);
@@ -1150,18 +1187,29 @@ public sealed partial class MelangeEngine : IDisposable
                 postCommitMs = Elapsed(postCommitStarted);
                 committedLsn = record.Lsn;
             }
+
+            rowCount = ops.Count;
+            committedBodyMs = bodyMs.GetValueOrDefault();
+            lockedMs = Elapsed(started);
         }
 
+        // The commit point, outside the lock: the record is buffered, and this is where it becomes
+        // durable — the next transaction's body runs while this one waits, which is what forms
+        // fsync batches. Everything ordering-sensitive (observers before the store applied, the
+        // store applied before the lock released) already happened; only the caller's return gates
+        // on durability. A durability failure throws here: the transaction is reported failed even
+        // though the in-memory projection applied it, and the poisoned log stops every later
+        // commit until a restart reconverges state from the durable prefix.
+        double? durabilityWaitMs = null;
+        if (committedLsn != 0)
+            durabilityWaitMs = _log.WaitDurable(committedLsn);
+
         activity?.SetTag("melange.outcome", "commit");
-        activity?.SetTag("melange.writeset.rows", ops.Count);
+        activity?.SetTag("melange.writeset.rows", rowCount);
         var elapsed = Elapsed(started);
-        _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
-        // Locked and total are the same interval here, by construction: `started` is read inside
-        // the lock. The threshold is on the locked portion at every isolation level, and for a
-        // serialized transaction that is the whole transaction — so this path's behaviour is
-        // exactly what it was before snapshot isolation existed.
+        _telemetry?.RecordTransaction(reducerName, "commit", elapsed, rowCount);
         if (elapsed > _options.Telemetry.SlowReducerMs)
-            WarnSlowReducer(activity, reducerName, elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count, elapsed, Isolation.Serialized);
+            WarnSlowReducer(activity, reducerName, elapsed, committedBodyMs, commitMs, durabilityWaitMs, postCommitMs, rowCount, lockedMs, Isolation.Serialized);
 
         return committedLsn;
     }
@@ -1259,7 +1307,6 @@ public sealed partial class MelangeEngine : IDisposable
                     var record = _log.Append(new CommitRequest(
                         Timestamp.FromDateTimeOffset(_time.GetUtcNow()), caller, reducerName, encodedArguments, ops, events.Events));
                     commitMs = Elapsed(commitStarted);
-                    fsyncMs = _log.LastAppendFsyncMilliseconds;
                     _telemetry?.RecordCommitDuration(commitMs);
                     commit?.SetTag("melange.lsn", (long)record.Lsn);
                     commit?.SetTag("melange.writeset.bytes", record.SerializedLength);
@@ -1274,11 +1321,17 @@ public sealed partial class MelangeEngine : IDisposable
 
                 lockedMs = Elapsed(lockedStarted);
             }
+
+            // The commit point, outside the lock — the group-commit split; see InvokeCore, which
+            // explains why only the caller's return (never the fan-out ordering) gates on it.
+            if (committedLsn != 0)
+                fsyncMs = _log.WaitDurable(committedLsn);
         }
         catch (Exception exception)
         {
-            // A guard rejected, or the append failed. The body's work is discarded; the ids it
-            // reserved are not returned to the sequence, which is what "unique, not dense" buys.
+            // A guard rejected, the append failed, or the batch fsync covering this record failed.
+            // The body's work is discarded; the ids it reserved are not returned to the sequence,
+            // which is what "unique, not dense" buys.
             ReportAbort(activity, reducerName, exception, Elapsed(started), bodyMs.GetValueOrDefault(), Elapsed(lockedStarted));
             throw;
         }
@@ -1344,8 +1397,11 @@ public sealed partial class MelangeEngine : IDisposable
                 ["melange.locked_ms"] = lockedMs,
                 ["melange.isolation"] = IsolationTag(isolation),
             };
-            // Absent, not zero: under a deferred fsync policy there was no flush to attribute, and
-            // a zero would read as "the disk was instant".
+            // The durability wait this caller actually experienced — under group commit that is
+            // the batch's cost from this transaction's seat, not a private fsync. Absent, not
+            // zero, when the policy defers durability off the commit path entirely (Interval,
+            // OsBuffered): there was no wait to attribute, and a zero would read as "the disk
+            // was instant".
             if (fsyncMs is { } fsync)
                 tags["melange.fsync_ms"] = fsync;
             activity.AddEvent(new ActivityEvent("melange.slow_reducer", tags: tags));

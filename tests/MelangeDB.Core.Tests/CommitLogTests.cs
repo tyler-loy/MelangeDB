@@ -117,21 +117,37 @@ public class CommitLogTests : IDisposable
     }
 
     [Fact]
-    public void Corruption_before_the_tail_is_fatal()
+    public void Corruption_below_the_snapshot_floor_is_fatal()
+    {
+        SeedWorkload();
+        _harness.Options.Snapshots.TruncateLog = false; // Keep the records the corruption targets.
+        Assert.Equal(4UL, _harness.Engine.TakeSnapshot());
+        _harness.Invoke("After", ctx => ctx.Db.Insert(new TerrainChunk { ChunkId = 99, Data = [1], Kind = ChunkKind.Empty }));
+        _harness.Engine.Dispose();
+
+        // Flip a byte inside the second record. The snapshot at LSN 4 proves records 1-4 were
+        // fsynced, so this cannot be a crash's torn tail — it is damaged committed history.
+        GroupCommitTests.CorruptRecordPayload(_harness.LogFilePath, ordinal: 2);
+
+        var fatal = Assert.Throws<InvalidDataException>(() => _harness.Restart());
+        Assert.Contains("restore from backup", fatal.Message);
+    }
+
+    [Fact]
+    public void Corruption_before_the_tail_without_a_durable_floor_truncates_to_the_tear()
     {
         SeedWorkload();
         _harness.Engine.Dispose();
 
-        // Flip a byte inside the first record: intact records follow, so this is real damage.
-        using (var file = new FileStream(_harness.LogFilePath, FileMode.Open, FileAccess.ReadWrite))
-        {
-            file.Seek(20, SeekOrigin.Begin);
-            var b = file.ReadByte();
-            file.Seek(-1, SeekOrigin.Current);
-            file.WriteByte((byte)(b ^ 0xFF));
-        }
+        // Flip a byte inside the first record. No snapshot exists, so nothing proves the record
+        // ever survived an fsync — under buffered group commit an unflushed tail can span several
+        // records and hold intact-looking ones beyond the tear, so recovery treats the whole
+        // suffix as torn and boots from the intact prefix rather than refusing.
+        GroupCommitTests.CorruptRecordPayload(_harness.LogFilePath, ordinal: 1);
 
-        Assert.Throws<InvalidDataException>(() => _harness.Restart());
+        _harness.Restart();
+        Assert.Equal(0UL, _harness.Engine.Log.HeadLsn);
+        Assert.Empty(_harness.Dump());
     }
 
     [Fact]
@@ -180,6 +196,7 @@ public class CommitLogTests : IDisposable
             log.AppendFaultInjection = null;
             var record = log.Append(MakeRequest("Second"));
             Assert.Equal(2UL, record.Lsn);
+            log.WaitDurable(record.Lsn); // ReadFrom serves nothing beyond the durable watermark.
             Assert.Equal(new ulong[] { 1, 2 }, log.ReadFrom(1).Select(r => r.Lsn));
             Assert.Equal(new[] { "First", "Second" }, log.ReadFrom(1).Select(r => r.ReducerName));
 

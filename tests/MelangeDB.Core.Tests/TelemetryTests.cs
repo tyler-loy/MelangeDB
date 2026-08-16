@@ -44,7 +44,7 @@ public class TelemetryTests : IDisposable
     }
 
     [Fact]
-    public void Reducer_span_carries_name_outcome_and_caller_and_commit_span_has_fsync_child()
+    public void Reducer_span_carries_name_outcome_and_caller_and_the_fsync_span_lands_on_the_flushing_transaction()
     {
         _harness.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
 
@@ -60,8 +60,11 @@ public class TelemetryTests : IDisposable
         Assert.Equal(1L, commit.GetTagItem("melange.lsn"));
         Assert.True((int)commit.GetTagItem("melange.writeset.bytes")! > 0);
 
+        // The fsync runs in the durability wait, after the commit span closed with the write lock:
+        // it parents to the reducer span of whichever transaction performed the flush — here the
+        // lone committer, which flushed for itself.
         var fsync = Assert.Single(spans, a => a.OperationName == "melange.fsync");
-        Assert.Equal(commit.SpanId, fsync.ParentSpanId);
+        Assert.Equal(reducer.SpanId, fsync.ParentSpanId);
 
         var apply = Assert.Single(spans, a => a.OperationName == "melange.apply");
         Assert.Equal("hot-store", apply.GetTagItem("melange.applier"));
@@ -196,8 +199,10 @@ public class TelemetryTests : IDisposable
         Assert.Equal(1, slow.Tags.Single(t => t.Key == "melange.writeset.rows").Value);
         Assert.All([body, commit, postCommit], part => Assert.True(part >= 0));
         Assert.True(body + commit + postCommit <= duration, $"{body}+{commit}+{postCommit} > {duration}");
-        // OnCommit is this harness's policy, so durability cost is attributable and reported.
-        Assert.True(Tag(slow, "melange.fsync_ms") <= commit);
+        // OnCommit is this harness's policy, so durability cost is attributable and reported: the
+        // wait this caller experienced, which sits beside the append (melange.commit_ms no longer
+        // contains it — the group-commit split moved durability out of the locked commit).
+        Assert.True(Tag(slow, "melange.fsync_ms") <= duration);
     }
 
     [Fact]

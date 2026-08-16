@@ -23,8 +23,20 @@ public interface ICommitLog : IDisposable
     Guid EpochId { get; }
 
     /// <summary>
+    /// The newest LSN the log's durability discipline promises will survive a crash. Anything that
+    /// leaves the process — a subscription delta, a replica stream, a downstream projection's
+    /// apply — must stay at or under it, because an LSN served beyond it could be untold by a
+    /// crash. Defaults to <see cref="HeadLsn"/>, the honest answer for a log with no deferred
+    /// durability; a log that buffers appends (group commit) overrides it with its fsynced
+    /// watermark.
+    /// </summary>
+    ulong DurableLsn => HeadLsn;
+
+    /// <summary>
     /// Appends one committed transaction, assigns the next LSN, and makes it durable per the
-    /// configured fsync policy. Returns the record as written.
+    /// configured fsync policy. Returns the record as written. A durability discipline that
+    /// defers the flush (group commit) completes it after this returns; <see cref="DurableLsn"/>
+    /// is the watermark of what has actually reached stable storage.
     /// </summary>
     CommitRecord Append(in CommitRequest request);
 

@@ -289,7 +289,10 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
         {
             while (true)
             {
-                await subscriber.Signal.WaitAsync(ct).ConfigureAwait(false);
+                // The timeout is the durability backstop, not the delivery path: the commit-time
+                // kick can arrive before the record's fsync completes, and the drain's capped log
+                // read then stops short — on a quiet engine nothing would ever re-kick.
+                await subscriber.Signal.WaitAsync(TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
                 await DrainAsync(subscriber, ct).ConfigureAwait(false);
             }
         }
