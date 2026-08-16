@@ -712,11 +712,26 @@ schema change means a new log epoch and therefore a fresh subscribe. A typed cli
 its bindings were generated from, once, before any row decodes.
 
 **Write lock** — The engine's single global writer lock, held across the *whole* transaction: reducer body,
-commit guards, log append and fsync, commit observers, and any automatic snapshot the commit triggers. Not
+commit guards, the buffered log append, commit observers, and any automatic snapshot the commit triggers. Not
 just the commit point — **body time is global write latency**, so a 75 ms reducer stalls every other
-transaction on that engine for 75 ms. Readers never take it: committed reads and subscription fan-out run
-against a lock-free view throughout. One writer per engine, and on a shard node one engine per shard, so the
-lock is per-shard rather than per-node.
+transaction on that engine for 75 ms. The durability wait is the one step outside it (see **Group commit**),
+which is what lets the next transaction's body overlap the previous one's fsync. Readers never take it:
+committed reads and subscription fan-out run against a lock-free view throughout. One writer per engine, and
+on a shard node one engine per shard, so the lock is per-shard rather than per-node.
+
+**Group commit** — The phase-17 split of the `OnCommit` commit path: the append buffers under the locks, the
+committing caller waits for durability after releasing them, and whoever finds the flusher idle fsyncs
+everything buffered so far. Batches form from contention itself — no timer, no delay, no batch-size knob; a
+lone caller fsyncs immediately at the old inline latency, and under concurrency one flush answers for every
+commit that arrived behind the previous one. Semantics are unchanged: a reducer that returns has committed
+durably, and a failed batch fsync fails every commit it covered and poisons the log.
+
+**Durable LSN (watermark)** — The newest LSN the configured fsync policy promises will survive a crash:
+the fsynced watermark under `OnCommit`, the head under `Interval`/`OsBuffered` (which promise nothing
+beyond the OS). Everything that leaves the process — subscription deltas, resume replays, replica and
+border streams, the Postgres apply, the online backup — is fenced at it, because recovery truncates a torn
+tail without minting an epoch and re-mints the same LSNs for different records: an external party holding
+an untold LSN would silently diverge. `ICommitLog.ReadFrom` serves nothing beyond it.
 
 **Write set** — The ordered row operations a transaction produced, keyed by table and primary key. **The
 authoritative payload of a log record** — logging the write set rather than the reducer invocation is what lets

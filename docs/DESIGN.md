@@ -164,9 +164,13 @@ appended).
 ### The write lock covers the whole body, not just the commit
 
 An engine has one global write lock, and `MelangeEngine.Invoke` takes it around the *entire*
-transaction: the reducer body, the commit guards, the log append and its fsync, the commit
-observers, and any automatic snapshot the commit happens to trigger. Nothing about a reducer runs
-concurrently with another reducer on the same engine. (This is the default and it is what the rest
+transaction: the reducer body, the commit guards, the buffered log append, the commit observers,
+and any automatic snapshot the commit happens to trigger. Nothing about a reducer runs
+concurrently with another reducer on the same engine. The one thing that runs *outside* the lock —
+since phase 17 — is the durability wait: the append buffers, the lock releases, and the caller
+then waits until a shared fsync covers its record (group commit), so concurrent commits batch
+their flushes while each still returns only once durable. What never changed: the caller's return,
+and anything leaving the process, gate on durability; the lock does not. (This is the default and it is what the rest
 of this section describes; a reducer may opt out per-reducer — see [snapshot
 isolation](#snapshot-isolation-for-the-sweep-that-windowing-cannot-save) below — and opting out is
 a decision with a correctness precondition, not a tuning knob.)

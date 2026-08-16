@@ -33,7 +33,21 @@ public class HotspotMeasurementTests(ITestOutputHelper output)
     public Task The_hotspot_ceiling_under_interval_fsync_is_the_transaction_loops_own() =>
         MeasureAsync(fsyncPerCommit: false);
 
-    private async Task MeasureAsync(bool fsyncPerCommit)
+    /// <summary>
+    /// The group-commit measurement (road-to-0.2 phase 17): the same crowded shard, same per-commit
+    /// durability, but the reducers issued from concurrent callers — the shape a real crowd
+    /// actually has, since every player's Move arrives on its own transport thread. Concurrency is
+    /// what group commit converts into batches: while one caller's fsync is in flight the others
+    /// run their bodies and park, and the next flush covers them all. The mean records-per-fsync
+    /// printed alongside is the batch formation made visible; sequential single-caller throughput
+    /// (the original measurement above) is unchanged by design, because a lone caller pays exactly
+    /// the old inline latency.
+    /// </summary>
+    [Fact]
+    public Task The_hotspot_ceiling_under_concurrent_callers_shares_fsyncs() =>
+        MeasureAsync(fsyncPerCommit: true, concurrency: 16);
+
+    private async Task MeasureAsync(bool fsyncPerCommit, int concurrency = 1)
     {
         await using var cluster = await ClusterFixture.StartAsync(
             shardNodes: 1, heartbeatMs: 500, failureTimeoutMs: 60_000, spatial: true,
@@ -56,13 +70,17 @@ public class HotspotMeasurementTests(ITestOutputHelper output)
 
         // Warm-up, then the measured window. Every call is one full durable transaction on the
         // shard's single-writer loop — the same loop a real crowd's reducers serialize through.
-        RunWindow(shard, players, square, TimeSpan.FromMilliseconds(500));
+        RunWindow(shard, players, square, TimeSpan.FromMilliseconds(500), concurrency);
         var window = TimeSpan.FromSeconds(2);
-        var commits = RunWindow(shard, players, square, window);
+        var fsyncsBefore = shard.Engine.LogFile.FsyncCount;
+        var commits = RunWindow(shard, players, square, window, concurrency);
+        var fsyncs = shard.Engine.LogFile.FsyncCount - fsyncsBefore;
 
         var perSecond = commits / window.TotalSeconds;
-        output.WriteLine($"Fsync {(fsyncPerCommit ? "per commit (default durability)" : "on a 50ms interval")}:");
+        output.WriteLine($"Fsync {(fsyncPerCommit ? "per commit (default durability)" : "on a 50ms interval")}, {concurrency} caller(s):");
         output.WriteLine($"Sustained: {perSecond:F0} commits/s across {Players} players in one chunk.");
+        if (fsyncPerCommit && fsyncs > 0)
+            output.WriteLine($"Group commit: {commits} commits over {fsyncs} fsyncs — mean batch {(double)commits / fsyncs:F1}.");
         output.WriteLine($"Per-player update rate at this crowd size: {perSecond / Players:F1} Hz.");
         output.WriteLine($"Degradation point at a 20 Hz per-player budget: ~{perSecond / 20:F0} players.");
         output.WriteLine($"Degradation point at a 10 Hz per-player budget: ~{perSecond / 10:F0} players.");
@@ -77,17 +95,43 @@ public class HotspotMeasurementTests(ITestOutputHelper output)
             $"a shard sustaining {perSecond:F0} commits/s indicates something structurally wrong");
     }
 
-    private static long RunWindow(ShardRuntime shard, Identity[] players, uint square, TimeSpan window)
+    private static long RunWindow(ShardRuntime shard, Identity[] players, uint square, TimeSpan window, int concurrency)
     {
-        long commits = 0;
-        var clock = Stopwatch.StartNew();
-        while (clock.Elapsed < window)
+        if (concurrency == 1)
         {
-            var player = players[commits % players.Length];
-            shard.ReducerHost.Call("Move", player, square);
-            commits++;
+            long commits = 0;
+            var clock = Stopwatch.StartNew();
+            while (clock.Elapsed < window)
+            {
+                var player = players[commits % players.Length];
+                shard.ReducerHost.Call("Move", player, square);
+                commits++;
+            }
+
+            return commits;
         }
 
-        return commits;
+        // Concurrent callers on dedicated threads, each round-robining its own slice of the
+        // crowd — the transport's shape, where every player's call arrives on its own thread and
+        // the engine's write lock is the serialization point.
+        long total = 0;
+        var callers = Enumerable.Range(0, concurrency).Select(caller => new Thread(() =>
+        {
+            long commits = 0;
+            var clock = Stopwatch.StartNew();
+            while (clock.Elapsed < window)
+            {
+                var player = players[(caller + (concurrency * commits)) % players.Length];
+                shard.ReducerHost.Call("Move", player, square);
+                commits++;
+            }
+
+            Interlocked.Add(ref total, commits);
+        })).ToArray();
+        foreach (var thread in callers)
+            thread.Start();
+        foreach (var thread in callers)
+            thread.Join();
+        return Interlocked.Read(ref total);
     }
 }

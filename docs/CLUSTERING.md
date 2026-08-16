@@ -396,21 +396,31 @@ bigger term and needs no coordination layer at all.
   shipped first.
 - **The hotspot ceiling is strategy-dependent, and worth telling users plainly.** Spatial partitioning
   cannot split a single crowded location; instancing can. A developer choosing a strategy is choosing
-  which failure mode they get. **Measured in phase 10** (in-process, one crowded shard on a real shard node
-  — engine, guards, and durable log in the path; 100 players in one chunk, movement reducers issued
-  round-robin, sustained commits/second over a 2 s window; Windows 11 dev machine with NVMe, Release build;
-  the methodology and the live measurement are `HotspotMeasurementTests`):
-  - Under the default `CommitLog:FsyncPolicy = OnCommit`, one shard sustains **~1,100 commits/s** — the
-    disk's fsync rate is the ceiling. That is ~55 players in one square at a 20 Hz per-player update budget,
-    ~110 at 10 Hz.
-  - Under `FsyncPolicy = Interval` (50 ms), the same shard sustains **~52,000 commits/s** — the serialized
-    transaction loop's own ceiling. ~2,600 players at 20 Hz, ~5,200 at 10 Hz.
+  which failure mode they get. **Measured in phase 10, re-measured for phase 17's group commit**
+  (in-process, one crowded shard on a real shard node — engine, guards, and durable log in the path;
+  100 players in one chunk, movement reducers over a 2 s window; Windows 11 dev machine with NVMe,
+  Release build, each row measured in isolation on the same day — absolute numbers are the machine's
+  and drift with it, which is why all three are re-measured together; the methodology and the live
+  measurement are `HotspotMeasurementTests`):
+  - Under the default `CommitLog:FsyncPolicy = OnCommit` with a **single sequential caller**, one shard
+    sustains **~500 commits/s** — each commit pays the disk's full fsync, ~25 players in one square at a
+    20 Hz per-player update budget. This row is the phase-10 measurement re-run, and group commit leaves
+    it unchanged by design: a lone caller fsyncs for itself at the old inline latency.
+  - Under the same per-commit durability with **16 concurrent callers** — the shape a real crowd has,
+    since every player's reducer arrives on its own transport thread — the same shard sustains
+    **~4,000 commits/s at a mean of 8 commits per fsync** (phase 17's group commit: while one caller's
+    fsync is in flight the others run their bodies and park, and the next flush covers them all).
+    ~200 players at 20 Hz, ~400 at 10 Hz. Every commit is still individually durable before its call
+    returns; the disk does the same work per flush and answers for eight commits instead of one.
+  - Under `FsyncPolicy = Interval` (50 ms), the shard sustains **~12,000 commits/s** — the serialized
+    transaction loop's own ceiling, with no durability wait at all. ~600 players at 20 Hz, ~1,200 at 10 Hz.
 
   Run the measurement on your hardware; the shape holds even where the numbers move. The point of publishing
-  it: 200 players in one town square fits comfortably under interval fsync and does not fit under per-commit
-  fsync — and *no cluster size changes either number*, because a crowded location is one shard on one node
-  by construction. Choosing spatial partitioning is choosing this ceiling; instancing trades it for the
-  inability to have one shared world.
+  it: the per-commit-fsync ceiling is no longer the arithmetic of one fsync per commit — it is the disk's
+  flush rate times however many commits contention packs behind each flush — but a crowded location is
+  still one shard on one node by construction, and *no cluster size changes any of these numbers*.
+  Choosing spatial partitioning is choosing this ceiling; instancing trades it for the inability to have
+  one shared world.
 
   These are the *commit loop's* ceilings, measured in-process on purpose. The full path — real clients,
   real sockets, subscriptions fanning every commit out to every subscriber on the shard — hits a different

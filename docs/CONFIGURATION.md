@@ -58,10 +58,11 @@ the subscriber's checkpoint lag is the honest measure of how far behind it is.
 `HotStore:MemoryBudgetBytes` planned no default and shipped with a real one — `134217728` (128 MiB) —
 because a paging store with an unset cap is unbounded, which is the failure mode this phase exists to
 remove. (2) `CommitLog:GroupCommit` shipped **accepted-and-reserved** at its default of `true` (the
-`Scheduler:MaxConcurrentTicks` precedent): the engine's single-writer lock is held across each whole
-transaction, body included, so no two appends are ever in flight for one fsync to cover — the
-bulk-ingestion path is the batching that actually exists; the knob binds and validates so a future
-concurrent commit path can honor it without a config break. (3) `Residency:Default` is consulted only for tables whose attribute leaves residency
+`Scheduler:MaxConcurrentTicks` precedent): at the time the engine's single-writer lock was held
+across each whole transaction, fsync included, so no two appends were ever in flight for one fsync
+to cover; the knob bound and validated so a future concurrent commit path could honor it without a
+config break — which phase 17 did, when the durability wait moved outside the lock and batches
+became real. (3) `Residency:Default` is consulted only for tables whose attribute leaves residency
 unspecified — and because `Paged` is the attribute's default value, an attribute explicitly declaring
 `Paged` is indistinguishable from silence; under a non-`Paged` configured default, the per-table
 override is how a table is pinned back down. `Residency:<TableName>` is `careful` as planned: a
@@ -184,7 +185,7 @@ posture — off unless opted into, and owner-role-gated when on. See the Bulk in
 | `CommitLog:Path` | string | `./data/log` | restart | 01 | |
 | `CommitLog:FsyncPolicy` | enum | `OnCommit` | live | 01 | `OnCommit` \| `Interval` \| `OsBuffered`. `OnCommit` is the only durable choice; the others trade a bounded window of committed-but-lost transactions for throughput and must say so in their XML docs. **This is the first throughput ceiling you will hit** — see the note below. |
 | `CommitLog:FsyncIntervalMs` | int | `100` | live | 01 | Only read when `FsyncPolicy = Interval`. This is the size of the data-loss window. |
-| `CommitLog:GroupCommit` | bool | `true` | live | 07 | Batch concurrent commits into one fsync. Improves throughput without weakening durability. Deliberately **not** phase 01 — group commit is an optimization phase 01 explicitly defers; 01 only makes the fsync policy configurable. |
+| `CommitLog:GroupCommit` | bool | `true` | live | 07/17 | Batch concurrent commits into one fsync — **honored since phase 17**, which is the concurrent commit path the phase-07 reservation waited for. Improves throughput without weakening durability: a reducer that returns has committed durably, batched or not. Only read under `FsyncPolicy = OnCommit`; `false` restores the phase-01 inline fsync, whose only argument is distrust of the batching, and the fault-injection suite is the answer to that. |
 | `Snapshots:Enabled` | bool | `true` | live | 07 | |
 | `Snapshots:IntervalTransactions` | long | `100000` | live | 07 | |
 | `Snapshots:TruncateLog` | bool | `true` | live | 07 | Truncation never passes the slowest applier or event-subscriber checkpoint regardless of this setting. |
@@ -192,21 +193,23 @@ posture — off unless opted into, and owner-role-gated when on. See the Bulk in
 ### Choosing an fsync policy
 
 This is the single setting with the largest effect on write throughput, and the published ceilings
-([CLUSTERING.md](CLUSTERING.md)) are a ~47× spread:
+([CLUSTERING.md](CLUSTERING.md), re-measured with phase 17's group commit) still span more than an
+order of magnitude:
 
 | Policy | Sustained commits/s, one shard | What you lose on a crash |
 | --- | ---: | --- |
-| `OnCommit` (default) | ~1,100 | Nothing. A record is on stable storage before the commit returns. |
-| `Interval` (50 ms) | ~52,000 | Up to `FsyncIntervalMs` of committed transactions. |
+| `OnCommit` (default), sequential caller | ~500 | Nothing. A record is on stable storage before the commit returns. |
+| `OnCommit` (default), 16 concurrent callers | ~4,000 (mean 8 commits/fsync) | Nothing — group commit batches fsyncs, never skips them. |
+| `Interval` (50 ms) | ~12,000 | Up to `FsyncIntervalMs` of committed transactions. |
 | `OsBuffered` | disk-independent | Whatever the page cache held. |
 
 The choice is per deployment, not per reducer, so pick for the **least forgiving** thing in the
 database. Two rules of thumb:
 
 - **Simulation state — positions, health, AI ticks, terrain edits.** `Interval` is the right
-  default. The data is reconstructible or quickly re-diverges from a stale value anyway, and 1,100
-  commits/s is a low ceiling for a populated shard. Note that the ceiling is *per shard* and adding
-  nodes does not raise it: one crowded town square is one writer.
+  default. The data is reconstructible or quickly re-diverges from a stale value anyway, and even
+  the group-commit ceiling is a fraction of the loop's own. Note that the ceiling is *per shard*
+  and adding nodes does not raise it: one crowded town square is one writer.
 - **Money, inventory transfers, authentication, anything a player can dispute.** `OnCommit`. A
   bounded loss window is still a window in which a purchase can vanish.
 
