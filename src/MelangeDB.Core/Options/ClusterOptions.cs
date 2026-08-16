@@ -207,4 +207,27 @@ public sealed class ClusterOptions
     /// call, so user code on this seam can stall neither the loop nor the hub.
     /// </summary>
     public int ProvisionTicketTimeoutMs { get; set; } = 600_000;
+
+    /// <summary>
+    /// Hub only: gates consolidation and decommissioning separately from
+    /// <see cref="RebalanceEnabled"/> — giving nodes back is the half with sharp edges, and a
+    /// fleet that only grows still solves the 2 p.m. problem (just not the 2 a.m. bill).
+    /// </summary>
+    public bool ScaleInEnabled { get; set; }
+
+    /// <summary>
+    /// Hub only: the floor on fleet size — scale-in never drains below it. Values below 1 are
+    /// treated as 1.
+    /// </summary>
+    public int MinNodes { get; set; } = 1;
+
+    /// <summary>
+    /// Scale-in's pacing, twice over: a node the loop just provisioned is exempt from
+    /// consolidation for this long (the newest node is the emptiest by definition, and the two
+    /// fleet moves must never take turns), and consecutive consolidations are spaced at least
+    /// this far apart. Long by default on purpose — the dead zone between
+    /// <see cref="RebalanceHotUtilization"/> and <see cref="RebalanceColdUtilization"/> does the
+    /// moment-to-moment damping; this floor is for the hour scale.
+    /// </summary>
+    public int ScaleInCooldownMs { get; set; } = 1_800_000;
 }

@@ -97,6 +97,9 @@ internal sealed partial class HubRuntime : IDisposable
     private bool _provisionGaveUp;
     private int _provisionCallInFlight;
     private readonly Dictionary<string, string> _expiredTickets = new(StringComparer.Ordinal);
+    private int _scaleInInFlight;
+    private long _lastScaleInTicks;
+    private readonly ConcurrentDictionary<string, long> _nodeProvisionedTicks = new(StringComparer.Ordinal);
     private readonly System.Diagnostics.Metrics.Meter _capacityMeter = new("MelangeDB");
     private readonly System.Diagnostics.Metrics.Histogram<double> _provisionLatency;
     private readonly System.Diagnostics.Metrics.Counter<long> _decommissions;
@@ -213,6 +216,13 @@ internal sealed partial class HubRuntime : IDisposable
                 "An INodeProvisioner is registered but Cluster:MaxNodes is not set. The provisioning loop can spend " +
                 "money, so its ceiling must be an explicit decision: set Cluster:MaxNodes to the largest fleet this " +
                 "deployment is willing to pay for, or remove the provisioner registration to keep the fleet fixed.");
+        }
+
+        if (_provisioner is not null && cluster.ScaleInEnabled && Math.Max(1, cluster.MinNodes) > cluster.MaxNodes)
+        {
+            throw new InvalidOperationException(
+                $"Cluster:MinNodes ({cluster.MinNodes}) exceeds Cluster:MaxNodes ({cluster.MaxNodes}); the fleet's floor " +
+                "cannot sit above its ceiling.");
         }
 
         _engine.SetTableAccessGuard(PlacementGuards.HubAccess());
@@ -648,6 +658,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             if (!cluster.RebalanceEnabled
                 || Interlocked.CompareExchange(ref _rebalanceMoveInFlight, 0, 0) != 0
+                || Interlocked.CompareExchange(ref _scaleInInFlight, 0, 0) != 0
                 || !_drainsInFlight.IsEmpty)
             {
                 return;
@@ -668,6 +679,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             var shardUtilization = new Dictionary<ShardKey, double>();
             var nodeUtilization = live.ToDictionary(static node => node, static _ => 0d, StringComparer.Ordinal);
+            var fullCoverage = true;
             foreach (var (node, shards) in byNode)
             {
                 foreach (var shard in shards)
@@ -676,6 +688,13 @@ internal sealed partial class HubRuntime : IDisposable
                     {
                         shardUtilization[shard] = sustained;
                         nodeUtilization[node] += sustained;
+                    }
+                    else
+                    {
+                        // A shard without whole-window history makes the fleet's aggregate an
+                        // underestimate — hot decisions tolerate that (they only need the covered
+                        // shards to be hot); the cold decision must not act on it.
+                        fullCoverage = false;
                     }
                 }
             }
@@ -691,6 +710,7 @@ internal sealed partial class HubRuntime : IDisposable
                         _provisionAttempts = 0;
                 }
 
+                EvaluateScaleIn(cluster, live, byNode, nodeUtilization, fullCoverage, now);
                 return;
             }
 
@@ -896,6 +916,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             if (fulfilled)
             {
+                _nodeProvisionedTicks[outstanding.Ticket.NodeName] = now.UtcTicks;
                 var latencyMs = (now - outstanding.RequestedAt).TotalMilliseconds;
                 _provisionLatency.Record(latencyMs);
                 Metrics.ProvisionFulfilled();
@@ -960,6 +981,7 @@ internal sealed partial class HubRuntime : IDisposable
 
         if (fulfilled is { } issued)
         {
+            _nodeProvisionedTicks[nodeName] = _time.GetUtcNow().UtcTicks;
             var latencyMs = (_time.GetUtcNow() - issued.RequestedAt).TotalMilliseconds;
             _provisionLatency.Record(latencyMs);
             Metrics.ProvisionFulfilled();
@@ -995,6 +1017,149 @@ internal sealed partial class HubRuntime : IDisposable
         {
             LogProvisionerCallFailed(_logger, "DecommissionAsync", exception.Message);
         }
+    }
+
+    /// <summary>
+    /// Scale-in (road-to-0.2 phase 14), evaluated only when nothing is hot: when the fleet's
+    /// aggregate sustained load would fit under <c>Cluster:RebalanceColdUtilization</c> on one
+    /// node fewer, the emptiest live node is consolidated away and handed back to the
+    /// provisioner. Behind its own switch, floored by <c>Cluster:MinNodes</c>, refused on partial
+    /// load-view coverage (never consolidate on an underestimate), and paced by
+    /// <c>Cluster:ScaleInCooldownMs</c> — which also exempts freshly provisioned nodes, because
+    /// the newest node is the emptiest by definition and the two fleet moves must never take
+    /// turns.
+    /// </summary>
+    private void EvaluateScaleIn(
+        ClusterOptions cluster,
+        HashSet<string> live,
+        Dictionary<string, List<ShardKey>> byNode,
+        Dictionary<string, double> nodeUtilization,
+        bool fullCoverage,
+        DateTimeOffset now)
+    {
+        if (_provisioner is null || !cluster.ScaleInEnabled || !fullCoverage)
+            return;
+        if (live.Count <= Math.Max(1, cluster.MinNodes))
+            return;
+
+        // Consolidation only in a fully connected fleet: a membership-alive node the hub cannot
+        // reach is either dying (a decommission still settling toward the failure sweep) or
+        // partitioned — either way the fleet is in flux, and scale-in is the one move with no
+        // urgency whatsoever.
+        if (live.Any(node => LinkOf(node) is null))
+            return;
+        lock (_capacityLock)
+        {
+            if (_ticket is not null)
+                return;
+        }
+
+        var cooldownTicks = TimeSpan.TicksPerMillisecond * Math.Max(0, cluster.ScaleInCooldownMs);
+        if (now.UtcTicks - Interlocked.Read(ref _lastScaleInTicks) < cooldownTicks)
+            return;
+
+        var aggregate = nodeUtilization.Values.Sum();
+        var remainder = aggregate / (live.Count - 1);
+        if (remainder >= cluster.RebalanceColdUtilization)
+            return;
+
+        var victim = nodeUtilization
+            .Where(pair => now.UtcTicks - _nodeProvisionedTicks.GetValueOrDefault(pair.Key) >= cooldownTicks)
+            .Where(pair => LinkOf(pair.Key) is not null)
+            .OrderBy(static pair => pair.Value)
+            .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
+            .Select(static pair => (string?)pair.Key)
+            .FirstOrDefault();
+        if (victim is null || Interlocked.CompareExchange(ref _scaleInInFlight, 1, 0) != 0)
+            return;
+
+        LogScaleInStarting(
+            _logger, victim, nodeUtilization[victim], aggregate, live.Count, remainder,
+            cluster.RebalanceColdUtilization, byNode.GetValueOrDefault(victim)?.Count ?? 0);
+        _ = Task.Run(() => ConsolidateAsync(victim));
+    }
+
+    /// <summary>
+    /// One consolidation session: drain the victim's shards onto the rest one at a time — phase
+    /// 13 drains, nothing new touches a shard — re-checking the cold condition before every drain
+    /// and once more at the last moment, because decommissioning a node the loop now needs is the
+    /// one mistake players would see. Aborting is free at every step: a partially drained node is
+    /// just an emptier node, and the loop's ordinary rules take it from there.
+    /// </summary>
+    private async Task ConsolidateAsync(string victim)
+    {
+        try
+        {
+            var cluster = Cluster;
+            var budget = Math.Max(4, 2 * _membership.AssignmentsFor(victim).Count);
+            while (true)
+            {
+                var owned = _membership.AssignmentsFor(victim);
+                if (owned.Count == 0)
+                    break;
+                if (budget-- <= 0)
+                {
+                    LogScaleInAborted(_logger, victim, "the node kept receiving new shards faster than the drains removed them");
+                    return;
+                }
+
+                if (!FleetIsColdOnRemainder(cluster))
+                {
+                    LogScaleInAborted(_logger, victim, "the fleet warmed while consolidating");
+                    return;
+                }
+
+                await DrainShardAsync(owned[0].Shard, destinationNode: null, _stopped.Token).ConfigureAwait(false);
+            }
+
+            if (!FleetIsColdOnRemainder(cluster) || _membership.AssignmentsFor(victim).Count > 0)
+            {
+                LogScaleInAborted(_logger, victim, "the last-moment re-check failed");
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastScaleInTicks, _time.GetUtcNow().UtcTicks);
+            LogScaleInDecommissioning(_logger, victim);
+            await DecommissionIsolatedAsync(victim).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            LogScaleInAborted(_logger, victim, exception.Message);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _scaleInInFlight, 0);
+        }
+    }
+
+    /// <summary>
+    /// The scale-in condition, recomputed from the stores: aggregate sustained load across the
+    /// live fleet fits under the cold threshold on one node fewer. False on any shard without
+    /// whole-window coverage — a cold call made on partial data is how a loop decommissions a
+    /// node it needs.
+    /// </summary>
+    private bool FleetIsColdOnRemainder(ClusterOptions cluster)
+    {
+        var now = _time.GetUtcNow();
+        var window = TimeSpan.FromSeconds(Math.Max(1, cluster.RebalanceWindowSeconds));
+        var live = _membership.Nodes()
+            .Where(static n => n.Alive)
+            .Select(static n => n.NodeName)
+            .ToHashSet(StringComparer.Ordinal);
+        if (live.Count <= Math.Max(1, cluster.MinNodes))
+            return false;
+
+        var aggregate = 0d;
+        foreach (var assignment in _membership.AllAssignments())
+        {
+            if (assignment.NodeName is not { } owner || !live.Contains(owner))
+                continue;
+            if (Load.SustainedUtilization(assignment.Shard, window, now) is not { } sustained)
+                return false;
+            aggregate += sustained;
+        }
+
+        return aggregate / (live.Count - 1) < cluster.RebalanceColdUtilization;
     }
 
     /// <summary>The live node owning the fewest shards, excluding the drain's origin — the default destination.</summary>
@@ -1520,6 +1685,23 @@ internal sealed partial class HubRuntime : IDisposable
         Message = "Capacity: node '{NodeName}' arrived after its ticket '{TicketId}' expired, but registration assigned it " +
                   "shards that were waiting for an owner — capacity arrived late but arrived, so it stays.")]
     private static partial void LogProvisionLateArrivalKept(ILogger logger, string nodeName, string ticketId);
+
+    [LoggerMessage(EventId = 1744, EventName = "ScaleInStarting", Level = LogLevel.Information,
+        Message = "Scale-in: aggregate sustained load {Aggregate:F2} across {LiveNodes} node(s) fits on one fewer at " +
+                  "{Remainder:P0}, under Cluster:RebalanceColdUtilization ({Cold}); consolidating the emptiest node " +
+                  "'{Victim}' ({VictimUtilization:P0}, {Shards} shard(s)) onto the rest.")]
+    private static partial void LogScaleInStarting(
+        ILogger logger, string victim, double victimUtilization, double aggregate, int liveNodes, double remainder, double cold, int shards);
+
+    [LoggerMessage(EventId = 1745, EventName = "ScaleInDecommissioning", Level = LogLevel.Information,
+        Message = "Scale-in: node '{NodeName}' owns nothing and the fleet is still cold at the last-moment re-check; " +
+                  "handing it back to the provisioner.")]
+    private static partial void LogScaleInDecommissioning(ILogger logger, string nodeName);
+
+    [LoggerMessage(EventId = 1746, EventName = "ScaleInAborted", Level = LogLevel.Warning,
+        Message = "Scale-in of '{NodeName}' stopped: {Reason}. The node stays and nothing was lost — consolidation is an " +
+                  "optimization, and aborting one is free.")]
+    private static partial void LogScaleInAborted(ILogger logger, string nodeName, string reason);
 
     [LoggerMessage(EventId = 1734, EventName = "RebalanceEvaluationFailed", Level = LogLevel.Warning,
         Message = "A rebalance tick failed to evaluate ({Reason}); the loop continues on its next tick.")]

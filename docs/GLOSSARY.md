@@ -257,6 +257,25 @@ other way. One outstanding at a time; expiry (`Cluster:ProvisionTicketTimeoutMs`
 one re-request, a second expiry latches the operator alert (EventId 1738), and a node arriving
 after its ticket expired is surplus — decommissioned unless shards were genuinely waiting for it.
 
+**Scale-in** — The fleet's reverse move (`Cluster:ScaleInEnabled`, off by default): when aggregate
+sustained load fits under `Cluster:RebalanceColdUtilization` on one node fewer, the emptiest live
+node's shards drain onto the rest — phase 13 drains, one at a time, re-checking the cold condition
+before each and once more at the last moment — and only a node membership confirms owns nothing is
+handed to `DecommissionAsync`. Floored by `Cluster:MinNodes`, paced by `Cluster:ScaleInCooldownMs`
+(which also exempts freshly provisioned nodes), and free to abort at every step: a partially
+drained node is just an emptier node.
+
+**Standby** — A pre-warmed shard node: started ahead of time, registered in membership, owning
+zero shards. Costs no machinery — the rebalance loop prefers assigning to an empty node over
+provisioning by construction, so a standby turns "provision, then reassign" into just "reassign".
+The recommended shape for games that cannot afford minutes of provision latency mid-surge.
+
+**Decommission** — Handing a node's instance back through the capacity seam
+(`INodeProvisioner.DecommissionAsync`). Called only for a node membership confirms owns no shards:
+the emptiest node after scale-in drained it, or a late arrival whose provision ticket already
+expired. Idempotent by expectation — decommissioning an instance that is already gone succeeds
+quietly.
+
 **Drain** — The planned move of one shard to another live node while both are up
 (`MelangeClusterCoordinator.DrainShardAsync`, road-to-0.2 phase 13): the origin takes a fresh
 snapshot and closes the shard's engine, membership moves the shard under a bumped fencing token,

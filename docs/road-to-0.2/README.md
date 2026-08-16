@@ -12,7 +12,7 @@ docs one level up describe the current system. Where a plan and the code disagre
 | | Phase | Status |
 | --- | --- | --- |
 | [13](plan-phase-13.md) | Clustering III — elastic assignment | Shipped |
-| [14](plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in | Planned |
+| [14](plan-phase-14.md) | Clustering IV — provisioned capacity and scale-in | Shipped |
 | [15](plan-phase-15.md) | Backup and restore | Planned |
 
 Phases 13 and 14 implement [design/elastic-rebalancing.md](../design/elastic-rebalancing.md):

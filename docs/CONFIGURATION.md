@@ -136,14 +136,18 @@ node's per-shard write-lock busy fractions, which can legitimately exceed 1.0 on
 several busy shard engines — the row says so, because a threshold read as "percent of one CPU"
 would be tuned wrong.
 
-**Planned for phases 14–15**: the remaining `Cluster:*` rows marked *planned* in the Cluster table
-below (phase 14, provisioned capacity — design record in
-[design/elastic-rebalancing.md](design/elastic-rebalancing.md)) and the `Backup:*` rows in the
-Backup section (phase 15). Defaults there are provisional until each phase lands and verifies them
-against the code, per this register's planned → shipped rule. One deliberate absence decided at
-planning time: the node provisioner is a **DI registration, not a configuration string**
+**Shipped as of phase 14** (defaults verified against `ClusterOptions`): `Cluster:MaxNodes`,
+`Cluster:MinNodes`, `Cluster:ScaleInEnabled`, `Cluster:ProvisionTicketTimeoutMs`, and
+`Cluster:ScaleInCooldownMs` — the last a key the plan's list did not name (scale-in's pacing
+needed an explicit number; see the phase's Shipped notes). `Cluster:RebalanceColdUtilization`'s
+phase-13 reservation is hereby redeemed: scale-in is its consumer. The deliberate absence decided
+at planning time stands: the node provisioner is a **DI registration, not a configuration string**
 (`INodeProvisioner`, the membership-store precedent) — a provisioner is a component with
 credentials, not a name.
+
+**Planned for phase 15**: the `Backup:*` rows in the Backup section. Defaults there are
+provisional until the phase lands and verifies them against the code, per this register's
+planned → shipped rule.
 
 **Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
 the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid
@@ -374,12 +378,13 @@ that were reshaped or removed when this shipped.
 | `Cluster:RebalanceEnabled` | bool | `false` | live | 13 | The hub's rebalance loop — off means the load view and the operator drain exist, but nothing moves a shard automatically. Off by default because a loop that relocates the world should be a decision, not a surprise. |
 | `Cluster:RebalanceWindowSeconds` | int | `60` | live | 13 | The sustained-load window: the loop acts on the window's *mean*, never a single heartbeat sample — and not at all until the load history covers the whole window, so a freshly started hub cannot mistake its first samples for sustained load. The first hysteresis layer. |
 | `Cluster:RebalanceHotUtilization` | double | `0.75` | live | 13 | Sustained utilization above which a node counts as hot: the sum of its shards' write-lock busy fractions (`melange.cluster.shard.utilization`) over the window — the resource the published hotspot ceilings are ceilings on. Note the sum can legitimately exceed 1.0 on a node running several busy shard engines. |
-| `Cluster:RebalanceColdUtilization` | double | `0.25` | live | 13 | The floor of the dead zone. In phase 13 nothing acts on cold — the gap between the two thresholds exists so the loop never chases its own wake; phase 14's scale-in is what eventually consumes it. Binds and validates; shipped accepted-and-reserved (the `GroupCommit` precedent). |
+| `Cluster:RebalanceColdUtilization` | double | `0.25` | live | 13 | The floor of the dead zone — the gap between the two thresholds exists so the loop never chases its own wake. Shipped accepted-and-reserved in phase 13; **consumed by phase 14's scale-in**: the fleet consolidates only when its aggregate sustained load fits under this threshold on one node fewer. |
 | `Cluster:ShardMoveMinIntervalMs` | int | `300000` | live | 13 | Per-shard floor between automatic moves (the `HandoffMinIntervalMs` precedent, at fleet scale): a shard that just moved — by the loop *or by an operator* — is not moved again by the loop for this long, whatever the load view says. Operator drains themselves are never blocked by it. Also the cadence of the loop's stuck-hot warnings (EventIds 1732/1733). |
 | `Cluster:DrainQueueTimeoutMs` | int | `60000` | live | 13 | Cap on gateway call-queueing during a drain before queued callers get a retryable error (EventId 1730). Deliberately its own key, defaulting far above the handoff queue's patience — recovering a shard is slower than importing a player, and this cap exists to bound a *wedged* drain, not a normal one. Also the floor of the drain's per-step link timeout, since quiesce and recovery scale with shard size. |
 | `Cluster:MaxNodes` | int | *(unset)* | live | 14 | Hard ceiling on fleet size; the rebalance loop never provisions past it. **Deliberately no default**: a registered `INodeProvisioner` with this unset is refused loudly at startup — startup-fatal, because a deployment that registered a provisioner meant to use it, and every default is wrong: low silently caps a deployment that meant to scale, high is a silent spending authorization. Irrelevant when no provisioner is registered. |
-| `Cluster:MinNodes` | int | `1` | live | 14 | **Planned.** Floor on fleet size; scale-in never drains below it. |
-| `Cluster:ScaleInEnabled` | bool | `false` | live | 14 | **Planned.** Gates consolidation and decommissioning separately from `RebalanceEnabled` — giving nodes back is the half with sharp edges, and a fleet that only grows still solves the 2 p.m. problem (just not the 2 a.m. bill). |
+| `Cluster:MinNodes` | int | `1` | live | 14 | Floor on fleet size; scale-in never drains below it. Values below 1 are treated as 1; a floor above the ceiling (`MinNodes > MaxNodes` with scale-in enabled and a provisioner registered) is refused at startup. |
+| `Cluster:ScaleInEnabled` | bool | `false` | live | 14 | Gates consolidation and decommissioning separately from `RebalanceEnabled` — giving nodes back is the half with sharp edges, and a fleet that only grows still solves the 2 p.m. problem (just not the 2 a.m. bill). Scale-in acts only on full load-view coverage (never on an underestimate), only in a fully connected fleet, and re-checks the cold condition at the last moment before decommissioning. |
+| `Cluster:ScaleInCooldownMs` | int | `1800000` | live | 14 | Scale-in's pacing, twice over: a node the loop just provisioned is exempt from consolidation for this long (the newest node is the emptiest by definition, and the two fleet moves must never take turns), and consecutive consolidations are spaced at least this far apart. Long by default on purpose — the dead zone between the hot and cold thresholds does the moment-to-moment damping; this floor is for the hour scale. |
 | `Cluster:ProvisionTicketTimeoutMs` | int | `600000` | live | 14 | How long the hub waits for a provision ticket's named node to join membership before declaring the ticket expired — an expiry triggers exactly one re-request, and a second expiry raises the operator alert (EventId 1738, the `melange-capacity` health check) and stops asking. Money is involved: the posture on repeated failure is *tell a human*, never *keep trying*. Also bounds each individual provisioner call, so user code on the seam can stall neither the loop nor the hub. |
 
 ## Diagnostics

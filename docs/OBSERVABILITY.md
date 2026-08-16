@@ -348,6 +348,14 @@ every node hot but shards no longer outnumber nodes, so a new node could receive
 `1742 ProvisionAtCeiling` is `Cluster:MaxNodes` doing its job while every node is hot: the two
 rate-limited "provisioning will not help / is not allowed" reports, both worth an operator's eyes.
 
+Scale-in: `1744 ScaleInStarting` carries the whole decision's arithmetic — the fleet's aggregate
+sustained load, what it comes to per node on one node fewer, the cold threshold, and the victim
+with its shard count. `1745 ScaleInDecommissioning` is the last-moment re-check passing — the node
+owns nothing and the fleet is still cold — and `1746 ScaleInAborted` is any consolidation stopping
+short (the fleet warmed, a drain failed, the re-check refused): the node stays and nothing was
+lost, so an occasional 1746 is the hysteresis working, while a *recurring* one means the fleet
+hovers at the cold boundary and the thresholds deserve a look.
+
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
 the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`

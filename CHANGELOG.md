@@ -59,6 +59,21 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The 2 a.m. bill: scale-in**
+  ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), final slice — the phase is
+  complete, and with it the whole elastic-capacity design record is built). Behind its own switch
+  (`Cluster:ScaleInEnabled`, off by default — giving nodes back is the half with sharp edges):
+  when the fleet's aggregate sustained load fits under `Cluster:RebalanceColdUtilization` on one
+  node fewer, the hub drains the emptiest node's shards onto the rest — phase 13 drains, one at a
+  time, re-checking the cold condition before each — and hands the node to `DecommissionAsync`
+  only after membership confirms it owns nothing *and* a last-moment re-check still says cold,
+  because decommissioning a node the loop now needs is the one mistake players would see.
+  Floored by `Cluster:MinNodes`, paced by `Cluster:ScaleInCooldownMs` (which also exempts freshly
+  provisioned nodes — the newest node is the emptiest by definition, and the two fleet moves must
+  never take turns), refused on partial load-view coverage and in a fleet with unreachable nodes,
+  and free to abort at every step (EventIds 1744–1746). The whole curve — two hot nodes grow to
+  three at the ceiling, cool, and consolidate back to the floor with the surplus process exiting —
+  runs as one test.
 - **The fleet follows load: provision-then-reassign**
   ([road-to-0.2 phase 14](docs/road-to-0.2/plan-phase-14.md), second slice). The rebalance loop's
   second move, taken only when the first is unavailable: every live node sustained-hot, no shard
