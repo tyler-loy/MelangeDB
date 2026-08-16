@@ -295,7 +295,9 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
     {
         while (!ct.IsCancellationRequested)
         {
-            var head = _engine.Log.HeadLsn;
+            // Durable, not head: ReadFrom serves nothing beyond the durability watermark — and a
+            // relational tier must not hold an LSN a crash on the engine could untell.
+            var head = _engine.Log.DurableLsn;
             var applied = AppliedLsn;
             if (applied >= head)
                 return;

@@ -113,7 +113,11 @@ public class CommitPathBenchmarks : IDisposable
         return length;
     }
 
-    /// <summary>Encode plus framing, CRC, and the write — the disk's share appears here.</summary>
+    /// <summary>
+    /// Encode plus framing, CRC, and the write. Since phase 17 the append is buffered under every
+    /// policy — the OnCommit fsync moved to <c>WaitDurable</c> — so the disk's share appears in
+    /// the full-commit row's gap, not here.
+    /// </summary>
     [Benchmark(Description = "append to the log")]
     public ulong AppendToLog() => _log.Append(_request).Lsn;
 
@@ -137,7 +141,7 @@ public class CommitPathBenchmarks : IDisposable
 
     /// <summary>
     /// The whole thing through the public entry point: body, write-set collapse, guards, append,
-    /// fsync, observers, apply. Everything above is a subset of this row.
+    /// observers, apply, and the durability wait. Everything above is a subset of this row.
     /// </summary>
     [Benchmark(Description = "full commit", Baseline = true)]
     public ulong FullCommit()

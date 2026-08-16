@@ -98,7 +98,7 @@ Source name: `MelangeDB`.
 | Span | Phase | Attributes | Notes |
 | --- | --- | --- | --- |
 | `melange.reducer` | 01 | `melange.reducer.name`, `melange.outcome` (`commit`/`abort`/`rejected`), `melange.writeset.rows`; `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off; `melange.reducer.args` only when `Telemetry:IncludeReducerArguments` is opted in (formatted values for in-process calls; the hex-encoded argument payload, capped at 256 bytes, for encoded dispatch) | The root span for client-initiated work. |
-| `melange.commit` | 01 | `melange.lsn`, `melange.writeset.bytes` | The critical section; a child `melange.fsync` span isolates durability cost from serialization cost. |
+| `melange.commit` | 01 | `melange.lsn`, `melange.writeset.bytes` | The locked critical section — since phase 17 the append alone, because the durability wait runs after the lock releases. The `melange.fsync` span belongs to whichever transaction performed the shared flush (a lone caller's own, under group commit possibly another commit's trace), so durability cost stays isolated from serialization cost without pretending a batch's flush was private. |
 | `melange.apply` | 01 | `melange.applier` | One per applier, per batch. |
 | `melange.subscription.initial` | 03 | `melange.table`, `melange.rows`, `melange.bytes` | The expensive half of a subscription; worth its own span. |
 | `melange.subscription.delta` | 03 | `melange.table`, `melange.subscribers` | Sampled — this is the highest-frequency operation in the system and must not be traced per row op at full rate. |
@@ -114,18 +114,18 @@ and they call for opposite responses:
 | Field | Span event tag | Log field | What a large value means |
 | --- | --- | --- | --- |
 | Locked | `melange.locked_ms` | `LockedMs` | How long the write lock was held — the threshold fires on this, and it is global write latency. |
-| Total | `melange.duration_ms` | `DurationMs` | The whole transaction. Equal to `LockedMs` under `Isolation.Serialized`. |
+| Total | `melange.duration_ms` | `DurationMs` | The whole transaction, durability wait included. Since phase 17 it exceeds `LockedMs` by that wait even under `Isolation.Serialized`. |
 | Body | `melange.body_ms` | `BodyMs` | The module does too much per transaction — narrow the window. |
-| Commit | `melange.commit_ms` | `CommitMs` | The log append, fsync included. |
-| Fsync | `melange.fsync_ms` | `FsyncMs` | Disk contention on this host — infrastructure, not application. |
+| Commit | `melange.commit_ms` | `CommitMs` | The log append — buffered since phase 17, so the disk no longer appears here. |
+| Fsync | `melange.fsync_ms` | `FsyncMs` | The durability wait this caller experienced — under group commit the shared flush's cost from this transaction's seat. Disk contention on this host — infrastructure, not application. |
 | Post-commit | `melange.post_commit_ms` | `PostCommitMs` | A commit observer, an applier handoff, or an automatic snapshot. |
 | Rows | `melange.writeset.rows` | `Rows` | Sizes the transaction; a wide body with one row op is a read-side problem. |
 | Isolation | `melange.isolation` | `Isolation` | `serialized` or `snapshot` — which of the two numbers above to believe. |
 
-**`LockedMs` and `DurationMs` are the same interval under the default `Isolation.Serialized`**, because the
-write lock covers the whole transaction; that path's warnings are exactly what they were before snapshot
-isolation existed. Under `Isolation.Snapshot` the body ran outside the lock, so the gap between the two
-numbers is precisely the stall that isolation level removed — and a 500 ms snapshot body does not warn at
+**`LockedMs` is the stall; `DurationMs` is the experience.** Under the default `Isolation.Serialized` the
+two differ only by the durability wait (phase 17 moved the fsync outside the lock), so a large gap between
+them on a serialized transaction reads as disk, not contention. Under `Isolation.Snapshot` the body also
+ran outside the lock, so the gap is the body plus the wait — and a 500 ms snapshot body does not warn at
 all, because it froze nothing. That is the point of thresholding on the locked half: an alert built to catch
 write stalls should not fire on a reducer that caused none. `melange.isolation` is also a tag on the
 `melange.reducer` span itself, so the two populations can be separated before any warning is involved.
@@ -140,6 +140,10 @@ reducer body.
 `Interval` or `OsBuffered` the flush happens on a timer thread or not at all, so no durability cost belongs
 to the appending transaction; a zero would read as "the disk was instant". Those warnings keep event id
 `1003` — alerts key on the id — under the event name `SlowReducerDeferredFsync` rather than `SlowReducer`.
+Under `OnCommit` the field is always present and can legitimately be near zero: a commit whose record an
+in-flight flush already covered waited almost nothing, which is group commit doing its job — the
+`melange.log.group_commit.batch_size` histogram beside it is how the amortized view is derived without
+either metric lying.
 
 **A transaction that aborts warns too.** For a serialized transaction, rolling back costs nothing and buys
 nothing: the write lock was held for the full duration either way, so a reducer that walks five thousand rows
@@ -201,6 +205,7 @@ Meter name: `MelangeDB`.
 | `melange.reducer.duration` | histogram | `ms` | `reducer` | 01 |
 | `melange.commit.duration` | histogram | `ms` | — | 01 |
 | `melange.fsync.duration` | histogram | `ms` | — | 01 |
+| `melange.log.group_commit.batch_size` | histogram | `{record}` | — | 17 |
 | `melange.writeset.rows` | histogram | `{row}` | `reducer` | 01 |
 | `melange.log.head_lsn` | gauge | `{lsn}` | — | 01 |
 | **`melange.applier.lag`** | gauge | `{tx}` | `applier` | 01 |
@@ -250,7 +255,10 @@ corresponds to a documented silent failure mode:
 Structured through `ILogger` with stable `EventId`s so log-based alerts don't break on message rewording.
 No parallel logging abstraction — the host's configured providers are the whole story.
 
-Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01); `1003 SlowReducer` —
+Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01);
+`1007 GroupFlushFailed` — a group fsync failed, every commit it covered is failed and rolled back,
+and the log rejects appends until restart; Critical, and the `melange-log` health check goes
+unhealthy with it (road-to-0.2 phase 17); `1003 SlowReducer` —
 also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flush, and
 `SlowReducerAborted` when the transaction did not commit, both under the same id —
 `1004 SnapshotIsolationUnavailable`, once per engine when a store offers no pinned reads,

@@ -48,8 +48,10 @@ The same operation is available programmatically as `MelangeBackup.Create` in `M
 ## `melange backup <url> --token <jwt> [-o world.mbak]`
 
 The online form: streams the archive from a running server's `/melange/backup` endpoint while
-commits continue. The capture is consistent at a **fenced LSN** — the head at the moment the
-stream begins — and the server holds a **truncation pin** for exactly the stream's duration, so
+commits continue. The capture is consistent at a **fenced LSN** — the durable watermark at the
+moment the stream begins (under group commit a record can sit appended while its commit still
+waits on the shared fsync, and an archive must never carry an LSN whose caller was not
+acknowledged) — and the server holds a **truncation pin** for exactly the stream's duration, so
 the snapshot and every record above it stay readable while they stream. Writes that land after
 the fence are simply not in this archive; they are in the next one.
 

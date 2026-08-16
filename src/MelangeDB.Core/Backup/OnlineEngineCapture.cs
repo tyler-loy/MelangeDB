@@ -39,7 +39,12 @@ internal static class OnlineEngineCapture
 
             var baseLsn = engine.Log.BaseLsn;
             var snapshotLsn = snapshot?.Header.Lsn ?? 0;
-            var fence = engine.Log.HeadLsn;
+
+            // Fenced at the durable watermark, not the head: under group commit a record can sit
+            // buffered while its commit still waits for the fsync, and a backup must never carry
+            // an LSN whose caller was not acknowledged — a crash on the source would untell it,
+            // leaving the archive claiming history the origin never had.
+            var fence = engine.Log.DurableLsn;
             engine.LogFile.FlushBuffers();
 
             var identity = new ArchiveEngineIdentity

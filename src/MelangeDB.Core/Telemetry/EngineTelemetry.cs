@@ -22,6 +22,7 @@ internal sealed class EngineTelemetry : IDisposable
     private readonly Histogram<double> _reducerDuration;
     private readonly Histogram<double> _commitDuration;
     private readonly Histogram<double> _fsyncDuration;
+    private readonly Histogram<long> _groupCommitBatch;
     private readonly Histogram<long> _writeSetRows;
     private readonly Counter<long> _rateLimited;
     private readonly Counter<long> _schedulerOverruns;
@@ -36,8 +37,9 @@ internal sealed class EngineTelemetry : IDisposable
         _meter = new Meter(SourceName);
         _transactions = _meter.CreateCounter<long>("melange.transactions", "{tx}", "Committed, aborted, and rejected transactions.");
         _reducerDuration = _meter.CreateHistogram<double>("melange.reducer.duration", "ms", "Reducer body plus commit duration.");
-        _commitDuration = _meter.CreateHistogram<double>("melange.commit.duration", "ms", "Log append duration, fsync included.");
+        _commitDuration = _meter.CreateHistogram<double>("melange.commit.duration", "ms", "Log append duration; the durability wait is melange.fsync.duration's.");
         _fsyncDuration = _meter.CreateHistogram<double>("melange.fsync.duration", "ms", "Durability flush duration.");
+        _groupCommitBatch = _meter.CreateHistogram<long>("melange.log.group_commit.batch_size", "{record}", "Records made durable per fsync under OnCommit — the distribution's shape is group commit working.");
         _writeSetRows = _meter.CreateHistogram<long>("melange.writeset.rows", "{row}", "Collapsed row ops per transaction.");
         _rateLimited = _meter.CreateCounter<long>("melange.ratelimit.rejected", "{call}", "Client reducer calls rejected by the rate limiter before any transaction opened.");
         _schedulerOverruns = _meter.CreateCounter<long>("melange.scheduler.overruns", "{tick}", "Ticks that ran past their timer's interval — the death-spiral early warning.");
@@ -183,6 +185,8 @@ internal sealed class EngineTelemetry : IDisposable
     public void RecordCommitDuration(double durationMs) => _commitDuration.Record(durationMs);
 
     public void RecordFsyncDuration(double durationMs) => _fsyncDuration.Record(durationMs);
+
+    public void RecordGroupCommitBatch(long records) => _groupCommitBatch.Record(records);
 
     public void Dispose() => _meter.Dispose();
 }

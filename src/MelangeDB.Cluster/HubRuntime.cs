@@ -1394,7 +1394,11 @@ internal sealed partial class HubRuntime : IDisposable
                         continue;
                     }
 
-                    var head = _engine.Log.HeadLsn;
+                    // Durable, not head: ReadFrom serves nothing beyond the durability watermark,
+                    // so judging availability by the head would busy-spin through the gap while a
+                    // commit's fsync is still in flight — and a replica must not receive an LSN a
+                    // crash on this hub could untell anyway.
+                    var head = _engine.Log.DurableLsn;
                     if (cursor < head)
                     {
                         var lsns = new List<ulong>();
@@ -1478,6 +1482,9 @@ internal sealed partial class HubRuntime : IDisposable
             }
         });
 
+        // The reset names an LSN the replica's cursor will count from, so it must be durable
+        // before the state leaves this hub — the same untellable-LSN rule as every egress gate.
+        _engine.Log.WaitDurable(resetLsn);
         await link.RequestAsync("replica-reset", new ReplicaReset(resetLsn, [.. tables]), ct).ConfigureAwait(false);
         LogReplicaBootstrapped(
             _logger,

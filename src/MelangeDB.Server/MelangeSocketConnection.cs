@@ -562,6 +562,11 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
                 return registered.InitialSet;
             });
+
+            // The set's anchor names an LSN the client will judge every subsequent delta against,
+            // so it must be durable before the first chunk leaves — the same untellable-LSN rule
+            // as the delta gate in TryDequeueNext.
+            _transport.Engine.Log.WaitDurable(initialSet.AnchorLsn);
             ServerTelemetry.CompleteInitialSet(activity, initialSet.Rows.Count, initialSet.Bytes);
             _sendSignal.Release();
         }
@@ -663,6 +668,12 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         }
 
         EnqueuePriority(new ResumeResultFrame(true, null));
+
+        // The gap runs up to resumeHead, and the log serves nothing beyond its durable watermark
+        // — records still waiting on their group fsync would silently fall out of the replay and
+        // never reach this client (the buffered frames below only cover LSNs above resumeHead).
+        // Waiting here closes the hole; it is bounded by one flush, like every durability gate.
+        engine.Log.WaitDurable(resumeHead);
 
         // Serve the gap from the log, then release live deltas buffered while replaying. The
         // buffered frames all carry LSNs above resumeHead, so the data channel stays in LSN order.
@@ -786,6 +797,16 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         var delta = _heldDelta;
         if (delta is null && _delta.TryDequeue(out var queued))
         {
+            // The durability gate (road-to-0.2 phase 17): fan-out enqueued this frame under the
+            // write lock, possibly before its record's group fsync completed, and a client must
+            // never apply an LSN a crash could untell — recovery truncates the torn tail without
+            // minting an epoch, re-mints the same LSNs for different records, and a cursor acked
+            // on the untold record would then silently diverge. The wait is bounded by one flush:
+            // the record's own committer is parked on the same fsync. Synthetic re-scope frames
+            // carry LSN 0 and gate on nothing.
+            if (queued.Frame.Lsn > 0)
+                _transport.Engine.Log.WaitDurable(queued.Frame.Lsn);
+
             // The encode the engine thread did not do. Off the lock, on the connection that
             // actually wants these bytes.
             Interlocked.Add(ref _bufferedDeltaBytes, -queued.Length);

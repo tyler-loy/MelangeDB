@@ -194,9 +194,11 @@ quadratic fan-out, backlog past the knee — is the durable result.
 
 ### Relating to the in-process hotspot ceiling
 
-CLUSTERING.md publishes the *commit loop's* ceiling, measured in-process on one crowded shard:
-~1,100 commits/s under per-commit fsync (the disk), ~52,000 commits/s under interval fsync (the
-loop). The socket path never gets near 52,000, because it hits **delta fan-out first**: with S
+CLUSTERING.md publishes the *commit loop's* ceilings, measured in-process on one crowded shard:
+~500 commits/s under per-commit fsync from a sequential caller (the disk), ~4,000 under the same
+durability from 16 concurrent callers (phase 17's group commit — the disk's flush rate times the
+batch contention forms), ~12,000 under interval fsync (the loop). The socket path never gets near
+the loop's ceiling, because it hits **delta fan-out first**: with S
 subscribers on a shard each committing at rate R, the server must deliver S x R row events per
 second per shard — quadratic in players per shard. The ladder above shows exactly that shape:
 commits scale linearly and stay cheap; the deliverable delta rate is what saturates.
@@ -209,11 +211,13 @@ no seams, 60 s, ~758 calls/s — one commit per call):
 | `interval` (50 ms) | 45,500 / 45,500 | 11.4 ms | 19.7 ms | 34.5 ms | 113 ms |
 | `commit` (default durability) | 45,550 / 45,550 | 46.4 ms | 522 ms | 1,294 ms | 2,855 ms |
 
-758 commits/s is under the measured ~1,100/s per-commit fsync ceiling, so throughput holds either
-way — but the *latency distribution* tells the story: under per-commit fsync every commit waits its
-turn behind the disk's fsync queue, and p90 goes from 20 ms to half a second at only ~70% of the
-ceiling. Choosing the fsync policy is choosing this distribution, exactly as CLUSTERING.md says at
-the strategy-choice point.
+758 commits/s sat under the sequential per-commit fsync ceiling of the day, so throughput held
+either way — but the *latency distribution* tells the story: under per-commit fsync every commit
+waits its turn behind the disk's fsync queue, and p90 goes from 20 ms to half a second at only
+~70% of that ceiling. Choosing the fsync policy is choosing this distribution, exactly as
+CLUSTERING.md says at the strategy-choice point. (Measured before phase 17's group commit; the
+concurrent callers this tool generates are exactly the shape that now shares fsyncs, so a re-run
+should show the per-commit-fsync tail collapse toward the batched ceiling.)
 
 ### Soak — memory over five minutes
 

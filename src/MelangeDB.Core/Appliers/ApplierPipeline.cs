@@ -10,6 +10,7 @@ public sealed class ApplierPipeline
     private readonly ICommitLog _log;
     private readonly EngineTelemetry? _telemetry;
     private readonly Func<CommitRecord, CommitRecord>? _transform;
+    private readonly Func<ulong, IEnumerable<CommitRecord>> _catchUpReader;
     private readonly List<Entry> _entries = [];
     private readonly Lock _lock = new();
 
@@ -18,12 +19,23 @@ public sealed class ApplierPipeline
     {
     }
 
-    internal ApplierPipeline(ICommitLog log, EngineTelemetry? telemetry, Func<CommitRecord, CommitRecord>? transform = null)
+    internal ApplierPipeline(
+        ICommitLog log,
+        EngineTelemetry? telemetry,
+        Func<CommitRecord, CommitRecord>? transform = null,
+        Func<ulong, IEnumerable<CommitRecord>>? catchUpReader = null)
     {
         ArgumentNullException.ThrowIfNull(log);
         _log = log;
         _telemetry = telemetry;
         _transform = transform;
+
+        // Pipeline-driven appliers are in-process projections, so their catch-up must not stop at
+        // the durability watermark: NotifyAppended hands them a record whose commit is still
+        // waiting for its fsync, and a capped read would silently skip it. The engine wires the
+        // log's uncapped read here; decoupled appliers read the log themselves through the capped
+        // public path, which is exactly right for effects that leave the process.
+        _catchUpReader = catchUpReader ?? log.ReadFrom;
     }
 
     public IReadOnlyList<ILogApplier> Appliers
@@ -144,7 +156,7 @@ public sealed class ApplierPipeline
         // appended records in NotifyAppended are current-shape by construction and skip it.
         // Decoupled appliers read the log themselves and own the same obligation; see
         // MelangeEngine.TransformToCurrentShape.
-        foreach (var record in _log.ReadFrom(entry.Applier.AppliedLsn + 1))
+        foreach (var record in _catchUpReader(entry.Applier.AppliedLsn + 1))
             entry.Applier.Apply(_transform is null ? record : _transform(record));
     }
 

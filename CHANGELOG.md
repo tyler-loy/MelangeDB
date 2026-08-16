@@ -59,6 +59,37 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Group commit: concurrent commits share fsyncs at unchanged `OnCommit` semantics**
+  ([road-to-0.2 phase 17](docs/road-to-0.2/plan-phase-17.md)). The commit path splits in two:
+  the append buffers under the engine's write lock, the committing caller waits for durability
+  after releasing it, and whoever finds the flusher idle fsyncs everything buffered so far —
+  batches form from contention itself, with no timer and no batch-size knob, and the fsync runs
+  through its own file handle so appends never stall behind the in-flight flush (measured: on
+  Windows a flush serializes against writes on the same handle, and batches simply never formed
+  through one). A lone caller fsyncs immediately at the old inline latency; a reducer that
+  returns has committed durably, exactly as before. Re-measured on the crowded-shard hotspot:
+  **~500 commits/s sequential → ~4,000 commits/s at 16 concurrent callers, a mean batch of 8
+  commits per fsync** ([CLUSTERING.md](docs/CLUSTERING.md)). `CommitLog:GroupCommit`, shipped
+  accepted-and-reserved in phase 07 for exactly this, is now honored — `false` restores the
+  inline fsync.
+
+  What moved with it, because durability is now a watermark rather than a property of every
+  appended byte: `ICommitLog` gained `DurableLsn` and `WaitDurable`, and **everything that
+  leaves the process is fenced at the watermark** — `ReadFrom` serves nothing beyond it (which
+  gated the Postgres dispatch loop, resume replay, replica and border streams, and the event
+  bus wholesale), live subscription deltas, initial-set anchors, resume heads, and the replica
+  bootstrap gate explicitly, and the online backup fences its capture at it. A failed group
+  fsync fails every commit it covered, rolls the file back to the last durable length, and
+  poisons the log until restart (EventId 1007, Critical). Crash recovery accepts multi-record
+  torn tails — buffered appends mean a crash's un-fsynced region can span records, with
+  intact-looking ones beyond the tear — and stays fatal for damage the durable floor proves was
+  fsynced: the newest snapshot's LSN, which every snapshot now forces the log durable through
+  before its file is written, under every fsync policy (closing a pre-existing
+  `Interval`/`OsBuffered` window where a crash could boot a snapshot ahead of its own log).
+  Telemetry: `melange.fsync_ms` is the durability wait the caller actually experienced,
+  `melange.commit_ms` the append alone, and the new `melange.log.group_commit.batch_size`
+  histogram's shape is the feature working.
+
 - **Hot-tier schema migration: add a column, redeploy, boot**
   ([road-to-0.2 phase 16](docs/road-to-0.2/plan-phase-16.md)). Row format v1 is
   positional — a row is its columns' bytes in declaration order — so until now the engine could

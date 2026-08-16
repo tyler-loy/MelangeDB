@@ -664,10 +664,17 @@ public sealed class CommitLogOptions
     public int FsyncIntervalMs { get; set; } = 100;
 
     /// <summary>
-    /// Batch concurrent commits into one fsync. Shipped accepted-and-reserved at its default: the
-    /// engine's single-writer lock serializes commits, so no two appends are ever in flight for
-    /// one fsync to cover — the bulk path is the batching that actually exists. The knob binds and
-    /// validates so a future concurrent commit path can honor it without a config break.
+    /// Batch concurrent commits into one fsync (road-to-0.2 phase 17): the append buffers under
+    /// the locks, the committing caller waits for durability outside them, and whoever finds the
+    /// flusher idle fsyncs everything buffered so far — batches form from contention itself, with
+    /// no timer, no added latency for a lone caller, and unchanged commit semantics (a reducer
+    /// that returns has committed durably). Only read when <see cref="FsyncPolicy"/> is
+    /// <see cref="FsyncPolicy.OnCommit"/> — the other policies have no commit-time fsync to
+    /// coalesce. False restores the phase-01 inline fsync: durability completes inside the
+    /// append, serialized under the engine's write lock, and its cost lands back inside
+    /// <c>melange.commit_ms</c>. The flag predates the feature (phase 07 shipped it
+    /// accepted-and-reserved for exactly this phase); there is no reason to set it false beyond
+    /// distrust, and the fault-injection suite is the answer to that.
     /// </summary>
     public bool GroupCommit { get; set; } = true;
 }
