@@ -6,8 +6,10 @@ polling an API.
 
 > **Status: alpha, unreleased.** The engine, transport, auth, scheduling, event bus, paged storage,
 > Postgres tier, clustering, and typed client bindings are implemented and tested. Nothing is at 1.0
-> and the public API will break between versions. It has not yet been proven against a production
-> workload — that's [phase 11](docs/ROADMAP.md), the port of a live 82-table game.
+> and the public API will break between versions. A live 82-table game — the
+> [phase 11](docs/ROADMAP.md) reference workload, ported off SpacetimeDB — runs on it and is
+> developed on it daily; what is still missing is the published comparison that turns that into
+> numbers, so treat the benchmarks in these docs as dev-machine measurements.
 
 MelangeDB exists to fix three specific things:
 

@@ -40,7 +40,7 @@ number of these are recorded refusals rather than omissions.
 | [08](plan-phase-08.md) | The Postgres tier and ad-hoc SQL | Shipped |
 | [09](plan-phase-09.md) | Clustering I — placement, hub/shard roles, instancing | Shipped |
 | [10](plan-phase-10.md) | Clustering II — spatial strategy and seamless handoff | Shipped |
-| [11](plan-phase-11.md) | Reference workload port and validation | **Outstanding** |
+| [11](plan-phase-11.md) | Reference workload port and validation | **Shipped** (the measurement pass is outstanding) |
 | [12](plan-phase-12.md) | Typed client bindings | Shipped |
 
 Phase 12 is numbered after 11 but landed first — the reasoning is in

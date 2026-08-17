@@ -1,5 +1,7 @@
 # Phase 11 — Reference workload port and validation
 
+**Status: Shipped — the port. The measurement pass is outstanding; see the shipped notes.**
+
 **Goal:** the reference workload runs on MelangeDB, and the three original complaints are demonstrably fixed
 rather than argued.
 
@@ -90,3 +92,32 @@ comparison, and changing the game while changing the database destroys it.
   this document: start porting at phase 03, not phase 11.
 - **A game is a moving target.** Development of the reference workload continues during the port; the diff grows. A freeze or
   a short port window matters more than it looks.
+
+## Shipped notes
+
+**The port landed, and then kept going.** The reference workload runs on MelangeDB — an ASP.NET host
+with `UseFasterHotStore()`, 88 tables, a commit log in the hundreds of megabytes — and the game is
+developed on it daily against `0.1.2-ci.*` prereleases published from main. That is a stronger form
+of the "playtest at parity" bar than the written checklist this plan asked for: parity is not a
+milestone the port passed once, it is the condition of a product under active development.
+
+**What it returned is the part that matters.** The plan predicted the port would find API mistakes
+that are expensive to fix late, and it did — the recovery regression, the client identity gap, the
+transient-rejection shape, `unknown_reducer` masking reducer faults, and adoption over an existing
+directory being silent all came from running the thing, and none of them were caught by a suite that
+was green throughout. Every one is closed. That is the evidence a port produces, and it arrived in
+the shape the risk register expected.
+
+**The measurement half is not done, and is not being quietly dropped.** None of the numbers this
+plan called the deliverable — the 10km and 20km memory comparisons, reducer latency percentiles for
+gather/move/attack/craft, terrain-streaming throughput across chunks, concurrent players per node —
+are recorded in this repo. Until they are, the published benchmarks are dev-machine measurements and
+[ROADMAP.md](../ROADMAP.md)'s "What's left" says so. The risk register's own warning applies to this
+note as much as to any other: a port that reports only wins is not evidence, and "it runs in
+production" is a fact about the port, not a measurement of it.
+
+**Incremental, not big-bang** — the settled answer to the plan's first open question, decided by
+events rather than by argument: the port tracked prerelease packages from main throughout, which
+made every MelangeDB change a small, reversible step for the consumer instead of one cutover. That
+is also why the issues above arrived one at a time and diagnosable, rather than as a single failed
+migration.
