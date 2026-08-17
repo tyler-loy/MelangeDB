@@ -150,7 +150,9 @@ credentials, not a name.
 `Backup:OwnerRole`, and `Backup:StreamStallTimeoutMs` — the online backup gate. The offline verbs
 (`melange backup <data-dir>`, `melange backup verify`, `melange restore`) deliberately have no
 configuration at all: they act on files, and the archive format is versioned in the file, not in
-options. See [BACKUP.md](BACKUP.md).
+options. Phase 19's additions keep that posture — `restore --at-lsn`, `restore --check`, and
+`melange clone` are arguments to an invocation, not settings a deployment carries. See
+[BACKUP.md](BACKUP.md).
 
 **Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
 the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid

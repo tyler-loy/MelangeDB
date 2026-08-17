@@ -59,6 +59,35 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Backup, second pass: `--check`, `clone`, and `--at-lsn`**
+  ([road-to-0.2 phase 19](docs/road-to-0.2/plan-phase-19.md)) — the three verbs phase 15 recorded
+  as next, now with the shipped archive underneath them.
+
+  **`melange restore … --check`** proves a restore boots. Verify walks frames; the check runs the
+  *real* recovery machinery — the actual `FileCommitLog` constructor (epoch, torn tail, CRC, base
+  sidecar), the snapshot opened under the restored epoch, every sidecar parsed — so a refusal is
+  the refusal a boot would have given, on a day you chose rather than one the outage did. It runs
+  against a scratch copy, so a checked restore is byte-identical to an unchecked one. The
+  schema-dependent half — the shape guard, index builds, residency, the projection rebuild — needs
+  the application's registry, so it is a second rung where that lives: **`host.CheckRestore(dir)`**
+  boots the restored directory through the ordinary engine constructor and reports per-table row
+  counts without serving. Each rung states in its own output what it proves and what it does not.
+
+  **`melange clone <archive> -o <dir>`** materializes an explicitly *different* world from a
+  production archive. Subscriber checkpoints are **dropped, not clamped** — a clone has no
+  subscribers, and inherited delivery state would skip events this world never emitted — and a
+  provenance sidecar records the source epoch, captured head, and archive, which the server
+  announces at every boot (EventId `1804 CloneProvenance`). A separate verb rather than a restore
+  flag, because the semantics differ in kind. Originators are untouched.
+
+  **`melange restore … --at-lsn <n>`** cuts the tail at a named LSN: the moment just before the
+  mistake, within the window one archive holds. Refused below the archive's snapshot floor (with
+  the earlier archive in the series named as the remediation) and above its captured head, and
+  refused on cluster archives, whose engines were captured at different fences. The rewind is
+  total, ids included: AutoInc values allocated above the cut are free again, and the fresh epoch
+  is what forces every consumer outside the world to rebuild rather than carry a stale reference
+  across the boundary.
+
 - **Truncation-floor observability: "why is the log not truncating" is now one look**
   ([road-to-0.2 phase 18](docs/road-to-0.2/plan-phase-18.md)). Everything that still needs old
   records pins the commit log through a *truncation floor*, and until now those registrations were
