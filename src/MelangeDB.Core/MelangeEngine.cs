@@ -204,6 +204,11 @@ public sealed partial class MelangeEngine : IDisposable
         // harmless one the design already accepts: an empty record, and the next boot re-migrates.)
         _log.WaitDurable(marker.Lsn);
         _shapes.History.Append(ShapeHistory.EntryOf(Schema, marker.Lsn));
+
+        // The resolution was built from this history before the reign existed; every decoupled
+        // reader in this process (the Postgres applier, the replica and border pumps, resume
+        // replay, a lagging applier's catch-up) transforms against it from here on.
+        _shapes.NoteEntryAppended();
         _shapes.History.Save(_shapes.SidecarPath);
         LogMessages.ShapeMigrated(_logger, string.Join("; ", _shapes.Changes), marker.Lsn);
 
