@@ -10,6 +10,8 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-08-17
+
 ### Breaking
 
 - **Protocol version 2: rows travel as schema-ordered bytes, not as named column maps.** Version 1 sent
@@ -423,6 +425,34 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A schema migration broke every decoupled reader in the process that performed it**
+  ([#92](https://github.com/tyler-loy/MelangeDB/issues/92)). The boot-time shape resolution sized
+  its per-reign mapper table once, and the migration then appended a reign to the same history — so
+  transforming any record at or above the marker threw. Pipeline-driven appliers skip the transform
+  for a record they just watched commit, which is why the suite stayed green; the Postgres applier,
+  the replica and border pumps, resume replay, and a lagging applier's catch-up all transform
+  unconditionally, and any of them was the first crash after an additive deploy with no restart in
+  between. The reigns and their mappers are now one immutable snapshot replaced wholesale, which
+  also removes the unsynchronized lazy cache those same readers were racing.
+
+- **A live `CommitLog:FsyncPolicy` / `CommitLog:GroupCommit` change could publish LSNs a crash
+  untells** ([#91](https://github.com/tyler-loy/MelangeDB/issues/91)). Group commit was the first
+  time the log head could sit above the fsynced watermark under `OnCommit`, and both keys are
+  documented live — so leaving `OnCommit` made `DurableLsn` jump to the head and `WaitDurable`
+  return immediately over records that were still only OS-buffered. A policy change is now a
+  **durability boundary**: everything appended under the outgoing policy is fsynced before the new
+  one takes effect, published under both locks so no append lands in between.
+
+- **A reducer whose body threw `ArgumentException` was reported as `unknown_reducer`**
+  ([#98](https://github.com/tyler-loy/MelangeDB/issues/98)). The reducer existed, had been
+  resolved, and had run — the arity check passing proves it — but any argument-shaped exception
+  escaping the body (an `ArgumentOutOfRangeException` from a row decode, say) answered "No reducer
+  named 'X' is registered", sending debugging to registration for a fault two layers down. The new
+  `UnknownReducerException` names the one condition that may answer `unknown_reducer`, and a body's
+  failure now takes the general arm. **Client-visible:** such a call answers `internal` / HTTP 500
+  where it previously answered `unknown_reducer` / HTTP 404. The HTTP path also now logs EventId
+  `1204` for it, which it never did — "see the server logs" was not true on that transport.
+
 - **FASTER recovery stopped paying for read views nobody holds.** Making the store's managed state
   persistent containers (the pinned-reads work) made recovery measurably slower on `FasterHotStore`
   — a consumer measured **+16.5%** (3.76 s → 4.37 s) replaying a 269 MB log ([#51](https://github.com/tyler-loy/MelangeDB/issues/51))
@@ -457,6 +487,23 @@ All packages ship together at one version; there is no per-package versioning. S
   in any scheduled table is now also warned about (EventId 1723).
 
 ### Changed
+
+- **Adopting a schema over an existing directory is no longer silent**
+  ([#99](https://github.com/tyler-loy/MelangeDB/issues/99)). The first boot that creates
+  `melange.shape` adopts the running code's schema as the meaning of every record already on disk —
+  the only possible reading, and correct exactly when the upgrade rule was followed (boot the old
+  schema once, then change it). Combining the two in one deploy produced a clean boot, a sidecar
+  appearing on disk, and a per-table mis-decode an arbitrary amount of time later. That moment now
+  logs **EventId 1008 `ShapeAdopted`** at warning level over a non-empty directory, naming the LSN
+  it adopted over and the recovery; a new world naming its first shape stays silent. The new
+  **`Schema:AllowAdoption`** decides whether it happens at all, and **defaults to `false`** — the
+  `Postgres:AutoMigrate` posture, because the two errors are not symmetric: refusing costs one boot
+  and one setting, assuming wrongly costs silently mis-read rows found arbitrarily later. The
+  refusal names both branches. It is a once-per-directory gate by construction, and a fresh install
+  never meets it. A row that no longer decodes now names the table, its byte count, and
+  where to look, instead of one word about a parameter name — on the reducer read path, the store's
+  index-maintenance path, and the transport's projection paths. [MIGRATION.md](docs/MIGRATION.md)
+  gains the recovery section it was missing.
 
 - **Mid-handoff write refusals are a typed transient rejection, not an internal error.** The
   conditions the cluster itself designed — a row frozen mid-handoff, a write routed to a border
