@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using MelangeDB.Core;
 using MelangeDB.Protocol;
 using MelangeDB.Server;
 using Microsoft.Extensions.Logging;
@@ -256,7 +257,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             var descriptor = _gateway.Reducers.Get(call.Reducer);
             toShard = descriptor.ExecutionSite == ReducerSite.Shard;
         }
-        catch (ArgumentException)
+        catch (UnknownReducerException)
         {
             // Unknown reducer: let the hub answer, so the error shape is the server's own.
         }

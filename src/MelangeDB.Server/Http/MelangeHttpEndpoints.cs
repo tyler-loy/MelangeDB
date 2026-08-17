@@ -2,6 +2,7 @@ using System.Text.Json;
 using MelangeDB.Core;
 using MelangeDB.Protocol;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 
 namespace MelangeDB.Server;
 
@@ -72,12 +73,18 @@ internal static class MelangeHttpEndpoints
         {
             await WriteErrorAsync(context, StatusCodes.Status403Forbidden, MelangeErrorCodes.Denied, exception.Message).ConfigureAwait(false);
         }
-        catch (ArgumentException)
+        catch (UnknownReducerException exception)
         {
-            await WriteErrorAsync(context, StatusCodes.Status404NotFound, MelangeErrorCodes.UnknownReducer, $"No reducer named '{reducer}' is registered.").ConfigureAwait(false);
+            // Only a name that did not resolve. An ArgumentException escaping the reducer's *body*
+            // — an ArgumentOutOfRangeException from a row decode, say — falls through to the arm
+            // below, because by the time a body runs, resolution has provably succeeded.
+            await WriteErrorAsync(context, StatusCodes.Status404NotFound, MelangeErrorCodes.UnknownReducer, exception.Message).ConfigureAwait(false);
         }
-        catch (Exception)
+        catch (Exception exception)
         {
+            // "See the server logs" is only true if something is written to them; the socket path
+            // has logged this since phase 03 and this one did not.
+            LogMessages.ReducerCallFailed(transport.Logger, reducer, exception);
             await WriteErrorAsync(context, StatusCodes.Status500InternalServerError, MelangeErrorCodes.Internal, "The reducer failed; see the server logs.").ConfigureAwait(false);
         }
     }
@@ -477,5 +484,18 @@ internal static class MelangeHttpEndpoints
         public void EnqueueDelta(TransactionUpdateFrame frame)
         {
         }
+    }
+
+    private static class LogMessages
+    {
+        /// <summary>The socket path's 1204, on the one-shot path: the same failure deserves the same id.</summary>
+        private static readonly Action<ILogger, string, Exception?> ReducerCallFailedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Error,
+                new EventId(1204, "ReducerCallFailed"),
+                "Reducer '{Reducer}' threw an unexpected exception during a transport call.");
+
+        public static void ReducerCallFailed(ILogger logger, string reducer, Exception failure) =>
+            ReducerCallFailedMessage(logger, reducer, failure);
     }
 }

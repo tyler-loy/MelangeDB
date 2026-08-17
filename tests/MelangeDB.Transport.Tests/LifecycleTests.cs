@@ -115,6 +115,23 @@ public class LifecycleTests
     }
 
     [Fact]
+    public async Task A_socket_call_whose_body_throws_ArgumentException_is_a_failure_not_a_missing_reducer()
+    {
+        // Issue #98, on the socket path: its ArgumentException arm sat directly above the general
+        // handler and swallowed every library-thrown argument fault from inside a reducer.
+        await using var host = await TransportTestHost.StartAsync();
+        await using var raw = new RawSocketClient();
+        await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
+
+        await raw.SendAsync(
+            new CallReducerFrame(1, "ThrowArgumentFromBody", ReducerArgs.Encode([1u]), null), TestContext.Current.CancellationToken);
+        var result = await raw.ReceiveUntilAsync<ReducerResultFrame>(TestContext.Current.CancellationToken);
+
+        Assert.False(result.Ok);
+        Assert.Equal(MelangeErrorCodes.Internal, result.ErrorCode);
+    }
+
+    [Fact]
     public async Task A_client_calling_a_scheduled_reducer_is_told_unknown()
     {
         await using var host = await TransportTestHost.StartAsync();

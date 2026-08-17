@@ -245,6 +245,15 @@ public sealed class PolicyReducers
     public void RefuseTransiently(ReducerContext ctx) =>
         throw new TransientRejectionException("a row is frozen mid-handoff (test stand-in)");
 
+    /// <summary>
+    /// Stands in for ordinary library code failing inside a reducer body (issue #98): the real
+    /// case was an ArgumentOutOfRangeException from a row decode two layers down. Nobody writes
+    /// the throw on purpose; everybody reaches it eventually.
+    /// </summary>
+    [Reducer]
+    public void ThrowArgumentFromBody(ReducerContext ctx, uint anything) =>
+        throw new ArgumentOutOfRangeException(nameof(anything), "from the body, not from dispatch");
+
     [Reducer(Policy = typeof(AdminOnly))]
     public void ClearCreatures(ReducerContext ctx)
     {

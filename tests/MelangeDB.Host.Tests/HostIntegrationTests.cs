@@ -204,7 +204,7 @@ public class HostIntegrationTests : IDisposable
     {
         using var host = TestApp.Build(_root);
         await host.StartAsync(TestContext.Current.CancellationToken);
-        Assert.Throws<ArgumentException>(() => host.Reducers().Call("Nonexistent", TestApp.Caller));
+        Assert.Throws<UnknownReducerException>(() => host.Reducers().Call("Nonexistent", TestApp.Caller));
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 }

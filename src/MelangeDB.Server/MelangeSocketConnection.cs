@@ -498,7 +498,11 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 TransientRejectionException => (MelangeErrorCodes.Transient, exception.Message),
                 RateLimitedException => (MelangeErrorCodes.RateLimited, exception.Message),
                 ReducerDeniedException => (MelangeErrorCodes.Denied, exception.Message),
-                ArgumentException => (MelangeErrorCodes.UnknownReducer, $"No reducer named '{call.Reducer}' is registered."),
+                // Only a name that did not resolve is "unknown". An ArgumentException escaping a
+                // reducer's *body* — an ArgumentOutOfRangeException from a row decode, say — is the
+                // reducer failing, and saying it is not registered sends debugging somewhere there
+                // is nothing to find.
+                UnknownReducerException => (MelangeErrorCodes.UnknownReducer, exception.Message),
                 _ => (MelangeErrorCodes.Internal, "The reducer failed; see the server logs."),
             };
             if (code == MelangeErrorCodes.Internal)

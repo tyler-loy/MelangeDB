@@ -323,7 +323,7 @@ public class SchedulerTests : IDisposable
     public async Task Scheduled_reducers_answer_unknown_to_clients_and_are_absent_from_the_unpoliced_report()
     {
         using var host = await StartHostAsync();
-        var thrown = Assert.Throws<ArgumentException>(() => host.Reducers().Call(
+        var thrown = Assert.Throws<UnknownReducerException>(() => host.Reducers().Call(
             "WorldTick",
             TestApp.Caller,
             ConnectionId.None,

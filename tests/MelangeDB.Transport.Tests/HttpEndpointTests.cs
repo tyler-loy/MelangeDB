@@ -54,6 +54,26 @@ public class HttpEndpointTests
     }
 
     [Fact]
+    public async Task A_reducer_that_throws_ArgumentException_from_its_body_is_a_failure_not_a_missing_reducer()
+    {
+        // Issue #98. The arity check passing proves resolution succeeded, so by the time a body
+        // runs, "no such reducer" is not a reachable truth — and reporting it sends debugging at
+        // registration, the dispatch table, and stale assemblies for a fault two layers down.
+        await using var host = await TransportTestHost.StartAsync();
+        using var http = host.CreateHttp();
+
+        var failed = await http.PostAsync("/melange/call/ThrowArgumentFromBody", Json("[1]"), TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.InternalServerError, failed.StatusCode);
+        Assert.Equal("internal", (await ReadJsonAsync(failed)).GetProperty("error").GetString());
+
+        // And the name that genuinely does not resolve still answers 404, from the one condition
+        // that can be decided before any user code runs.
+        var unknown = await http.PostAsync("/melange/call/NoSuchReducer", Json("[]"), TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
+        Assert.Equal("unknown_reducer", (await ReadJsonAsync(unknown)).GetProperty("error").GetString());
+    }
+
+    [Fact]
     public async Task Bulk_ingestion_appends_one_write_set_not_one_transaction_per_row()
     {
         // Bulk is off by default and owner-gated since issue #31; this test is about the write
