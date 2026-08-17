@@ -285,7 +285,7 @@ internal sealed class TransactionDb : IDbView
         }
         catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
         {
-            throw RowSerializer.DecodeFailed(schema, bytes.Length, column: null, exception);
+            throw RowSerializer.DecodeFailed($"Table '{schema.Name}'", bytes.Length, column: null, exception);
         }
     }
 

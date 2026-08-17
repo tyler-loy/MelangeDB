@@ -247,12 +247,10 @@ internal static class ShapeGuard
             // reading, which is why the upgrade rule (documented in MIGRATION.md) is: the first
             // boot that creates this sidecar must not also change the schema.
             //
-            // Over an *empty* directory that is a new world naming its first shape: uninteresting,
-            // and silent. Over a directory that already holds records it is an assumption about
-            // bytes a different binary wrote, sound only if the operator followed the rule — which
-            // the engine cannot verify. Everything around this step is loud; this one used to be
-            // silent, and the cost of the silence is a per-table mis-decode arriving an arbitrary
-            // amount of time after a boot that looked perfectly clean (issue #99).
+            // Over an empty directory that is a new world naming its first shape, and silent.
+            // Over one that already holds records it is an assumption about bytes a different
+            // binary wrote, sound only if the operator followed the rule — which the engine cannot
+            // verify, so it says so instead.
             if (headLsn > 0)
             {
                 if (!allowAdoption)

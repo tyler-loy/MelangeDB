@@ -455,7 +455,12 @@ public class SchemaShapeTests : IDisposable
         Assert.Equal(LogLevel.Warning, entry.Level);
         Assert.Equal(2d, entry.Number("HeadLsn"));
         Assert.Contains("upgrade rule", entry.Message);
-        Assert.Contains("bulk endpoint", entry.Message);
+
+        // The recovery is only actionable with its gates named: /melange/bulk answers 403 unless
+        // both are set, and a 3 a.m. instruction that does not work is worse than none.
+        Assert.Contains("POST /melange/bulk", entry.Message);
+        Assert.Contains("Bulk:Enabled", entry.Message);
+        Assert.Contains("Bulk:OwnerRole", entry.Message);
     }
 
     [Fact]
@@ -503,8 +508,8 @@ public class SchemaShapeTests : IDisposable
     [Fact]
     public void Refusing_adoption_never_blocks_a_new_world()
     {
-        // The flag guards a reinterpretation, not a first naming — a deployment that turns it on
-        // for safety must still be able to create a database.
+        // The flag guards a reinterpretation, not a first naming — a deployment that sets
+        // AllowAdoption to false for safety must still be able to create a database.
         var options = OptionsFor(NewRoot());
         options.Schema.AllowAdoption = false;
         using var fresh = Boot(options, HeroTable<HeroV1>());
@@ -528,6 +533,33 @@ public class SchemaShapeTests : IDisposable
         Assert.Contains("MIGRATION.md", failure.Message);
         Assert.Contains("EventId 1008", failure.Message);
         Assert.NotNull(failure.InnerException);
+    }
+
+    [Fact]
+    public void A_generated_codec_names_the_row_type_when_the_bytes_run_out()
+    {
+        // Production tables carry a generated codec, and index maintenance decodes on the store's
+        // apply path — which after a bad adoption is very often the first decode of all, ahead of
+        // any read. It has to name what it was decoding too.
+        using var harness = new EngineHarness();
+        var table = harness.Engine.Schema.Get(typeof(Player));
+        var truncated = new CommitRecord
+        {
+            Lsn = harness.Engine.Log.HeadLsn + 1,
+            FormatVersion = 1,
+            Timestamp = new Timestamp(1),
+            Caller = EngineHarness.Caller,
+            ReducerName = "Planted",
+            Arguments = ReadOnlyMemory<byte>.Empty,
+            WriteSet = [new RowOp(RowOpKind.Insert, table.Id, new RowKey(new byte[16]), new byte[4])],
+            Events = [],
+            SerializedLength = 0,
+        };
+
+        var failure = Assert.Throws<InvalidDataException>(() => harness.Engine.HotStore.Apply(truncated));
+        Assert.Contains("Player", failure.Message);
+        Assert.Contains("4 byte(s)", failure.Message);
+        Assert.Contains("EventId 1008", failure.Message);
     }
 
     private static ulong HeadOf(MelangeDbOptions options, params TableSchema[] tables)

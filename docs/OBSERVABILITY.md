@@ -288,7 +288,8 @@ the running code's schema as the meaning of records already on disk, because no 
 existed: the only possible reading of those bytes, correct only if the upgrade rule was followed,
 and until it had an id the one step in this area that happened in silence. Warning, and only ever
 over a non-empty directory: a new world naming its first shape reinterprets nothing and says
-nothing. `Schema:AllowAdoption` turns it into a refusal — `1203 HeartbeatTimeout`,
+nothing. Setting `Schema:AllowAdoption` to `false` turns the warning into a boot refusal; it
+defaults to `true`, which logs and proceeds — `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
 `1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,
 `1403 SubscriberCheckpointEvicted` — the loud eviction the expiry design promises — and

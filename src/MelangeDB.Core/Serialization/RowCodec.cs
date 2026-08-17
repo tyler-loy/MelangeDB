@@ -61,17 +61,42 @@ public abstract class RowCodec<TRow> : RowCodec
     /// </summary>
     public abstract void AssignAutoInc(ref TRow row, AutoIncStage stage, TableId table);
 
+    /// <summary>
+    /// The bridges decode before they encode, and index maintenance reaches them on the store's
+    /// apply path — which is where a row whose stored bytes no longer match this build's schema is
+    /// very often decoded for the first time, ahead of any read. Naming what failed here is what
+    /// keeps that first failure legible; see <see cref="RowSerializer.DecodeFailed"/>.
+    /// </summary>
     public sealed override RowKey? EncodeColumnFromBytes(string column, ReadOnlySpan<byte> row)
     {
-        var typed = Deserialize(row);
+        TRow typed;
+        try
+        {
+            typed = Deserialize(row);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            throw RowSerializer.DecodeFailed($"Row type '{typeof(TRow).Name}'", row.Length, column, exception);
+        }
+
         return EncodeColumn(column, in typed);
     }
 
+    /// <inheritdoc cref="EncodeColumnFromBytes"/>
     public sealed override void EncodeColumnsFromBytes(ReadOnlySpan<byte> row, IReadOnlyList<string> columns, RowKey[] destination)
     {
         ArgumentNullException.ThrowIfNull(columns);
         ArgumentNullException.ThrowIfNull(destination);
-        var typed = Deserialize(row);
+        TRow typed;
+        try
+        {
+            typed = Deserialize(row);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            throw RowSerializer.DecodeFailed($"Row type '{typeof(TRow).Name}'", row.Length, column: null, exception);
+        }
+
         for (var i = 0; i < columns.Count; i++)
             destination[i] = EncodeColumn(columns[i], in typed) ?? default;
     }

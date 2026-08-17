@@ -1737,8 +1737,9 @@ public sealed partial class MelangeEngine : IDisposable
                 "self-description, so there is no other possible reading. That is correct only if this " +
                 "deployment booted its previous schema once before changing it — the upgrade rule in " +
                 "docs/MIGRATION.md. If the schema changed in the same deploy, the tables that changed are " +
-                "being mis-read right now: rewrite their rows through the bulk endpoint, which never reads " +
-                "the old bytes. Set Schema:AllowAdoption to false to refuse this boot instead.");
+                "being mis-read right now: rewrite only those tables' rows through POST /melange/bulk, which " +
+                "never reads the old bytes (it needs Bulk:Enabled on and the caller's Bulk:OwnerRole claim). " +
+                "Set Schema:AllowAdoption to false to refuse this boot instead.");
 
         public static void ShapeAdopted(ILogger logger, string directory, ulong headLsn) =>
             ShapeAdoptedMessage(logger, directory, headLsn, null);
