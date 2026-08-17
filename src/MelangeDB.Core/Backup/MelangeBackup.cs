@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+
 namespace MelangeDB.Core;
 
 /// <summary>
@@ -169,6 +171,33 @@ public static class MelangeBackup
     /// </summary>
     public static RestoreSummary Clone(string archivePath, string targetDirectory)
         => ArchiveRestore.Restore(archivePath, targetDirectory, new ArchiveRestore.RestorePlan(IsClone: true));
+
+    /// <summary>
+    /// The file-level boot proof: runs the real recovery machinery — the actual
+    /// <see cref="FileCommitLog"/> constructor, the snapshot opened under the restored epoch, every
+    /// sidecar parsed — against a scratch copy of <paramref name="restoredDirectory"/>, so a
+    /// checked restore stays byte-identical to an unchecked one. Throws the refusal a boot would
+    /// have thrown, on a day the operator chose rather than one the outage did.
+    /// <para>
+    /// What it cannot prove, it says it cannot prove: index builds, residency, and the shape
+    /// guard's judgement all need the application's registry. Use
+    /// <see cref="CheckRestore(string, SchemaRegistry, ILoggerFactory?)"/> where that lives.
+    /// </para>
+    /// </summary>
+    public static RestoreCheckReport CheckRestore(string restoredDirectory)
+        => RestoreCheck.Run(restoredDirectory, schema: null, loggers: null);
+
+    /// <summary>
+    /// The full boot proof, run where the schema lives: the ordinary engine constructor with the
+    /// application's own registry — recovery, the shape guard, the projection rebuild — reporting
+    /// per-table row counts and returning without serving. One line in a staging runbook, and
+    /// CI-able: restore last night's archive, check it, alert on the refusal.
+    /// </summary>
+    public static RestoreCheckReport CheckRestore(string restoredDirectory, SchemaRegistry schema, ILoggerFactory? loggerFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        return RestoreCheck.Run(restoredDirectory, schema, loggerFactory);
+    }
 
     /// <summary>
     /// Reads a data directory's clone provenance, or null when the world is not a clone — the

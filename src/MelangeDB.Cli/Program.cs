@@ -8,7 +8,7 @@ using MelangeDB.Core;
 //   melange backup ./data/log [-o world.mbak]
 //   melange backup https://game.example.com --token <jwt> [-o world.mbak]
 //   melange backup verify world.mbak
-//   melange restore world.mbak -o ./data/log [--at-lsn 41200]
+//   melange restore world.mbak -o ./data/log [--at-lsn 41200] [--check]
 //   melange clone world.mbak -o ./staging/log
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
@@ -21,8 +21,9 @@ using MelangeDB.Core;
 // that no longer happened. `--at-lsn` cuts the tail at a named LSN: the moment just before the
 // mistake, within the window one archive holds. `clone` materializes an explicitly *different*
 // world from a production archive — staging seeded from production, with subscriber checkpoints
-// dropped and a provenance sidecar recording what it is a clone of. An unverified backup is a
-// hope, not a backup.
+// dropped and a provenance sidecar recording what it is a clone of. `restore --check` runs the
+// real recovery machinery against a scratch copy of what it just restored, and says plainly what
+// that proves and what only a host-side boot can. An unverified backup is a hope, not a backup.
 if (args.Length == 0)
 {
     PrintUsage();
@@ -116,7 +117,7 @@ static int RunVerify(string[] rest)
 
 static int RunRestore(string[] rest)
 {
-    if (!ParseArguments(rest, null, out var archive, out var target, out _, out var atLsn))
+    if (!ParseArguments(rest, null, out var archive, out var target, out _, out var atLsn, out var check))
         return Usage();
     try
     {
@@ -134,13 +135,32 @@ static int RunRestore(string[] rest)
         }
 
         Console.WriteLine("The fresh epoch means clients with pre-restore resume cursors will full-resync — that is the point of it.");
-        return 0;
+        return check ? PrintCheck(MelangeBackup.CheckRestore(target)) : 0;
     }
     catch (Exception exception) when (IsHandled(exception))
     {
         Console.Error.WriteLine(exception.Message);
         return 1;
     }
+}
+
+// The check's own output, printed by whichever verb ran it. The ranking sentence comes from the
+// report rather than from here, so what the check proves is stated in one place and quoted
+// everywhere — which is the whole point of ranking it at all.
+static int PrintCheck(RestoreCheckReport report)
+{
+    foreach (var engine in report.Engines)
+    {
+        Console.WriteLine(
+            $"Checked {engine.Key} at {engine.Directory}: epoch {engine.Epoch:D}, LSNs {engine.BaseLsn}..{engine.HeadLsn}, " +
+            $"{engine.SnapshotRows} snapshot row(s) + {engine.TailRecords} log record(s).");
+        Console.WriteLine($"  sidecars: {(engine.Sidecars.Count == 0 ? "none" : string.Join(", ", engine.Sidecars))}");
+        foreach (var (table, rows) in engine.RowsByTable)
+            Console.WriteLine($"  {table}: {rows} row(s)");
+    }
+
+    Console.WriteLine(report.Proves);
+    return 0;
 }
 
 static int RunClone(string[] rest)
@@ -172,15 +192,22 @@ static int RunClone(string[] rest)
 // world should land). --token falls back to the MELANGE_TOKEN environment variable, which keeps
 // the JWT out of shell history and process listings in scripts.
 static bool ParseSourceAndOutput(string[] rest, string? defaultOutput, out string source, out string output, out string? token)
-    => ParseArguments(rest, defaultOutput, out source, out output, out token, out _);
+    => ParseArguments(rest, defaultOutput, out source, out output, out token, out _, out _);
 
 static bool ParseArguments(
-    string[] rest, string? defaultOutput, out string source, out string output, out string? token, out ulong? atLsn)
+    string[] rest,
+    string? defaultOutput,
+    out string source,
+    out string output,
+    out string? token,
+    out ulong? atLsn,
+    out bool check)
 {
     source = "";
     output = defaultOutput ?? "";
     token = Environment.GetEnvironmentVariable("MELANGE_TOKEN");
     atLsn = null;
+    check = false;
     var sawSource = false;
     var sawOutput = false;
     for (var i = 0; i < rest.Length; i++)
@@ -201,6 +228,9 @@ static bool ParseArguments(
             case "--at-lsn":
                 Console.Error.WriteLine("--at-lsn takes an LSN: a whole number naming the moment to restore to.");
                 return false;
+            case "--check":
+                check = true;
+                break;
             case "-h" or "--help":
                 return false;
             default:
@@ -228,6 +258,6 @@ static void PrintUsage()
     Console.Error.WriteLine("usage: melange schema <module.dll | http(s)://host[:port][/path]> [-o melange-schema.json]");
     Console.Error.WriteLine("       melange backup <data-dir | http(s)://host[:port][/path]> [-o world.mbak] [--token <jwt>]");
     Console.Error.WriteLine("       melange backup verify <archive>");
-    Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>]");
+    Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>] [--check]");
     Console.Error.WriteLine("       melange clone <archive> -o <data-dir>");
 }
