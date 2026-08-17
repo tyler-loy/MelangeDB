@@ -99,6 +99,20 @@ public sealed class HealthChecksOptions
     /// reports unhealthy.
     /// </summary>
     public long ApplierLagThreshold { get; set; } = 10_000;
+
+    /// <summary>
+    /// How many records may sit pinned above the log's truncation floor before the
+    /// <c>melange-retention</c> check reports unhealthy. Records, not bytes: LSNs are dense and
+    /// exact, and this follows <see cref="ApplierLagThreshold"/>'s precedent — the byte figure is
+    /// on every truncation's log line, where the size is already known.
+    /// <para>
+    /// The default sits an order of magnitude above <c>Snapshots:IntervalTransactions</c> on
+    /// purpose: the pinned distance reaches one snapshot interval in normal operation, simply
+    /// because the head advances between snapshots. Raise both together, or this threshold alone
+    /// alarms on health.
+    /// </para>
+    /// </summary>
+    public long RetentionPinnedThreshold { get; set; } = 1_000_000;
 }
 
 /// <summary>
