@@ -308,6 +308,14 @@ public sealed partial class MelangeEngine : IDisposable
     internal Exception? LogFailure => _log.Failure;
 
     /// <summary>
+    /// Applies a live change to the durability keys. Not a plain options copy: a policy change is
+    /// a durability boundary, and the log makes everything appended under the outgoing policy
+    /// durable before the new one takes effect. See <see cref="FileCommitLog.ApplyDurabilityPolicy"/>.
+    /// </summary>
+    internal void ApplyDurabilityPolicy(FsyncPolicy policy, bool groupCommit) =>
+        _log.ApplyDurabilityPolicy(policy, groupCommit);
+
+    /// <summary>
     /// The timestamp of the newest record recovered at startup, or null for an empty log — the
     /// scheduler's approximation of when the process went down.
     /// </summary>

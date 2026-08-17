@@ -325,6 +325,83 @@ public class GroupCommitTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(FsyncPolicy.Interval)]
+    [InlineData(FsyncPolicy.OsBuffered)]
+    public void Leaving_OnCommit_flushes_before_the_new_policy_takes_effect(FsyncPolicy next)
+    {
+        // Issue #91. Group commit was the first time the head could sit above the fsynced
+        // watermark under OnCommit. Publishing a policy that answers DurableLsn with the head —
+        // and returns from WaitDurable immediately — over records that are still only OS-buffered
+        // would let a subscription delta, a replica stream, or a backup fence serve LSNs a crash
+        // untells, with no epoch change to make the divergence visible.
+        var options = OptionsFor();
+        using var log = new FileCommitLog(options);
+        var record = log.Append(MakeRequest("Buffered"));
+        Assert.True(log.FsyncedLsn < record.Lsn, "the append should be buffered, not yet durable");
+
+        log.ApplyDurabilityPolicy(next, groupCommit: true);
+
+        // Everything appended under OnCommit is on disk before the policy that stops promising it.
+        Assert.Equal(record.Lsn, log.FsyncedLsn);
+        Assert.Equal(record.Lsn, log.DurableLsn);
+    }
+
+    [Fact]
+    public void Turning_group_commit_off_flushes_the_batch_it_is_switching_away_from()
+    {
+        // The inline-fsync path advances the watermark under the append lock alone, which is safe
+        // only while no group flush can exist. The transition is what has to hold that invariant:
+        // flush first, then flip, so nothing is in flight to race the first inline fsync.
+        var options = OptionsFor();
+        using var log = new FileCommitLog(options);
+        var buffered = log.Append(MakeRequest("Buffered"));
+        Assert.True(log.FsyncedLsn < buffered.Lsn);
+
+        log.ApplyDurabilityPolicy(FsyncPolicy.OnCommit, groupCommit: false);
+        Assert.Equal(buffered.Lsn, log.FsyncedLsn);
+
+        // And from here every append is durable on return, so no waiter parks and none becomes a
+        // flusher — the invariant the inline path's lock-free watermark advance rests on.
+        var inline = log.Append(MakeRequest("Inline"));
+        Assert.Equal(inline.Lsn, log.FsyncedLsn);
+        var flushes = log.FsyncCount;
+        Assert.NotNull(log.WaitDurable(inline.Lsn));
+        Assert.Equal(flushes, log.FsyncCount);
+    }
+
+    [Fact]
+    public void Coming_back_to_OnCommit_flushes_what_the_looser_policy_never_promised()
+    {
+        // The other direction is not a hole but it is a discontinuity: DurableLsn would drop from
+        // the head to a watermark that never moved. Flushing on every change keeps the number
+        // monotonic across the boundary, which is what its consumers' cursors assume.
+        var options = OptionsFor(FsyncPolicy.OsBuffered);
+        using var log = new FileCommitLog(options);
+        var record = log.Append(MakeRequest("Loose"));
+        Assert.Equal(record.Lsn, log.DurableLsn); // Vacuously, under OsBuffered.
+        Assert.True(log.FsyncedLsn < record.Lsn);
+
+        log.ApplyDurabilityPolicy(FsyncPolicy.OnCommit, groupCommit: true);
+
+        Assert.Equal(record.Lsn, log.FsyncedLsn);
+        Assert.Equal(record.Lsn, log.DurableLsn);
+    }
+
+    [Fact]
+    public void A_policy_change_that_changes_nothing_costs_no_fsync()
+    {
+        var options = OptionsFor();
+        using var log = new FileCommitLog(options);
+        log.Append(MakeRequest("One"));
+        log.WaitDurable(1);
+        var before = log.FsyncCount;
+
+        log.ApplyDurabilityPolicy(FsyncPolicy.OnCommit, groupCommit: true);
+
+        Assert.Equal(before, log.FsyncCount);
+    }
+
     private static CommitRequest MakeRequest(string reducerName)
     {
         var op = new RowOp(RowOpKind.Insert, TableId.FromName("Whatever"), new RowKey([1, 2, 3]), new byte[] { 4, 5, 6 });

@@ -278,6 +278,60 @@ public sealed class FileCommitLog : ICommitLog
         AdvanceDurable(head, length);
     }
 
+    /// <summary>
+    /// Applies a live change to <c>CommitLog:FsyncPolicy</c> / <c>CommitLog:GroupCommit</c>, which
+    /// is a <b>durability boundary</b>: everything appended under the outgoing policy is made
+    /// durable before the new one takes effect.
+    /// <para>
+    /// Group commit was the first time <see cref="HeadLsn"/> could sit above the fsynced watermark
+    /// under <see cref="FsyncPolicy.OnCommit"/>, and both keys are documented live. Publishing a
+    /// switch away from <c>OnCommit</c> without flushing would make <see cref="DurableLsn"/> jump
+    /// to the head and <see cref="WaitDurable"/> return immediately, so subscription deltas,
+    /// replica and border streams, the relational tier's dispatch, and the online backup's fence
+    /// would all serve records that are still only OS-buffered — untold by a crash, with no epoch
+    /// change to make the divergence visible. The flush is what keeps the phase-17 promise true
+    /// across an operator action.
+    /// </para>
+    /// <para>
+    /// Published under both locks so no append can land between the flush and the new policy: an
+    /// append that beat the publish would be buffered under the old policy and covered by the new
+    /// one's answer. Holding <c>_fsyncLock</c> also excludes an in-flight group flush, which is
+    /// what makes the inline-fsync path safe — while <c>GroupCommit</c> is false every append
+    /// advances the watermark itself, so <see cref="WaitDurable"/> never parks and no flusher can
+    /// exist to race the inline fsync's <see cref="AdvanceDurable"/>.
+    /// </para>
+    /// </summary>
+    internal void ApplyDurabilityPolicy(FsyncPolicy policy, bool groupCommit)
+    {
+        lock (_fsyncLock)
+        {
+            ulong head;
+            long length;
+            lock (_lock)
+            {
+                if (_options.FsyncPolicy == policy && _options.GroupCommit == groupCommit)
+                    return;
+                if (_disposed || _failure is not null)
+                {
+                    // A poisoned or closed log promises nothing and accepts no appends; the policy
+                    // is bookkeeping at that point, and forcing a flush would only throw over it.
+                    _options.FsyncPolicy = policy;
+                    _options.GroupCommit = groupCommit;
+                    return;
+                }
+
+                _stream.Flush(flushToDisk: true);
+                Interlocked.Increment(ref _fsyncCount);
+                head = _headLsn;
+                length = _stream.Length;
+                _options.FsyncPolicy = policy;
+                _options.GroupCommit = groupCommit;
+            }
+
+            AdvanceDurable(head, length);
+        }
+    }
+
     public ulong HeadLsn
     {
         get
@@ -346,9 +400,16 @@ public sealed class FileCommitLog : ICommitLog
                     else if (_options.FsyncPolicy == FsyncPolicy.OnCommit && !_options.GroupCommit)
                     {
                         // CommitLog:GroupCommit = false restores the phase-01 inline fsync:
-                        // durability completes here, under both locks, and WaitDurable finds the
-                        // watermark already advanced. A failure takes the rollback path below —
+                        // durability completes here, under the append lock, and WaitDurable finds
+                        // the watermark already advanced. A failure takes the rollback path below —
                         // the single-append contract, exactly as before the split.
+                        //
+                        // This advances the watermark without holding _fsyncLock, which is safe
+                        // only because no group flush can exist while GroupCommit is false: every
+                        // append advances the watermark itself, so no waiter ever parks and none
+                        // becomes a flusher. ApplyDurabilityPolicy is what makes the transition
+                        // into and out of that state hold the invariant, by flushing under both
+                        // locks before the flag changes.
                         using var fsync = _telemetry?.StartFsync();
                         var fsyncStarted = Stopwatch.GetTimestamp();
                         _stream.Flush(flushToDisk: true);
