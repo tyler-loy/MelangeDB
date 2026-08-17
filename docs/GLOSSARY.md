@@ -637,8 +637,8 @@ supplies the mechanism; spatial partitioning and instancing are both first-class
 that contract cannot be verified statically.
 
 **Snapshot** — A materialized state capture at an LSN, allowing the log behind it to be truncated — never past
-the slowest applier checkpoint, the slowest *live* event-subscriber checkpoint, or the Resume retention
-window. Full-format by settled decision (phase 07): one CRC-guarded file beside the log, atomically swapped,
+any **truncation floor**: the slowest applier checkpoint, the slowest *live* event-subscriber checkpoint, the
+Resume retention window, or any other named holder. Full-format by settled decision (phase 07): one CRC-guarded file beside the log, atomically swapped,
 carrying the epoch, the LSN, the AutoInc sequences, and every row. Restart is snapshot plus tail replay.
 
 **Subscriber checkpoint** — An event subscriber's durable applied-LSN, the same shape as an applier's: a
@@ -667,6 +667,19 @@ registration order and survives restarts. Write-set ops and log records are keye
 type. Collisions are detected at schema registration.
 
 **Tier** — Which storage engine holds a table: `Hot` or `Relational`.
+
+**Truncation floor** — A named holder of the commit log: a mechanism that still needs old records, providing
+the highest LSN compaction may remove from its perspective. Log truncation takes the minimum across all of
+them and never passes it. The built-in set is `snapshot` (the ceiling — truncation never passes the snapshot
+it was decided behind), `resume-window`, `event-bus`, `backup-pin`, `shard-freeze`, `shard-import`,
+`shard-sidecar`, `cluster-events`, and one per applier name, plus `unnamed` for a floor registered through
+`AddTruncationFloor(Func<ulong?>)`. The one whose LSN is lowest is the **governing floor**: the answer to "why
+is the log not truncating", named in every truncation's log line, in `melange.log.truncation_floor`'s tag, and
+in the `melange-retention` health check. Distinct from a **truncation pin** (`MelangeEngine.PinTruncation`),
+which is a scoped lease with an explicit release rather than a permanent registration that decides per
+evaluation; the pins collectively appear as the `backup-pin` floor. Floors are evaluated only when truncation
+is decided — providers run under the write lock and may have side effects — so the metric is that reading
+paired with the live head (phase 18).
 
 **Timer row** — A row in a table declaring `Scheduled`, carrying a `ScheduleAt`. Timers are **data, not code**,
 which is what makes scheduling transactional, recoverable, and partitionable — an inline `[Cron(...)]` attribute

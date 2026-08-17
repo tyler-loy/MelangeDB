@@ -31,7 +31,11 @@ internal sealed class EngineTelemetry : IDisposable
     private Func<long>? _eventQueueDepth;
     private Func<HotStoreStatistics>? _storeStatistics;
 
-    public EngineTelemetry(TelemetryOptions options, Func<ulong> headLsn, Func<IEnumerable<(string Applier, long Lag)>> applierLags)
+    public EngineTelemetry(
+        TelemetryOptions options,
+        Func<ulong> headLsn,
+        Func<IEnumerable<(string Applier, long Lag)>> applierLags,
+        Func<TruncationFloorReport?>? truncationFloors = null)
     {
         _options = options;
         _meter = new Meter(SourceName);
@@ -47,6 +51,28 @@ internal sealed class EngineTelemetry : IDisposable
         _deadLettered = _meter.CreateCounter<long>("melange.events.deadlettered", "{event}", "Events whose delivery exhausted its retries and was recorded to the dead-letter path.");
         _meter.CreateObservableGauge("melange.events.queue_depth", () => _eventQueueDepth?.Invoke() ?? 0L, "{event}", "Events held in the bus's in-memory delivery window.");
         _meter.CreateObservableGauge("melange.log.head_lsn", () => (long)headLsn(), "{lsn}", "LSN of the newest log record.");
+
+        // Truncation floors, as of the last truncation decision — see TruncationFloorReport for why
+        // they are a cached reading. Paired with the live head, which is what makes pinned_records
+        // grow while a stuck holder stands still. Both report nothing at all until a decision has
+        // been made: an absent series says "never evaluated", where a zero would say "healthy".
+        _meter.CreateObservableGauge(
+            "melange.log.truncation_floor",
+            () => TruncationFloorMeasurements(truncationFloors),
+            "{lsn}",
+            "Highest LSN each holder permits log compaction to remove — the answer to who is pinning the log.");
+        _meter.CreateObservableGauge(
+            "melange.log.pinned_records",
+            () =>
+            {
+                var report = truncationFloors?.Invoke();
+                if (report is null)
+                    return Array.Empty<Measurement<long>>();
+                var head = headLsn();
+                return [new Measurement<long>(head > report.EffectiveFloor ? (long)(head - report.EffectiveFloor) : 0)];
+            },
+            "{record}",
+            "Records the truncation floors hold above the effective floor — the headline number that grows when a holder stalls.");
         _meter.CreateObservableGauge(
             "melange.applier.lag",
             () => applierLags().Select(l => new Measurement<long>(l.Lag, new KeyValuePair<string, object?>("applier", l.Applier))),
@@ -67,6 +93,27 @@ internal sealed class EngineTelemetry : IDisposable
             () => StoreMeasurements(static t => t.RowsScanned),
             "{row}",
             "Rows returned by full table scans.");
+    }
+
+    /// <summary>
+    /// One measurement per floor name. Two registrations may share a name (two shards' freeze
+    /// markers, or several unnamed third-party floors), and a duplicated tag set would let the last
+    /// one win arbitrarily — so a shared name reports the lowest of its readings, which is the one
+    /// actually holding the log.
+    /// </summary>
+    private static IEnumerable<Measurement<long>> TruncationFloorMeasurements(Func<TruncationFloorReport?>? provider)
+    {
+        if (provider?.Invoke() is not { } report)
+            yield break;
+        var lowest = new Dictionary<string, ulong>(StringComparer.Ordinal);
+        foreach (var floor in report.Floors)
+        {
+            if (!lowest.TryGetValue(floor.Name, out var existing) || floor.Lsn < existing)
+                lowest[floor.Name] = floor.Lsn;
+        }
+
+        foreach (var (name, lsn) in lowest)
+            yield return new Measurement<long>((long)lsn, new KeyValuePair<string, object?>("floor", name));
     }
 
     private IEnumerable<Measurement<long>> StoreMeasurements(Func<HotStoreTableStatistics, long> select)

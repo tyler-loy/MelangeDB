@@ -65,7 +65,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         // Log truncation must never pass the slowest live event subscriber; the bus's minimum
         // checkpoint is registered as a truncation floor the snapshot path consults.
         if (_eventBus is { } bus)
-            engine.AddTruncationFloor(() => bus.MinimumLiveCheckpointLsn);
+            engine.AddTruncationFloor(TruncationFloorNames.EventBus, () => bus.MinimumLiveCheckpointLsn);
 
         // Seeding runs before the scheduler, so a timer row an init reducer inserts is in the
         // pending set the scheduler builds rather than an observed commit arriving beside it. Only

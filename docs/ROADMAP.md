@@ -91,7 +91,7 @@ deferred — mutually independent, in any order.
 | [15](road-to-0.2/plan-phase-15.md) | Backup and restore: the `.mbak` archive (snapshot + log tail, per engine — the truth, not the projections), `melange backup` / `restore` / `backup verify` | **Shipped** |
 | [16](road-to-0.2/plan-phase-16.md) | Hot-tier schema migration: the shape sidecar, additive changes replay by name-mapped rebuild, destructive changes refuse loudly — DESIGN.md §10's open half | **Shipped** |
 | [17](road-to-0.2/plan-phase-17.md) | Group commit: coalesced fsyncs at unchanged `OnCommit` semantics — the hotspot ceiling re-measured | Shipped |
-| [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Planned |
+| [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Shipped |
 | [19](road-to-0.2/plan-phase-19.md) | Backup, second pass: `restore --check` (the boot-proof), `melange clone` (explicitly a different world), `restore --at-lsn` | Planned |
 
 ## What's left

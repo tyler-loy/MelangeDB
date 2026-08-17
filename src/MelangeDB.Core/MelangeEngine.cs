@@ -24,8 +24,11 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly ThreadLocal<bool> _inReducer = new();
     private readonly List<ICommitObserver> _commitObservers = [];
     private readonly List<ICommitGuard> _commitGuards = [];
-    private readonly List<Func<ulong?>> _truncationFloors = [];
+    private readonly List<(string Name, Func<ulong?> Provider)> _truncationFloors = [];
     private readonly List<TruncationPin> _truncationPins = [];
+
+    /// <summary>The last truncation decision's floors; null until one has been made. See <see cref="TruncationFloors"/>.</summary>
+    private TruncationFloorReport? _floorReport;
     private TableAccessGuard? _tableGuard;
     private readonly IDisposable? _storeLifetime;
     // Null when the configured hot store does not offer pinned reads. Snapshot-isolated reducers
@@ -69,7 +72,8 @@ public sealed partial class MelangeEngine : IDisposable
             ? new EngineTelemetry(
                 options.Telemetry,
                 () => _log?.HeadLsn ?? 0UL,
-                () => Appliers?.Lags() ?? [])
+                () => Appliers?.Lags() ?? [],
+                () => _floorReport)
             : null;
         try
         {
@@ -119,7 +123,7 @@ public sealed partial class MelangeEngine : IDisposable
             Appliers = new ApplierPipeline(_log, _telemetry, _shapes.TransformRecord, _log.ReadUncapped);
             Appliers.Register(new HotStoreApplier(store));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
-            _truncationFloors.Add(PinnedTruncationFloor);
+            _truncationFloors.Add((TruncationFloorNames.BackupPin, PinnedTruncationFloor));
             if (options.Residency.ReportOnStartup)
                 ReportResidency(store);
             CompleteShapeMigration(store);
@@ -729,19 +733,43 @@ public sealed partial class MelangeEngine : IDisposable
     }
 
     /// <summary>
-    /// Registers a truncation floor: a provider of the highest LSN log compaction may remove from
-    /// that consumer's perspective (its checkpoint). Null means the consumer pins nothing. The
+    /// Registers a named truncation floor: a provider of the highest LSN log compaction may remove
+    /// from that consumer's perspective (its checkpoint). Null means the consumer pins nothing. The
     /// event bus registers <c>MinimumLiveCheckpointLsn</c> here so truncation never strands a
     /// subscriber that is merely behind.
+    /// <para>
+    /// The name is what makes a pinned log diagnosable — it is the <c>melange.log.truncation_floor</c>
+    /// tag, the floor named in every truncation's log line, and the holder the
+    /// <c>melange-retention</c> health check points at. Use a stable mechanism name, not a
+    /// per-instance one: it is a metric dimension. <see cref="TruncationFloorNames"/> holds the
+    /// built-in set.
+    /// </para>
     /// </summary>
-    public void AddTruncationFloor(Func<ulong?> floor)
+    public void AddTruncationFloor(string name, Func<ulong?> floor)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(floor);
         lock (_writeLock)
         {
-            _truncationFloors.Add(floor);
+            _truncationFloors.Add((name, floor));
         }
     }
+
+    /// <summary>
+    /// Registers an unnamed truncation floor — <see cref="AddTruncationFloor(string, Func{ulong?})"/>
+    /// under <see cref="TruncationFloorNames.Unnamed"/>. Kept rather than broken pre-1.0 for the
+    /// sake of one string: a third-party floor that never names itself still has to show up in the
+    /// report, and showing up as "unnamed" is itself the diagnosis.
+    /// </summary>
+    public void AddTruncationFloor(Func<ulong?> floor) => AddTruncationFloor(TruncationFloorNames.Unnamed, floor);
+
+    /// <summary>
+    /// The floors as they stood at the last truncation decision, or null if none has been made —
+    /// snapshots disabled, <c>Snapshots:TruncateLog</c> off, or simply no snapshot yet. Read by
+    /// the <c>melange.log.*</c> gauges and the <c>melange-retention</c> health check; see
+    /// <see cref="TruncationFloorReport"/> for why it is cached rather than evaluated on demand.
+    /// </summary>
+    public TruncationFloorReport? TruncationFloors => _floorReport;
 
     /// <summary>
     /// Pins log truncation at the current base for the lifetime of the returned handle: while any
@@ -910,20 +938,44 @@ public sealed partial class MelangeEngine : IDisposable
     /// <summary>
     /// The truncation floors, applied in one place so no configuration can override them: the
     /// snapshot LSN itself, every applier's checkpoint, every registered floor (live event
-    /// subscribers), and the Resume retention window — a reconnecting client's gap must stay
-    /// servable from the log for <c>Resume:RetentionWindowSeconds</c>.
+    /// subscribers, backup pins, cluster handoff markers), and the Resume retention window — a
+    /// reconnecting client's gap must stay servable from the log for
+    /// <c>Resume:RetentionWindowSeconds</c>.
+    /// <para>
+    /// Every floor is named and the whole reading is kept (<see cref="TruncationFloors"/>), because
+    /// the operator's question is never "what is the floor" but "who is holding it". The decision
+    /// logs either way — a truncation that removes nothing <em>because</em> a floor pinned it is
+    /// the interesting case, and it used to be perfectly silent.
+    /// </para>
     /// </summary>
     private void TruncateLogCore(ulong snapshotLsn)
     {
+        // The snapshot is the ceiling and the first candidate, so a healthy log reports "snapshot"
+        // as its governing floor: nothing is holding anything back.
+        var floors = new List<TruncationFloor>(_truncationFloors.Count + Appliers.Appliers.Count + 2)
+        {
+            new(TruncationFloorNames.Snapshot, snapshotLsn),
+        };
         var floor = snapshotLsn;
         foreach (var applier in Appliers.Appliers)
-            floor = Math.Min(floor, applier.AppliedLsn);
-        foreach (var provider in _truncationFloors)
         {
-            if (provider() is { } pinned)
-                floor = Math.Min(floor, pinned);
+            floors.Add(new TruncationFloor(applier.Name, applier.AppliedLsn));
+            floor = Math.Min(floor, applier.AppliedLsn);
         }
 
+        foreach (var (name, provider) in _truncationFloors)
+        {
+            if (provider() is not { } pinned)
+                continue;
+            floors.Add(new TruncationFloor(name, pinned));
+            floor = Math.Min(floor, pinned);
+        }
+
+        // The retention window is scanned only as far as the floor the other holders already set —
+        // the record that binds it, if any, is the oldest one still inside the window. When nothing
+        // binds, the reading is the ceiling it scanned to: "permits removing at least this much",
+        // which keeps the floor's tag present rather than flickering in and out of the metric.
+        var resumeFloor = floor;
         var retentionCutoff = _time.GetUtcNow().AddSeconds(-_options.Resume.RetentionWindowSeconds);
         var cutoffMicros = Timestamp.FromDateTimeOffset(retentionCutoff).UnixTimeMicroseconds;
         foreach (var record in _log.ReadFrom(_log.BaseLsn + 1))
@@ -932,15 +984,38 @@ public sealed partial class MelangeEngine : IDisposable
                 break;
             if (record.Timestamp.UnixTimeMicroseconds >= cutoffMicros)
             {
-                floor = Math.Min(floor, record.Lsn - 1);
+                resumeFloor = record.Lsn - 1;
                 break;
             }
         }
 
+        floors.Add(new TruncationFloor(TruncationFloorNames.ResumeWindow, resumeFloor));
+        floor = Math.Min(floor, resumeFloor);
+
+        var governing = floors[0];
+        foreach (var candidate in floors)
+        {
+            if (candidate.Lsn < governing.Lsn)
+                governing = candidate;
+        }
+
+        var head = _log.HeadLsn;
+        var pinnedRecords = head > floor ? head - floor : 0;
         if (floor <= _log.BaseLsn)
+        {
+            // Nothing removable. Either the log is already compacted to the floor, or a holder has
+            // stopped moving — the same shape of line, because the operator cannot tell which from
+            // silence.
+            _floorReport = new TruncationFloorReport(snapshotLsn, head, _log.BaseLsn, floor, governing, floors);
+            LogMessages.LogTruncationPinned(
+                _logger, governing.Name, governing.Lsn, _log.BaseLsn, head, pinnedRecords, _log.FileLengthBytes);
             return;
+        }
+
         _log.TruncateBefore(floor);
-        LogMessages.LogTruncated(_logger, floor, snapshotLsn);
+        _floorReport = new TruncationFloorReport(snapshotLsn, head, _log.BaseLsn, floor, governing, floors);
+        LogMessages.LogTruncated(
+            _logger, floor, snapshotLsn, governing.Name, governing.Lsn, pinnedRecords, _log.FileLengthBytes);
     }
 
     /// <summary>
@@ -1602,16 +1677,30 @@ public sealed partial class MelangeEngine : IDisposable
         public static void SnapshotWritten(ILogger logger, ulong lsn, string path) =>
             SnapshotWrittenMessage(logger, lsn, path, null);
 
-        private static readonly Action<ILogger, ulong, ulong, Exception?> LogTruncatedMessage =
-            LoggerMessage.Define<ulong, ulong>(
+        private static readonly Action<ILogger, ulong, ulong, string, ulong, ulong, long, Exception?> LogTruncatedMessage =
+            LoggerMessage.Define<ulong, ulong, string, ulong, ulong, long>(
                 LogLevel.Information,
                 new EventId(1503, "LogTruncated"),
                 "Commit log truncated up to LSN {Floor} behind the snapshot at LSN {SnapshotLsn}; " +
-                "the floor is the minimum of the snapshot, every applier checkpoint, every live " +
-                "event-subscriber checkpoint, and the Resume retention window.");
+                "governing floor '{FloorName}' at LSN {FloorLsn}, {PinnedRecords} record(s) behind " +
+                "the head. Log file is now {LogBytes} byte(s).");
 
-        public static void LogTruncated(ILogger logger, ulong floor, ulong snapshotLsn) =>
-            LogTruncatedMessage(logger, floor, snapshotLsn, null);
+        public static void LogTruncated(
+            ILogger logger, ulong floor, ulong snapshotLsn, string floorName, ulong floorLsn, ulong pinnedRecords, long logBytes) =>
+            LogTruncatedMessage(logger, floor, snapshotLsn, floorName, floorLsn, pinnedRecords, logBytes, null);
+
+        private static readonly Action<ILogger, string, ulong, ulong, ulong, ulong, long, Exception?> LogTruncationPinnedMessage =
+            LoggerMessage.Define<string, ulong, ulong, ulong, ulong, long>(
+                LogLevel.Information,
+                new EventId(1510, "LogTruncationPinned"),
+                "Commit log truncation removed nothing: floor '{FloorName}' at LSN {FloorLsn} holds " +
+                "the base at LSN {BaseLsn}, with the head at LSN {HeadLsn} — {PinnedRecords} " +
+                "record(s), {LogBytes} byte(s) pinned. Everything older than the floor stays on " +
+                "disk until that holder checkpoints past it.");
+
+        public static void LogTruncationPinned(
+            ILogger logger, string floorName, ulong floorLsn, ulong baseLsn, ulong headLsn, ulong pinnedRecords, long logBytes) =>
+            LogTruncationPinnedMessage(logger, floorName, floorLsn, baseLsn, headLsn, pinnedRecords, logBytes, null);
 
         private static readonly Action<ILogger, Exception?> SnapshotFailedMessage =
             LoggerMessage.Define(

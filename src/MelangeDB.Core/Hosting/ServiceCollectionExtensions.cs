@@ -16,7 +16,8 @@ public static class ServiceCollectionExtensions
     /// Adds MelangeDB: options bound from the <c>MelangeDb:</c> section (so appsettings.json,
     /// environment variables, and Azure App Configuration all work with no MelangeDB-specific
     /// code), the engine and reducer host, the hosted service owning startup and graceful
-    /// shutdown, and the <c>melange-log</c> health check.
+    /// shutdown, and the <c>melange-log</c>, <c>melange-applier</c>, and <c>melange-retention</c>
+    /// health checks.
     /// </summary>
     public static IServiceCollection AddMelangeDb(this IServiceCollection services, Action<MelangeDbBuilder> configure)
     {
@@ -80,6 +81,7 @@ public static class ServiceCollectionExtensions
         services.TryAddSingleton<MelangeDbRuntimeState>();
         services.TryAddSingleton<MelangeLogHealthCheck>();
         services.TryAddSingleton<MelangeApplierHealthCheck>();
+        services.TryAddSingleton<MelangeRetentionHealthCheck>();
         services.AddHostedService<MelangeDbHostedService>();
         services.Configure<HealthCheckServiceOptions>(options =>
         {
@@ -97,6 +99,15 @@ public static class ServiceCollectionExtensions
                 options.Registrations.Add(new HealthCheckRegistration(
                     "melange-applier",
                     provider => provider.GetRequiredService<MelangeApplierHealthCheck>(),
+                    failureStatus: null,
+                    tags: null));
+            }
+
+            if (options.Registrations.All(r => r.Name != "melange-retention"))
+            {
+                options.Registrations.Add(new HealthCheckRegistration(
+                    "melange-retention",
+                    provider => provider.GetRequiredService<MelangeRetentionHealthCheck>(),
                     failureStatus: null,
                     tags: null));
             }

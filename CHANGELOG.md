@@ -59,6 +59,29 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Truncation-floor observability: "why is the log not truncating" is now one look**
+  ([road-to-0.2 phase 18](docs/road-to-0.2/plan-phase-18.md)). Everything that still needs old
+  records pins the commit log through a *truncation floor*, and until now those registrations were
+  anonymous `Func<ulong?>`s whose minimum truncation took in silence — a crashed subscriber, a
+  stalled applier, or an orphaned handoff marker filled a disk with no path to the cause short of a
+  debugger. Floors now have names (`AddTruncationFloor(string, Func<ulong?>)`; the unnamed overload
+  survives, reporting as `unnamed`), and every truncation decision says which one **governed**:
+  EventId `1503 LogTruncated` gained the floor's name, its LSN, the pinned record count, and the log's
+  size in bytes, and the new `1510 LogTruncationPinned` covers the decision that removes *nothing*
+  because a floor pinned it — the interesting case, and the one that was perfectly silent.
+
+  The signals: **`melange.log.pinned_records`** is the headline gauge to alert on, and
+  **`melange.log.truncation_floor`** (tagged `floor`) is the drill-down that names the holder. The
+  floors are the reading taken at the last truncation decision — providers run under the engine write
+  lock and one of them writes a file on evaluation, so a per-scrape evaluation was never on the table —
+  paired with the *live* head, which is exactly the number that grows while a stuck holder stands
+  still. Neither series publishes at all before the first decision: an absent series says "never
+  evaluated", where a zero would say "healthy". The **`melange-retention`** health check is the same
+  finding as an alert, unhealthy past `HealthChecks:RetentionPinnedThreshold` (records, default
+  1,000,000) with the governing floor named in its description. A runbook —
+  [OBSERVABILITY.md](docs/OBSERVABILITY.md), "the log is growing — who is holding it" — walks the
+  sequence of looks from the gauge to the named holder's own signals.
+
 - **Group commit: concurrent commits share fsyncs at unchanged `OnCommit` semantics**
   ([road-to-0.2 phase 17](docs/road-to-0.2/plan-phase-17.md)). The commit path splits in two:
   the append buffers under the engine's write lock, the committing caller waits for durability

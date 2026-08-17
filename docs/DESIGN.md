@@ -481,7 +481,10 @@ samples/                        worker-service host + console client
   [plan-phase-16.md](road-to-0.2/plan-phase-16.md).
 - ~~**Log compaction / snapshots**~~ — **Settled in phase 07: full snapshot + truncate.** Snapshot at an
   LSN beside the log, truncate behind it, never past the slowest applier, the slowest live event
-  subscriber, or the Resume retention window; restart is snapshot plus tail replay. See
-  [plan-phase-07.md](road-to-0.1/plan-phase-07.md).
+  subscriber, or the Resume retention window; restart is snapshot plus tail replay. Each of those
+  holders is a **named truncation floor** since road-to-0.2 phase 18, and every truncation decision
+  logs which one governed — including the decision that removes nothing. See
+  [plan-phase-07.md](road-to-0.1/plan-phase-07.md) and
+  [plan-phase-18.md](road-to-0.2/plan-phase-18.md).
 - **Codegen targets** — a real project has several client trees (game client, admin web, CLI tools)
   generating from one schema. `MelangeDB.CodeGen` should emit to multiple output trees from the start.
