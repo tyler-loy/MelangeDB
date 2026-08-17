@@ -40,6 +40,8 @@ public sealed class MelangeDbOptions
 
     public SnapshotsOptions Snapshots { get; set; } = new();
 
+    public SchemaOptions Schema { get; set; } = new();
+
     public PostgresOptions Postgres { get; set; } = new();
 
     public DiagnosticsOptions Diagnostics { get; set; } = new();
@@ -168,6 +170,25 @@ public sealed class SnapshotsOptions
     /// retention window, regardless of this setting.
     /// </summary>
     public bool TruncateLog { get; set; } = true;
+}
+
+/// <summary>Schema-governance options (<c>MelangeDb:Schema:*</c>).</summary>
+public sealed class SchemaOptions
+{
+    /// <summary>
+    /// Whether a boot may <em>adopt</em> the running code's schema as the meaning of rows already
+    /// on disk — which is what happens the first time a directory that predates the shape sidecar
+    /// is booted. It is the only possible reading of those bytes, and it is sound exactly when the
+    /// operator followed the upgrade rule: boot the old schema once, then change it.
+    /// <para>
+    /// Left on, an adoption over a non-empty directory logs loudly (EventId 1008) and proceeds.
+    /// Turned off, it refuses the boot instead — the <c>Postgres:AutoMigrate</c> posture, for
+    /// deployments that would rather stop than discover a mis-decode later, since a wrong adoption
+    /// is not a stall but silently wrong reads of existing data. Adoption over an <em>empty</em>
+    /// directory is a new world naming its first shape and is never affected.
+    /// </para>
+    /// </summary>
+    public bool AllowAdoption { get; set; } = true;
 }
 
 /// <summary>The hot-store engines <c>HotStore:Engine</c> may name.</summary>

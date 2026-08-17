@@ -93,7 +93,13 @@ public sealed partial class MelangeEngine : IDisposable
             // Shape governance before any row byte is interpreted: load (or adopt) the shape
             // sidecar, refuse a destructive schema change, and hold the additive transform that
             // recovery routes every snapshot row and tail record through. See ShapeGuard.
-            _shapes = ShapeGuard.Resolve(options.CommitLog.Path, schema, _log.BaseLsn);
+            _shapes = ShapeGuard.Resolve(
+                options.CommitLog.Path,
+                schema,
+                _log.BaseLsn,
+                _log.HeadLsn,
+                options.Schema.AllowAdoption,
+                lsn => LogMessages.ShapeAdopted(_logger, options.CommitLog.Path, lsn));
             var store = CreateStore(options, schema, hotStoreProvider, loggers);
             _storeLifetime = store as IDisposable;
 
@@ -1721,6 +1727,21 @@ public sealed partial class MelangeEngine : IDisposable
         public static void LogTruncationPinned(
             ILogger logger, string floorName, ulong floorLsn, ulong baseLsn, ulong headLsn, ulong pinnedRecords, long logBytes) =>
             LogTruncationPinnedMessage(logger, floorName, floorLsn, baseLsn, headLsn, pinnedRecords, logBytes, null);
+
+        private static readonly Action<ILogger, string, ulong, Exception?> ShapeAdoptedMessage =
+            LoggerMessage.Define<string, ulong>(
+                LogLevel.Warning,
+                new EventId(1008, "ShapeAdopted"),
+                "This boot adopted the running code's schema as the meaning of every record already in " +
+                "'{Directory}' (up to LSN {HeadLsn}): no melange.shape sidecar existed, and rows carry no " +
+                "self-description, so there is no other possible reading. That is correct only if this " +
+                "deployment booted its previous schema once before changing it — the upgrade rule in " +
+                "docs/MIGRATION.md. If the schema changed in the same deploy, the tables that changed are " +
+                "being mis-read right now: rewrite their rows through the bulk endpoint, which never reads " +
+                "the old bytes. Set Schema:AllowAdoption to false to refuse this boot instead.");
+
+        public static void ShapeAdopted(ILogger logger, string directory, ulong headLsn) =>
+            ShapeAdoptedMessage(logger, directory, headLsn, null);
 
         private static readonly Action<ILogger, Guid, ulong, string, DateTimeOffset, DateTimeOffset, Exception?> CloneProvenanceMessage =
             LoggerMessage.Define<Guid, ulong, string, DateTimeOffset, DateTimeOffset>(
