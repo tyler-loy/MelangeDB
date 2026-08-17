@@ -140,9 +140,15 @@ public static class MelangeBackup
     /// <paramref name="targetDirectory"/> — a rewind, for replacement, not cloning: a fresh epoch
     /// is always minted, so clients holding pre-restore resume cursors are refused resume and
     /// full-resync. Any failure removes everything the restore wrote.
+    /// <para>
+    /// <paramref name="options"/> carries the point-in-time cut (<see cref="RestoreOptions.AtLsn"/>):
+    /// the restored world stops at that LSN, with everything above it left in the archive. The
+    /// cut is bounded by the archive's own snapshot floor and its captured head, and is refused
+    /// on cluster archives, whose engines were captured at different fences.
+    /// </para>
     /// </summary>
-    public static RestoreSummary Restore(string archivePath, string targetDirectory)
-        => ArchiveRestore.Restore(archivePath, targetDirectory);
+    public static RestoreSummary Restore(string archivePath, string targetDirectory, RestoreOptions? options = null)
+        => ArchiveRestore.Restore(archivePath, targetDirectory, options);
 
     /// <summary>
     /// CRC-walks every frame and dry-replays the archive into an in-memory projection, reporting
@@ -168,14 +174,31 @@ public sealed record BackupEngineSummary(
 public sealed record BackupSummary(IReadOnlyList<BackupEngineSummary> Engines, long TotalBytes);
 
 /// <summary>
+/// How a restore differs from the plain rewind. Empty is the plain rewind; a separate type
+/// because the interesting restores are the ones that need saying out loud at the call site.
+/// </summary>
+public sealed record RestoreOptions
+{
+    /// <summary>
+    /// Restore the world as of this LSN, discarding everything the archive holds above it — the
+    /// moment just before the mistake. Null restores the whole capture. Must sit between the
+    /// archive's snapshot LSN and its captured head, inclusive; single-engine archives only.
+    /// </summary>
+    public ulong? AtLsn { get; init; }
+}
+
+/// <summary>
 /// One engine as restored: its fresh epoch (minted always — a restore is a rewind, and the mint
 /// is what forces stale resume cursors into a full resync) and where its files landed.
 /// </summary>
+/// <param name="HeadLsn">The restored world's head — the point-in-time cut, or the captured head.</param>
+/// <param name="CapturedHeadLsn">The head the archive holds. Above <paramref name="HeadLsn"/> only for a point-in-time restore, and the difference is what was left behind.</param>
 public sealed record RestoredEngineSummary(
     string Key,
     Guid NewEpoch,
     ulong SnapshotLsn,
     ulong HeadLsn,
+    ulong CapturedHeadLsn,
     string Directory);
 
 /// <summary>What a restore materialized.</summary>

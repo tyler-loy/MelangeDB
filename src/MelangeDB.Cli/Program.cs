@@ -8,7 +8,7 @@ using MelangeDB.Core;
 //   melange backup ./data/log [-o world.mbak]
 //   melange backup https://game.example.com --token <jwt> [-o world.mbak]
 //   melange backup verify world.mbak
-//   melange restore world.mbak -o ./data/log
+//   melange restore world.mbak -o ./data/log [--at-lsn 41200]
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
 // its URL form fetches from a running server's schema endpoint. `backup` captures a stopped
@@ -17,7 +17,8 @@ using MelangeDB.Core;
 // Backup:OwnerRole claim); `verify` CRC-walks and dry-replays one; `restore`
 // materializes a data directory a server boots from — with a fresh epoch, always, because a
 // restore is a rewind and stale resume cursors must full-resync rather than resume into history
-// that no longer happened. An unverified backup is a hope, not a backup.
+// that no longer happened. `--at-lsn` cuts the tail at a named LSN: the moment just before the
+// mistake, within the window one archive holds. An unverified backup is a hope, not a backup.
 if (args.Length == 0)
 {
     PrintUsage();
@@ -110,13 +111,23 @@ static int RunVerify(string[] rest)
 
 static int RunRestore(string[] rest)
 {
-    if (!ParseSourceAndOutput(rest, null, out var archive, out var target, out _))
+    if (!ParseArguments(rest, null, out var archive, out var target, out _, out var atLsn))
         return Usage();
     try
     {
-        var summary = MelangeBackup.Restore(archive, target);
+        var summary = MelangeBackup.Restore(archive, target, new RestoreOptions { AtLsn = atLsn });
         foreach (var engine in summary.Engines)
+        {
             Console.WriteLine($"Restored {engine.Key} into {engine.Directory}: head LSN {engine.HeadLsn}, new epoch {engine.NewEpoch:D}.");
+            if (engine.HeadLsn < engine.CapturedHeadLsn)
+            {
+                Console.WriteLine(
+                    $"  Cut at LSN {engine.HeadLsn}: {engine.CapturedHeadLsn - engine.HeadLsn} record(s) up to the captured head " +
+                    $"{engine.CapturedHeadLsn} are not in this world. The rewind is total — AutoInc ids allocated in that " +
+                    "range are free again, so reconcile anything outside this database that recorded them.");
+            }
+        }
+
         Console.WriteLine("The fresh epoch means clients with pre-restore resume cursors will full-resync — that is the point of it.");
         return 0;
     }
@@ -132,10 +143,15 @@ static int RunRestore(string[] rest)
 // world should land). --token falls back to the MELANGE_TOKEN environment variable, which keeps
 // the JWT out of shell history and process listings in scripts.
 static bool ParseSourceAndOutput(string[] rest, string? defaultOutput, out string source, out string output, out string? token)
+    => ParseArguments(rest, defaultOutput, out source, out output, out token, out _);
+
+static bool ParseArguments(
+    string[] rest, string? defaultOutput, out string source, out string output, out string? token, out ulong? atLsn)
 {
     source = "";
     output = defaultOutput ?? "";
     token = Environment.GetEnvironmentVariable("MELANGE_TOKEN");
+    atLsn = null;
     var sawSource = false;
     var sawOutput = false;
     for (var i = 0; i < rest.Length; i++)
@@ -149,6 +165,13 @@ static bool ParseSourceAndOutput(string[] rest, string? defaultOutput, out strin
             case "--token" when i + 1 < rest.Length:
                 token = rest[++i];
                 break;
+            case "--at-lsn" when i + 1 < rest.Length && ulong.TryParse(rest[i + 1], out var lsn):
+                atLsn = lsn;
+                i++;
+                break;
+            case "--at-lsn":
+                Console.Error.WriteLine("--at-lsn takes an LSN: a whole number naming the moment to restore to.");
+                return false;
             case "-h" or "--help":
                 return false;
             default:
@@ -176,5 +199,5 @@ static void PrintUsage()
     Console.Error.WriteLine("usage: melange schema <module.dll | http(s)://host[:port][/path]> [-o melange-schema.json]");
     Console.Error.WriteLine("       melange backup <data-dir | http(s)://host[:port][/path]> [-o world.mbak] [--token <jwt>]");
     Console.Error.WriteLine("       melange backup verify <archive>");
-    Console.Error.WriteLine("       melange restore <archive> -o <data-dir>");
+    Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>]");
 }
