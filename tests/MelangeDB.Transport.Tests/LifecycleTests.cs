@@ -143,6 +143,16 @@ public class LifecycleTests
         Assert.False(result.Ok);
         Assert.Equal(MelangeErrorCodes.UnknownReducer, result.ErrorCode);
 
+        // Byte-for-byte what a name that genuinely does not resolve answers: a difference of any
+        // kind — including an exception's (Parameter '…') suffix — confirms this reducer exists.
+        await raw.SendAsync(new CallReducerFrame(2, "NoSuchReducer", ReducerArgs.Encode([]), null), TestContext.Current.CancellationToken);
+        var absent = await raw.ReceiveUntilAsync<ReducerResultFrame>(TestContext.Current.CancellationToken);
+        Assert.Equal(MelangeErrorCodes.UnknownReducer, absent.ErrorCode);
+        Assert.Equal(
+            absent.Message?.Replace("NoSuchReducer", "Respawn", StringComparison.Ordinal),
+            result.Message);
+        Assert.Equal("No reducer named 'Respawn' is registered.", result.Message);
+
         // Same answer over HTTP: the one-shot call path is a client origin too.
         using var http = host.CreateHttp();
         var response = await http.PostAsync("/melange/call/Respawn", new StringContent("[]"), TestContext.Current.CancellationToken);

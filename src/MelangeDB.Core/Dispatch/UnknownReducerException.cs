@@ -24,4 +24,13 @@ public sealed class UnknownReducerException(string reducerName, string? paramNam
 {
     /// <summary>The name as the caller sent it.</summary>
     public string ReducerName { get; } = reducerName;
+
+    /// <summary>
+    /// The one sentence, without <see cref="ArgumentException"/>'s <c>(Parameter '…')</c> suffix.
+    /// The message reaches clients verbatim, and the suffix would both change the wire text and —
+    /// because the two throw sites name different parameters — let a caller tell a name that does
+    /// not exist from a lifecycle or scheduled reducer that does. Keeping those indistinguishable
+    /// is the reason the second case answers "unknown" at all.
+    /// </summary>
+    public override string Message { get; } = $"No reducer named '{reducerName}' is registered.";
 }

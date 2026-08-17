@@ -42,7 +42,13 @@ public class HttpEndpointTests
 
         var unknown = await http.PostAsync("/melange/call/NoSuchReducer", Json("[]"), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
-        Assert.Equal("unknown_reducer", (await ReadJsonAsync(unknown)).GetProperty("error").GetString());
+        var unknownBody = await ReadJsonAsync(unknown);
+        Assert.Equal("unknown_reducer", unknownBody.GetProperty("error").GetString());
+
+        // The message is wire text: exactly one sentence, with no exception-shaped suffix. It must
+        // also be the same sentence a non-client-callable reducer gets, or the difference confirms
+        // that one exists — see A_client_calling_a_scheduled_reducer_is_told_unknown.
+        Assert.Equal("No reducer named 'NoSuchReducer' is registered.", unknownBody.GetProperty("message").GetString());
 
         var badArgs = await http.PostAsync("/melange/call/SetChunk", Json("""["nope"]"""), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.BadRequest, badArgs.StatusCode);
