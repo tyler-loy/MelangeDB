@@ -308,8 +308,11 @@ public class SchemaShapeTests : IDisposable
             v1.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 5, Name = "eve" }));
         }
 
-        // Simulate a pre-phase-16 directory: the sidecar never existed.
+        // Simulate a pre-phase-16 directory: the sidecar never existed. Adoption over records is
+        // refused by default, so this opts in the way the upgrade rule's operator does — this test
+        // is about what adoption produces, not about whether it is allowed.
         File.Delete(Path.Combine(options.CommitLog.Path, ShapeHistory.FileName));
+        options.Schema.AllowAdoption = true;
         using (var adopted = Boot(options, HeroTable<HeroV1>()))
         {
             var sidecar = Sidecar(options);
@@ -444,6 +447,7 @@ public class SchemaShapeTests : IDisposable
     public void Adopting_a_schema_over_records_a_different_binary_wrote_says_so_at_the_moment_it_happens()
     {
         var options = PreSidecarDirectory();
+        options.Schema.AllowAdoption = true;
         var logs = new LogCapture();
 
         using (var booted = Boot(options, logs, HeroTable<HeroV1>()))
@@ -485,19 +489,20 @@ public class SchemaShapeTests : IDisposable
     }
 
     [Fact]
-    public void Adoption_over_an_existing_directory_can_be_refused_outright()
+    public void Adoption_over_an_existing_directory_is_refused_by_default()
     {
-        // The AutoMigrate posture, opt-in: a wrong adoption is not a stall but silently wrong reads
-        // of existing data, so a deployment may prefer to stop and be told.
+        // The AutoMigrate posture. The two errors are not symmetric: refusing costs one boot and
+        // one setting, while assuming wrongly costs a mis-decode discovered arbitrarily later — so
+        // the default stops, and the message tells the operator which branch they are in.
         var options = PreSidecarDirectory();
-        options.Schema.AllowAdoption = false;
 
         var refusal = Assert.Throws<SchemaShapeException>(() => Boot(options, HeroTable<HeroV1>()));
         Assert.Contains("Schema:AllowAdoption", refusal.Message);
         Assert.Contains("silently mis-reads", refusal.Message);
+        Assert.Contains("restore it from backup", refusal.Message);
 
-        // Refusing writes nothing: the next boot decides afresh, which is what makes the flag a
-        // gate rather than a one-way door.
+        // Refusing writes nothing: the next boot decides afresh, which is what makes this a gate
+        // rather than a one-way door.
         Assert.False(File.Exists(Path.Combine(options.CommitLog.Path, ShapeHistory.FileName)));
 
         options.Schema.AllowAdoption = true;
@@ -506,15 +511,27 @@ public class SchemaShapeTests : IDisposable
     }
 
     [Fact]
-    public void Refusing_adoption_never_blocks_a_new_world()
+    public void The_refusal_never_blocks_a_new_world()
     {
-        // The flag guards a reinterpretation, not a first naming — a deployment that sets
-        // AllowAdoption to false for safety must still be able to create a database.
-        var options = OptionsFor(NewRoot());
-        options.Schema.AllowAdoption = false;
-        using var fresh = Boot(options, HeroTable<HeroV1>());
+        // The gate guards a reinterpretation, not a first naming. A fresh install has no records to
+        // reinterpret and must never meet this setting — which is what keeps a default that refuses
+        // from being a default that stops people using the database.
+        using var fresh = Boot(OptionsFor(NewRoot()), HeroTable<HeroV1>());
         fresh.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 1, Name = "new" }));
         Assert.Single(Rows<HeroV1>(fresh));
+    }
+
+    [Fact]
+    public void A_directory_that_already_carries_a_sidecar_is_never_gated()
+    {
+        // Every directory written by a build that has the sidecar carries one, so the gate is a
+        // once-per-directory event by construction rather than something a running deployment meets.
+        var options = OptionsFor(NewRoot(), snapshots: false);
+        using (var first = Boot(options, HeroTable<HeroV1>()))
+            first.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 1, Name = "alice" }));
+
+        using var second = Boot(options, HeroTable<HeroV1>());
+        Assert.Single(Rows<HeroV1>(second));
     }
 
     [Fact]

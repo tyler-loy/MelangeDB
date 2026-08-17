@@ -71,13 +71,19 @@ supported paths out:
   and quoting the rule. A new world naming its first shape is silent — nothing is being
   reinterpreted there.
 
-  **`Schema:AllowAdoption` defaults to `true`**: the adoption proceeds and warns. Set it to
-  **`false`** and the boot refuses instead — the `Postgres:AutoMigrate` posture applied to the one
-  step whose wrong answer is not a stall but silently wrong reads. Refusing is not the default
-  because the assumption is correct whenever the rule was followed, so it would block every
-  legitimate upgrade boot to catch the deploy that did not — but a deployment that would rather
-  stop and be told should set it to `false`. The refusal writes nothing, so the next boot decides
-  afresh.
+  **`Schema:AllowAdoption` defaults to `false`, and that first boot refuses.** The engine cannot
+  verify that the rule was followed, and the two errors are not symmetric: refusing costs one boot
+  and one setting, while assuming wrongly costs rows silently mis-read and found arbitrarily later.
+  So it stops and names both branches — set the key to `true` for that one boot if the schema did
+  *not* change in this deploy, or boot the previous schema first if it did. Turn it back off
+  afterwards; the adoption that then proceeds logs EventId 1008. The refusal writes nothing, so the
+  next boot decides afresh.
+
+  This is the `Postgres:AutoMigrate` posture applied to the hot tier's one irreversible assumption,
+  and it is a **once-per-directory** gate by construction: every directory written by a build that
+  has the sidecar carries one, so only an upgrade from a build that predates it — or a sidecar that
+  was deleted or lost — reaches the question. A fresh install has no records to reinterpret and
+  never meets the setting at all.
 
 - **Clusters deploy one binary.** Shard engines each keep their own sidecar and migrate
   independently at open, but border and replica streams exchange current-shape rows — mixed-schema

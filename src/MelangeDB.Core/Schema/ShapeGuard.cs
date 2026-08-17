@@ -285,12 +285,16 @@ internal static class ShapeGuard
                 {
                     throw new SchemaShapeException(
                         $"'{path}' does not exist, so this boot would adopt the running code's schema as the meaning " +
-                        $"of every record already in this directory (up to LSN {headLsn}) — and Schema:AllowAdoption " +
-                        "is off. That reading is correct only if this deployment booted its previous schema once " +
-                        "before changing it (the upgrade rule in docs/MIGRATION.md). If it did, set " +
-                        "Schema:AllowAdoption to true for this one boot and turn it back off. If it did not, boot " +
-                        "the previous schema first: adopting a changed schema over existing rows does not fail, it " +
-                        "silently mis-reads them.",
+                        $"of every record already in this directory (up to LSN {headLsn}). That reading is correct " +
+                        "only if this deployment booted its previous schema once before changing it — the upgrade " +
+                        "rule in docs/MIGRATION.md — and nothing in the directory can prove either way, so the boot " +
+                        "refuses rather than assume. Two branches:\n" +
+                        "  - The schema did NOT change in this deploy: set Schema:AllowAdoption to true, boot once " +
+                        "to write the sidecar, and turn it back off.\n" +
+                        "  - The schema DID change in this deploy: boot the previous schema first, then change it. " +
+                        "Adopting a changed schema over existing rows does not fail — it silently mis-reads them.\n" +
+                        "If the sidecar was deleted or lost rather than never written, restore it from backup " +
+                        "instead: it records what this directory's row bytes mean.",
                         ["no shape sidecar exists and this directory already holds records"]);
                 }
 

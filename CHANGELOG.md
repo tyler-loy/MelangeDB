@@ -496,8 +496,11 @@ All packages ship together at one version; there is no per-package versioning. S
   appearing on disk, and a per-table mis-decode an arbitrary amount of time later. That moment now
   logs **EventId 1008 `ShapeAdopted`** at warning level over a non-empty directory, naming the LSN
   it adopted over and the recovery; a new world naming its first shape stays silent. The new
-  **`Schema:AllowAdoption`** (default `true`) turns the warning into a boot refusal for deployments
-  that would rather stop. A row that no longer decodes now names the table, its byte count, and
+  **`Schema:AllowAdoption`** decides whether it happens at all, and **defaults to `false`** — the
+  `Postgres:AutoMigrate` posture, because the two errors are not symmetric: refusing costs one boot
+  and one setting, assuming wrongly costs silently mis-read rows found arbitrarily later. The
+  refusal names both branches. It is a once-per-directory gate by construction, and a fresh install
+  never meets it. A row that no longer decodes now names the table, its byte count, and
   where to look, instead of one word about a parameter name — on the reducer read path, the store's
   index-maintenance path, and the transport's projection paths. [MIGRATION.md](docs/MIGRATION.md)
   gains the recovery section it was missing.

@@ -181,14 +181,21 @@ public sealed class SchemaOptions
     /// is booted. It is the only possible reading of those bytes, and it is sound exactly when the
     /// operator followed the upgrade rule: boot the old schema once, then change it.
     /// <para>
-    /// Left on, an adoption over a non-empty directory logs loudly (EventId 1008) and proceeds.
-    /// Turned off, it refuses the boot instead — the <c>Postgres:AutoMigrate</c> posture, for
-    /// deployments that would rather stop than discover a mis-decode later, since a wrong adoption
-    /// is not a stall but silently wrong reads of existing data. Adoption over an <em>empty</em>
-    /// directory is a new world naming its first shape and is never affected.
+    /// <b>Off by default</b>, the <c>Postgres:AutoMigrate</c> posture: a wrong adoption is not a
+    /// stall but silently wrong reads of existing data, and the two errors are not symmetric — a
+    /// refusal costs one boot and one setting, while a wrong assumption costs a mis-decode
+    /// discovered arbitrarily later. The boot refuses and says which branch the operator is in.
+    /// Turn it on for that one boot when the rule was followed, then turn it back off.
+    /// </para>
+    /// <para>
+    /// This is a once-per-directory event by construction: a directory written by a build that has
+    /// the sidecar always carries one, so only an upgrade from a build that predates it — or a
+    /// sidecar that was deleted or lost — can reach the question at all. Adoption over an
+    /// <em>empty</em> directory is a new world naming its first shape and is never affected, so a
+    /// fresh install never meets this setting.
     /// </para>
     /// </summary>
-    public bool AllowAdoption { get; set; } = true;
+    public bool AllowAdoption { get; set; }
 }
 
 /// <summary>The hot-store engines <c>HotStore:Engine</c> may name.</summary>

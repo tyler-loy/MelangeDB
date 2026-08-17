@@ -1752,7 +1752,7 @@ public sealed partial class MelangeEngine : IDisposable
                 "docs/MIGRATION.md. If the schema changed in the same deploy, the tables that changed are " +
                 "being mis-read right now: rewrite only those tables' rows through POST /melange/bulk, which " +
                 "never reads the old bytes (it needs Bulk:Enabled on and the caller's Bulk:OwnerRole claim). " +
-                "Set Schema:AllowAdoption to false to refuse this boot instead.");
+                "Schema:AllowAdoption was set to allow this; turn it back off.");
 
         public static void ShapeAdopted(ILogger logger, string directory, ulong headLsn) =>
             ShapeAdoptedMessage(logger, directory, headLsn, null);
