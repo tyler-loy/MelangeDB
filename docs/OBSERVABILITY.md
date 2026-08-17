@@ -405,6 +405,15 @@ the remediation in the message, exactly as the epoch-mismatch refusal (which is 
 `melange restore` produces, since restore always mints a fresh epoch). Both are the events an
 operator greps for at 3 a.m. after a restore; both messages print the way out.
 
+**`1804 CloneProvenance`** (phase 19) is the boot banner of a cloned world: the source epoch, the
+captured head LSN, the archive it came from, and when it was captured and cloned — read back from
+the `melange.provenance.json` sidecar `melange clone` leaves behind. Information rather than a
+warning, because a clone is deliberate; unconditional, because "which world is this, and how
+stale?" gets asked at the worst possible moment, and a server that answers in its own startup log
+answers faster than any runbook. Its absence is equally informative: a world with no 1804 is not a
+clone. The restore check's two rungs raise no EventId of their own — they are tools that return a
+report or throw, and their verdict is the exit code a CI job alerts on.
+
 The hub's `ClusterMetrics` also carries the handoff counters the phase-10 acceptance tests read:
 `HandoffsStarted`, `HandoffsCompleted`, `HandoffsAborted`, `HandoffsUnresolved` (import fate unknowable when
 the coordinator gave up; a reconciler resolves each later), `HandoffsRateLimited`, and the `HandoffsInFlight`

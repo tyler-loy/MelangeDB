@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+
 namespace MelangeDB.Core;
 
 /// <summary>
@@ -140,9 +142,69 @@ public static class MelangeBackup
     /// <paramref name="targetDirectory"/> — a rewind, for replacement, not cloning: a fresh epoch
     /// is always minted, so clients holding pre-restore resume cursors are refused resume and
     /// full-resync. Any failure removes everything the restore wrote.
+    /// <para>
+    /// <paramref name="options"/> carries the point-in-time cut (<see cref="RestoreOptions.AtLsn"/>):
+    /// the restored world stops at that LSN, with everything above it left in the archive. The
+    /// cut is bounded by the archive's own snapshot floor and its captured head, and is refused
+    /// on cluster archives, whose engines were captured at different fences.
+    /// </para>
     /// </summary>
-    public static RestoreSummary Restore(string archivePath, string targetDirectory)
-        => ArchiveRestore.Restore(archivePath, targetDirectory);
+    public static RestoreSummary Restore(string archivePath, string targetDirectory, RestoreOptions? options = null)
+        => ArchiveRestore.Restore(archivePath, targetDirectory, options);
+
+    /// <summary>
+    /// Materializes an <b>explicitly different world</b> from a production archive — the
+    /// staging-seeded-from-production verb. Everything a restore does (fresh epoch, empty target,
+    /// all-or-nothing), plus the two deltas that make "different world" true rather than
+    /// aspirational: subscriber checkpoints are <b>dropped, not clamped</b>, because a clone has
+    /// no subscribers yet and production's event-delivery state resuming in staging is the exact
+    /// confusion this verb exists to prevent; and a provenance sidecar records what this world is
+    /// a clone of, so the support question is answered by a file and by every boot's log.
+    /// <para>
+    /// A separate verb rather than a restore flag, per phase 15's settlement: the semantics differ
+    /// in kind, and a flag would invite using one where the other was meant. What the archive
+    /// cannot carry, the operator still owns — a clone needs its own Postgres schema (the phase 08
+    /// bootstrap fills an empty one), its own data directory, and its own fleet. Originators are
+    /// untouched: they exist so allocators that might meet never collide, and two worlds whose
+    /// stores, tiers, and clients never meet collide nowhere.
+    /// </para>
+    /// </summary>
+    public static RestoreSummary Clone(string archivePath, string targetDirectory)
+        => ArchiveRestore.Restore(archivePath, targetDirectory, new ArchiveRestore.RestorePlan(IsClone: true));
+
+    /// <summary>
+    /// The file-level boot proof: runs the real recovery machinery — the actual
+    /// <see cref="FileCommitLog"/> constructor, the snapshot opened under the restored epoch, every
+    /// sidecar parsed — against a scratch copy of <paramref name="restoredDirectory"/>, so a
+    /// checked restore stays byte-identical to an unchecked one. Throws the refusal a boot would
+    /// have thrown, on a day the operator chose rather than one the outage did.
+    /// <para>
+    /// What it cannot prove, it says it cannot prove: index builds, residency, and the shape
+    /// guard's judgement all need the application's registry. Use
+    /// <see cref="CheckRestore(string, SchemaRegistry, ILoggerFactory?)"/> where that lives.
+    /// </para>
+    /// </summary>
+    public static RestoreCheckReport CheckRestore(string restoredDirectory)
+        => RestoreCheck.Run(restoredDirectory, schema: null, loggers: null);
+
+    /// <summary>
+    /// The full boot proof, run where the schema lives: the ordinary engine constructor with the
+    /// application's own registry — recovery, the shape guard, the projection rebuild — reporting
+    /// per-table row counts and returning without serving. One line in a staging runbook, and
+    /// CI-able: restore last night's archive, check it, alert on the refusal.
+    /// </summary>
+    public static RestoreCheckReport CheckRestore(string restoredDirectory, SchemaRegistry schema, ILoggerFactory? loggerFactory = null)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        return RestoreCheck.Run(restoredDirectory, schema, loggerFactory);
+    }
+
+    /// <summary>
+    /// Reads a data directory's clone provenance, or null when the world is not a clone — the
+    /// programmatic form of the same answer <see cref="CloneProvenance"/> gives at boot.
+    /// </summary>
+    public static CloneProvenance? ReadProvenance(string dataDirectory)
+        => CloneProvenance.TryRead(dataDirectory);
 
     /// <summary>
     /// CRC-walks every frame and dry-replays the archive into an in-memory projection, reporting
@@ -168,14 +230,31 @@ public sealed record BackupEngineSummary(
 public sealed record BackupSummary(IReadOnlyList<BackupEngineSummary> Engines, long TotalBytes);
 
 /// <summary>
+/// How a restore differs from the plain rewind. Empty is the plain rewind; a separate type
+/// because the interesting restores are the ones that need saying out loud at the call site.
+/// </summary>
+public sealed record RestoreOptions
+{
+    /// <summary>
+    /// Restore the world as of this LSN, discarding everything the archive holds above it — the
+    /// moment just before the mistake. Null restores the whole capture. Must sit between the
+    /// archive's snapshot LSN and its captured head, inclusive; single-engine archives only.
+    /// </summary>
+    public ulong? AtLsn { get; init; }
+}
+
+/// <summary>
 /// One engine as restored: its fresh epoch (minted always — a restore is a rewind, and the mint
 /// is what forces stale resume cursors into a full resync) and where its files landed.
 /// </summary>
+/// <param name="HeadLsn">The restored world's head — the point-in-time cut, or the captured head.</param>
+/// <param name="CapturedHeadLsn">The head the archive holds. Above <paramref name="HeadLsn"/> only for a point-in-time restore, and the difference is what was left behind.</param>
 public sealed record RestoredEngineSummary(
     string Key,
     Guid NewEpoch,
     ulong SnapshotLsn,
     ulong HeadLsn,
+    ulong CapturedHeadLsn,
     string Directory);
 
 /// <summary>What a restore materialized.</summary>

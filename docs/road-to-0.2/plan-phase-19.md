@@ -1,5 +1,7 @@
 # Phase 19 — Backup, second pass: check, clone, point-in-time
 
+**Status: Shipped.**
+
 **Goal:** the three verbs phase 15 explicitly recorded as next, now with the shipped archive
 underneath them: prove a restore boots (`--check`), seed an explicitly different world from a
 production archive (`clone`), and restore to a moment just before the mistake (`--at-lsn`).
@@ -79,33 +81,84 @@ worlds; nothing ever makes them one again.
 
 ## Decisions to settle
 
-### Open: does clone change the originator
+### Settled: clone does not change the originator
 
-The phase 15 record sketched clone as "new originator id, new Postgres schema." The schema half
-is clearly right. The originator half is less clear than it sounded: originators exist so
-*allocators that might meet* never collide, and a clone is a separate world whose stores,
-Postgres, and clients never meet production's — same-valued ids in different worlds collide
-nowhere. Meanwhile originator assignment is membership's job at runtime, not a value the data
-directory owns, so "clone rewrites the originator" may not even be a coherent operation at the
-directory level. Leaning: clone does not touch originators; the provenance sidecar is what
-distinguishes the worlds for support purposes. To settle by writing the id-collision analysis
-into the plan's settlement rather than hand-waving either way — and if a future feature ever
-lets two worlds exchange rows, *that* feature owns the originator question.
+As the leaning, and the id-collision analysis is the settlement rather than a hand-wave.
+Originators exist so *allocators that might meet* never collide. A clone's stores, relational
+tier, and clients never meet production's: its Postgres schema is its own (empty, bootstrapped
+from the restored log), its data directory is its own, its fleet is its own. Two ids of equal
+value in two worlds that never exchange a row collide nowhere — an id is unique within the world
+that allocated it, and that is the whole contract.
 
-### Open: where `--check`'s CLI rung runs recovery
+The half of the phase 15 sketch that turned out incoherent is the operation itself. A data
+directory records no originator to rewrite: `MelangeEngine` takes it as a constructor argument,
+the membership store assigns it per shard at runtime, and a single-node deployment gets zero. So
+"clone rewrites the originator" names nothing that exists at the directory level. What
+distinguishes the worlds is the provenance sidecar, which is a support artifact and says so. If a
+future feature ever lets two worlds exchange rows, that feature owns the originator question —
+and it will own it with a mechanism, not a flag on a restore verb.
 
-Recovery mutates (mints epochs, truncates torn tails), so the CLI rung must not run it against
-the directory it just restored — a checked restore should be byte-identical to an unchecked one.
-Leaning: copy to a scratch directory and recover the copy — honest and simple, costs one extra
-materialization, bounded by archive size which is already "small and shaped like the state." The
-alternative (a read-only recovery mode threaded through `FileCommitLog`) touches the most
-load-bearing constructor in the codebase for a verb that runs at most nightly. To settle against
-the actual copy cost on the port's archive.
+### Settled: the CLI rung recovers a scratch copy, and the cost was measured
 
-### Open: verb spelling
+As the leaning, and the measurement is why it is not a close call. A data-directory-shaped copy
+(one large log, one large snapshot, a few small sidecars) runs at disk speed on this box's NVMe:
+**21 ms for 64 MB, 66 ms for 256 MB, 274 ms for 1 GB — ~3.7 GB/s.** Against the recovery it
+precedes, for a verb that runs at most nightly, that is noise. Threading a read-only mode through
+`FileCommitLog`'s constructor — the most load-bearing constructor in the codebase, and the one
+whose mutations *are* recovery — to save 274 ms would have been a poor trade at any archive size
+this design produces.
 
-`--check` as a restore flag versus `melange backup check <archive>` as its own verb. Leaning:
-flag on restore — the check *is* a restore that proves itself and cleans up nothing extra,
-whereas a separate verb implies a separate operation and would restore to a temp dir anyway.
-The host rung is API-first regardless; its CLI spelling can follow the host integration that
-actually ships.
+The copy also turned out to be what makes the byte-identity property testable at all:
+`A_checked_restore_is_byte_identical_to_an_unchecked_one` hashes every file before and after both
+rungs, which is a stronger statement than "we were careful".
+
+### Settled: `--check` is a flag on restore
+
+As the leaning. The check *is* a restore that proves itself; a separate verb implies a separate
+operation and would have to restore to a temporary directory anyway. The host rung shipped
+API-first as planned — `MelangeBackup.CheckRestore(directory, schema)` with an `IHost.CheckRestore`
+extension over it — and deliberately has no CLI spelling: the schema lives in the application's
+own process, so the host rung's natural home is a line in that application's staging job, not a
+flag on a tool that would have to load the module assembly to find a registry.
+
+## Shipped notes
+
+- **The plan's AutoInc claim was wrong, and the correction is the better story.** The plan settled
+  `--at-lsn`'s sequence handling as "safe-high: ids allocated between `n` and the captured head are
+  skipped, never reused." They are not. The archive carries sequences as of its *snapshot*, and
+  boot re-observes only the records the cut kept — so those ids are free again, and the next insert
+  takes one.
+
+  Delivering the promise would have required observing the discarded records' AutoInc columns,
+  which needs the schema a restore deliberately does not have; the only schema-free approximation
+  (reading ids out of row *keys*) silently covers `[PrimaryKey][AutoInc]` and misses everything
+  else, and a heuristic that is silently partial is worse than a total statement. So the statement
+  is total: **a restore rewinds everything, ids included, and the fresh epoch is what makes that
+  safe** — exactly as it already is for LSNs. Nothing inside the restored world refers to the
+  discarded ids; every consumer outside it is forced to rebuild by the epoch change. What remains
+  is genuinely outside the database's boundary (a ledger, a receipt, an analytics store), and a
+  rewind is a business-level event for those regardless. `A_cut_rewinds_the_autoinc_allocator_with_everything_else`
+  pins the real behaviour so the docs can never drift back to the promise.
+
+- **A cut stops the writing, never the walk.** The archive's integrity claims — contiguity, the
+  promised head, the end frame's counts — are about what was *captured*, so a cut that skipped
+  reading the discarded region would let a corrupt archive pass by not looking at the corruption.
+  Every frame is read and checked; only the write is filtered.
+
+- **The check's refusals are recovery's refusals, not a second opinion.** The CLI rung runs the
+  actual `FileCommitLog` constructor rather than re-deriving its judgements, which is the same
+  reasoning that made `LogFileFormat` a read-only *mirror* of recovery in phase 15 rather than a
+  second implementation. Where the check adds judgements of its own — snapshot/log epoch coherence,
+  a snapshot predating the base — they are the conditions `DataDirectoryCapture` already refuses a
+  backup for, stated in the same words.
+
+- **Clone provenance stays out of archives.** `ArchiveRestore` refuses unknown sidecars by design,
+  so adding one to the capture list would make newer archives unreadable by older builds — a real
+  cost for no gain, since a backup captures a *world* and a restore of a clone's archive is a
+  rewind of the clone. The sidecar is directory-local, and a test round-trips a clone through
+  backup and restore to hold that.
+
+- **Continuous log shipping stayed out of scope, unchanged**, and is now the natural next phase if
+  the archive-series cadence proves too coarse: `--at-lsn` reaches back to one archive's snapshot
+  floor, and the series is what reaches further. Surgical single-shard restore, archive
+  encryption, and cross-world merge are all unchanged from the plan.

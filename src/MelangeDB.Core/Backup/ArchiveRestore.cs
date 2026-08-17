@@ -21,7 +21,17 @@ namespace MelangeDB.Core;
 /// </summary>
 internal static class ArchiveRestore
 {
-    public static RestoreSummary Restore(string archivePath, string targetDirectory)
+    /// <summary>
+    /// What this materialization is, beyond a plain restore. Internal because the difference
+    /// between a restore and a clone is a <em>verb</em>, not a flag: the semantics differ in kind,
+    /// and a flag would invite using one where the other was meant.
+    /// </summary>
+    internal sealed record RestorePlan(ulong? AtLsn = null, bool IsClone = false);
+
+    public static RestoreSummary Restore(string archivePath, string targetDirectory, RestoreOptions? options = null)
+        => Restore(archivePath, targetDirectory, new RestorePlan(options?.AtLsn));
+
+    public static RestoreSummary Restore(string archivePath, string targetDirectory, RestorePlan plan)
     {
         if (!File.Exists(archivePath))
             throw new FileNotFoundException($"Archive '{archivePath}' does not exist.", archivePath);
@@ -47,10 +57,11 @@ internal static class ArchiveRestore
             var manifest = ReadJsonFrame<ArchiveManifest>(reader, ArchiveFrameType.Manifest, archivePath);
             if (manifest.Engines.Count == 0)
                 throw new InvalidDataException($"'{archivePath}': the manifest names no engines; the archive is corrupt.");
+            RefusePointInTimeOnClusterArchives(manifest, plan, archivePath);
 
             var engines = new List<RestoredEngineSummary>();
             foreach (var key in manifest.Engines)
-                engines.Add(RestoreEngine(reader, DirectoryFor(manifest, key, target, archivePath), key, archivePath));
+                engines.Add(RestoreEngine(reader, DirectoryFor(manifest, key, target, archivePath), key, archivePath, manifest, plan, archivePath));
 
             var footer = ReadJsonFrame<ArchiveFooter>(reader, ArchiveFrameType.ArchiveEnd, archivePath);
             if (footer.Engines != manifest.Engines.Count)
@@ -88,6 +99,25 @@ internal static class ArchiveRestore
     }
 
     /// <summary>
+    /// A cluster archive is per-shard consistent at <em>different</em> fences — the capture holds
+    /// no global total order, because none exists. One LSN therefore names no cross-shard moment,
+    /// and per-shard LSNs would manufacture a consistency the capture never had. Refused rather
+    /// than approximated.
+    /// </summary>
+    private static void RefusePointInTimeOnClusterArchives(ArchiveManifest manifest, RestorePlan options, string source)
+    {
+        if (options.AtLsn is null)
+            return;
+        if (manifest.Engines.Count == 1 && manifest.Engines[0] == ArchiveFormat.SingleNodeEngineKey)
+            return;
+        throw new InvalidOperationException(
+            $"'{source}' is a cluster archive ({manifest.Engines.Count} engine(s)); point-in-time restore takes " +
+            "single-engine archives only. Each engine was captured at its own fence, so one LSN names no moment " +
+            "the cluster ever occupied, and per-shard LSNs would manufacture a consistency the capture never had. " +
+            "Restore the archive whole, or take the point-in-time restore from a single-node archive.");
+    }
+
+    /// <summary>
     /// The restored layout: a single-node archive materializes straight into the target (point
     /// <c>CommitLog:Path</c> there); a cluster archive materializes <c>hub/</c> and
     /// <c>shards/shard-k/</c> (point the hub's <c>CommitLog:Path</c> at <c>hub/</c> and every
@@ -109,12 +139,20 @@ internal static class ArchiveRestore
         throw new InvalidDataException($"'{source}': unknown engine key '{key}' in a version-{ArchiveFormat.FormatVersion} archive; the archive is corrupt.");
     }
 
-    private static RestoredEngineSummary RestoreEngine(ArchiveFrameReader reader, string engineDirectory, string engineKey, string source)
+    private static RestoredEngineSummary RestoreEngine(
+        ArchiveFrameReader reader,
+        string engineDirectory,
+        string engineKey,
+        string source,
+        ArchiveManifest manifest,
+        RestorePlan options,
+        string archivePath)
     {
         var identity = ReadJsonFrame<ArchiveEngineIdentity>(reader, ArchiveFrameType.EngineBegin, source);
         if (identity.Key != engineKey)
             throw new InvalidDataException($"'{source}': engine '{identity.Key}' arrived where the manifest promised '{engineKey}'; the archive is corrupt.");
         var isShard = engineKey.StartsWith(ArchiveFormat.ShardEngineKeyPrefix, StringComparison.Ordinal);
+        var restoredHead = ResolveCut(identity, options, source);
         var newEpoch = Guid.NewGuid();
         Directory.CreateDirectory(engineDirectory);
 
@@ -137,19 +175,26 @@ internal static class ArchiveRestore
                 }));
         }
 
+        // Every record frame is read and checked whichever LSN the restore stops at — the archive's
+        // own integrity claims (contiguity, the promised head, the end frame's count) are about
+        // what was captured, not about what this restore chose to keep. Only the writing stops
+        // early; the walk never does.
         long tailRecords = 0;
         var expectedLsn = identity.SnapshotLsn;
         LogFileFormat.WriteLogFile(
             Path.Combine(engineDirectory, "melange.log"),
-            LogRecordFrames(reader, source).Select(payload =>
-            {
-                var lsn = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(2));
-                expectedLsn++;
-                if (lsn != expectedLsn)
-                    throw new InvalidDataException($"'{source}': log records are not contiguous (expected LSN {expectedLsn}, found {lsn}); the archive is corrupt.");
-                tailRecords++;
-                return payload;
-            }));
+            LogRecordFrames(reader, source)
+                .Select(payload =>
+                {
+                    var lsn = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(2));
+                    expectedLsn++;
+                    if (lsn != expectedLsn)
+                        throw new InvalidDataException($"'{source}': log records are not contiguous (expected LSN {expectedLsn}, found {lsn}); the archive is corrupt.");
+                    tailRecords++;
+                    return (Lsn: lsn, Payload: payload);
+                })
+                .Where(record => record.Lsn <= restoredHead)
+                .Select(static record => record.Payload));
         if (expectedLsn != identity.HeadLsn)
             throw new InvalidDataException($"'{source}': the log tail ends at LSN {expectedLsn} but the engine's identity promises head {identity.HeadLsn}; the archive is corrupt.");
 
@@ -164,8 +209,15 @@ internal static class ArchiveRestore
             var (name, content) = ParseSidecarFrame(frame.Payload, source);
             switch (name)
             {
+                case "melange.events.json" when options.IsClone:
+                    // Dropped, not clamped. A clone has no subscribers yet, and production's
+                    // event-delivery state resuming in staging — handlers deciding they have
+                    // already delivered what this world has never emitted — is exactly the
+                    // confusion the verb exists to prevent. Absent means "start from the
+                    // beginning", which is what a new world means.
+                    break;
                 case "melange.events.json":
-                    File.WriteAllBytes(Path.Combine(engineDirectory, name), ClampEventCheckpoints(content, identity.HeadLsn));
+                    File.WriteAllBytes(Path.Combine(engineDirectory, name), ClampEventCheckpoints(content, restoredHead));
                     break;
                 case ShapeHistory.FileName:
                     // The shape history is LSN-keyed and epoch-independent; restore changes no
@@ -203,9 +255,61 @@ internal static class ArchiveRestore
             File.WriteAllBytes(Path.Combine(engineDirectory, "melange.base"), baseBytes);
         }
 
+        if (options.IsClone)
+        {
+            new CloneProvenance(
+                CloneProvenance.CloneKind,
+                identity.SourceEpoch,
+                restoredHead,
+                Path.GetFileName(archivePath),
+                manifest.CapturedAtUnixMs,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                newEpoch).Write(engineDirectory);
+        }
+
         File.WriteAllBytes(Path.Combine(engineDirectory, "melange.epoch"), newEpoch.ToByteArray());
 
-        return new RestoredEngineSummary(identity.Key, newEpoch, identity.SnapshotLsn, identity.HeadLsn, engineDirectory);
+        return new RestoredEngineSummary(
+            identity.Key, newEpoch, identity.SnapshotLsn, restoredHead, identity.HeadLsn, engineDirectory);
+    }
+
+    /// <summary>
+    /// Where the tail is cut. Without <c>--at-lsn</c> that is the captured head; with it, the LSN
+    /// the operator named — bounded below by the archive's snapshot (an archive cannot rewind
+    /// below its own materialized floor, because everything under it exists only as snapshot
+    /// state) and above by the captured head (there is nothing up there to restore).
+    /// <para>
+    /// AutoInc sequences come from the snapshot header and are then re-observed from the records
+    /// this restore kept — so a cut rewinds the allocator along with everything else, and ids
+    /// allocated in the discarded range are free again. That is the honest reading of a rewind:
+    /// those allocations are not history any more, nothing inside the restored world refers to
+    /// them, and the fresh epoch is what forces every consumer outside it (clients, the relational
+    /// tier) to rebuild rather than carry a stale reference across the boundary. The archive
+    /// cannot offer better — it carries sequences as of its snapshot, and observing the discarded
+    /// range would need the schema a restore deliberately does not have.
+    /// </para>
+    /// </summary>
+    private static ulong ResolveCut(ArchiveEngineIdentity identity, RestorePlan options, string source)
+    {
+        if (options.AtLsn is not { } atLsn)
+            return identity.HeadLsn;
+        if (atLsn > identity.HeadLsn)
+        {
+            throw new InvalidOperationException(
+                $"'{source}' was captured at head LSN {identity.HeadLsn}; there is no LSN {atLsn} in it to restore to. " +
+                "Point-in-time restore rewinds within one archive — it cannot roll forward past its capture.");
+        }
+
+        if (atLsn < identity.SnapshotLsn)
+        {
+            throw new InvalidOperationException(
+                $"'{source}' materializes its state at snapshot LSN {identity.SnapshotLsn}; LSN {atLsn} is below that " +
+                "floor and the records that would rewind to it are not in this archive. That moment still exists in " +
+                "an earlier archive in the series — the one whose snapshot LSN is at or below " +
+                $"{atLsn} (melange backup verify prints it). Restore that one --at-lsn {atLsn} instead.");
+        }
+
+        return atLsn;
     }
 
     private static IEnumerable<SnapshotRow> SnapshotRowFrames(ArchiveFrameReader reader, string source)

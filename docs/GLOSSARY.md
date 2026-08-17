@@ -305,6 +305,39 @@ resume cursors full-resync instead of resuming into history that no longer happe
 must be empty, and any failure removes everything written. The Postgres projection is not in the
 archive and is refused loudly (EventIds 1605/1608) rather than silently overwritten.
 
+**Point-in-time restore** — `melange restore <archive> -o <dir> --at-lsn <n>` (road-to-0.2 phase
+19): a restore whose tail is cut at LSN `n` — the moment just before the mistake. The archive
+carries the tail record by record, so the verb collects rather than invents. Bounded by the
+archive's own snapshot floor below (that state exists only as a snapshot; an earlier archive in
+the series holds the earlier moment) and its captured head above, and refused on cluster archives,
+whose engines were captured at different fences. The rewind is total: AutoInc ids allocated above
+the cut are free again, because boot re-observes only the records the cut kept, and the fresh
+epoch is what forces every consumer outside the world to rebuild rather than carry a stale
+reference across the boundary.
+
+**Clone** — `melange clone <archive> -o <dir>` (road-to-0.2 phase 19): materializes an explicitly
+*different* world from a production archive — staging seeded from production. Restore's semantics
+plus two deltas: subscriber checkpoints are **dropped, not clamped** (a clone has no subscribers,
+and inherited delivery state would skip events this world never emitted), and a **provenance**
+sidecar records what it is a clone of. A separate verb, not a restore flag, because the semantics
+differ in kind. Originators are untouched — they exist so allocators that might meet never
+collide, and two worlds that never meet collide nowhere. What the archive cannot carry is the
+operator's: its own Postgres schema, data directory, and fleet.
+
+**Clone provenance (`melange.provenance.json`)** — The sidecar a clone leaves beside its log:
+source epoch, captured head LSN, archive file name, capture and clone timestamps, and the clone's
+own fresh epoch. Directory-local, deliberately not in archives — a backup captures a world, and a
+restore of a clone's archive is a rewind of the clone. Read back at every boot and announced
+(EventId 1804), so "which world is this, and how stale?" is answered by the server's own log.
+
+**Restore check** — The boot-proof, in two rungs (road-to-0.2 phase 19), each stating what it
+proves and what it does not. `melange restore … --check` runs the real recovery machinery — the
+`FileCommitLog` constructor, the snapshot under the restored epoch, every sidecar parsed — against
+a scratch copy, so a checked restore is byte-identical to an unchecked one. `IHost.CheckRestore`
+adds the schema-dependent half: the ordinary engine constructor with the application's registry,
+the shape guard, the projection rebuild, and per-table row counts. Verify proves the archive; only
+a boot proves the world.
+
 **Shape (`melange.shape`)** — The persisted meaning of a table's row bytes: its key column and
 its ordered (name, kind) column list. Row format v1 is positional, so the bytes alone cannot say
 what they mean; the shape sidecar beside the log says it — as a *history*, each entry fenced by
