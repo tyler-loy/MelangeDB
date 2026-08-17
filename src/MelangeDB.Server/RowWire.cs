@@ -26,6 +26,21 @@ internal static class RowWire
         if (projection is null)
             return row;
 
+        try
+        {
+            return ProjectCore(schema, row, projection);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            // A row whose stored bytes no longer match this build's schema fails here as an index
+            // fault from inside the column walk. Naming the table is the difference between a
+            // diagnosable subscription and one word about a parameter.
+            throw RowSerializer.DecodeFailed($"Table '{schema.Name}'", row.Length, column: null, exception);
+        }
+    }
+
+    private static ReadOnlyMemory<byte> ProjectCore(TableSchema schema, ReadOnlyMemory<byte> row, IReadOnlySet<string> projection)
+    {
         var span = row.Span;
         var measure = new RowReader(span);
         var total = 0;
@@ -91,7 +106,16 @@ internal static class RowWire
         var columns = new Dictionary<string, object?>(projection?.Count ?? schema.Columns.Count, StringComparer.Ordinal);
         foreach (var column in schema.Columns)
         {
-            var value = ReadValue(ref reader, column.Kind);
+            object? value;
+            try
+            {
+                value = ReadValue(ref reader, column.Kind);
+            }
+            catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+            {
+                throw RowSerializer.DecodeFailed($"Table '{schema.Name}'", row.Length, column.Name, exception);
+            }
+
             if (projection is null || projection.Contains(column.Name))
                 columns[column.Name] = value;
         }
@@ -104,6 +128,18 @@ internal static class RowWire
     /// keeps a projected subscription silent when only non-projected columns changed.
     /// </summary>
     public static bool ProjectedEqual(TableSchema schema, ReadOnlySpan<byte> oldRow, ReadOnlySpan<byte> newRow, IReadOnlySet<string> projection)
+    {
+        try
+        {
+            return ProjectedEqualCore(schema, oldRow, newRow, projection);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            throw RowSerializer.DecodeFailed($"Table '{schema.Name}'", newRow.Length, column: null, exception);
+        }
+    }
+
+    private static bool ProjectedEqualCore(TableSchema schema, ReadOnlySpan<byte> oldRow, ReadOnlySpan<byte> newRow, IReadOnlySet<string> projection)
     {
         var oldReader = new RowReader(oldRow);
         var newReader = new RowReader(newRow);

@@ -191,6 +191,7 @@ posture — off unless opted into, and owner-role-gated when on. See the Bulk in
 | `Snapshots:Enabled` | bool | `true` | live | 07 | |
 | `Snapshots:IntervalTransactions` | long | `100000` | live | 07 | |
 | `Snapshots:TruncateLog` | bool | `true` | live | 07 | Truncation never passes the slowest applier or event-subscriber checkpoint regardless of this setting. Since phase 18 every one of those holders is a *named* truncation floor, and each truncation decision logs which one governed — including the decision that removes nothing. Off means the log grows without bound by design, which is also what `melange-retention` reports. |
+| `Schema:AllowAdoption` | bool | `true` | restart | 19 | Whether a boot may adopt the running code's schema as the meaning of records already on disk — what happens the first time a directory that predates the shape sidecar boots. Sound exactly when the upgrade rule was followed (boot the old schema once, then change it), which the engine cannot verify. Left on, an adoption over a non-empty directory logs **EventId 1008** and proceeds; turned off, it refuses the boot instead — the `Postgres:AutoMigrate` posture, for deployments that would rather stop than discover a mis-decode later. Adoption over an *empty* directory is a new world naming its first shape and is never affected. See [MIGRATION.md](MIGRATION.md). |
 
 ### Choosing an fsync policy
 

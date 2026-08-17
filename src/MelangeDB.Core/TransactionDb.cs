@@ -269,11 +269,25 @@ internal sealed class TransactionDb : IDbView
         }
     }
 
+    /// <summary>
+    /// Decodes one stored row. The generated codec is the fast path; the wrapper exists because a
+    /// row that does not decode is the shape of a schema mismatch, and the reader that fails has
+    /// no idea which table it was reading — see <see cref="RowSerializer.DecodeFailed"/>.
+    /// </summary>
     private static TRow Materialize<TRow>(TableSchema schema, ReadOnlyMemory<byte> bytes)
         where TRow : struct
-        => schema.Codec is RowCodec<TRow> codec
-            ? codec.Deserialize(bytes.Span)
-            : (TRow)RowSerializer.Deserialize(schema, bytes);
+    {
+        try
+        {
+            return schema.Codec is RowCodec<TRow> codec
+                ? codec.Deserialize(bytes.Span)
+                : (TRow)RowSerializer.Deserialize(schema, bytes);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            throw RowSerializer.DecodeFailed($"Table '{schema.Name}'", bytes.Length, column: null, exception);
+        }
+    }
 
     private static RowKey? EncodePendingColumn(TableSchema schema, ColumnSchema column, ReadOnlyMemory<byte> rowBytes)
     {

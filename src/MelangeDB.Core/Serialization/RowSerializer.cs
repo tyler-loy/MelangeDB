@@ -136,9 +136,45 @@ public static class RowSerializer
         using var reader = new BinaryReader(stream);
         var row = Activator.CreateInstance(table.RowType)!;
         foreach (var column in table.Columns)
-            column.SetValue(row, ReadValue(reader, column));
+        {
+            try
+            {
+                column.SetValue(row, ReadValue(reader, column));
+            }
+            catch (Exception exception) when (IsDecodeFault(exception))
+            {
+                throw DecodeFailed($"Table '{table.Name}'", data.Length, column.Name, exception);
+            }
+        }
+
         return row;
     }
+
+    /// <summary>
+    /// Whether an exception is a row that ran out from under its schema rather than a fault of its
+    /// own. Row format v1 is positional and carries no length prefix per column, so a schema that
+    /// expects more columns than the bytes hold simply reads off the end — as an index or range
+    /// fault from deep inside the reader, naming a parameter and nothing else.
+    /// </summary>
+    internal static bool IsDecodeFault(Exception exception) =>
+        exception is ArgumentException or IndexOutOfRangeException or EndOfStreamException or OverflowException;
+
+    /// <summary>
+    /// The decode failure with the context the reader could not have: what was being decoded, how
+    /// many bytes the row actually held, and the reading that explains almost every occurrence. A
+    /// bare "Parameter 'length'" is recoverable only from a stack trace, and the operator who needs
+    /// it is looking at a log line.
+    /// </summary>
+    /// <param name="subject">What failed, already phrased — <c>Table 'Hero'</c> or <c>Row type 'Hero'</c>.</param>
+    internal static InvalidDataException DecodeFailed(string subject, int rowBytes, string? column, Exception inner) =>
+        new(
+            $"{subject}: the stored row ({rowBytes} byte(s)) does not decode under this build's schema" +
+            (column is null ? string.Empty : $", reading column '{column}'") +
+            ". Row bytes are positional and carry no self-description, so a schema expecting more than the row " +
+            "holds reads off the end. The usual cause is a shape mismatch: rows written under an older schema " +
+            "than this directory's melange.shape sidecar accounts for — see docs/MIGRATION.md, and check the boot " +
+            "log for EventId 1008 (a schema adopted over records a different binary wrote).",
+            inner);
 
     private static void WriteValue(BinaryWriter writer, ColumnSchema column, object? value)
     {

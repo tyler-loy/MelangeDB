@@ -259,7 +259,13 @@ internal sealed class ShapeResolution
 /// </summary>
 internal static class ShapeGuard
 {
-    public static ShapeResolution Resolve(string logDirectory, SchemaRegistry schema, ulong baseLsn)
+    public static ShapeResolution Resolve(
+        string logDirectory,
+        SchemaRegistry schema,
+        ulong baseLsn,
+        ulong headLsn = 0,
+        bool allowAdoption = true,
+        Action<ulong>? onAdoptedOverExistingRecords = null)
     {
         var path = Path.Combine(logDirectory, ShapeHistory.FileName);
         var history = ShapeHistory.Load(path);
@@ -268,6 +274,29 @@ internal static class ShapeGuard
             // Adoption assumes existing records were written by this schema — the only possible
             // reading, which is why the upgrade rule (documented in MIGRATION.md) is: the first
             // boot that creates this sidecar must not also change the schema.
+            //
+            // Over an empty directory that is a new world naming its first shape, and silent.
+            // Over one that already holds records it is an assumption about bytes a different
+            // binary wrote, sound only if the operator followed the rule — which the engine cannot
+            // verify, so it says so instead.
+            if (headLsn > 0)
+            {
+                if (!allowAdoption)
+                {
+                    throw new SchemaShapeException(
+                        $"'{path}' does not exist, so this boot would adopt the running code's schema as the meaning " +
+                        $"of every record already in this directory (up to LSN {headLsn}) — and Schema:AllowAdoption " +
+                        "is off. That reading is correct only if this deployment booted its previous schema once " +
+                        "before changing it (the upgrade rule in docs/MIGRATION.md). If it did, set " +
+                        "Schema:AllowAdoption to true for this one boot and turn it back off. If it did not, boot " +
+                        "the previous schema first: adopting a changed schema over existing rows does not fail, it " +
+                        "silently mis-reads them.",
+                        ["no shape sidecar exists and this directory already holds records"]);
+                }
+
+                onAdoptedOverExistingRecords?.Invoke(headLsn);
+            }
+
             history = ShapeHistory.Adopt(schema, fromLsn: 1);
             history.Save(path);
             return new ShapeResolution(history, schema, path);

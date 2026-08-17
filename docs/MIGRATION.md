@@ -65,6 +65,20 @@ supported paths out:
   or restoring a pre-phase-16 archive) *adopts* the booting code's schema as the shape of all
   existing records — the only possible reading. So: never combine the MelangeDB upgrade with a
   schema change in one deploy; boot the old schema once, then change it.
+
+  **The adoption announces itself.** When it happens over a directory that already holds records,
+  the boot logs **EventId 1008 `ShapeAdopted`** at warning level, naming the LSN it adopted over
+  and quoting the rule. A new world naming its first shape is silent — nothing is being
+  reinterpreted there.
+
+  **`Schema:AllowAdoption` defaults to `true`**: the adoption proceeds and warns. Set it to
+  **`false`** and the boot refuses instead — the `Postgres:AutoMigrate` posture applied to the one
+  step whose wrong answer is not a stall but silently wrong reads. Refusing is not the default
+  because the assumption is correct whenever the rule was followed, so it would block every
+  legitimate upgrade boot to catch the deploy that did not — but a deployment that would rather
+  stop and be told should set it to `false`. The refusal writes nothing, so the next boot decides
+  afresh.
+
 - **Clusters deploy one binary.** Shard engines each keep their own sidecar and migrate
   independently at open, but border and replica streams exchange current-shape rows — mixed-schema
   fleets are not supported; a schema change is a stop-the-fleet deploy.
@@ -75,3 +89,29 @@ supported paths out:
   lagging applier's catch-up, a replay tool — must route records through
   `MelangeEngine.TransformToCurrentShape` before decoding rows. Pipeline-driven appliers get
   this automatically.
+
+### "I already booted the wrong way" — recovering an adopted mis-decode
+
+The failure is per-table and arrives late: everything untouched by the schema change keeps working
+perfectly, and the tables that changed read as garbage or throw
+(`Table 'X': the stored row (N byte(s)) does not decode…`) the first time something reads them —
+possibly long after a boot that looked clean.
+
+**Rewrite the affected rows through the bulk endpoint.** `POST /melange/bulk` bypasses reducers, so
+it never reads the old bytes — exactly the property needed when *reading* is what fails. Supply
+every column; the rewritten rows land under the current shape and the table is consistent again.
+Only tables whose shape changed need it, and it is otherwise an ordinary write, so nothing else in
+the world is disturbed.
+
+The endpoint is gated, deliberately, and both gates are off by default — so this recovery needs
+two things set before it will answer anything but `403`:
+
+- **`Bulk:Enabled`** — `true` for the duration of the repair.
+- **`Bulk:OwnerRole`** — the caller's token must carry that role claim. Bulk writes bypass every
+  reducer and its policies, so a valid token alone is not enough.
+
+Turn both back off afterwards.
+
+The alternative — revert the schema, boot, export, re-apply — is strictly worse and needs the old
+binary. If the data is unreadable *and* unrecoverable by rewriting, restore from the archive taken
+before the deploy and redo the upgrade in two steps.

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace MelangeDB.Core.Tests;
@@ -150,6 +151,9 @@ public class SchemaShapeTests : IDisposable
 
     private static MelangeEngine Boot(MelangeDbOptions options, params TableSchema[] tables) =>
         new(options, new SchemaRegistry(tables));
+
+    private static MelangeEngine Boot(MelangeDbOptions options, ILoggerFactory loggers, params TableSchema[] tables) =>
+        new(options, new SchemaRegistry(tables), loggers);
 
     private static ShapeHistory Sidecar(MelangeDbOptions options) =>
         ShapeHistory.Load(Path.Combine(options.CommitLog.Path, ShapeHistory.FileName))!;
@@ -415,6 +419,147 @@ public class SchemaShapeTests : IDisposable
         using var v2 = Boot(restoredOptions, HeroTable<HeroV2>());
         var hero = Assert.Single(Rows<HeroV2>(v2));
         Assert.Equal((11, 0, "judy"), (hero.X, hero.Level, hero.Name));
+    }
+
+    // -- Adoption over an existing directory (issue #99) ------------------------------------------
+
+    /// <summary>
+    /// A directory as it looks coming from a build that predates the shape sidecar: records on
+    /// disk, no melange.shape beside them.
+    /// </summary>
+    private MelangeDbOptions PreSidecarDirectory()
+    {
+        var options = OptionsFor(NewRoot(), snapshots: false);
+        using (var v1 = Boot(options, HeroTable<HeroV1>()))
+        {
+            v1.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 10, Name = "alice" }));
+            v1.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 2, X = 20, Name = "bob" }));
+        }
+
+        File.Delete(Path.Combine(options.CommitLog.Path, ShapeHistory.FileName));
+        return options;
+    }
+
+    [Fact]
+    public void Adopting_a_schema_over_records_a_different_binary_wrote_says_so_at_the_moment_it_happens()
+    {
+        var options = PreSidecarDirectory();
+        var logs = new LogCapture();
+
+        using (var booted = Boot(options, logs, HeroTable<HeroV1>()))
+            Assert.Equal(2, Rows<HeroV1>(booted).Count);
+
+        // Everything around this step is loud and this one was silent, so the mis-decode it can
+        // cause arrives an arbitrary amount of time after a boot that looked perfectly clean.
+        var entry = logs.Single(1008);
+        Assert.Equal(LogLevel.Warning, entry.Level);
+        Assert.Equal(2d, entry.Number("HeadLsn"));
+        Assert.Contains("upgrade rule", entry.Message);
+
+        // The recovery is only actionable with its gates named: /melange/bulk answers 403 unless
+        // both are set, and a 3 a.m. instruction that does not work is worse than none.
+        Assert.Contains("POST /melange/bulk", entry.Message);
+        Assert.Contains("Bulk:Enabled", entry.Message);
+        Assert.Contains("Bulk:OwnerRole", entry.Message);
+    }
+
+    [Fact]
+    public void A_new_world_naming_its_first_shape_says_nothing()
+    {
+        // The safe case, and the common one: no records exist, so nothing is being reinterpreted.
+        var logs = new LogCapture();
+        using var fresh = Boot(OptionsFor(NewRoot()), logs, HeroTable<HeroV1>());
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1008);
+    }
+
+    [Fact]
+    public void A_boot_that_already_has_a_sidecar_says_nothing_either()
+    {
+        var options = OptionsFor(NewRoot(), snapshots: false);
+        using (var first = Boot(options, HeroTable<HeroV1>()))
+            first.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 10, Name = "alice" }));
+
+        var logs = new LogCapture();
+        using var second = Boot(options, logs, HeroTable<HeroV1>());
+        Assert.DoesNotContain(logs.Entries, e => e.EventId == 1008);
+    }
+
+    [Fact]
+    public void Adoption_over_an_existing_directory_can_be_refused_outright()
+    {
+        // The AutoMigrate posture, opt-in: a wrong adoption is not a stall but silently wrong reads
+        // of existing data, so a deployment may prefer to stop and be told.
+        var options = PreSidecarDirectory();
+        options.Schema.AllowAdoption = false;
+
+        var refusal = Assert.Throws<SchemaShapeException>(() => Boot(options, HeroTable<HeroV1>()));
+        Assert.Contains("Schema:AllowAdoption", refusal.Message);
+        Assert.Contains("silently mis-reads", refusal.Message);
+
+        // Refusing writes nothing: the next boot decides afresh, which is what makes the flag a
+        // gate rather than a one-way door.
+        Assert.False(File.Exists(Path.Combine(options.CommitLog.Path, ShapeHistory.FileName)));
+
+        options.Schema.AllowAdoption = true;
+        using var booted = Boot(options, HeroTable<HeroV1>());
+        Assert.Equal(2, Rows<HeroV1>(booted).Count);
+    }
+
+    [Fact]
+    public void Refusing_adoption_never_blocks_a_new_world()
+    {
+        // The flag guards a reinterpretation, not a first naming — a deployment that sets
+        // AllowAdoption to false for safety must still be able to create a database.
+        var options = OptionsFor(NewRoot());
+        options.Schema.AllowAdoption = false;
+        using var fresh = Boot(options, HeroTable<HeroV1>());
+        fresh.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 1, Name = "new" }));
+        Assert.Single(Rows<HeroV1>(fresh));
+    }
+
+    [Fact]
+    public void A_row_that_does_not_decode_names_the_table_and_the_reading_that_explains_it()
+    {
+        // Issue #99's symptom, and what an operator's log used to carry: one word about a
+        // parameter name from deep inside a reader that has no idea which table it was decoding.
+        // A short row is what a schema expecting more columns than the bytes hold looks like.
+        var table = HeroTable<HeroV2>();
+        var truncated = new byte[6];
+
+        var failure = Assert.Throws<InvalidDataException>(() => RowSerializer.Deserialize(table, truncated));
+
+        Assert.Contains("Table 'Hero'", failure.Message);
+        Assert.Contains("6 byte(s)", failure.Message);
+        Assert.Contains("MIGRATION.md", failure.Message);
+        Assert.Contains("EventId 1008", failure.Message);
+        Assert.NotNull(failure.InnerException);
+    }
+
+    [Fact]
+    public void A_generated_codec_names_the_row_type_when_the_bytes_run_out()
+    {
+        // Production tables carry a generated codec, and index maintenance decodes on the store's
+        // apply path — which after a bad adoption is very often the first decode of all, ahead of
+        // any read. It has to name what it was decoding too.
+        using var harness = new EngineHarness();
+        var table = harness.Engine.Schema.Get(typeof(Player));
+        var truncated = new CommitRecord
+        {
+            Lsn = harness.Engine.Log.HeadLsn + 1,
+            FormatVersion = 1,
+            Timestamp = new Timestamp(1),
+            Caller = EngineHarness.Caller,
+            ReducerName = "Planted",
+            Arguments = ReadOnlyMemory<byte>.Empty,
+            WriteSet = [new RowOp(RowOpKind.Insert, table.Id, new RowKey(new byte[16]), new byte[4])],
+            Events = [],
+            SerializedLength = 0,
+        };
+
+        var failure = Assert.Throws<InvalidDataException>(() => harness.Engine.HotStore.Apply(truncated));
+        Assert.Contains("Player", failure.Message);
+        Assert.Contains("4 byte(s)", failure.Message);
+        Assert.Contains("EventId 1008", failure.Message);
     }
 
     [Fact]

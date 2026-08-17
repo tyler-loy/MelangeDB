@@ -18,6 +18,10 @@
     <!-- The transport's durability-gate test holds a group flush hostage through the commit
          log's flush fault-injection seam; it asserts on no other internals. -->
     <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+    <!-- The transport decodes stored row bytes on its own paths — projection, the HTTP column
+         view, the projected-delta comparison — and shares the engine's decode-failure message so
+         a row that no longer matches this build's schema names itself wherever it is first read. -->
+    <InternalsVisibleTo Include="MelangeDB.Server" />
     <!-- The cluster package starts and stops per-shard schedulers and reads the engine's live
          options instance when composing per-shard engines. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
