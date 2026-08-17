@@ -139,10 +139,17 @@ public class HostIntegrationTests : IDisposable
         var log = host.Engine().LogFile;
         host.Reducers().Call("AddNote", TestApp.Caller, "before the reload", 1.0);
 
+        // A committed call is already durable — the engine waits for it — so a record that is
+        // genuinely buffered has to be appended without a committer behind it. That is the state
+        // the reload must not publish over.
+        var buffered = log.Append(new CommitRequest(
+            new Timestamp(1), TestApp.Caller, "Planted", ReadOnlyMemory<byte>.Empty, []));
+        Assert.True(log.FsyncedLsn < buffered.Lsn, "the planted append should be buffered, not durable");
+
         host.ReloadWith("MelangeDb:CommitLog:FsyncPolicy", "OsBuffered");
 
         Assert.Equal(FsyncPolicy.OsBuffered, host.Engine().Options.CommitLog.FsyncPolicy);
-        Assert.Equal(log.HeadLsn, log.FsyncedLsn);
+        Assert.Equal(buffered.Lsn, log.FsyncedLsn);
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 

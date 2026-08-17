@@ -281,24 +281,11 @@ public sealed class FileCommitLog : ICommitLog
     /// <summary>
     /// Applies a live change to <c>CommitLog:FsyncPolicy</c> / <c>CommitLog:GroupCommit</c>, which
     /// is a <b>durability boundary</b>: everything appended under the outgoing policy is made
-    /// durable before the new one takes effect.
+    /// durable before the new one takes effect, so a policy that answers
+    /// <see cref="DurableLsn"/> with the head can never do so over a buffered record.
     /// <para>
-    /// Group commit was the first time <see cref="HeadLsn"/> could sit above the fsynced watermark
-    /// under <see cref="FsyncPolicy.OnCommit"/>, and both keys are documented live. Publishing a
-    /// switch away from <c>OnCommit</c> without flushing would make <see cref="DurableLsn"/> jump
-    /// to the head and <see cref="WaitDurable"/> return immediately, so subscription deltas,
-    /// replica and border streams, the relational tier's dispatch, and the online backup's fence
-    /// would all serve records that are still only OS-buffered — untold by a crash, with no epoch
-    /// change to make the divergence visible. The flush is what keeps the phase-17 promise true
-    /// across an operator action.
-    /// </para>
-    /// <para>
-    /// Published under both locks so no append can land between the flush and the new policy: an
-    /// append that beat the publish would be buffered under the old policy and covered by the new
-    /// one's answer. Holding <c>_fsyncLock</c> also excludes an in-flight group flush, which is
-    /// what makes the inline-fsync path safe — while <c>GroupCommit</c> is false every append
-    /// advances the watermark itself, so <see cref="WaitDurable"/> never parks and no flusher can
-    /// exist to race the inline fsync's <see cref="AdvanceDurable"/>.
+    /// The new policy is published under both locks, so no append can land between the flush and
+    /// the change and be covered by an answer it was not written under.
     /// </para>
     /// </summary>
     internal void ApplyDurabilityPolicy(FsyncPolicy policy, bool groupCommit)
