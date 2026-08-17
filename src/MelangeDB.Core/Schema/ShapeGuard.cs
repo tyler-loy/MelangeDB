@@ -112,7 +112,13 @@ internal sealed class ShapeResolution
 {
     private readonly SchemaRegistry _schema;
     private readonly Dictionary<TableId, TableShape> _currentByTable;
-    private readonly List<Dictionary<TableId, RowShapeMapper?>> _mappersByEntry;
+
+    /// <summary>
+    /// The reigns and their mappers as one snapshot, replaced wholesale rather than mutated. Both
+    /// halves must agree: an index derived from one list and used against the other is the bug
+    /// this shape is here to make unrepresentable.
+    /// </summary>
+    private Reigns _reigns;
 
     public ShapeResolution(ShapeHistory history, SchemaRegistry schema, string sidecarPath)
     {
@@ -120,7 +126,7 @@ internal sealed class ShapeResolution
         _schema = schema;
         SidecarPath = sidecarPath;
         _currentByTable = schema.Tables.ToDictionary(t => t.Id, TableShape.Of);
-        _mappersByEntry = [.. history.Entries.Select(_ => new Dictionary<TableId, RowShapeMapper?>())];
+        _reigns = BuildReigns();
     }
 
     public ShapeHistory History { get; }
@@ -182,43 +188,65 @@ internal sealed class ShapeResolution
     }
 
     /// <summary>
+    /// Rebuilds the snapshot after a reign was appended to the history. Both halves are replaced
+    /// together and never mutated in place, because an index taken from the entries and used
+    /// against the mappers must always mean the same reign.
+    /// </summary>
+    public void NoteEntryAppended() => Volatile.Write(ref _reigns, BuildReigns());
+
+    /// <summary>
     /// The mapper for a row of <paramref name="table"/> written at <paramref name="lsn"/>, or null
     /// for pass-through — the governing shape equals the current one, or the table is unknown to
     /// both the history and the schema (whatever wrote it, this boot cannot reinterpret it).
+    /// A pure read of an immutable snapshot, which is what makes it safe from the several readers
+    /// that reach it concurrently.
     /// </summary>
     private RowShapeMapper? MapperFor(ulong lsn, TableId table)
     {
-        var index = IndexOfEntryAt(lsn);
-        var cache = _mappersByEntry[index];
-        if (cache.TryGetValue(table, out var cached))
-            return cached;
-
-        RowShapeMapper? mapper = null;
-        if (_currentByTable.TryGetValue(table, out var current))
-        {
-            var entry = History.Entries[index];
-            var source = entry.Tables
-                .Where(p => TableId.FromName(p.Key) == table)
-                .Select(p => p.Value)
-                .FirstOrDefault();
-            if (source is not null && !source.SameAs(current))
-                mapper = new RowShapeMapper(source, current);
-        }
-
-        cache[table] = mapper;
-        return mapper;
+        var reigns = Volatile.Read(ref _reigns);
+        var mappers = reigns.Mappers[IndexOfEntryAt(reigns.Entries, lsn)];
+        return mappers.GetValueOrDefault(table);
     }
 
-    private int IndexOfEntryAt(ulong lsn)
+    /// <summary>
+    /// Every reign's mappers, computed once. Only tables that actually changed shape get an entry:
+    /// the common case is a table whose shape never moved, and a missing entry is the same
+    /// pass-through answer as a null one.
+    /// </summary>
+    private Reigns BuildReigns()
     {
-        for (var i = History.Entries.Count - 1; i >= 0; i--)
+        var entries = History.Entries.ToArray();
+        var mappers = new IReadOnlyDictionary<TableId, RowShapeMapper?>[entries.Length];
+        for (var i = 0; i < entries.Length; i++)
         {
-            if (History.Entries[i].FromLsn <= lsn)
+            var byTable = new Dictionary<TableId, RowShapeMapper?>();
+            foreach (var (name, source) in entries[i].Tables)
+            {
+                var id = TableId.FromName(name);
+                if (_currentByTable.TryGetValue(id, out var current) && !source.SameAs(current))
+                    byTable[id] = new RowShapeMapper(source, current);
+            }
+
+            mappers[i] = byTable;
+        }
+
+        return new Reigns(entries, mappers);
+    }
+
+    private static int IndexOfEntryAt(IReadOnlyList<ShapeEntry> entries, ulong lsn)
+    {
+        for (var i = entries.Count - 1; i >= 0; i--)
+        {
+            if (entries[i].FromLsn <= lsn)
                 return i;
         }
 
         return 0;
     }
+
+    private sealed record Reigns(
+        IReadOnlyList<ShapeEntry> Entries,
+        IReadOnlyList<IReadOnlyDictionary<TableId, RowShapeMapper?>> Mappers);
 }
 
 /// <summary>

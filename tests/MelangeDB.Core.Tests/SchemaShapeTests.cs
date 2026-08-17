@@ -417,6 +417,71 @@ public class SchemaShapeTests : IDisposable
         Assert.Equal((11, 0, "judy"), (hero.X, hero.Level, hero.Name));
     }
 
+    [Fact]
+    public void The_migrating_process_can_still_transform_records_written_after_its_own_marker()
+    {
+        // Issue #92. The migration appends a reign to the live history *after* the transform was
+        // resolved, and every decoupled reader in that same process — the Postgres applier, the
+        // replica and border pumps, resume replay, a lagging applier's catch-up — transforms
+        // unconditionally. Pipeline-driven appliers skip the transform for a record they just
+        // watched commit, which is why every other test here missed this.
+        var root = NewRoot();
+        var options = OptionsFor(root);
+        using (var v1 = Boot(options, HeroTable<HeroV1>()))
+            v1.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = 1, X = 10, Name = "alice" }));
+
+        using var v2 = Boot(options, HeroTable<HeroV2>());
+        v2.Invoke(
+            "Later", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV2 { Id = 2, X = 20, Level = 5, Name = "bob", Alive = true }));
+
+        // A post-marker record is already current-shape, so this is a pass-through — but only if
+        // the resolution can index the reign the migration added.
+        var record = v2.Log.ReadFrom(v2.Log.HeadLsn).Single();
+        var transformed = v2.TransformToCurrentShape(record);
+        Assert.Equal(record.WriteSet.Count, transformed.WriteSet.Count);
+
+        var table = v2.Schema.Get(typeof(HeroV2));
+        var hero = (HeroV2)RowSerializer.Deserialize(table, transformed.WriteSet[0].Row);
+        Assert.Equal((20, 5, "bob", true), (hero.X, hero.Level, hero.Name, hero.Alive));
+    }
+
+    [Fact]
+    public async Task Concurrent_readers_transform_pre_marker_records_without_racing_the_mapper_cache()
+    {
+        // The same cache was an unsynchronized Dictionary filled on first use, which the Postgres
+        // loop and the replica/border pumps reach concurrently after a migration boot. Undefined
+        // behaviour on Dictionary is not something to leave to luck on a hot read path.
+        var root = NewRoot();
+        var options = OptionsFor(root, snapshots: false);
+        using (var v1 = Boot(options, HeroTable<HeroV1>()))
+        {
+            for (var i = 1; i <= 20; i++)
+            {
+                var id = (ulong)i;
+                v1.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV1 { Id = id, X = (int)id, Name = $"hero-{id}" }));
+            }
+        }
+
+        using var v2 = Boot(options, HeroTable<HeroV2>());
+        var records = v2.Log.ReadFrom(1).ToList();
+        var table = v2.Schema.Get(typeof(HeroV2));
+        var ct = TestContext.Current.CancellationToken;
+
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => Task.Run(
+            () =>
+            {
+                foreach (var record in records)
+                {
+                    foreach (var op in v2.TransformToCurrentShape(record).WriteSet)
+                    {
+                        var hero = (HeroV2)RowSerializer.Deserialize(table, op.Row);
+                        Assert.Equal($"hero-{hero.Id}", hero.Name);
+                    }
+                }
+            },
+            ct))).WaitAsync(TimeSpan.FromSeconds(30), ct);
+    }
+
     private static ulong HeadOf(MelangeDbOptions options, params TableSchema[] tables)
     {
         using var probe = Boot(options, tables);

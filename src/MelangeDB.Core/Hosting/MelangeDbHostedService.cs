@@ -52,7 +52,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         _engine = engine;
         _reloadBridge = _monitor.OnChange(next =>
         {
-            CopyLiveKeys(next, engine.Options);
+            CopyLiveKeys(next, engine);
             ApplyResidencyOverrides(next, engine.Options, engine);
         });
         ReportUnpolicedReducers();
@@ -149,9 +149,15 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     /// engine reads per operation. Restart-only keys (paths, Telemetry:Enabled) are deliberately
     /// not copied; see docs/CONFIGURATION.md for each key's reload semantic.
     /// </summary>
-    private static void CopyLiveKeys(MelangeDbOptions next, MelangeDbOptions live)
+    private static void CopyLiveKeys(MelangeDbOptions next, MelangeEngine engine)
     {
-        live.CommitLog.FsyncPolicy = next.CommitLog.FsyncPolicy;
+        var live = engine.Options;
+
+        // FsyncPolicy and GroupCommit are not plain copies: a change to either is a durability
+        // boundary, and the log flushes everything appended under the outgoing policy before the
+        // new one takes effect. Copying them here would let DurableLsn jump to the head over
+        // records that are still only OS-buffered. See FileCommitLog.ApplyDurabilityPolicy.
+        engine.ApplyDurabilityPolicy(next.CommitLog.FsyncPolicy, next.CommitLog.GroupCommit);
         live.CommitLog.FsyncIntervalMs = next.CommitLog.FsyncIntervalMs;
         live.Telemetry.IncludeCallerIdentity = next.Telemetry.IncludeCallerIdentity;
         live.Telemetry.IncludeReducerArguments = next.Telemetry.IncludeReducerArguments;
@@ -174,7 +180,6 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Events.RetryBackoffMs = next.Events.RetryBackoffMs;
         live.Events.MaxPublishDepth = next.Events.MaxPublishDepth;
         live.Events.SubscriberExpirySeconds = next.Events.SubscriberExpirySeconds;
-        live.CommitLog.GroupCommit = next.CommitLog.GroupCommit;
         live.Snapshots.Enabled = next.Snapshots.Enabled;
         live.Snapshots.IntervalTransactions = next.Snapshots.IntervalTransactions;
         live.Snapshots.TruncateLog = next.Snapshots.TruncateLog;

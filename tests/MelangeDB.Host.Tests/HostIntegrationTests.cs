@@ -125,6 +125,35 @@ public class HostIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Reloading_the_fsync_policy_makes_what_it_stops_promising_durable_first()
+    {
+        // Issue #91, through the wiring an operator actually uses. A record committed under
+        // OnCommit but not yet flushed must be on disk before a policy that answers DurableLsn
+        // with the head takes effect — otherwise the next delta, replica batch, or backup fence
+        // serves an LSN a crash would untell.
+        using var host = TestApp.Build(_root, new Dictionary<string, string?>
+        {
+            ["MelangeDb:CommitLog:GroupCommit"] = "true",
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        var log = host.Engine().LogFile;
+        host.Reducers().Call("AddNote", TestApp.Caller, "before the reload", 1.0);
+
+        // A committed call is already durable — the engine waits for it — so a record that is
+        // genuinely buffered has to be appended without a committer behind it. That is the state
+        // the reload must not publish over.
+        var buffered = log.Append(new CommitRequest(
+            new Timestamp(1), TestApp.Caller, "Planted", ReadOnlyMemory<byte>.Empty, []));
+        Assert.True(log.FsyncedLsn < buffered.Lsn, "the planted append should be buffered, not durable");
+
+        host.ReloadWith("MelangeDb:CommitLog:FsyncPolicy", "OsBuffered");
+
+        Assert.Equal(FsyncPolicy.OsBuffered, host.Engine().Options.CommitLog.FsyncPolicy);
+        Assert.Equal(buffered.Lsn, log.FsyncedLsn);
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
     public async Task Hosted_service_recovers_state_across_restart()
     {
         using (var host = TestApp.Build(_root))
