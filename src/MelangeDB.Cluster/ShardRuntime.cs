@@ -132,8 +132,8 @@ internal sealed partial class ShardRuntime : IDisposable
         // origin is known settled. Truncating one away would silently unfreeze a mid-transfer
         // player (origin) or make WasImported answer a wrong "no" (destination): either way, two
         // owners — the exact silent-gap bug class phase 08 fixed for the Postgres checkpoint.
-        Engine.AddTruncationFloor(() => MarkerFloor(_pendingFreezes));
-        Engine.AddTruncationFloor(() => MarkerFloor(_unsettledImports));
+        Engine.AddTruncationFloor(TruncationFloorNames.ShardFreeze, () => MarkerFloor(_pendingFreezes));
+        Engine.AddTruncationFloor(TruncationFloorNames.ShardImport, () => MarkerFloor(_unsettledImports));
 
         // Not a pin — a refresh point. Truncation may erase border records whose effects only the
         // borrowed sidecar remembers, so the sidecar is rewritten at the head the moment
@@ -141,7 +141,9 @@ internal sealed partial class ShardRuntime : IDisposable
         // itself): after the write, everything at or below the head is reconstructible from
         // sidecar plus tail, and nothing needs pinning. The stale-sidecar check in recovery stays
         // as the loud safety net.
-        Engine.AddTruncationFloor(() =>
+        // Named like the rest even though it never pins: a floor that always answers null is absent
+        // from the report, which is the honest reading of "this one is holding nothing".
+        Engine.AddTruncationFloor(TruncationFloorNames.ShardSidecar, () =>
         {
             WriteBorrowedSidecar();
             return null;

@@ -209,6 +209,21 @@ public sealed class FileCommitLog : ICommitLog
     internal long FsyncCount => Interlocked.Read(ref _fsyncCount);
 
     /// <summary>
+    /// The log file's current size on disk. Records are the unit truncation reasons in, but bytes
+    /// are the unit the operator fears, so every truncation decision reports both.
+    /// </summary>
+    internal long FileLengthBytes
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _stream.Length;
+            }
+        }
+    }
+
+    /// <summary>
     /// The egress gate, without the engine's cost attribution: same wait, discarded measurement.
     /// Only meaningful under <see cref="FsyncPolicy.OnCommit"/> — the internal overload documents
     /// why the other policies return immediately.
