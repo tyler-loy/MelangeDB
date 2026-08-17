@@ -210,6 +210,11 @@ public sealed partial class MelangeEngine : IDisposable
         // harmless one the design already accepts: an empty record, and the next boot re-migrates.)
         _log.WaitDurable(marker.Lsn);
         _shapes.History.Append(ShapeHistory.EntryOf(Schema, marker.Lsn));
+
+        // The resolution was built from this history before the reign existed; every decoupled
+        // reader in this process (the Postgres applier, the replica and border pumps, resume
+        // replay, a lagging applier's catch-up) transforms against it from here on.
+        _shapes.NoteEntryAppended();
         _shapes.History.Save(_shapes.SidecarPath);
         LogMessages.ShapeMigrated(_logger, string.Join("; ", _shapes.Changes), marker.Lsn);
 
@@ -307,6 +312,14 @@ public sealed partial class MelangeEngine : IDisposable
 
     /// <summary>The commit log's poisoned-state failure, if any — the melange-log health signal.</summary>
     internal Exception? LogFailure => _log.Failure;
+
+    /// <summary>
+    /// Applies a live change to the durability keys. Not a plain options copy: a policy change is
+    /// a durability boundary, and the log makes everything appended under the outgoing policy
+    /// durable before the new one takes effect. See <see cref="FileCommitLog.ApplyDurabilityPolicy"/>.
+    /// </summary>
+    internal void ApplyDurabilityPolicy(FsyncPolicy policy, bool groupCommit) =>
+        _log.ApplyDurabilityPolicy(policy, groupCommit);
 
     /// <summary>
     /// The timestamp of the newest record recovered at startup, or null for an empty log — the

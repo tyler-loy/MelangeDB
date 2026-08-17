@@ -23,5 +23,5 @@ public sealed class ReducerRegistry
     public ReducerDescriptor Get(string name) =>
         _byName.TryGetValue(name, out var descriptor)
             ? descriptor
-            : throw new ArgumentException($"No reducer named '{name}' is registered.", nameof(name));
+            : throw new UnknownReducerException(name, nameof(name));
 }
