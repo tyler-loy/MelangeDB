@@ -188,11 +188,9 @@ internal sealed class ShapeResolution
     }
 
     /// <summary>
-    /// Re-reads the history after an entry was appended to it — the migration's new reign. The
-    /// resolution is built at boot, but <c>CompleteShapeMigration</c> adds a reign to the same
-    /// history afterwards, and every decoupled reader in that process transforms against it.
-    /// Called from the engine constructor, before anything else can see the engine; the volatile
-    /// publish is for the readers that arrive later.
+    /// Rebuilds the snapshot after a reign was appended to the history. Both halves are replaced
+    /// together and never mutated in place, because an index taken from the entries and used
+    /// against the mappers must always mean the same reign.
     /// </summary>
     public void NoteEntryAppended() => Volatile.Write(ref _reigns, BuildReigns());
 
@@ -200,12 +198,8 @@ internal sealed class ShapeResolution
     /// The mapper for a row of <paramref name="table"/> written at <paramref name="lsn"/>, or null
     /// for pass-through — the governing shape equals the current one, or the table is unknown to
     /// both the history and the schema (whatever wrote it, this boot cannot reinterpret it).
-    /// <para>
-    /// A pure read of an immutable snapshot. The mappers used to be filled lazily into a plain
-    /// <see cref="Dictionary{TKey,TValue}"/>, which the Postgres applier, the replica and border
-    /// pumps, and resume replay all reach concurrently — undefined behaviour on a hot path, for a
-    /// table of at most (reigns × tables) entries that costs nothing to build at boot.
-    /// </para>
+    /// A pure read of an immutable snapshot, which is what makes it safe from the several readers
+    /// that reach it concurrently.
     /// </summary>
     private RowShapeMapper? MapperFor(ulong lsn, TableId table)
     {
