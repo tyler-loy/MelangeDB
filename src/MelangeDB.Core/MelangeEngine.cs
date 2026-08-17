@@ -124,6 +124,7 @@ public sealed partial class MelangeEngine : IDisposable
             Appliers.Register(new HotStoreApplier(store));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
             _truncationFloors.Add((TruncationFloorNames.BackupPin, PinnedTruncationFloor));
+            ReportCloneProvenance(options.CommitLog.Path);
             if (options.Residency.ReportOnStartup)
                 ReportResidency(store);
             CompleteShapeMigration(store);
@@ -1019,6 +1020,25 @@ public sealed partial class MelangeEngine : IDisposable
     }
 
     /// <summary>
+    /// Announces at every boot that this world is a clone, and of what (EventId 1804). A clone is
+    /// deliberate, so this is Information rather than a warning — but it is unconditional, because
+    /// "which world is this and how stale is it" is asked at the worst possible moment, and a
+    /// server that answers it in its own startup log answers it faster than any runbook.
+    /// </summary>
+    private void ReportCloneProvenance(string logDirectory)
+    {
+        if (CloneProvenance.TryRead(logDirectory) is not { } provenance)
+            return;
+        LogMessages.CloneProvenance(
+            _logger,
+            provenance.SourceEpoch,
+            provenance.SourceHeadLsn,
+            provenance.Archive,
+            DateTimeOffset.FromUnixTimeMilliseconds(provenance.ArchiveCapturedAtUnixMs),
+            DateTimeOffset.FromUnixTimeMilliseconds(provenance.ClonedAtUnixMs));
+    }
+
+    /// <summary>
     /// The startup residency report (EventId 1501): each resident table's row count and measured
     /// bytes, the buffer-pool cap, and the total they sum to. The memory budget is a declared,
     /// computable artifact — this makes it an observed one.
@@ -1701,6 +1721,18 @@ public sealed partial class MelangeEngine : IDisposable
         public static void LogTruncationPinned(
             ILogger logger, string floorName, ulong floorLsn, ulong baseLsn, ulong headLsn, ulong pinnedRecords, long logBytes) =>
             LogTruncationPinnedMessage(logger, floorName, floorLsn, baseLsn, headLsn, pinnedRecords, logBytes, null);
+
+        private static readonly Action<ILogger, Guid, ulong, string, DateTimeOffset, DateTimeOffset, Exception?> CloneProvenanceMessage =
+            LoggerMessage.Define<Guid, ulong, string, DateTimeOffset, DateTimeOffset>(
+                LogLevel.Information,
+                new EventId(1804, "CloneProvenance"),
+                "This world is a clone of epoch {SourceEpoch} at LSN {SourceHeadLsn}, from archive " +
+                "'{Archive}' captured {CapturedAt:u}, cloned {ClonedAt:u}. It is a separate world: its " +
+                "subscriber checkpoints were dropped, and it needs its own Postgres schema and its own fleet.");
+
+        public static void CloneProvenance(
+            ILogger logger, Guid sourceEpoch, ulong sourceHeadLsn, string archive, DateTimeOffset capturedAt, DateTimeOffset clonedAt) =>
+            CloneProvenanceMessage(logger, sourceEpoch, sourceHeadLsn, archive, capturedAt, clonedAt, null);
 
         private static readonly Action<ILogger, Exception?> SnapshotFailedMessage =
             LoggerMessage.Define(

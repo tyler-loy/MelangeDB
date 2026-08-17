@@ -1,7 +1,7 @@
 using MelangeDB.Cli;
 using MelangeDB.Core;
 
-// The `melange` umbrella command. Four verbs:
+// The `melange` umbrella command. Five verbs:
 //
 //   melange schema path/to/Module.dll [-o melange-schema.json]
 //   melange schema http://localhost:5310 [-o melange-schema.json]
@@ -9,6 +9,7 @@ using MelangeDB.Core;
 //   melange backup https://game.example.com --token <jwt> [-o world.mbak]
 //   melange backup verify world.mbak
 //   melange restore world.mbak -o ./data/log [--at-lsn 41200]
+//   melange clone world.mbak -o ./staging/log
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
 // its URL form fetches from a running server's schema endpoint. `backup` captures a stopped
@@ -18,7 +19,10 @@ using MelangeDB.Core;
 // materializes a data directory a server boots from — with a fresh epoch, always, because a
 // restore is a rewind and stale resume cursors must full-resync rather than resume into history
 // that no longer happened. `--at-lsn` cuts the tail at a named LSN: the moment just before the
-// mistake, within the window one archive holds. An unverified backup is a hope, not a backup.
+// mistake, within the window one archive holds. `clone` materializes an explicitly *different*
+// world from a production archive — staging seeded from production, with subscriber checkpoints
+// dropped and a provenance sidecar recording what it is a clone of. An unverified backup is a
+// hope, not a backup.
 if (args.Length == 0)
 {
     PrintUsage();
@@ -31,6 +35,7 @@ return args[0] switch
     "backup" when args.Length >= 2 && args[1] == "verify" => RunVerify(args.AsSpan(2).ToArray()),
     "backup" => await RunBackupAsync(args.AsSpan(1).ToArray()),
     "restore" => RunRestore(args.AsSpan(1).ToArray()),
+    "clone" => RunClone(args.AsSpan(1).ToArray()),
     _ => Usage(),
 };
 
@@ -138,6 +143,30 @@ static int RunRestore(string[] rest)
     }
 }
 
+static int RunClone(string[] rest)
+{
+    if (!ParseSourceAndOutput(rest, null, out var archive, out var target, out _))
+        return Usage();
+    try
+    {
+        var summary = MelangeBackup.Clone(archive, target);
+        foreach (var engine in summary.Engines)
+            Console.WriteLine($"Cloned {engine.Key} into {engine.Directory}: head LSN {engine.HeadLsn}, new epoch {engine.NewEpoch:D}.");
+        Console.WriteLine(
+            "This is a different world, not a copy of the same one: subscriber checkpoints were dropped, and " +
+            $"{CloneProvenance.FileName} records what it is a clone of (the server says so at every boot).");
+        Console.WriteLine(
+            "What the archive cannot carry is yours: give it its own Postgres schema (an empty one bootstraps " +
+            "itself), its own data directory, and its own fleet. Never point it at production's.");
+        return 0;
+    }
+    catch (Exception exception) when (IsHandled(exception))
+    {
+        Console.Error.WriteLine(exception.Message);
+        return 1;
+    }
+}
+
 // The shared argument shape: one positional source, one -o/--output, and --token for the
 // privileged URL form. A null default output makes -o required (restore refuses to guess where a
 // world should land). --token falls back to the MELANGE_TOKEN environment variable, which keeps
@@ -200,4 +229,5 @@ static void PrintUsage()
     Console.Error.WriteLine("       melange backup <data-dir | http(s)://host[:port][/path]> [-o world.mbak] [--token <jwt>]");
     Console.Error.WriteLine("       melange backup verify <archive>");
     Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>]");
+    Console.Error.WriteLine("       melange clone <archive> -o <data-dir>");
 }

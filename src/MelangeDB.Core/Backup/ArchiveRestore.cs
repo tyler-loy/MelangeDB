@@ -21,9 +21,18 @@ namespace MelangeDB.Core;
 /// </summary>
 internal static class ArchiveRestore
 {
+    /// <summary>
+    /// What this materialization is, beyond a plain restore. Internal because the difference
+    /// between a restore and a clone is a <em>verb</em>, not a flag: the semantics differ in kind,
+    /// and a flag would invite using one where the other was meant.
+    /// </summary>
+    internal sealed record RestorePlan(ulong? AtLsn = null, bool IsClone = false);
+
     public static RestoreSummary Restore(string archivePath, string targetDirectory, RestoreOptions? options = null)
+        => Restore(archivePath, targetDirectory, new RestorePlan(options?.AtLsn));
+
+    public static RestoreSummary Restore(string archivePath, string targetDirectory, RestorePlan plan)
     {
-        var restoreOptions = options ?? new RestoreOptions();
         if (!File.Exists(archivePath))
             throw new FileNotFoundException($"Archive '{archivePath}' does not exist.", archivePath);
         var target = Path.GetFullPath(targetDirectory);
@@ -48,11 +57,11 @@ internal static class ArchiveRestore
             var manifest = ReadJsonFrame<ArchiveManifest>(reader, ArchiveFrameType.Manifest, archivePath);
             if (manifest.Engines.Count == 0)
                 throw new InvalidDataException($"'{archivePath}': the manifest names no engines; the archive is corrupt.");
-            RefusePointInTimeOnClusterArchives(manifest, restoreOptions, archivePath);
+            RefusePointInTimeOnClusterArchives(manifest, plan, archivePath);
 
             var engines = new List<RestoredEngineSummary>();
             foreach (var key in manifest.Engines)
-                engines.Add(RestoreEngine(reader, DirectoryFor(manifest, key, target, archivePath), key, archivePath, manifest, restoreOptions));
+                engines.Add(RestoreEngine(reader, DirectoryFor(manifest, key, target, archivePath), key, archivePath, manifest, plan, archivePath));
 
             var footer = ReadJsonFrame<ArchiveFooter>(reader, ArchiveFrameType.ArchiveEnd, archivePath);
             if (footer.Engines != manifest.Engines.Count)
@@ -95,7 +104,7 @@ internal static class ArchiveRestore
     /// and per-shard LSNs would manufacture a consistency the capture never had. Refused rather
     /// than approximated.
     /// </summary>
-    private static void RefusePointInTimeOnClusterArchives(ArchiveManifest manifest, RestoreOptions options, string source)
+    private static void RefusePointInTimeOnClusterArchives(ArchiveManifest manifest, RestorePlan options, string source)
     {
         if (options.AtLsn is null)
             return;
@@ -136,7 +145,8 @@ internal static class ArchiveRestore
         string engineKey,
         string source,
         ArchiveManifest manifest,
-        RestoreOptions options)
+        RestorePlan options,
+        string archivePath)
     {
         var identity = ReadJsonFrame<ArchiveEngineIdentity>(reader, ArchiveFrameType.EngineBegin, source);
         if (identity.Key != engineKey)
@@ -199,6 +209,13 @@ internal static class ArchiveRestore
             var (name, content) = ParseSidecarFrame(frame.Payload, source);
             switch (name)
             {
+                case "melange.events.json" when options.IsClone:
+                    // Dropped, not clamped. A clone has no subscribers yet, and production's
+                    // event-delivery state resuming in staging — handlers deciding they have
+                    // already delivered what this world has never emitted — is exactly the
+                    // confusion the verb exists to prevent. Absent means "start from the
+                    // beginning", which is what a new world means.
+                    break;
                 case "melange.events.json":
                     File.WriteAllBytes(Path.Combine(engineDirectory, name), ClampEventCheckpoints(content, restoredHead));
                     break;
@@ -238,6 +255,18 @@ internal static class ArchiveRestore
             File.WriteAllBytes(Path.Combine(engineDirectory, "melange.base"), baseBytes);
         }
 
+        if (options.IsClone)
+        {
+            new CloneProvenance(
+                CloneProvenance.CloneKind,
+                identity.SourceEpoch,
+                restoredHead,
+                Path.GetFileName(archivePath),
+                manifest.CapturedAtUnixMs,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                newEpoch).Write(engineDirectory);
+        }
+
         File.WriteAllBytes(Path.Combine(engineDirectory, "melange.epoch"), newEpoch.ToByteArray());
 
         return new RestoredEngineSummary(
@@ -260,7 +289,7 @@ internal static class ArchiveRestore
     /// range would need the schema a restore deliberately does not have.
     /// </para>
     /// </summary>
-    private static ulong ResolveCut(ArchiveEngineIdentity identity, RestoreOptions options, string source)
+    private static ulong ResolveCut(ArchiveEngineIdentity identity, RestorePlan options, string source)
     {
         if (options.AtLsn is not { } atLsn)
             return identity.HeadLsn;

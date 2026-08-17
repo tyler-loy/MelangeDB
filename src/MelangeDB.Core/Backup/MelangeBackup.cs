@@ -151,6 +151,33 @@ public static class MelangeBackup
         => ArchiveRestore.Restore(archivePath, targetDirectory, options);
 
     /// <summary>
+    /// Materializes an <b>explicitly different world</b> from a production archive — the
+    /// staging-seeded-from-production verb. Everything a restore does (fresh epoch, empty target,
+    /// all-or-nothing), plus the two deltas that make "different world" true rather than
+    /// aspirational: subscriber checkpoints are <b>dropped, not clamped</b>, because a clone has
+    /// no subscribers yet and production's event-delivery state resuming in staging is the exact
+    /// confusion this verb exists to prevent; and a provenance sidecar records what this world is
+    /// a clone of, so the support question is answered by a file and by every boot's log.
+    /// <para>
+    /// A separate verb rather than a restore flag, per phase 15's settlement: the semantics differ
+    /// in kind, and a flag would invite using one where the other was meant. What the archive
+    /// cannot carry, the operator still owns — a clone needs its own Postgres schema (the phase 08
+    /// bootstrap fills an empty one), its own data directory, and its own fleet. Originators are
+    /// untouched: they exist so allocators that might meet never collide, and two worlds whose
+    /// stores, tiers, and clients never meet collide nowhere.
+    /// </para>
+    /// </summary>
+    public static RestoreSummary Clone(string archivePath, string targetDirectory)
+        => ArchiveRestore.Restore(archivePath, targetDirectory, new ArchiveRestore.RestorePlan(IsClone: true));
+
+    /// <summary>
+    /// Reads a data directory's clone provenance, or null when the world is not a clone — the
+    /// programmatic form of the same answer <see cref="CloneProvenance"/> gives at boot.
+    /// </summary>
+    public static CloneProvenance? ReadProvenance(string dataDirectory)
+        => CloneProvenance.TryRead(dataDirectory);
+
+    /// <summary>
     /// CRC-walks every frame and dry-replays the archive into an in-memory projection, reporting
     /// per-table row counts and the LSN range. Any corruption throws
     /// <see cref="InvalidDataException"/> naming the frame. An unverified backup is a hope, not a
