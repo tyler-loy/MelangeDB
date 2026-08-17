@@ -68,7 +68,7 @@ DI in phase 02, the RAM ceiling in phase 07, and clustering prepared for by the 
 | Phase | Title | Status |
 | --- | --- | --- |
 | [12](road-to-0.1/plan-phase-12.md) | Typed client bindings | **Shipped.** A language-neutral `melange-schema.json` manifest exported by the `melange` CLI, consumed by the same analyzer to generate typed rows, refcounted merged caches, subscription helpers, and reducer stubs — one tree per consuming project, never by referencing server code. Plus a `Manual` dispatch mode that applies whole frames on the host's own thread, for engines that allow scene mutation only from theirs. See [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md). |
-| [11](road-to-0.1/plan-phase-11.md) | Reference workload port and validation | **Outstanding.** The port of a live 82-table SpacetimeDB game, and the only thing that will turn "tested" into "proven." |
+| [11](road-to-0.1/plan-phase-11.md) | Reference workload port and validation | **Shipped.** The 82-table SpacetimeDB game runs on MelangeDB and is developed on it daily — an ASP.NET host with `UseFasterHotStore()`, tracking `0.1.2-ci.*` prereleases from main. Parity is a live product rather than a checklist, which is the strongest form the bar could take. The port is also the sharpest source of evidence this repo has: it found the recovery regression, the client identity gap, the transient-rejection shape, the reducer-error mismapping, and the silent shape adoption — none of which the suite caught. **The plan's measurement half is not recorded here yet;** see [What's left](#whats-left). |
 
 Phase 12 was numbered after 11 but landed first: the port's scoping pass
 ([#20](https://github.com/tyler-loy/MelangeDB/issues/20)) measured 459 client call sites that are
@@ -96,9 +96,14 @@ deferred — mutually independent, in any order.
 
 ## What's left
 
-**Phase 11 is the whole remaining bar.** Everything else is implemented and tested; nothing has been
-proven against a production workload. Until that port lands, treat recorded benchmarks as
-measurements on a dev machine rather than as production characteristics.
+**The measurements phase 11 promised.** The port itself has landed — the reference workload runs on
+MelangeDB and is developed on it — but the controlled comparison the plan called its deliverable has
+not been recorded in this repo: memory for the 10km world against SpacetimeDB's and for the 20km
+world it cannot host, reducer latency p50/p99 for gather/move/attack/craft, terrain-streaming
+throughput across chunk boundaries, and concurrent players per node. Until those land here, **treat
+every benchmark in these docs as a dev-machine measurement rather than a production
+characteristic** — that distinction is the whole reason the phase asked for numbers, and phase 11's
+own risk register is explicit that a port reporting only wins is not evidence.
 
 Known deferrals, each recorded with its reasoning rather than left as an omission:
 

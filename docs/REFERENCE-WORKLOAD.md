@@ -1,8 +1,10 @@
 # Coverage check: the reference workload against the MelangeDB design
 
-The reference workload is a live SpacetimeDB game — 82 tables, three client trees, in production —
-and the only real workload MelangeDB has to satisfy. This audits [DESIGN.md](DESIGN.md) against what
-that module actually uses.
+The reference workload is a live game — 82 tables, three client trees — and the only real workload
+MelangeDB has to satisfy. This audits [DESIGN.md](DESIGN.md) against what that module actually uses.
+It was written against the game on SpacetimeDB, before the port; the game now runs on MelangeDB and
+is developed on it ([phase 11](road-to-0.1/plan-phase-11.md)), so read the numbers below as the
+shape the design had to satisfy rather than as a description of a system it still runs on.
 
 Every number below was measured against its source rather than estimated. The game itself is a
 private codebase, so it is referred to throughout the docs as "the reference workload"; what matters
