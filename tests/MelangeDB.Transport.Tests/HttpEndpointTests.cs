@@ -42,7 +42,13 @@ public class HttpEndpointTests
 
         var unknown = await http.PostAsync("/melange/call/NoSuchReducer", Json("[]"), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
-        Assert.Equal("unknown_reducer", (await ReadJsonAsync(unknown)).GetProperty("error").GetString());
+        var unknownBody = await ReadJsonAsync(unknown);
+        Assert.Equal("unknown_reducer", unknownBody.GetProperty("error").GetString());
+
+        // The message is wire text: exactly one sentence, with no exception-shaped suffix. It must
+        // also be the same sentence a non-client-callable reducer gets, or the difference confirms
+        // that one exists — see A_client_calling_a_scheduled_reducer_is_told_unknown.
+        Assert.Equal("No reducer named 'NoSuchReducer' is registered.", unknownBody.GetProperty("message").GetString());
 
         var badArgs = await http.PostAsync("/melange/call/SetChunk", Json("""["nope"]"""), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.BadRequest, badArgs.StatusCode);
@@ -51,6 +57,26 @@ public class HttpEndpointTests
         var rejected = await http.PostAsync("/melange/call/Move", Json("[1.5]"), TestContext.Current.CancellationToken);
         Assert.Equal(System.Net.HttpStatusCode.BadRequest, rejected.StatusCode);
         Assert.Equal("rejected", (await ReadJsonAsync(rejected)).GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task A_reducer_that_throws_ArgumentException_from_its_body_is_a_failure_not_a_missing_reducer()
+    {
+        // Issue #98. The arity check passing proves resolution succeeded, so by the time a body
+        // runs, "no such reducer" is not a reachable truth — and reporting it sends debugging at
+        // registration, the dispatch table, and stale assemblies for a fault two layers down.
+        await using var host = await TransportTestHost.StartAsync();
+        using var http = host.CreateHttp();
+
+        var failed = await http.PostAsync("/melange/call/ThrowArgumentFromBody", Json("[1]"), TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.InternalServerError, failed.StatusCode);
+        Assert.Equal("internal", (await ReadJsonAsync(failed)).GetProperty("error").GetString());
+
+        // And the name that genuinely does not resolve still answers 404, from the one condition
+        // that can be decided before any user code runs.
+        var unknown = await http.PostAsync("/melange/call/NoSuchReducer", Json("[]"), TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.NotFound, unknown.StatusCode);
+        Assert.Equal("unknown_reducer", (await ReadJsonAsync(unknown)).GetProperty("error").GetString());
     }
 
     [Fact]

@@ -115,6 +115,23 @@ public class LifecycleTests
     }
 
     [Fact]
+    public async Task A_socket_call_whose_body_throws_ArgumentException_is_a_failure_not_a_missing_reducer()
+    {
+        // Issue #98, on the socket path: its ArgumentException arm sat directly above the general
+        // handler and swallowed every library-thrown argument fault from inside a reducer.
+        await using var host = await TransportTestHost.StartAsync();
+        await using var raw = new RawSocketClient();
+        await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken);
+
+        await raw.SendAsync(
+            new CallReducerFrame(1, "ThrowArgumentFromBody", ReducerArgs.Encode([1u]), null), TestContext.Current.CancellationToken);
+        var result = await raw.ReceiveUntilAsync<ReducerResultFrame>(TestContext.Current.CancellationToken);
+
+        Assert.False(result.Ok);
+        Assert.Equal(MelangeErrorCodes.Internal, result.ErrorCode);
+    }
+
+    [Fact]
     public async Task A_client_calling_a_scheduled_reducer_is_told_unknown()
     {
         await using var host = await TransportTestHost.StartAsync();
@@ -125,6 +142,16 @@ public class LifecycleTests
         var result = await raw.ReceiveUntilAsync<ReducerResultFrame>(TestContext.Current.CancellationToken);
         Assert.False(result.Ok);
         Assert.Equal(MelangeErrorCodes.UnknownReducer, result.ErrorCode);
+
+        // Byte-for-byte what a name that genuinely does not resolve answers: a difference of any
+        // kind — including an exception's (Parameter '…') suffix — confirms this reducer exists.
+        await raw.SendAsync(new CallReducerFrame(2, "NoSuchReducer", ReducerArgs.Encode([]), null), TestContext.Current.CancellationToken);
+        var absent = await raw.ReceiveUntilAsync<ReducerResultFrame>(TestContext.Current.CancellationToken);
+        Assert.Equal(MelangeErrorCodes.UnknownReducer, absent.ErrorCode);
+        Assert.Equal(
+            absent.Message?.Replace("NoSuchReducer", "Respawn", StringComparison.Ordinal),
+            result.Message);
+        Assert.Equal("No reducer named 'Respawn' is registered.", result.Message);
 
         // Same answer over HTTP: the one-shot call path is a client origin too.
         using var http = host.CreateHttp();

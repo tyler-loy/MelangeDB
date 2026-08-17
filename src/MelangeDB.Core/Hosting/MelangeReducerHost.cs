@@ -99,7 +99,7 @@ public sealed class MelangeReducerHost
             // able to force a world tick. Answering "unknown" rather than "forbidden" keeps
             // their existence unconfirmed.
             if (descriptor.Kind != ReducerKind.Standard || _scheduledReducers.Contains(descriptor.Name))
-                throw new ArgumentException($"No reducer named '{reducerName}' is registered.", nameof(reducerName));
+                throw new UnknownReducerException(reducerName, nameof(reducerName));
 
             if (options.RateLimit.Enabled && !_rateLimiter.TryAcquire(caller, descriptor.Name, options.RateLimit))
             {

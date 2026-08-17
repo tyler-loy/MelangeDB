@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "0.1.2.0",
-  "schemaHash": "a5358172461a853178652d94fbe56f0d865a49da9bd0709666a9eac6805a5136",
+  "schemaHash": "dbaee701f4bfe8413a139cbfd5d81485a453fd31c0a72dbed8e26e647529b8a1",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -599,6 +599,16 @@
         {
           "name": "skillName",
           "kind": "String",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "ThrowArgumentFromBody",
+      "params": [
+        {
+          "name": "anything",
+          "kind": "UInt32",
           "isArray": false
         }
       ]
