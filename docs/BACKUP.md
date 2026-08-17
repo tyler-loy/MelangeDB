@@ -66,7 +66,10 @@ The pin is bounded, like every truncation pin: a client that stops reading is cu
 client must not become a full disk. The aborted partial download fails `verify`, which is the
 point of verify. Watch `melange.backup.duration` — it is also the pin's hold time; archives that
 stream for long enough to matter are the cue to back up right after a snapshot, when the tail
-riding along is smallest.
+riding along is smallest. A pin that outlives its timeout anyway shows up where every other holder
+of the log does: as the `backup-pin` truncation floor in `melange.log.truncation_floor`, and in the
+`melange-retention` health check's description — see the runbook in
+[OBSERVABILITY.md](OBSERVABILITY.md).
 
 In-process schedulers can take the same capture without HTTP: `MelangeBackup.CreateOnline` in
 `MelangeDB.Core`.

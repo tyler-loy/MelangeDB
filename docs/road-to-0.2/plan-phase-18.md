@@ -1,5 +1,7 @@
 # Phase 18 — Truncation-floor observability
 
+**Status: Shipped.**
+
 **Goal:** "why is the log not truncating" — the disk-filling question — answerable in one look:
 every truncation floor has a name, the governing floor is visible in metrics and logged at
 truncation time, and a pinned log surfaces in the health endpoint before it surfaces as a full
@@ -67,17 +69,66 @@ grow teeth this phase deliberately does not have. Naming first; policy only with
 
 ## Decisions to settle
 
-### Open: threshold in records, bytes, or time
+### Settled: the threshold is in records, and the log line carries bytes
 
-The pinned quantity is naturally records (LSNs are dense); the operator's fear is bytes; the
-truest signal is time-behind-head. Leaning: records for the check's threshold (cheap, exact,
-already the unit of `melange.applier.lag`, whose threshold precedent this follows), with bytes
-exposed on the gauge's log line since truncation already knows the file length. Time requires
-per-LSN timestamps that truncated records no longer have; not worth inventing storage for.
+As the leaning. `HealthChecks:RetentionPinnedThreshold` counts records — cheap, exact, and the
+unit `melange.applier.lag`'s threshold already established — and both truncation log lines carry
+`LogBytes` beside `PinnedRecords`, since the file's length is known for free at the moment of the
+decision. Time-behind-head stayed out: it needs per-LSN timestamps that truncated records no longer
+have.
 
-### Open: does the unnamed overload survive
+One thing the plan did not anticipate: the default has to sit **above
+`Snapshots:IntervalTransactions`**, because the pinned distance reaches one snapshot interval in
+ordinary operation — the head advances between snapshots while the floors are the reading taken at
+the last one. The default is 1,000,000 against a 100,000-transaction interval, and the option's doc
+says to raise both together.
 
-Leaning: keep `AddTruncationFloor(Func<ulong?>)` delegating to the named one with a
-`"unnamed"` tag rather than breaking the public API pre-1.0 for a string. The pre-1.0 caveat
-permits the break, but the cost of keeping it is one constant, and third-party floors that
-never name themselves still show up — as `"unnamed"`, which is itself diagnostic.
+### Settled: the unnamed overload survives
+
+As the leaning. `AddTruncationFloor(Func<ulong?>)` delegates to the named registration under
+`"unnamed"`. The cost is one constant; the benefit is that a third-party floor that never names
+itself still appears in the report and the metric, which is itself the diagnosis.
+
+## Shipped notes
+
+- **The floor set is larger than the registration list.** The plan's seven names were the
+  `AddTruncationFloor` call sites, but three more mechanisms bound truncation without ever
+  registering: the snapshot LSN itself (the ceiling), each applier's checkpoint, and the Resume
+  retention window, all applied inline in `TruncateLogCore`. All three are now named floors in the
+  same report, because an operator asking "who is holding the log" does not care which of them was
+  a registration. `snapshot` governing is what a healthy log looks like: nothing is holding
+  anything back. Appliers report under their own applier name (`postgres`, `hot-store`) rather than
+  the plan's illustrative `postgres-applier`, so `melange.applier.lag{applier="postgres"}` and
+  `melange.log.truncation_floor{floor="postgres"}` name the same thing.
+
+- **The floors are a cached reading, not a live query** — the one design decision this phase turned
+  on. Evaluating floors from a metrics scrape is not merely wasteful, it is wrong three times over:
+  providers run under the engine write lock by contract (`PinnedTruncationFloor` walks the pin list
+  with no further locking), a scrape would race that state, and one registered floor — the
+  cluster's borrowed-sidecar refresh — *writes a file* on evaluation, registered as a floor
+  precisely so it runs when truncation is being decided. So `TruncateLogCore` stores the whole
+  reading and the gauges pair it with the **live** head. That pairing is not a compromise: it is
+  what makes `pinned_records` grow while a stuck holder stands still, which is the shape an
+  operator alerts on. The cadence is self-correcting — a log that is growing is taking commits, and
+  commits are what drive snapshots.
+
+- **Absent beats zero.** Neither gauge publishes anything before the first truncation decision, and
+  `melange-retention` reports healthy with an explicit "no truncation has been decided yet". A zero
+  would have read as "healthy" on a log nothing has ever compacted.
+
+- **The removed-nothing line is the same shape as the truncated line, on purpose.** From silence an
+  operator cannot distinguish a log that is already compacted to its floor from one that has
+  stopped compacting; the second fills the disk. `1510 LogTruncationPinned` carries the same
+  fields as `1503`, so an alert keying on `FloorName` and `FloorLsn` works across both, and a
+  stream of 1510 with one unchanging `FloorLsn` is the diagnosis without further work.
+
+- **The resume window is scanned no harder than before.** Its loop still stops at the floor the
+  other holders already set, so when it does not bind, its reading is the ceiling it scanned to —
+  "permits removing at least this much". That keeps the tag present in the metric rather than
+  flickering in and out, at no extra read cost.
+
+- **Duplicate names resolve to the lowest reading in the metric**, while the report keeps every
+  registration. Two shards' freeze markers, or several unnamed third-party floors, would otherwise
+  produce a duplicated tag set where the last writer wins arbitrarily.
+
+- Both `/melange/status` and automatic floor eviction stayed out of scope, unchanged from the plan.

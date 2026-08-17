@@ -208,6 +208,8 @@ Meter name: `MelangeDB`.
 | `melange.log.group_commit.batch_size` | histogram | `{record}` | — | 17 |
 | `melange.writeset.rows` | histogram | `{row}` | `reducer` | 01 |
 | `melange.log.head_lsn` | gauge | `{lsn}` | — | 01 |
+| `melange.log.truncation_floor` | gauge | `{lsn}` | `floor` | 18 |
+| **`melange.log.pinned_records`** | gauge | `{record}` | — | 18 |
 | **`melange.applier.lag`** | gauge | `{tx}` | `applier` | 01 |
 | `melange.store.resident_bytes` | gauge | `By` | `table` | 07 |
 | `melange.store.page_faults` | counter | `{fault}` | `table` | 07 |
@@ -249,6 +251,22 @@ corresponds to a documented silent failure mode:
   load. It needs to be visible before players feel it.
 - **`melange.shard.span_violations`** — the one contract MelangeDB cannot verify statically. Non-zero in
   production means transactions are silently going distributed.
+- **`melange.log.pinned_records`** — the log is the system of record, so anything that still needs old records
+  keeps them, and a holder that stops checkpointing fills a disk with a log that will not compact. Alert on
+  this one number; drill into `melange.log.truncation_floor`'s `floor` tag for the name.
+
+**Reading the two truncation gauges.** `melange.log.truncation_floor` reports, per named holder, the highest LSN
+it permits compaction to remove — as of the last truncation *decision*, not as of the scrape. Floor providers
+run under the engine write lock and one of them writes a file on evaluation (the cluster's borrowed-sidecar
+refresh is registered as a floor precisely so it runs at that moment), so evaluating them per scrape would race
+engine state and rewrite that sidecar continuously. `melange.log.pinned_records` pairs that cached floor with
+the **live** head, which is exactly the number that grows while a stuck holder stands still. Neither series is
+published at all until a decision has been made — snapshots off, `Snapshots:TruncateLog` off, or no snapshot
+yet: an absent series says "never evaluated", where a zero would say "healthy". The floor names are a small
+static set by construction (they name mechanisms, not instances), which is what keeps the `floor` tag on the
+right side of the cardinality rule: `snapshot`, `resume-window`, `event-bus`, `backup-pin`, `shard-freeze`,
+`shard-import`, `shard-sidecar`, `cluster-events`, one per applier name, and `unnamed` for a third-party floor
+registered through the overload that takes no name.
 
 ## Logs
 
@@ -271,13 +289,18 @@ marker LSN the new shape governs from; Warning-level because automatic must neve
 `1403 SubscriberCheckpointEvicted` — the loud eviction the expiry design promises — and
 `1404 SubscriberLostPlace`, how a returning subscriber is told it starts from current state (06);
 `1501 ResidencyReport` — the startup residency report: per resident table row count and measured bytes, the
-buffer-pool cap, and the total they sum to — `1502 SnapshotWritten`, `1503 LogTruncated` (naming the floor it
-respected), `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
+buffer-pool cap, and the total they sum to — `1502 SnapshotWritten`, `1503 LogTruncated` — since phase 18 it
+names the *governing* floor rather than the anonymous LSN it respected: floor name, floor LSN, records still
+pinned behind the head, and the log file's size in bytes — `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
 `1505 AutoResidencyDemoted` — an `Auto` table crossing its threshold is the cliff arriving, and it announces
 itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, `1508 ResidencyChanged` — the careful
-per-table override being applied at runtime (07) — and `1509 SnapshotAlreadyRunning`, Debug-level, the
+per-table override being applied at runtime (07) — `1509 SnapshotAlreadyRunning`, Debug-level, the
 only signal that snapshots now write outside the write lock: an interval short enough for two to
-overlap is a configuration to raise, not an error to chase; `1601 PostgresApplierStalled` — the loud stall the phase-08
+overlap is a configuration to raise, not an error to chase; and `1510 LogTruncationPinned` — a truncation that
+removed **nothing** because a floor pinned it, naming the holder, its LSN, the head, the pinned record count,
+and the bytes they occupy. The same shape as 1503 on purpose: from silence an operator cannot tell a log that
+is already compacted from one that has stopped compacting, and the second is the one that fills the disk
+(road-to-0.2 phase 18); `1601 PostgresApplierStalled` — the loud stall the phase-08
 risk register demands: first failure always, then every 30 seconds under `Diagnostics:ReportApplierLag` with
 the growing lag — `1602 PostgresApplierRecovered`, `1603 PostgresSchemaMigrated` (the DDL AutoMigrate
 applied — automatic must not mean silent), `1604 PostgresMigrationRefused` (carrying the exact pending DDL,
@@ -413,6 +436,41 @@ host to register into, so the first one landed with phase 02's host integration 
 | `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form | 08 |
 | `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
 | `melange-capacity` | Two provision attempts failed or expired and the loop has stopped asking (**shipped, 14**) — EventId 1738 in health-endpoint form, cleared when a ticket-named node joins. Degraded while a ticket is outstanding; healthy off the hub or with no provisioner registered. | 14 |
+| `melange-retention` | More records are pinned above the log's truncation floor than `HealthChecks:RetentionPinnedThreshold` allows (**shipped, 18**) — the disk-filling alarm, with the governing floor's name and LSN in the description. `melange.log.pinned_records` is its metric form. Healthy trivially when snapshots or truncation are not configured, and while no truncation has been decided yet. The applier check overlaps by one holder deliberately: an applier is one of seven, and it fires far earlier at its own threshold. | 18 |
+
+## Runbook: the log is growing — who is holding it
+
+The commit log is the system of record, so everything that still needs old records keeps them, and each of
+those holders is a **truncation floor**. Every one of them is *supposed* to pin the log — briefly. The failure
+is one of them pinning it for days: a crashed event subscriber that never checkpoints again, a stalled
+applier, a handoff marker orphaned by a bug, a backup pin whose stream died. The symptom is always the same
+disk. This is the sequence of looks that names the cause.
+
+1. **Is anything holding it at all?** `melange.log.pinned_records`. Flat and small is a healthy log; a line
+   climbing without ever falling back is a floor that has stopped moving. Note that it reaches one
+   `Snapshots:IntervalTransactions` in normal operation — the head advances between snapshots — so the shape
+   to react to is *never returning to the floor*, not the height alone.
+2. **Which holder?** `melange.log.truncation_floor`, broken out by the `floor` tag. The lowest series is the
+   one governing. `snapshot` being lowest means nothing is holding the log back at all; anything else names a
+   mechanism: `event-bus` (the slowest live subscriber's checkpoint), an applier name such as `postgres`,
+   `resume-window`, `backup-pin`, `shard-freeze` / `shard-import` (a handoff saga that never resolved),
+   `cluster-events`, or `unnamed` for a floor some third-party code registered without naming.
+3. **Confirm against the log line.** Every truncation decision says the same thing at Information level:
+   `1503 LogTruncated` when records went, `1510 LogTruncationPinned` when the decision removed nothing because
+   a floor pinned it. Both carry `FloorName`, `FloorLsn`, `PinnedRecords`, and `LogBytes`. A stream of 1510
+   with one unchanging `FloorLsn` is the diagnosis; the byte figure is what to compare against the disk.
+4. **Then work the named holder, not the log.** `event-bus` → a subscriber that never checkpoints, which the
+   bus's own checkpoint expiry (EventId `1403 SubscriberCheckpointEvicted`) resolves on its own timescale; an
+   applier name → `melange.applier.lag` and the `melange-applier` check, which say why that projection
+   stopped; `backup-pin` → a backup stream that never finished (`Backup:StreamStallTimeoutMs`);
+   `shard-freeze` / `shard-import` → an unresolved handoff saga, visible in the cluster events;
+   `resume-window` → `Resume:RetentionWindowSeconds` is simply larger than the truncation interval, which is
+   configuration rather than a fault.
+
+`melange-retention` is the same finding as an alert: unhealthy once the pinned distance passes
+`HealthChecks:RetentionPinnedThreshold`, with the governing floor named in its description. Truncation
+floors are never evicted automatically — expiring an abandoned holder is policy the event bus owns for its
+own checkpoints, and generalizing it would let observability grow teeth it deliberately does not have.
 
 ## Standing requirement
 
