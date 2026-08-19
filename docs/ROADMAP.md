@@ -68,7 +68,7 @@ DI in phase 02, the RAM ceiling in phase 07, and clustering prepared for by the 
 | Phase | Title | Status |
 | --- | --- | --- |
 | [12](road-to-0.1/plan-phase-12.md) | Typed client bindings | **Shipped.** A language-neutral `melange-schema.json` manifest exported by the `melange` CLI, consumed by the same analyzer to generate typed rows, refcounted merged caches, subscription helpers, and reducer stubs — one tree per consuming project, never by referencing server code. Plus a `Manual` dispatch mode that applies whole frames on the host's own thread, for engines that allow scene mutation only from theirs. See [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md). |
-| [11](road-to-0.1/plan-phase-11.md) | Reference workload port and validation | **Shipped.** The 82-table SpacetimeDB game runs on MelangeDB and is developed on it daily — an ASP.NET host with `UseFasterHotStore()`, tracking `0.1.2-ci.*` prereleases from main. Parity is a live product rather than a checklist, which is the strongest form the bar could take. The port is also the sharpest source of evidence this repo has: it found the recovery regression, the client identity gap, the transient-rejection shape, the reducer-error mismapping, and the silent shape adoption — none of which the suite caught. **The plan's measurement half is not recorded here yet;** see [What's left](#whats-left). |
+| [11](road-to-0.1/plan-phase-11.md) | Reference workload port and validation | **Shipped.** The 82-table SpacetimeDB game runs on MelangeDB and is developed on it daily — an ASP.NET host with `UseFasterHotStore()`, tracking the `-ci.*` prereleases published from `main` — deliberately not named as a version here, since `VersionPrefix` moves every release and a pinned number dates this page. Parity is a live product rather than a checklist, which is the strongest form the bar could take. The port is also the sharpest source of evidence this repo has: it found the recovery regression, the client identity gap, the transient-rejection shape, the reducer-error mismapping, and the silent shape adoption — none of which the suite caught. **The plan's measurement half is not recorded here yet;** see [What's left](#whats-left). |
 
 Phase 12 was numbered after 11 but landed first: the port's scoping pass
 ([#20](https://github.com/tyler-loy/MelangeDB/issues/20)) measured 459 client call sites that are
@@ -94,6 +94,27 @@ deferred — mutually independent, in any order.
 | [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Shipped |
 | [19](road-to-0.2/plan-phase-19.md) | Backup, second pass: `restore --check` (the boot-proof), `melange clone` (explicitly a different world), `restore --at-lsn` | **Shipped** |
 
+## M5 — 0.3: the day-to-day surface · planned
+
+Post-0.2 work, planned in [road-to-0.3/](road-to-0.3/). 0.1 built the engine and 0.2 was capacity
+and operations; both made the database do more. 0.3 is the surface a team building on this every day
+still has to invent for itself — inspect what the log already recorded, test a tick without standing
+up a host, and reach the world from a browser. Phase 20 is not that, and comes first anyway: it is
+the measurement debt below, and three separate decisions are waiting on it.
+
+| Phase | Title | Status |
+| --- | --- | --- |
+| [20](road-to-0.3/plan-phase-20.md) | The measurement pass: phase 11's outstanding half, plus the reassignment window and the per-tick cost of scheduled reducers | Planned |
+| [21](road-to-0.3/plan-phase-21.md) | `melange inspect`: time-travel over the commit log — jump to an LSN, see the world, the reducer that produced it, and its write set | Planned |
+| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Planned |
+| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Planned |
+| 24 | Scheduler lane: simulation work yields to client-initiated work when they contend | [Design record](design/scheduler-lanes.md) written; conditional on a phase 20 measurement, and may close as a refusal |
+
+Phases 21–23 are mutually independent and land in any order. Phase 24 is gated on 20 for its sizing
+and gets a design record before a plan, the way
+[design/elastic-rebalancing.md](design/elastic-rebalancing.md) preceded 13–14 — it is the only one
+of the set that changes engine semantics.
+
 ## What's left
 
 **The measurements phase 11 promised.** The port itself has landed — the reference workload runs on
@@ -105,12 +126,30 @@ every benchmark in these docs as a dev-machine measurement rather than a product
 characteristic** — that distinction is the whole reason the phase asked for numbers, and phase 11's
 own risk register is explicit that a port reporting only wins is not evidence.
 
+This is now scheduled as [phase 20](road-to-0.3/plan-phase-20.md), which also picks up two
+measurements phase 11 did not ask for, because decisions made since then wait on them: the
+reassignment window for a crowded shard, and what the fourteen scheduled reducers cost a player
+reducer on the same lock.
+
 Known deferrals, each recorded with its reasoning rather than left as an omission:
 
 - **Joins in subscriptions.** Incrementally maintaining them is differential-dataflow territory; an
   audit of a real 82-table game found **zero** subscriptions using one.
 - **Unreliable/UDP transport — permanently.** A reducer is a transaction; a client must know whether
   it committed. Rate limiting plus client-side interpolation is the supported answer.
+- **A stock admin console — permanently.** The recurring request is a shipped web UI: live tables,
+  ad-hoc SQL, reducer call log, shard map, load, retention floors, backup status, who is connected.
+  Every one of those is already reachable, and that is the deliverable: the ad-hoc SQL endpoint
+  (phase 08), the `melange-schema.json` manifest (phase 12), and the span and metric register in
+  [OBSERVABILITY.md](OBSERVABILITY.md) — `melange.cluster.shard.utilization` and
+  `melange.shard.owned` for the shard map and load, `melange.log.truncation_floor` for retention
+  floors (phase 18), `melange.backup.*` for backup status (phase 15), `melange.connections.active`
+  for sessions, the `melange.reducer` span for the call log. **Publishing the signals is the
+  engine's job; prescribing the tool that draws them is not.** A console is a product with opinions
+  about who operates it, and it would be built against a surface this project already commits to
+  keeping stable. The gap is deliberate rather than an oversight — the standing convention that
+  every change instruments what it adds is what keeps the surface complete enough that the gap
+  stays cheap to fill.
 - **Schema migration against an existing log is no longer deferred** — the relational half settled
   in phase 08, and the hot-tier half shipped as
   [phase 16](road-to-0.2/plan-phase-16.md): additive automatic and loud, destructive refused and
@@ -120,7 +159,8 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
 - **Dynamic *assignment* is no longer deferred** — it is M4 above, planned as phases 13–14.
   What stays deferred: dynamic boundary *splitting* (the quadtree; its narrowed customer and
   reopening trigger are recorded in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)),
-  shard-level HA, and sharding the hub.
+  [shard-level HA](idea-bin/shard-ha-warm-replica.md) (a warm-replica shape and its reopening
+  trigger are in the idea bin; this deferral stands until that trigger fires), and sharding the hub.
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
 - **A complete read-modify-write detector for snapshot reducers.** The detectable common shape —
   `Find`, then `Update` of the same row, inside a body declared `Isolation.Snapshot` — is built as
@@ -128,3 +168,31 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
   general, and a body that recomputes a row it also read is legitimate, so the diagnostic can never
   be an error and its silence is not proof of eligibility. The other open guardrails are recorded in
   [design/snapshot-isolation.md](design/snapshot-isolation.md).
+
+## The 1.0 question, deliberately open
+
+**What 1.0 requires is not decided, and is not being decided yet.** Pre-1.0 means the public API may
+break in any release ([RELEASING.md](RELEASING.md), and the caveat at the top of
+[CHANGELOG.md](../CHANGELOG.md)), and that has been cheap so far because the only consumer tracks
+prereleases from `main` and absorbs breaks as they land.
+
+0.3 is where it stops being free. That milestone adds a second public package
+(`MelangeDB.Testing`), a package in a second ecosystem, and — most binding of all — a **written
+client-conformance contract**, which is the kind of commitment that gets expensive to walk back once
+anyone has implemented against it.
+
+**The trigger for deciding: the reference workload reaching alpha.** An API freeze argued in the
+abstract produces a list nobody can check; the same question asked by a product with players has
+concrete answers about which breaks actually hurt. Revisit then, with 0.3's numbers and its
+conformance document both in hand.
+
+## Ideas that are neither planned nor refused
+
+The deferrals above are **decided**: each one has an argument behind it, and several are permanent.
+Things that have been thought about enough to have a shape but not enough to have a verdict live in
+[idea-bin/](idea-bin/) instead, one file each, every entry carrying a shape, what it would cost, and
+the measurement or named consumer that would turn it into a phase. An idea there is not a commitment
+and not a soft refusal — it is an argument left open on purpose.
+
+Where an idea proposes a shape for something the list above already refuses — currently
+[shard-level HA](idea-bin/shard-ha-warm-replica.md) — the deferral stands until its trigger fires.

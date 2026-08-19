@@ -54,6 +54,12 @@ a MelangeDB version is one coherent set.
 **Pre-1.0 means the public API may break in any release.** That is stated in the README, the
 changelog, and here, because a consumer pinning `0.x` deserves to know it before rather than after.
 
+What 1.0 requires is deliberately undecided, with the reasoning and the trigger for deciding it
+recorded in [ROADMAP.md](ROADMAP.md#the-10-question-deliberately-open). Note for whoever revisits
+it: "all packages publish together at one version" is a rule written when every package was a NuGet
+package, and a second ecosystem tests it — see
+[road-to-0.3 phase 23](road-to-0.3/plan-phase-23.md).
+
 ## Cutting a release
 
 1. Open a PR that bumps `VersionPrefix` in `Directory.Build.props` and moves the `CHANGELOG.md`
@@ -177,10 +183,10 @@ Or as a `PackageReference`:
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="MelangeDB.Core" Version="0.1.0" />
-  <PackageReference Include="MelangeDB.Server" Version="0.1.0" />
-  <PackageReference Include="MelangeDB.Storage.Faster" Version="0.1.0" />
-  <PackageReference Include="MelangeDB.CodeGen" Version="0.1.0" />
+  <PackageReference Include="MelangeDB.Core" Version="0.2.0" />
+  <PackageReference Include="MelangeDB.Server" Version="0.2.0" />
+  <PackageReference Include="MelangeDB.Storage.Faster" Version="0.2.0" />
+  <PackageReference Include="MelangeDB.CodeGen" Version="0.2.0" />
 </ItemGroup>
 ```
 
