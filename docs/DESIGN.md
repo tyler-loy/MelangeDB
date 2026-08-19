@@ -464,9 +464,16 @@ samples/                        worker-service host + console client
   *rows* no longer travel as MessagePack maps: they travel as the schema-ordered v1 bytes the store
   already holds, described once per subscription by a wire descriptor. That is the source-generated
   binary format, arrived at from the other direction — measured at 4.6–12.4× on encode and 2.4–2.9× on
-  decode, with the bytes a comparatively minor 1.18–1.40×. Reducer arguments and parameter maps are
-  still MessagePack values and are the remaining half. See
+  decode, with the bytes a comparatively minor 1.18–1.40×. See
   [design/performance-sweep.md](design/performance-sweep.md).
+  **The remaining half is narrower than it first reads.** Reducer *arguments* already left
+  MessagePack: `ReducerArgs` encodes a count plus self-describing tagged values, which is why an
+  argument payload decodes with no schema at all. What still rides as MessagePack values is the
+  **subscription and resume parameter map** (`SubscribeFrame.Parameters`, `ResumeSubscription`) —
+  one map per subscribe, not per row, which is why it has never been worth a break on its own.
+  Sequencing note: [road-to-0.3 phase 23](road-to-0.3/plan-phase-23.md) is when a second client
+  runtime implements this encoding, and pinning a contract is cheaper before a second
+  implementation exists than after.
 - ~~**Schema migration**~~ — **Settled in phases 08 and 16; both tiers follow one rule: additive is
   automatic and loud, destructive is refused and manual.** The relational half (phase 08): additive
   DDL under `Postgres:AutoMigrate`, destructive refused with the pending DDL printed. The hot-tier
@@ -486,5 +493,12 @@ samples/                        worker-service host + console client
   logs which one governed — including the decision that removes nothing. See
   [plan-phase-07.md](road-to-0.1/plan-phase-07.md) and
   [plan-phase-18.md](road-to-0.2/plan-phase-18.md).
-- **Codegen targets** — a real project has several client trees (game client, admin web, CLI tools)
-  generating from one schema. `MelangeDB.CodeGen` should emit to multiple output trees from the start.
+- ~~**Codegen targets**~~ — **Settled in phase 12.** A real project has several client trees (game
+  client, admin web, CLI tools) generating from one schema, and the answer was to invert the
+  question: generation is **per consuming project**, driven by the `melange-schema.json` manifest as
+  an AdditionalFile, never by one emitter fanning out to several output trees and never by
+  referencing server code. Each tree generates its own bindings from the same manifest, so "multiple
+  targets" is the default rather than a feature. The reference workload's three trees are the
+  worked example. See [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md) and
+  [plan-phase-12.md](road-to-0.1/plan-phase-12.md); the *language* half of this question is
+  [road-to-0.3 phase 23](road-to-0.3/plan-phase-23.md).

@@ -4,9 +4,11 @@ A C# alternative to [SpacetimeDB](https://spacetimedb.com): a store where your a
 *inside* the transaction boundary, and connected clients subscribe to live query results instead of
 polling an API.
 
-> **Status: alpha, unreleased.** The engine, transport, auth, scheduling, event bus, paged storage,
-> Postgres tier, clustering, and typed client bindings are implemented and tested. Nothing is at 1.0
-> and the public API will break between versions. A live 82-table game — the
+> **Status: 0.2.0, on nuget.org, pre-1.0.** The engine, transport, auth, scheduling, event bus,
+> paged storage, Postgres tier, clustering with elastic assignment, schema migration, and backup and
+> restore are implemented and tested, along with typed client bindings and the `melange` CLI.
+> **Nothing is at 1.0 and the public API may break in any release** — what 1.0 requires is
+> [deliberately still open](docs/ROADMAP.md#the-10-question-deliberately-open). A live game — the
 > [phase 11](docs/ROADMAP.md) reference workload, ported off SpacetimeDB — runs on it and is
 > developed on it daily; what is still missing is the published comparison that turns that into
 > numbers, so treat the benchmarks in these docs as dev-machine measurements.
@@ -22,6 +24,22 @@ MelangeDB exists to fix three specific things:
   not a server you deploy. Reducers are DI-resolved classes, so `IConfiguration`, `ILogger<T>`, and
   `IOptionsMonitor<T>` are constructor-injected like anything else — Azure App Configuration and
   feature flags just work.
+
+## Install
+
+```
+dotnet add package MelangeDB.Core
+dotnet add package MelangeDB.Server           # WebSocket transport and subscriptions
+dotnet add package MelangeDB.Storage.Faster   # the paged hot store
+dotnet add package MelangeDB.CodeGen          # the source generator
+```
+
+All packages ship together at one version. `MelangeDB.CodeGen` is the generator — referencing it is
+all it takes. Add `MelangeDB.Client` to a client project, `MelangeDB.Cluster` to run more than one
+node, and `MelangeDB.Storage.Postgres` for the optional relational tier. The `melange` CLI is a
+dotnet tool: `dotnet tool install -g MelangeDB.Cli`. See
+[docs/RELEASING.md](docs/RELEASING.md#consuming-the-packages) for the full set and for consuming
+per-commit prereleases.
 
 ## A first look
 
@@ -107,10 +125,18 @@ A runnable version of all of this lives in [`samples/`](samples).
 | Clustering: placement, hub/shard roles, instancing | Shipped (09) |
 | Clustering: spatial sharding, seamless handoff | Shipped (10) |
 | Typed client bindings, schema manifest, `melange` CLI | Shipped (12) |
-| Production validation against a live game | Outstanding (11) |
+| Elastic clustering: load-following assignment, provisioned capacity, scale-in | Shipped (13, 14) |
+| Backup and restore: `.mbak` archives, point-in-time, clone, boot-proof | Shipped (15, 19) |
+| Hot-tier schema migration: additive automatic, destructive refused | Shipped (16) |
+| Group commit: coalesced fsyncs at unchanged durability | Shipped (17) |
+| Named truncation floors and the retention health check | Shipped (18) |
+| Validation against a live game | Shipped (11) — its measurement pass is outstanding |
 
-Deliberately out of scope: joins in subscriptions, an unreliable/UDP transport, and a sandbox for
-reducer code. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) rather than left as an omission.
+Deliberately out of scope: joins in subscriptions, an unreliable/UDP transport, a sandbox for
+reducer code, and a stock admin console. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) or
+recorded as a refusal in [docs/ROADMAP.md](docs/ROADMAP.md) rather than left as an omission — and
+what is genuinely undecided is in [docs/idea-bin/](docs/idea-bin/) instead, with the trigger that
+would settle it.
 
 ## Docs
 
@@ -133,9 +159,13 @@ reducer code. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) rather than lef
   `backup verify` verbs. An unverified backup is a hope, not a backup.
 - **[docs/LOAD-TESTING.md](docs/LOAD-TESTING.md)** — the load rig, what it measures, and the recorded numbers.
 - **[docs/ROADMAP.md](docs/ROADMAP.md)** — what shipped in each phase, the decisions each one settled, and
-  what's left.
+  what's left. Its deferrals are decided refusals; [docs/idea-bin/](docs/idea-bin/) holds the ones
+  still open, each with the trigger that would turn it into work.
 - **[docs/REFERENCE-WORKLOAD.md](docs/REFERENCE-WORKLOAD.md)** — the design audited against a live
-  82-table SpacetimeDB game, as a reality check on scope.
+  82-table SpacetimeDB game, as a reality check on scope. (That audit is a snapshot taken before the
+  port; the game has grown since.)
+- **[docs/design/](docs/design/)** — worked-through design records for the decisions too big for a
+  phase plan: elastic rebalancing, snapshot isolation, the performance sweep, and scheduler lanes.
 - **[docs/RELEASING.md](docs/RELEASING.md)** — how the packages are versioned and published.
 
 ## Layout
@@ -154,6 +184,7 @@ reducer code. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) rather than lef
 | `src/MelangeDB.OpenTelemetry` | Optional: registers MelangeDB's signal names with OpenTelemetry. |
 | `src/MelangeDB.Cli` | The `melange` dotnet tool — schema export and tooling. |
 | `tools/MelangeDB.LoadTest` | The load rig behind the recorded performance numbers. |
+| `bench/MelangeDB.Benchmarks` | BenchmarkDotNet suites for the commit, apply, and wire paths. |
 | `samples/` | A worker-service host and a console client that talk to each other. |
 
 ## Building

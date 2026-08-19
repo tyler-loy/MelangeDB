@@ -6,6 +6,13 @@ It was written against the game on SpacetimeDB, before the port; the game now ru
 is developed on it ([phase 11](road-to-0.1/plan-phase-11.md)), so read the numbers below as the
 shape the design had to satisfy rather than as a description of a system it still runs on.
 
+**The game has kept growing since the port, and the gap matters for one thing.** The audited
+SpacetimeDB module sits at 82 table files and 39 reducer files; the live MelangeDB module is past 97
+and 48, and moves most weeks. Nothing in this audit's *conclusions* is affected — it records which
+design features a real workload needed, and growth does not un-need them. What it does affect is any
+head-to-head measurement against the frozen baseline, which now compares two different games; see
+[road-to-0.3 phase 20](road-to-0.3/plan-phase-20.md).
+
 Every number below was measured against its source rather than estimated. The game itself is a
 private codebase, so it is referred to throughout the docs as "the reference workload"; what matters
 here is the shape of what it does, all of which is reproduced in the tables that follow.
