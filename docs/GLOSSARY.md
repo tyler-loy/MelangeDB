@@ -43,6 +43,11 @@ A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `Relational` + `Glo
 
 Rows union, columns intersect. Getting this backwards produces either a leak or an unusable system.
 
+Policies are evaluated **per row op**, when the row they guard is written — not when a table they
+*read* changes. A row that becomes visible because a different row changed is not delivered until the
+subscription is re-established; neither touching the row nor re-scoping picks it up. See
+[THREAT-MODEL.md](THREAT-MODEL.md#when-policies-are-evaluated--and-when-they-are-not).
+
 ### Delta vs. domain event
 
 Both flow out of the commit log; they are not the same thing.

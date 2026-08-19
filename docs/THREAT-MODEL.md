@@ -99,6 +99,47 @@ The composition rule, which is easy to get backwards:
 - `[ServerOnly]` exclusion has **no modes**: it holds for admins, and it holds in ad-hoc SQL's owner mode.
   Owner mode bypasses row and column *policies*; it does not reopen columns that never leave the process.
 
+### When policies are evaluated — and when they are not
+
+The composition rule says what a policy admits. This says *when* it is asked, which turns out to be a
+correctness property rather than a performance note.
+
+> **Policies are evaluated per row op, on the fan-out path.** A policy is consulted when the row it
+> guards is written — never when a row it *reads* changes. So a row that becomes visible because some
+> other row changed is not delivered, and a row that becomes invisible the same way is not withdrawn.
+
+The shape that surfaces this is a membership-scoped table — "visible if the caller is in this group":
+
+- a caller joins the group;
+- **existing subscribers see the newcomer**, because the newcomer's row is a write their subscriptions
+  evaluate, and by then they were already members;
+- **the newcomer does not see the incumbents**, because nothing wrote to the incumbents' rows. The only
+  thing that changed is the row the policy *reads* to decide.
+
+It presents as a one-sided roster: complete on one side, self-only on the other. It looks like a
+delivery bug, and the two obvious remedies both fail silently.
+
+**Touching the affected rows from the same reducer does not work.** Fan-out runs before the hot store
+applies, so policy reads of other tables see pre-transaction committed state — in which the newcomer
+is still not a member. The row ops are produced, the policy evaluates them invisible, and nothing is
+sent. (That pre-transaction guarantee is deliberate and worth keeping: it is also what stops a policy
+observing a partially applied write set.)
+
+**Re-scoping the subscription does not work either.** A re-scope returns a diff, and it reconstructs
+what the client already holds by re-running the *old* query under the *current* policy. A row that
+became visible without being written is therefore counted as already-held and never sent. Re-scope is
+the right tool for a moving window over stable visibility — terrain streaming — and the wrong one here.
+
+**What works is a fresh subscription.** An initial set is computed by scanning the store and applying
+the policy to committed state, so it reflects visibility as it stands. Unsubscribe and subscribe again
+for the affected scope.
+
+This is a design consequence rather than a defect. Re-evaluating automatically means incremental view
+maintenance over arbitrary C#: either every subscription re-tested against every row on every
+transaction, or a declared-dependency system that stops policies being ordinary C# code. Both cost
+more than they are worth, and the per-scope re-subscribe is a clean answer — once you know to reach
+for it.
+
 ## Gap 2 — Reducer authorization
 
 The reference workload calls `RequireAdmin(ctx)` **24 times**, by hand, at the top of privileged reducers. Every one of
