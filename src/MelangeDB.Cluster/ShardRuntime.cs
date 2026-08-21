@@ -303,21 +303,22 @@ internal sealed partial class ShardRuntime : IDisposable
             // time, so work added here inflates the denominator and the shard reports as less
             // loaded than it is. That direction suppresses scale-out, so a fresher row count is
             // not worth buying with sampling time.
+            // The subtraction happens here, against the borrowed count read in the same pass.
+            // Mixing freshness would not merely age the figure, it would invent an empty shard: a
+            // stale partitioned total of 3 against a live borrowed count of 50 — a band that
+            // landed since the last pass — clamps to 0 and puts a shard that still owns three rows
+            // on the holding-nothing list. Both terms move together or the difference is fiction.
             (_residentBytes, _authoritativeRows) = Engine.ReadConsistent(_ => (
                 Engine.HotStore.Statistics().Tables.Sum(static table => table.ResidentBytes),
-                PartitionedRowCount()));
+                Math.Max(0, PartitionedRowCount() - BorrowedRowCount)));
             _residentSampledTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
-        // Borrowed rows are counted live — one field read — while the authoritative total is as
-        // fresh as the throttle above. The subtraction can therefore go negative when a band lands
-        // between the two, hence the clamp. Both numbers are advisory: whatever eventually acts on
-        // emptiness re-checks under the shard's own lock rather than trusting a sampled gauge.
-        var borrowed = BorrowedRowCount;
-
+        // The borrowed series stays live because nothing keys emptiness on it; the authoritative
+        // figure is as fresh as the throttle, and advisory either way — whatever acts on emptiness
+        // re-checks under the shard's own lock rather than trusting a sampled gauge.
         return new ShardLoadDto(
-            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, borrowed,
-            Math.Max(0, _authoritativeRows - borrowed));
+            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount, _authoritativeRows);
     }
 
     /// <summary>

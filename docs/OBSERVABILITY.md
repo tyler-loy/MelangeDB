@@ -262,11 +262,17 @@ file when evaluated, and all of them race a scrape), and sessions live on the ga
 acts on the list re-checks both on the owning node, under the lock; the list exists so that check
 runs against a handful of shards rather than every shard the cluster has ever created.
 
-**Both are advisory.** They are sampled per heartbeat and can be a heartbeat old, and the pair can
-tear between two cheap reads. Anything that *acts* on emptiness — the shard reaper this pair exists
-to make possible — must re-check under the shard's own lock rather than trust a gauge. Reading low
-is the dangerous direction, which is why the row count is sampled every heartbeat rather than on the
-resident-bytes throttle beside it.
+**Both are advisory, and the row count is throttled.** `authoritative_rows` is computed in the same
+throttled pass that samples resident bytes, so it can be as old as that interval — not one
+heartbeat. It has to be: `SampleLoad` runs *inside* the interval its own utilization divides by, so
+per-heartbeat work there inflates the denominator and makes shards report as less loaded than they
+are, which suppresses scale-out. Both terms of the subtraction are read in that one pass, because
+mixing a stale row total with a live borrowed count does not merely age the figure — it invents an
+empty shard whenever a band lands.
+
+`borrowed_rows` is read live, since nothing keys emptiness on it, so the two gauges can disagree by
+one sampling interval. Anything that *acts* on emptiness — the shard reaper this pair exists to make
+possible — must re-check under the shard's own lock rather than trusting a gauge.
 
 ### The four that actually matter
 

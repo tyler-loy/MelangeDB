@@ -74,6 +74,83 @@ public class BorderReplicationTests
         Assert.Empty(cluster.Hub.Load.ShardsHoldingNothing(now.AddMinutes(5), TimeSpan.FromSeconds(30)));
     }
 
+    /// <summary>
+    /// A band landing must not make a shard that owns rows read as empty. The two terms of the
+    /// subtraction have to come from the same pass: a partitioned total sampled before the band
+    /// arrived, minus a borrowed count read after it, clamps to zero and puts a shard that still
+    /// owns rows on the holding-nothing list. That is the one direction the signal must never get
+    /// wrong.
+    /// </summary>
+    [Fact]
+    public async Task A_band_landing_does_not_clamp_a_shard_that_owns_rows_down_to_empty()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(
+            shardNodes: 2, heartbeatMs: 150, failureTimeoutMs: 60_000, spatial: true);
+        var shardA = (await cluster.EnsureShardOwnedAsync(BlockA)).Runtime.TryGetShard(new ShardKey(BlockA))!;
+        var shardB = (await cluster.EnsureShardOwnedAsync(BlockB)).Runtime.TryGetShard(new ShardKey(BlockB))!;
+
+        // Two critters deep inside A, away from any band — A's own, and nobody else's business.
+        shardA.ReducerHost.Call("SpawnCritter", ClusterFixture.Caller, 10UL, Chunks.Id(0, 0));
+        shardA.ReducerHost.Call("SpawnCritter", ClusterFixture.Caller, 11UL, Chunks.Id(0, 1));
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Load.Snapshot().Any(load => load.Shard.Value == BlockA && load.AuthoritativeRows == 2),
+            "A reported the two critters it owns",
+            timeoutSeconds: 30);
+
+        // Now B fills its edge chunk, so A borrows more rows than it owns. A's own count must not
+        // move: it owns two critters before the band and two after.
+        for (var seed = 20UL; seed < 26UL; seed++)
+            shardB.ReducerHost.Call("SpawnCritter", ClusterFixture.Caller, seed, Chunks.Id(4, 2));
+
+        await ClusterFixture.WaitUntilAsync(
+            () => shardA.BorrowedRowCount > 2,
+            "A is borrowing more of B's band than it owns itself");
+
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Load.Snapshot().Any(load => load.Shard.Value == BlockA && load.BorrowedRows > 2),
+            "the hub saw the larger band");
+
+        var a = cluster.Hub.Load.Snapshot().First(load => load.Shard.Value == BlockA);
+        Assert.Equal(2, a.AuthoritativeRows);
+        Assert.DoesNotContain(
+            BlockA,
+            cluster.Hub.Load.ShardsHoldingNothing(a.At, TimeSpan.FromSeconds(30)).Select(l => l.Shard.Value));
+    }
+
+    /// <summary>
+    /// A drain-quiesced shard must stop being a candidate immediately, not a freshness window
+    /// later. Quiescing removes the shard from the owner's open set in the same lock that sets its
+    /// drain mark, so the two are disjoint and a load sweep over open shards alone can never
+    /// report the drain — the hub would keep the last pre-quiesce sample, which says nothing is
+    /// draining, and go on listing an empty shard that is mid-transfer.
+    /// </summary>
+    [Fact]
+    public async Task A_quiesced_shard_reports_its_drain_and_drops_out_of_the_narrowing()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(
+            shardNodes: 2, heartbeatMs: 150, failureTimeoutMs: 60_000, spatial: true);
+        var owner = await cluster.EnsureShardOwnedAsync(BlockA);
+
+        // An untouched shard: no critters, so nothing of its own to lose.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Load.Snapshot().Any(load => load.Shard.Value == BlockA && load.AuthoritativeRows == 0),
+            "the empty shard reported a load sample",
+            timeoutSeconds: 30);
+        var seen = cluster.Hub.Load.Snapshot().First(load => load.Shard.Value == BlockA);
+        Assert.Contains(BlockA, cluster.Hub.Load.ShardsHoldingNothing(seen.At, TimeSpan.FromSeconds(30)).Select(l => l.Shard.Value));
+
+        var token = cluster.Hub.Membership.GetAssignment(new ShardKey(BlockA))!.FencingToken;
+        owner.Runtime.QuiesceShard(new ShardDrain(BlockA, token));
+
+        // The shard stops sampling the moment it is quiesced, so its last measurement stays in the
+        // view and stays inside the freshness window. Only the drain mark can take it out of the
+        // narrowing, which is the whole point: freshness alone would keep listing it.
+        await ClusterFixture.WaitUntilAsync(
+            () => !cluster.Hub.Load.ShardsHoldingNothing(seen.At, TimeSpan.FromSeconds(30))
+                .Any(load => load.Shard.Value == BlockA),
+            "the owner reported the drain and the shard left the narrowing");
+    }
+
     [Fact]
     public async Task Border_band_entities_are_visible_on_the_neighbouring_node_and_not_mutable_there()
     {
