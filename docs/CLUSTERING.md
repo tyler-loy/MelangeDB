@@ -148,11 +148,14 @@ node", and the empty answer reads as fact. A refusal naming the placement is inf
 successful lie is not.
 
 To read partitioned rows, go through a reducer or a subscription: the gateway routes both to the
-owning shard. **Bulk loading partitioned data has no cluster path today** — the endpoint writes to
-the node-local engine, which is the wrong engine for rows that belong to a shard. Seeding a
-clustered world means routed reducer calls, which forfeits bulk's measured 44× advantage over
-per-row transactions. Fanning a bulk batch out from the hub — which already holds the strategy and
-can partition by `ShardForRow` — is the natural fix and is tracked, not built.
+owning shard.
+
+**Bulk ingestion is the exception, and it is routed rather than refused.** Refusing would have left
+a clustered deployment with no way to seed a world except routed reducer calls, forfeiting bulk's
+measured 44× advantage over per-row transactions on every bake — a real cost, unlike ad-hoc SQL,
+where the alternative is a subscription that works. So `/bulk` on the **hub** fans the batch out;
+see [Bulk ingestion in a cluster](#bulk-ingestion-in-a-cluster). On a shard node it is still the
+wrong engine, and now says so at the commit point rather than accepting the rows.
 
 ## Sharding is user-defined
 
@@ -332,6 +335,70 @@ error:
 fencing term and a **new originator**, because originators are allocated from a high-water mark and
 a reaped shard's prefix retires with it. Ids minted under it may still be alive in a neighbour, and
 `AutoInc`'s contract is unique-not-dense.
+
+### Bulk ingestion in a cluster
+
+A loader keeps posting one batch to one endpoint. The hub groups the rows by
+`IShardStrategy.ShardForRow`, keeps `Global`, `Replicated`, and `Local` rows on its own engine, and
+forwards each group to the node owning that shard. Topology stays hidden, the same way the gateway
+hides it for reducers and subscriptions. The alternative — a per-shard bulk endpoint with the loader
+sharding its own writes — works, and puts the deployment's sharding function into every tool that
+loads data.
+
+**Atomicity is per engine, and that is the honest statement rather than a weakening.** Bulk has
+always been "one write set, one transaction, one log record"; fanned out, one batch becomes N
+commits on N logs. A single-node deployment has one engine, so nothing there changes. Nothing is
+promised across shards, and nothing ever was. The response reflects it: `results` is an array of
+`{shard, lsn, rows}`, because there is no such thing as *the* LSN of a batch that spanned three
+logs.
+
+Three properties are worth knowing about, because each is load-bearing:
+
+- **The hub encodes each row before routing it.** `RowRef` carries both the serialized bytes and a
+  by-name column accessor, and the bundled spatial strategy reads only columns — so it is tempting
+  to route a dictionary through a `RowRef` with empty bytes and skip the encode. A strategy that
+  reached for the bytes would then read *empty rather than throw*: rows silently routed to the wrong
+  shard, authoritative in the wrong engine. The encode costs one serialization the owning shard
+  redoes; bulk's advantage is transaction overhead, not encoding, so paying it twice is noise.
+
+- **Each receiving shard re-resolves every row, unconditionally.** A forwarded group is single-shard
+  by the hub's reckoning, and the hub's reckoning is exactly what can be wrong — a drifted shard
+  map, a strategy that differs between hub and node. It is tempting to lean on the shard-span check
+  here, which does include the executing shard in what it compares; two things make that not enough.
+  `Cluster:ShardSpanCheck` defaults to `DebugOnly`, so in a Release cluster — the only kind with a
+  bake to run — it is off. And a spatial strategy's `MayCommit` deliberately admits the seam, so a
+  row a band's depth across the line is admitted by design. The guard that would catch a misroute is
+  absent exactly where it would be needed, so the receiver checks for itself, and refuses the whole
+  group naming both shards.
+
+- **`[AutoInc]` is allocated by the owning shard**, never by the hub, so ids keep their
+  originator prefix and two shards allocating "the first row" cannot collide. What travels is the
+  hub's routing preimage plus the list of columns the caller actually supplied; the shard
+  reconstitutes the caller's row from the two and stages it through the ordinary bulk path.
+
+**Bulk does not create shards by default.** `EnsureShard` creates on demand, so a world generator
+touching thousands of shard keys would otherwise turn one POST into thousands of shards, their
+originators, and their data directories. Reaping exists now, but it is a deliberate operator action
+rather than something that happens on its own, and code is revertible where durable directories are
+not. A batch routing to a shard that does not exist is refused **whole and before any engine
+writes**, naming the shards to pre-declare with `MelangeClusterCoordinator.EnsureShard`. Set
+`Bulk:CreateShards` to accept create-on-demand; the hub then creates *and opens* every missing
+destination up front, because a shard's owner learns of an assignment on its next heartbeat and a
+bake creates and writes in the same breath.
+
+**Re-posting a partly-applied bake is sound**, which is what keeps all of the above from needing to
+be a distributed transaction: rows are upserts and `[AutoInc]` is originator-prefixed, so the
+results array only has to be good enough to tell an operator what landed.
+
+One thing to keep an eye on: this makes the hub a **data path**. It is a control plane plus
+`Global`/`Replicated` data the rest of the time, and pushing tens of MB of bake traffic through it
+makes it a throughput participant, which is the assumption [ROADMAP.md](ROADMAP.md) leans on when it
+defers sharding the hub. Two honest caveats on the current implementation: the hub **buffers the
+whole batch**, since the endpoint parses the request body into rows before anything is routed, and
+it forwards groups **one at a time**, so a batch spanning many shards pays them in sequence rather
+than in parallel. Neither is inherent — the round-trip count is the number of destination shards
+rather than the number of rows, and a bake is rare — but both are the first things to change if hub
+load or bake wall-clock ever becomes interesting.
 
 ## Handoff
 

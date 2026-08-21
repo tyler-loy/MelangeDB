@@ -25,7 +25,7 @@ internal static class AdHocAggregateBuilder
             throw new SubscriptionRejectedException(
                 MelangeErrorCodes.NotRelationalTier,
                 $"Table '{schema.Name}' is hot-tier; aggregates run against the relational tier only. " +
-                "The four row shapes remain available for hot tables.");
+                "The row shapes remain available for hot tables.");
         }
 
         var groupBy = parsed.GroupBy.Select(item => Resolve(schema, item)).ToList();

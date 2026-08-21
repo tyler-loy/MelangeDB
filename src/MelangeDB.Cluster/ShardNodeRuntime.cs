@@ -127,6 +127,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         var engine = _services.GetRequiredService<MelangeEngine>();
         engine.SetTableAccessGuard(PlacementGuards.NodeLocalAccess(cluster.NodeName));
 
+        // And the commit-point half, which the access guard cannot cover: bulk ingestion never
+        // touches a table handle, so without this a batch of Partitioned rows posted to this
+        // node's own endpoint committed into an engine nothing reads them from. The hub has had
+        // the equivalent guard all along.
+        engine.AddCommitGuard(new NodeLocalCommitGuard(engine.Schema, cluster.NodeName));
+
         _strategy = _services.GetService<IShardStrategy>();
         _connectLoop = Task.Run(RunAsync);
         _reconcileLoop = Task.Run(ReconcileHandoffsAsync);
@@ -694,6 +700,17 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 return Task.FromResult<object?>(new ShardExecuteReply(lsn));
             }
 
+            case "shard-bulk":
+            {
+                var bulk = body!.Value.Deserialize<ShardBulk>()!;
+                var runtime = RequireShard(new ShardKey(bulk.Shard), bulk.FencingToken);
+                return Task.FromResult<object?>(ApplyBulkGroup(
+                    runtime,
+                    new ShardKey(bulk.Shard),
+                    new Identity(Convert.FromHexString(bulk.CallerHex)),
+                    bulk.Rows));
+            }
+
             case "handoff-query-owner":
             {
                 var query = body!.Value.Deserialize<HandoffQuery>()!;
@@ -713,6 +730,70 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             default:
                 throw new InvalidOperationException($"Unknown node-link message '{type}'.");
         }
+    }
+
+    /// <summary>
+    /// Takes one group of a fanned-out bulk batch: re-resolve every row, then write the group as
+    /// one transaction on this shard's engine.
+    ///
+    /// <para><b>The re-resolution is the correctness of the whole feature, and it is not
+    /// redundant.</b> It is tempting to think the existing shard-span check already covers a
+    /// misrouted row — it does include the executing shard in the set it compares, so a row
+    /// belonging elsewhere would widen the span and fail. Two things make that not enough.
+    /// <c>Cluster:ShardSpanCheck</c> defaults to <c>DebugOnly</c>, so in a Release cluster — the
+    /// only kind that has a bake to run — the check is off. And a spatial strategy's
+    /// <c>MayCommit</c> deliberately admits the seam, so a row a border band's depth across the
+    /// line is admitted by design. So the guard that would catch this is absent exactly where it
+    /// would be needed. One <c>ShardForRow</c> per row, unconditionally, is the price of the hub
+    /// being allowed to decide destinations at all.</para>
+    ///
+    /// <para>Refused whole and before any write, naming the row: a bake that half-lands rows into
+    /// the wrong engine is worse than one that lands nothing, because nothing is a re-post and
+    /// half is an investigation.</para>
+    /// </summary>
+    private ShardBulkReply ApplyBulkGroup(ShardRuntime runtime, ShardKey shard, Identity caller, BulkRowDto[] rows)
+    {
+        var schema = runtime.Engine.Schema;
+        var strategy = _strategy
+            ?? throw new InvalidOperationException(
+                $"Node '{NodeName}' has no IShardStrategy registered; a forwarded bulk group cannot be verified.");
+
+        List<BulkRow> staged = new(rows.Length);
+        foreach (var dto in rows)
+        {
+            if (!schema.TryGetByName(dto.Table, out var table))
+                throw new InvalidOperationException($"No table named '{dto.Table}' is registered on node '{NodeName}'.");
+
+            var resolved = strategy.ShardForRow(table.Id, table.ToRowRef(dto.Row));
+            if (resolved != shard)
+            {
+                throw new InvalidOperationException(
+                    $"A forwarded bulk row of '{table.Name}' resolves to {resolved} on node '{NodeName}', but the hub "
+                    + $"routed it to {shard}. The hub's shard map and this node's strategy disagree; nothing in this "
+                    + "group was written.");
+            }
+
+            staged.Add(new BulkRow(table.Name, ColumnsOf(table, dto)));
+        }
+
+        var record = runtime.Engine.BulkInsert(caller, staged);
+        return new ShardBulkReply(record?.Lsn ?? 0, staged.Count);
+    }
+
+    /// <summary>
+    /// Rebuilds the caller's column dictionary from the routing preimage and the list of columns
+    /// they actually supplied. Only the supplied ones are put back, which is what lets an
+    /// <c>[AutoInc]</c> column the caller omitted be allocated here — by this shard, under its own
+    /// originator prefix — rather than arriving as the preimage's zero and colliding with every
+    /// other shard's zero.
+    /// </summary>
+    private static Dictionary<string, object?> ColumnsOf(TableSchema table, BulkRowDto dto)
+    {
+        var boxed = RowSerializer.Deserialize(table, dto.Row);
+        var columns = new Dictionary<string, object?>(dto.Supplied.Length, StringComparer.Ordinal);
+        foreach (var name in dto.Supplied)
+            columns[name] = table.Column(name).GetValue(boxed);
+        return columns;
     }
 
     /// <summary>

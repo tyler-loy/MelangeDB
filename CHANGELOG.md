@@ -23,6 +23,23 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Bulk ingestion has a cluster path: a hub fans a batch out to the shards that own its rows**,
+  closing [#115](https://github.com/tyler-loy/MelangeDB/issues/115). One batch, one endpoint, no
+  topology in the loader — the hub groups by `IShardStrategy.ShardForRow`, keeps `Global`,
+  `Replicated`, and `Local` rows on its own engine, and forwards each group to its owner. Unlike
+  ad-hoc SQL on a `Partitioned` table (#114), this could not be answered by refusing: refusing
+  leaves a clustered deployment seeding worlds through routed reducer calls, forfeiting bulk's
+  measured 44× advantage on every bake.
+
+  `[AutoInc]` is allocated by the **owning shard**, never the hub, so ids keep their originator
+  prefix and two shards allocating "the first row" cannot collide. Each receiving shard
+  **re-resolves every row and refuses the group on a mismatch** — the shard-span check looks like
+  it already covers this, but `Cluster:ShardSpanCheck` defaults to `DebugOnly` and a spatial
+  strategy's `MayCommit` admits the seam by design, so the guard is absent exactly where a
+  misrouted bake would need it. New `Bulk:CreateShards`, off by default: a batch routing to a shard
+  that does not exist is refused whole before any engine writes, rather than turning one POST into
+  thousands of durable directories. See [CLUSTERING.md](docs/CLUSTERING.md).
+
 - **A fourth subscription predicate, `WHERE col <> 0` — the rows where a column has been set at
   all**, closing [#122](https://github.com/tyler-loy/MelangeDB/issues/122). Both SQL spellings
   (`<>` and `!=`) parse. The operand must be the column's own default, and the shape is served on
@@ -70,6 +87,15 @@ All packages ship together at one version; there is no per-package versioning. S
   re-checks both on the owning node under the lock.
 
 ### Fixed
+
+- **A shard node's own engine accepted bulk rows that belonged to a shard, and reported success.**
+  `PlacementGuards.NodeLocalAccess` has always said that engine holds only `Local` tables, but it is
+  a *table-access* guard and bulk ingestion never touches a table handle — so a batch of
+  `Partitioned` rows committed into an engine nothing reads those rows from: authoritative nowhere,
+  invisible to the shard owning the key, answered as an ok. The hub has had the commit-point
+  counterpart since clustering landed, and its comment names bulk as the path it exists for; the
+  node-local engine simply never got one. Found while building the fan-out
+  ([#115](https://github.com/tyler-loy/MelangeDB/issues/115)).
 
 - **Postgres membership no longer derives a new shard's originator from the shards that still
   exist.** It allocated `MAX(originator) + 1`, so deleting a shard row would hand its originator to

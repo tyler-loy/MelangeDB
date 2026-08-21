@@ -523,6 +523,52 @@ internal sealed partial class HubRuntime : IDisposable
         return reply!.Value.Deserialize<ShardExecuteReply>()!.Lsn;
     }
 
+    /// <summary>
+    /// Hands one group of a fanned-out bulk batch to the node owning <paramref name="shard"/>, as
+    /// one transaction on that shard's engine. The group is single-shard by this hub's reckoning;
+    /// the receiver re-resolves every row against its own strategy before writing, because this
+    /// hub's reckoning is exactly the thing that can be wrong.
+    /// <para>
+    /// <c>Bulk:CreateShards</c> is enforced by the caller, so a shard with no assignment reaches
+    /// here only when creating one was opted into — which is what makes <see cref="ResolveShard"/>
+    /// (create-on-first-use) the right resolver at this point and the wrong one before it.
+    /// </para>
+    /// </summary>
+    /// <summary>
+    /// Creates <paramref name="shard"/> if it does not exist and makes sure its owner has it open
+    /// before returning — the drain's <c>assignments-apply</c> push, reused.
+    /// <para>
+    /// Without the push, creating a shard and writing to it in the same breath races the owner's
+    /// heartbeat: membership records the assignment immediately, the node learns of it up to one
+    /// heartbeat later, and a message arriving in between is refused as "this node does not own
+    /// that shard". A bake is exactly the caller that does both in the same breath.
+    /// </para>
+    /// </summary>
+    internal async Task EnsureShardOpenAsync(ShardKey shard, CancellationToken ct = default)
+    {
+        var (assignment, _) = ResolveShard(shard);
+        if (LinkOf(assignment.NodeName!) is not { } link)
+            return;
+        await link.RequestAsync(
+            "assignments-apply",
+            new AssignmentsApply(AssignmentsDto(assignment.NodeName!)),
+            ct,
+            Math.Max(30_000, Cluster.DrainQueueTimeoutMs)).ConfigureAwait(false);
+    }
+
+    internal async Task<ShardBulkReply> BulkToShardAsync(
+        ShardKey shard, Identity caller, BulkRowDto[] rows, CancellationToken ct = default)
+    {
+        var (assignment, _) = ResolveShard(shard);
+        var link = LinkOf(assignment.NodeName!)
+            ?? throw new InvalidOperationException($"No live link to '{assignment.NodeName}', the owner of {shard}.");
+        var reply = await link.RequestAsync(
+            "shard-bulk",
+            new ShardBulk(shard.Value, assignment.FencingToken, caller.ToString(), rows),
+            ct).ConfigureAwait(false);
+        return reply!.Value.Deserialize<ShardBulkReply>()!;
+    }
+
     private readonly ConcurrentDictionary<ShardKey, byte> _drainsInFlight = new();
 
     /// <summary>

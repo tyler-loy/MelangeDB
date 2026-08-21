@@ -106,6 +106,13 @@ public static class MelangeClusterServiceCollectionExtensions
         services.AddHostedService<ClusterRuntimeHost>();
         services.TryAddSingleton<MelangeShardHealthCheck>();
         services.TryAddSingleton<MelangeCapacityHealthCheck>();
+
+        // The bulk endpoint's routing seam, registered only on a hub — {path}/bulk resolves
+        // IBulkRouter and writes to the local engine when there is none, which is exactly the
+        // right behaviour on a single node and on a shard node (where the endpoint refuses
+        // Partitioned rows outright rather than writing them into the wrong engine).
+        services.TryAddSingleton<IBulkRouter>(static provider =>
+            new HubBulkRouter(provider, provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>()));
         services.Configure<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckServiceOptions>(static options =>
         {
             if (options.Registrations.All(static r => r.Name != "melange-shard"))

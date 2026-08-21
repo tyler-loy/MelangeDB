@@ -468,6 +468,20 @@ public sealed class BulkOptions
     /// never silently downgraded. Empty makes bulk ingestion unusable by everyone.
     /// </summary>
     public string OwnerRole { get; set; } = "melange-bulk-owner";
+
+    /// <summary>
+    /// Whether a hub's bulk fan-out may bring shards into existence for destinations that have
+    /// none. Off by default, and deliberately: a world generator touching thousands of shard keys
+    /// would otherwise create thousands of shards, their originators, and their data directories
+    /// from one POST. Code is revertible and durable directories are not, so the default is the
+    /// choice that can be taken back.
+    /// <para>
+    /// With it off, a batch naming an unknown destination is refused whole — before any engine
+    /// writes — and names the shards to pre-declare (<c>MelangeClusterCoordinator.EnsureShard</c>).
+    /// Ignored outside <c>Cluster:Role = Hub</c>.
+    /// </para>
+    /// </summary>
+    public bool CreateShards { get; set; }
 }
 
 /// <summary>Online backup options (<c>MelangeDb:Backup:*</c>).</summary>
