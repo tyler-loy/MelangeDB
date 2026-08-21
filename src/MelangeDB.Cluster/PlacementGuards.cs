@@ -129,6 +129,48 @@ internal sealed class HubCommitGuard : ICommitGuard
 }
 
 /// <summary>
+/// A shard node's node-local engine commit-point guard — the counterpart of
+/// <see cref="HubCommitGuard"/>, and it was missing.
+/// <para>
+/// <see cref="PlacementGuards.NodeLocalAccess"/> already says this engine holds only <c>Local</c>
+/// tables, but an access guard sees reducer table handles and bulk ingestion does not use them.
+/// So a bulk batch of <c>Partitioned</c> rows posted to a shard node's own HTTP endpoint
+/// committed <em>successfully</em> into an engine nothing reads those rows from: authoritative
+/// nowhere, invisible to the shard that owns the key, and reported as an ok. The hub has had this
+/// guard since clustering landed — the comment on <see cref="HubCommitGuard"/> names bulk as the
+/// path it exists for — and the node-local engine simply never got one.
+/// </para>
+/// </summary>
+internal sealed class NodeLocalCommitGuard : ICommitGuard
+{
+    private readonly SchemaRegistry _schema;
+    private readonly string _nodeName;
+
+    public NodeLocalCommitGuard(SchemaRegistry schema, string nodeName)
+    {
+        _schema = schema;
+        _nodeName = nodeName;
+    }
+
+    public void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin)
+    {
+        if (origin == CommitOrigin.Internal)
+            return;
+        foreach (var op in writeSet)
+        {
+            if (_schema.TryGet(op.Table, out var table) && table.Placement != Placement.Local)
+            {
+                throw new InvalidOperationException(
+                    $"'{reducerName}' writes Placement.{table.Placement} table '{table.Name}' into shard node "
+                    + $"'{_nodeName}''s node-local engine, which holds only Local tables. Partitioned rows are written "
+                    + "by the node owning their shard, and Global and Replicated rows on the hub — post the batch to "
+                    + "the hub, which routes it.");
+            }
+        }
+    }
+}
+
+/// <summary>
 /// A shard engine's commit-point guard, checked in order of blast radius: the fencing lease
 /// (a node that lost the hub must not write at all), frozen handoff rows (a mid-transfer player
 /// is writable nowhere), placement (bulk-path Global/Replicated writes), and the shard-span

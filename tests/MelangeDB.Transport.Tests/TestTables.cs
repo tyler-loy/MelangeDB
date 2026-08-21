@@ -114,6 +114,19 @@ public partial struct AllKinds
     public Timestamp At;
 }
 
+/// <summary>
+/// Node-local: the one placement a shard node's own engine legitimately holds, so it is what a
+/// clustered-role bulk test can write without tripping the Partitioned refusal (#115).
+/// </summary>
+[Table(Placement = Placement.Local)]
+public partial struct NodeCounter
+{
+    [PrimaryKey]
+    public long Id;
+
+    public long Count;
+}
+
 /// <summary>Private: no subscription may name it, and the error must not confirm it exists.</summary>
 [Table]
 public partial struct SecretTable

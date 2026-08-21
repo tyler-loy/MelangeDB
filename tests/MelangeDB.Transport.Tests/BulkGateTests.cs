@@ -32,6 +32,13 @@ public class BulkGateTests
 
     private const string OneRow = """{"tables": {"Chunk": [{"Id": 1, "X": 2, "Data": "AQID"}]}}""";
 
+    /// <summary>
+    /// A <c>Local</c> table, which is the only placement a shard-role node's own engine holds. The
+    /// clustered tests here are about authentication, and <c>Chunk</c> is <c>Partitioned</c> —
+    /// legal to bulk-load on a single node, refused on a shard node since #115.
+    /// </summary>
+    private const string OneLocalRow = """{"tables": {"NodeCounter": [{"Id": 1, "Count": 7}]}}""";
+
     [Fact]
     public async Task The_issue_repro_a_guest_token_on_a_stock_host_is_refused()
     {
@@ -109,7 +116,7 @@ public class BulkGateTests
             isGuest: false, isSqlOwner: false, isBulkOwner: true, DateTimeOffset.UtcNow.AddMinutes(5));
         using var http = host.CreateHttp(assertion);
 
-        var response = await http.PostAsync("/melange/bulk", Json(OneRow), TestContext.Current.CancellationToken);
+        var response = await http.PostAsync("/melange/bulk", Json(OneLocalRow), TestContext.Current.CancellationToken);
 
         var body = await ReadJsonAsync(response);
         Assert.True(response.IsSuccessStatusCode, body.ToString());
@@ -118,6 +125,28 @@ public class BulkGateTests
         Assert.Equal(JsonValueKind.Null, result.GetProperty("shard").ValueKind);
         Assert.Equal(1, result.GetProperty("rows").GetInt32());
         Assert.True(result.GetProperty("lsn").GetUInt64() > 0);
+    }
+
+    /// <summary>
+    /// A shard node's own engine is not any shard's engine, so a batch of <c>Partitioned</c> rows
+    /// posted to it is refused rather than written where nothing reads it (#115). The mirror of
+    /// the ad-hoc SQL refusal, and the reason the clustered tests above load a <c>Local</c> table.
+    /// </summary>
+    [Fact]
+    public async Task A_shard_role_node_refuses_a_partitioned_batch()
+    {
+        await using var host = await TransportTestHost.StartAsync(EnabledClustered);
+        using var http = host.CreateHttp(TestTokens.For("loader", role: BulkOwnerRole));
+
+        var response = await http.PostAsync("/melange/bulk", Json(OneRow), TestContext.Current.CancellationToken);
+
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
+        var error = await ReadJsonAsync(response);
+        Assert.Equal("partitioned_elsewhere", error.GetProperty("error").GetString());
+        Assert.Contains("fans it out", error.GetProperty("message").GetString()!, StringComparison.Ordinal);
+
+        var schema = host.Engine.Schema.Get(typeof(Chunk));
+        Assert.Equal(0, host.Engine.ReadConsistent(_ => host.Engine.HotStore.Scan(schema.Id).Count()));
     }
 
     [Fact]

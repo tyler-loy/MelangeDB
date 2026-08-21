@@ -96,11 +96,16 @@ internal static class MelangeHttpEndpoints
     /// bulk writes bypass every reducer and its policies, so any valid token is not enough.
     /// <para>
     /// Answers <c>{"ok", "rows", "results": [{"shard", "lsn", "rows"}]}</c> — one result per engine
-    /// that took rows, which today is always exactly one. The atomicity guarantee is <b>per
-    /// engine</b>: this path appends one write set as one transaction, and a single-node
-    /// deployment has one engine, so nothing weaker is being promised than before. The array is
-    /// the shape that survives a batch spanning shards, where there is no single LSN to report,
-    /// and it ships ahead of that so the fan-out adds elements rather than breaking callers.
+    /// that took rows. The atomicity guarantee is <b>per engine</b>: each engine appends its share
+    /// as one write set in one transaction, and a single-node deployment has one engine, so
+    /// nothing weaker is promised there than before. An LSN is meaningful only inside one log,
+    /// which is why a batch spanning shards reports an array rather than a number.
+    /// </para>
+    /// <para>
+    /// In a cluster the batch is routed rather than written locally: a hub fans it out to the
+    /// shard engines owning the rows (see <see cref="IBulkRouter"/>), and a shard node refuses a
+    /// batch touching <c>Partitioned</c> tables, because its own engine is not any shard's engine
+    /// and the rows would land authoritative nowhere useful.
     /// </para>
     /// </summary>
     public static async Task BulkAsync(HttpContext context, MelangeTransport transport)
@@ -147,25 +152,52 @@ internal static class MelangeHttpEndpoints
             return;
         }
 
+        var clusterRole = transport.Options.Cluster.Role;
+        if (clusterRole == ClusterRole.Shard
+            && PartitionedTableIn(transport.Engine.Schema, rows) is { } partitioned)
+        {
+            // The mirror of the ad-hoc SQL refusal (#114): a shard node's own engine holds the
+            // node's Local tables, not any shard's Partitioned rows. Writing here would succeed
+            // and be authoritative nowhere the game reads from, which is worse than a refusal.
+            await WriteErrorAsync(
+                context,
+                StatusCodes.Status400BadRequest,
+                MelangeErrorCodes.PartitionedElsewhere,
+                $"Table '{partitioned}' is Partitioned: its rows live in the per-shard engines, not in this node's "
+                + $"(Cluster:Role is {clusterRole}). Post the batch to the hub, which fans it out to the shards that "
+                + "own the rows.").ConfigureAwait(false);
+            return;
+        }
+
         try
         {
-            var record = transport.Engine.BulkInsert(session.Identity, rows);
+            // Role is the gate, not merely the presence of a router: the cluster package registers
+            // one whenever it is added, and resolving it anywhere but the hub would stand a hub
+            // runtime up on a node that is not one.
+            var results = clusterRole == ClusterRole.Hub
+                && context.RequestServices.GetService(typeof(IBulkRouter)) is IBulkRouter router
+                ? await router.RouteAsync(session.Identity, rows, context.RequestAborted).ConfigureAwait(false)
+                : LocalResult(transport.Engine.BulkInsert(session.Identity, rows), rows.Count);
 
-            // One result per engine that took rows, even though this path only ever has one.
-            // An LSN is meaningful within a single log, so a batch that is one day fanned out
-            // across shards has no single LSN to report — the array is the shape that survives
-            // that, and emitting it now means the fan-out adds elements rather than breaking
-            // every caller. `shard` is null here because a node-local engine is not a shard's.
+            // One result per engine that took rows. `shard` is null for a node-local engine,
+            // which is not any shard's — on a single-node deployment that is the only element.
             await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
             {
                 writer.WriteBoolean("ok", true);
                 writer.WriteNumber("rows", rows.Count);
                 writer.WriteStartArray("results");
-                writer.WriteStartObject();
-                writer.WriteNull("shard");
-                writer.WriteNumber("lsn", record?.Lsn ?? 0);
-                writer.WriteNumber("rows", rows.Count);
-                writer.WriteEndObject();
+                foreach (var result in results)
+                {
+                    writer.WriteStartObject();
+                    if (result.Shard is { } shard)
+                        writer.WriteNumber("shard", shard);
+                    else
+                        writer.WriteNull("shard");
+                    writer.WriteNumber("lsn", result.Lsn);
+                    writer.WriteNumber("rows", result.Rows);
+                    writer.WriteEndObject();
+                }
+
                 writer.WriteEndArray();
             }).ConfigureAwait(false);
         }
@@ -173,11 +205,33 @@ internal static class MelangeHttpEndpoints
         {
             await WriteErrorAsync(context, StatusCodes.Status400BadRequest, MelangeErrorCodes.InvalidArguments, exception.Message).ConfigureAwait(false);
         }
+        catch (InvalidOperationException exception)
+        {
+            // A routing failure — no owner for a destination shard, no live link to it. The
+            // operator's move is to fix the cluster and re-post: bulk rows are upserts and
+            // [AutoInc] is originator-prefixed, so re-running a partly-applied batch is sound.
+            await WriteErrorAsync(context, StatusCodes.Status503ServiceUnavailable, MelangeErrorCodes.Transient, exception.Message).ConfigureAwait(false);
+        }
+    }
+
+    private static IReadOnlyList<BulkResult> LocalResult(CommitRecord? record, int rows) =>
+        [new BulkResult(Shard: null, record?.Lsn ?? 0, rows)];
+
+    /// <summary>The first <c>Partitioned</c> table named by a batch, or null when none is.</summary>
+    private static string? PartitionedTableIn(SchemaRegistry schema, IReadOnlyList<BulkRow> rows)
+    {
+        foreach (var row in rows)
+        {
+            if (schema.TryGetByName(row.Table, out var table) && table.Placement == Placement.Partitioned)
+                return table.Name;
+        }
+
+        return null;
     }
 
     /// <summary>
     /// POST {path}/sql — one-shot query: <c>{"query": "...", "params": {...}}</c>. Off until
-    /// <c>Sql:AdHocEnabled</c> opts in. The four row shapes run against the hot store at head,
+    /// <c>Sql:AdHocEnabled</c> opts in. The row shapes run against the hot store at head,
     /// under the same cost ceilings subscriptions have; aggregate shapes (<c>COUNT</c>/<c>SUM</c>/
     /// <c>AVG</c>/<c>MIN</c>/<c>MAX</c>, <c>GROUP BY</c>, <c>DATE_TRUNC</c> bucketing) run against
     /// the relational tier and reflect its applier's checkpoint. <c>Sql:AdHocMode</c> is the

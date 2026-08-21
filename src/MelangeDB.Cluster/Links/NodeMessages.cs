@@ -180,6 +180,32 @@ internal sealed record ShardExecute(ulong Shard, long FencingToken, string Reduc
 
 internal sealed record ShardExecuteReply(ulong Lsn);
 
+/// <summary>
+/// One bulk row on its way to the shard that owns it. <see cref="Row"/> is the <em>routing
+/// preimage</em>: the caller's values, coerced and serialized by the hub with the same
+/// <c>RowSerializer</c> the engine uses, with unsupplied columns at their defaults. It is the
+/// bytes the hub handed the strategy to decide the destination, so the receiver re-deciding from
+/// the same bytes is comparing like with like.
+/// <para>
+/// <see cref="Supplied"/> names the columns the caller actually gave, because the difference
+/// matters: an <c>[AutoInc]</c> column the caller omitted must be <em>allocated by the owning
+/// shard</em> — originator-prefixed, so shards never coordinate — and a preimage cannot say that
+/// on its own, every unsupplied column reading as zero. The receiver reconstitutes the caller's
+/// dictionary from the two and stages it through the ordinary bulk path.
+/// </para>
+/// </summary>
+internal sealed record BulkRowDto(string Table, byte[] Row, string[] Supplied);
+
+/// <summary>
+/// The hub asking a shard's owner to take one group of a fanned-out bulk batch. Single-shard by
+/// construction — but the receiver re-resolves every row anyway, because "by construction" is the
+/// hub's construction and this is the only place that can check it. The fencing token makes a
+/// group aimed at a stale owner fail loudly instead of landing on the wrong term.
+/// </summary>
+internal sealed record ShardBulk(ulong Shard, long FencingToken, string CallerHex, BulkRowDto[] Rows);
+
+internal sealed record ShardBulkReply(ulong Lsn, int Rows);
+
 internal sealed record HandoffQuery(string HandoffId, ulong ToShard);
 
 internal sealed record HandoffQueryReply(bool Imported);
