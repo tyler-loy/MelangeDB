@@ -2,6 +2,8 @@
 
 **Status: Planned.**
 
+**Scope note:** this phase is the *decision-gating* half only. The head-to-head comparison against SpacetimeDB is deferred, and whether it runs at all is its own open decision — see [Decisions to settle](#settled-this-is-two-phases-and-only-the-first-is-scheduled).
+
 **Goal:** the numbers [phase 11](../road-to-0.1/plan-phase-11.md) called its deliverable are
 recorded in this repo, including the ones that came out worse — and with them, the two measurements
 that other decisions are now explicitly waiting on. At the end of this phase, "treat every benchmark
@@ -93,14 +95,14 @@ bots.
 
 ## Deliverables
 
-**The four phase 11 numbers**, in the form that plan specified, amended by the audit above:
+**The phase 11 numbers that gate other work.** The two comparison-shaped ones below are struck: they moved to the deferred half, and are kept here rather than deleted because the shape they would have taken is itself the argument against running them.
 
-- **Memory for the 10 km world versus SpacetimeDB's**, with **both sides pinned at the port
+- ~~**Memory for the 10 km world versus SpacetimeDB's**~~ — **deferred.** It would have needed **both sides pinned at the port
   commit** — the only point at which they were the same game. Everything else in this phase measures
   current MelangeDB; this one number does not, and says so where it is published. The alternative,
   live-against-frozen, biases *against* MelangeDB by thirteen tables, which is the safe direction for
   a self-run benchmark and also the direction that makes the number mean nothing.
-- **Memory for the 20 km world SpacetimeDB cannot host** (98,596 chunks) on one node within a fixed
+- ~~**Memory for the 20 km world SpacetimeDB cannot host**~~ — **deferred with its sibling**, though it is the one that survives the objection: it is a capability claim needing no baseline. (98,596 chunks) on one node within a fixed
   budget. This is complaint 2 — the RAM ceiling — either demonstrated or not, and it needs no
   baseline, so it is unaffected by the drift above.
 - **Reducer latency p50/p99 for gather, move, attack, and craft**, from the
@@ -204,22 +206,32 @@ made explicitly and is recorded as "not being quietly dropped." If it is dropped
 *loudly*, with this reasoning attached — that would discharge the debt honestly, which silence
 would not.
 
-### Whether this is one phase or two
+### Settled: this is two phases, and only the first is scheduled
 
-The audit splits the deliverables cleanly along a line the original plan did not see.
+The audit split the deliverables along a line the original plan did not see, and they are now
+scoped separately.
 
-**Decision-gating and cheap:** the scheduled-reducer cost (a dashboard read), the fan-out share, and
-the reassignment window from the cluster tests. These unblock phase 24 and two idea-bin triggers,
-need no new tooling, and are days rather than weeks.
+**Phase 20 is the decision-gating half:** the scheduled-reducer cost (start from the consumer's
+existing write-lock dashboard), the fan-out share, and the reassignment window from MelangeDB's own
+cluster tests. These unblock phase 24 and two idea-bin triggers, need no new tooling, and are days
+rather than weeks.
 
-**Promise-discharging and expensive:** the SpacetimeDB comparison, the armed-and-crafting bot fleet,
-and multi-process fleet orchestration. These unblock nothing, and two of the three are tool-building
-rather than measurement.
+**The comparison half is deferred and undecided:** the head-to-head against SpacetimeDB, the
+armed-and-crafting bot fleet, and multi-process fleet orchestration. It unblocks nothing, two of the
+three are tool-building rather than measurement, and bundling them meant the cheap measurements that
+gate real work waited behind a comparison that gates none.
 
-**Leaning:** split them. The first group runs as phase 20 and keeps 0.3 moving; the second becomes
-its own decision, taken on its own merits, with "record why we are not doing this" as a legitimate
-outcome. Bundling them means the cheap measurements that actually gate work wait behind a
-comparison that gates nothing.
+**Whether the comparison runs at all is a separate decision, still open**, and the evidence has been
+accumulating against it. The frozen baseline drifts every week the game ships — 82 table files at
+the port against 97 and climbing, measured an hour apart during this plan's own audit. More
+pointedly, the workload has since made changes its author judges would not have been feasible on
+SpacetimeDB at all. A benchmark whose two sides have diverged in *capability* is not measuring an
+engine, and "recorded why we are not running it" discharges phase 11's promise more honestly than a
+comparison of two different games would.
+
+What that costs, stated plainly so the choice is not made by drift: without it, the only head-to-head
+evidence MelangeDB has is the port's existence, and [ROADMAP.md](../ROADMAP.md)'s warning narrows
+rather than lifts.
 
 ### Live workload or synthetic rig
 

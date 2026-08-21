@@ -104,7 +104,7 @@ the measurement debt below, and three separate decisions are waiting on it.
 
 | Phase | Title | Status |
 | --- | --- | --- |
-| [20](road-to-0.3/plan-phase-20.md) | The measurement pass: phase 11's outstanding half, plus the reassignment window and the per-tick cost of scheduled reducers | Planned |
+| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half: the reassignment window and the per-tick cost of scheduled reducers. The head-to-head comparison is split out and undecided | Planned |
 | [21](road-to-0.3/plan-phase-21.md) | `melange inspect`: time-travel over the commit log — jump to an LSN, see the world, the reducer that produced it, and its write set | Planned |
 | [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Planned |
 | [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Planned |
@@ -126,10 +126,16 @@ every benchmark in these docs as a dev-machine measurement rather than a product
 characteristic** — that distinction is the whole reason the phase asked for numbers, and phase 11's
 own risk register is explicit that a port reporting only wins is not evidence.
 
-This is now scheduled as [phase 20](road-to-0.3/plan-phase-20.md), which also picks up two
-measurements phase 11 did not ask for, because decisions made since then wait on them: the
-reassignment window for a crowded shard, and what the fourteen scheduled reducers cost a player
-reducer on the same lock.
+The measurements that *gate other work* are now [phase 20](road-to-0.3/plan-phase-20.md), including
+two phase 11 did not ask for: the reassignment window for a crowded shard, and what the scheduled
+reducers cost a player reducer on the same lock.
+
+**The head-to-head comparison against SpacetimeDB is split out of that phase and remains
+undecided.** Its baseline froze at the port and the game has kept shipping — including changes its
+author judges would not have been feasible on SpacetimeDB at all — so the two sides have diverged in
+capability rather than merely in size. Running it would compare two different games; not running it
+is a legitimate outcome that has to be *recorded* rather than reached by drift. Until one or the
+other happens, the warning above stands unchanged.
 
 Known deferrals, each recorded with its reasoning rather than left as an omission:
 
