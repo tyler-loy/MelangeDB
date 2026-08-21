@@ -87,6 +87,10 @@ public class BulkGateTests
         var body = await ReadJsonAsync(response);
         Assert.True(response.IsSuccessStatusCode, body.ToString());
         Assert.Equal(1, body.GetProperty("rows").GetInt32());
+        var result = Assert.Single(body.GetProperty("results").EnumerateArray().ToArray());
+        Assert.Equal(JsonValueKind.Null, result.GetProperty("shard").ValueKind);
+        Assert.Equal(1, result.GetProperty("rows").GetInt32());
+        Assert.True(result.GetProperty("lsn").GetUInt64() > 0);
 
         var schema = host.Engine.Schema.Get(typeof(Chunk));
         var row = host.Engine.ReadConsistent(_ =>
@@ -110,6 +114,10 @@ public class BulkGateTests
         var body = await ReadJsonAsync(response);
         Assert.True(response.IsSuccessStatusCode, body.ToString());
         Assert.Equal(1, body.GetProperty("rows").GetInt32());
+        var result = Assert.Single(body.GetProperty("results").EnumerateArray().ToArray());
+        Assert.Equal(JsonValueKind.Null, result.GetProperty("shard").ValueKind);
+        Assert.Equal(1, result.GetProperty("rows").GetInt32());
+        Assert.True(result.GetProperty("lsn").GetUInt64() > 0);
     }
 
     [Fact]
