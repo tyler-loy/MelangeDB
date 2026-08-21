@@ -68,4 +68,17 @@ public interface IMembershipStore
     /// a node that is not registered and alive — a drain must never assign to a corpse.
     /// </summary>
     ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now);
+
+    /// <summary>
+    /// Forgets a shard entirely — the counterpart <see cref="EnsureShard"/> never had. Returns
+    /// false for a shard the store does not know, so a repeated reap is not an error.
+    /// <para>
+    /// The caller guarantees the shard is already closed and its data removed; this only drops the
+    /// ownership record. <b>The originator is not released</b>: ids minted under it outlive the
+    /// shard, so allocation is a high-water mark and a removed shard's prefix retires with it.
+    /// A shard key that is visited again afterwards is simply new — <see cref="EnsureShard"/>
+    /// mints it a fresh originator and a fresh term.
+    /// </para>
+    /// </summary>
+    bool RemoveShard(ShardKey shard);
 }

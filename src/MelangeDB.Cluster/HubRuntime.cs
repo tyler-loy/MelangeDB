@@ -538,6 +538,71 @@ internal sealed partial class HubRuntime : IDisposable
     /// mid-drain heals by the origin's draining-mark expiry. The shard is writable on at most one
     /// node at every instant: it is closed on the origin before the destination ever learns of it.
     /// </summary>
+    /// <summary>
+    /// Removes a shard that holds nothing of its own: the owner verifies and deletes, then the
+    /// hub forgets the assignment. The counterpart <c>EnsureShard</c> never had.
+    /// <para>
+    /// Deliberately a host API and not an endpoint. This is the one cluster operation that
+    /// destroys durable state, and a new authenticated wire surface for it would drag the whole
+    /// gating ladder behind it for a call an operator makes by hand; direct callers are the host's
+    /// own code, the same line <c>BulkInsert</c> draws.
+    /// </para>
+    /// <para>
+    /// <b>Ordering is the crash-safety story.</b> The membership row goes last, so a failure
+    /// anywhere before it leaves a shard that is still owned and still openable — "the reap did
+    /// not happen" — rather than a directory nobody owns. The originator is never released: ids
+    /// minted under it outlive the shard.
+    /// </para>
+    /// <para>
+    /// Returns false when the owner refuses, which is an ordinary outcome rather than an error:
+    /// the caller is working from a sampled view and the owner holds the truth. The refusal is
+    /// logged with its reason.
+    /// </para>
+    /// </summary>
+    public async Task<bool> ReapShardAsync(ShardKey shard, CancellationToken ct = default)
+    {
+        var assignment = _membership.GetAssignment(shard)
+            ?? throw new InvalidOperationException($"{shard} was never created; there is nothing to reap.");
+        if (assignment.NodeName is not { } owner)
+        {
+            throw new InvalidOperationException(
+                $"{shard} has no owner, so no node can confirm it is empty. Let it be assigned first — an unowned "
+                + "shard's directory is still somewhere, and the hub does not know where.");
+        }
+
+        var link = LinkOf(owner)
+            ?? throw new InvalidOperationException(
+                $"No live link to '{owner}', the owner of {shard}. A reap needs the owner to check and delete; a dead "
+                + "owner is the failure detector's job.");
+
+        // One at a time, and never alongside a drain: both decide where the shard ends up.
+        if (!_drainsInFlight.TryAdd(shard, 0))
+            throw new InvalidOperationException($"{shard} is already being drained or reaped; one outcome at a time.");
+
+        try
+        {
+            var stepTimeoutMs = Math.Max(30_000, Cluster.DrainQueueTimeoutMs);
+            var response = await link.RequestAsync(
+                "shard-reap", new ShardReap(shard.Value, assignment.FencingToken), ct, stepTimeoutMs).ConfigureAwait(false);
+            var reply = response?.Deserialize<ShardReapReply>()
+                ?? throw new InvalidOperationException($"'{owner}' returned no answer for the reap of {shard}.");
+            if (!reply.Reaped)
+            {
+                LogShardReapRefused(_logger, shard.Value, owner, reply.Refusal ?? "no reason given");
+                return false;
+            }
+
+            // Last, and only after the owner confirms the data is gone.
+            _membership.RemoveShard(shard);
+            LogShardReaped(_logger, shard.Value, owner);
+            return true;
+        }
+        finally
+        {
+            _drainsInFlight.TryRemove(shard, out _);
+        }
+    }
+
     public async Task DrainShardAsync(ShardKey shard, string? destinationNode = null, CancellationToken ct = default)
     {
         var assignment = _membership.GetAssignment(shard)
@@ -1713,6 +1778,17 @@ internal sealed partial class HubRuntime : IDisposable
         Message = "Scale-in of '{NodeName}' stopped: {Reason}. The node stays and nothing was lost — consolidation is an " +
                   "optimization, and aborting one is free.")]
     private static partial void LogScaleInAborted(ILogger logger, string nodeName, string reason);
+
+    [LoggerMessage(EventId = 1748, EventName = "ShardReaped", Level = LogLevel.Warning,
+        Message = "Shard {Shard} was reaped: '{Owner}' confirmed it held nothing of its own and deleted it, and the hub " +
+            "has forgotten the assignment. Its originator is retired rather than reused; visiting the shard key again " +
+            "creates a new shard.")]
+    private static partial void LogShardReaped(ILogger logger, ulong shard, string owner);
+
+    [LoggerMessage(EventId = 1749, EventName = "ShardReapRefused", Level = LogLevel.Information,
+        Message = "Reap of shard {Shard} refused by its owner '{Owner}': {Reason}. The hub asks from a sampled view and " +
+            "the owner settles it under the shard's own lock, so a refusal is the check working rather than a failure.")]
+    private static partial void LogShardReapRefused(ILogger logger, ulong shard, string owner, string reason);
 
     [LoggerMessage(EventId = 1734, EventName = "RebalanceEvaluationFailed", Level = LogLevel.Warning,
         Message = "A rebalance tick failed to evaluate ({Reason}); the loop continues on its next tick.")]
