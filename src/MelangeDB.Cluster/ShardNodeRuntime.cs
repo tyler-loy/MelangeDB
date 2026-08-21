@@ -230,14 +230,29 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private ShardLoadDto[] CollectLoads()
     {
         List<ShardRuntime> owned;
+        List<ShardKey> draining;
         lock (_shardsLock)
         {
             owned = [.. _shards.Values];
+
+            // A quiesced shard is not in _shards — QuiesceShard removes it in the same lock that
+            // sets the drain mark — so the two sets are disjoint and a drain can only be reported
+            // from the mark. Without this the hub keeps the last pre-quiesce sample, which says
+            // Draining = false, and an empty shard stays on the holding-nothing list for a whole
+            // freshness window while it is mid-drain. Read on the owner because IsDrainingLocked
+            // expires the mark as it inspects it; the hub cannot age it for us.
+            draining = [.. _draining.Keys.ToList().Where(IsDrainingLocked)];
         }
 
-        var loads = new ShardLoadDto[owned.Count];
+        var loads = new ShardLoadDto[owned.Count + draining.Count];
         for (var i = 0; i < owned.Count; i++)
             loads[i] = owned[i].SampleLoad();
+
+        // A drained shard's engine is closed, so there is nothing to measure and the zeroes are
+        // honest rather than a stand-in: the flag is the payload, and the hub reads no numbers off
+        // a sample that carries it.
+        for (var i = 0; i < draining.Count; i++)
+            loads[owned.Count + i] = new ShardLoadDto(draining[i].Value, 0, 0, 0, 0, 0, Draining: true);
         return loads;
     }
 
@@ -368,7 +383,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// recovery tail is short, and report the head the destination will recover to. The snapshot
     /// and close run outside the shard-set lock — the node's other shards must keep serving.
     /// </summary>
-    private ShardDrainReply QuiesceShard(ShardDrain drain)
+    /// <summary>
+    /// Internal rather than private for the drain-reporting test: a quiesced shard leaves
+    /// <c>_shards</c> here, which is precisely why its drain mark has to be reported from
+    /// <c>_draining</c> and why the omission was invisible until something drove this directly.
+    /// </summary>
+    internal ShardDrainReply QuiesceShard(ShardDrain drain)
     {
         var shard = new ShardKey(drain.Shard);
         ShardRuntime runtime;

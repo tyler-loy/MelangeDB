@@ -10,6 +10,22 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **Two per-shard row gauges, `melange.cluster.shard.authoritative_rows` and
+  `melange.cluster.shard.borrowed_rows`.** The first counts only rows in `Partitioned` tables minus
+  the border-band copies a shard holds of its neighbours' — what would be *permanently* lost if the
+  shard were removed, as against what comes back on its own (`Local` timer rows are rebuilt by the
+  shard's init reducer, `Replicated` rows are the hub's, borrowed rows are rebuilt by a band reset).
+  Both ride the existing load sample, so a shard node reports them on every heartbeat at no extra
+  sampling cost. Advisory by construction — see [OBSERVABILITY.md](docs/OBSERVABILITY.md). Groundwork
+  for [#112](https://github.com/tyler-loy/MelangeDB/issues/112).
+- **`ClusterLoadView.ShardsHoldingNothing`** narrows on those gauges: shards reporting no
+  authoritative rows, not drain-quiesced, and heard from recently enough that a silent node cannot
+  make its shards look empty. A narrowing rather than a verdict — nothing pinning the log and
+  unoccupied are deliberately absent, because neither can be answered from a sample — so a caller
+  re-checks both on the owning node under the lock.
+
 ### Fixed
 
 - **Postgres membership no longer derives a new shard's originator from the shards that still

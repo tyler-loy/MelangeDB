@@ -43,7 +43,14 @@ internal sealed record HeartbeatReply(ShardAssignmentDto[] Assignments);
 /// heartbeat (see <c>MelangeEngine.WriteLockBusyTicks</c>): the resource the published hotspot
 /// ceilings are ceilings on, already in [0, 1], no per-hardware calibration needed.
 /// </summary>
-internal sealed record ShardLoadDto(ulong Shard, double Utilization, ulong HeadLsn, long ResidentBytes, int BorrowedRows);
+internal sealed record ShardLoadDto(
+    ulong Shard,
+    double Utilization,
+    ulong HeadLsn,
+    long ResidentBytes,
+    int BorrowedRows,
+    long AuthoritativeRows,
+    bool Draining = false);
 
 /// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
 internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);

@@ -230,12 +230,49 @@ Meter name: `MelangeDB`.
 | `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 |
 | `melange.cluster.shard.utilization` | gauge | `{ratio}` | `shard`, `node` | 13 |
 | `melange.cluster.shard.resident_bytes` | gauge | `By` | `shard`, `node` | 13 |
+| `melange.cluster.shard.authoritative_rows` | gauge | `{row}` | `shard`, `node` | 13 |
+| `melange.cluster.shard.borrowed_rows` | gauge | `{row}` | `shard`, `node` | 13 |
 | `melange.cluster.nodes` | gauge | `{node}` | — | 14 |
 | `melange.cluster.provision.outstanding` | gauge | `{ticket}` | — | 14 |
 | `melange.cluster.provision.latency` | histogram | `ms` | — | 14 |
 | `melange.cluster.decommissions` | counter | `{node}` | — | 14 |
 | `melange.backup.bytes` | counter | `By` | `outcome` | 15 |
 | `melange.backup.duration` | histogram | `ms` | `outcome` | 15 |
+
+### Reading the two shard row gauges
+
+`melange.cluster.shard.authoritative_rows` counts only rows in `Partitioned` tables, minus the
+border-band copies the shard holds of its neighbours'. That is deliberately narrower than "rows in
+this engine", and the narrowing is the point: it answers **what would be permanently lost if this
+shard were removed.** Everything excluded comes back on its own — `Local` tables (timer rows above
+all) are rebuilt by the shard's init reducer when it next opens, `Replicated` rows are the hub's
+copies, and borrowed rows are rebuilt by a band reset. A shard holding nothing but its own timer
+row reads as zero here, which is the honest answer.
+
+`melange.cluster.shard.borrowed_rows` is the other half: how much of a neighbour's band this shard
+is carrying. Together they separate "this shard is busy" from "this shard is watching something
+busy".
+
+`ClusterLoadView.ShardsHoldingNothing` narrows on the pair: shards reporting no authoritative rows,
+not drain-quiesced, and heard from recently enough that a node cannot make its shards look empty by
+going silent. **It is a narrowing, not a verdict.** Two conditions are deliberately absent — nothing
+pinning the log, and unoccupied — because neither can be answered from a sample. Truncation floors
+are evaluated only inside a truncation decision under the engine write lock (one of them writes a
+file when evaluated, and all of them race a scrape), and sessions live on the gateway. A caller that
+acts on the list re-checks both on the owning node, under the lock; the list exists so that check
+runs against a handful of shards rather than every shard the cluster has ever created.
+
+**Both are advisory, and the row count is throttled.** `authoritative_rows` is computed in the same
+throttled pass that samples resident bytes, so it can be as old as that interval — not one
+heartbeat. It has to be: `SampleLoad` runs *inside* the interval its own utilization divides by, so
+per-heartbeat work there inflates the denominator and makes shards report as less loaded than they
+are, which suppresses scale-out. Both terms of the subtraction are read in that one pass, because
+mixing a stale row total with a live borrowed count does not merely age the figure — it invents an
+empty shard whenever a band lands.
+
+`borrowed_rows` is read live, since nothing keys emptiness on it, so the two gauges can disagree by
+one sampling interval. Anything that *acts* on emptiness — the shard reaper this pair exists to make
+possible — must re-check under the shard's own lock rather than trusting a gauge.
 
 ### The four that actually matter
 
