@@ -517,7 +517,10 @@ assignments change.
 **Originator** — The 16-bit prefix of every AutoInc id, naming which allocator minted it: 0 is the hub, and
 the membership store assigns each shard a distinct originator for life — so two shards can never mint the
 same value with no coordination on the hot path, and the sequence continues from the shard's own log when
-ownership moves.
+ownership moves. Allocation is a **high-water mark and never a reuse**: ids minted under an originator
+outlive their shard, since an entity that crosses a border carries its id into the neighbour, so a shard's
+prefix is retired with it rather than handed on. That bounds a cluster to 65,535 shards ever created, not
+65,535 at once.
 
 **Out of line** — Where a large `byte[]` payload (256 bytes and up) lives in the paging store: a separate blob
 log, keyed by row and column, while the main record keeps only the column's framing. Scanning a blob table by

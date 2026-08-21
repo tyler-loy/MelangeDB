@@ -58,6 +58,13 @@ public sealed class PostgresMembershipStore : IMembershipStore
                     fencing_token bigint NOT NULL,
                     originator int NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS {Schema}.melange_cluster_originator (
+                    lock_row boolean PRIMARY KEY,
+                    next_originator int NOT NULL
+                );
+                INSERT INTO {Schema}.melange_cluster_originator (lock_row, next_originator)
+                VALUES (true, COALESCE((SELECT MAX(originator) FROM {Schema}.melange_cluster_shards), 0) + 1)
+                ON CONFLICT (lock_row) DO NOTHING;
                 """;
             command.ExecuteNonQuery();
             _schemaReady = true;
@@ -126,12 +133,31 @@ public sealed class PostgresMembershipStore : IMembershipStore
         if (ReadAssignment(connection, transaction, shard) is { } existing)
             return existing;
 
+        // A high-water mark, never derived from the live rows: ids minted under an originator
+        // outlive their shard, so a removed shard's prefix has to retire with it.
         ushort originator;
         using (var next = connection.CreateCommand())
         {
             next.Transaction = transaction;
-            next.CommandText = $"SELECT COALESCE(MAX(originator), 0) + 1 FROM {Schema}.melange_cluster_shards";
-            originator = Convert.ToUInt16(next.ExecuteScalar());
+            next.CommandText = $"""
+                UPDATE {Schema}.melange_cluster_originator
+                SET next_originator = next_originator + 1
+                WHERE lock_row
+                RETURNING next_originator - 1
+                """;
+            // No row means the singleton is missing or corrupt, and EnsureSchema will not seed it
+            // again this process. Convert.ToInt32(null) would be 0 — the hub's own originator —
+            // so the failure would surface as ids colliding with the hub's rather than as a fault.
+            if (next.ExecuteScalar() is not { } scalar || Convert.ToInt32(scalar) is var allocated && allocated <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"The originator high-water row in {Schema}.melange_cluster_originator is missing or invalid; "
+                    + "shard originators cannot be allocated. Restore the cluster schema from backup.");
+            }
+
+            if (allocated > ushort.MaxValue)
+                throw new InvalidOperationException("The 16-bit originator space is exhausted.");
+            originator = (ushort)allocated;
         }
 
         var owner = LeastLoadedNode(connection, transaction, except: null);
