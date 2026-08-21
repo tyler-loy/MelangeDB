@@ -10,6 +10,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Fixed
+
+- **Ad-hoc SQL against a `Partitioned` table is now refused in a cluster instead of returning an
+  empty result.** `/melange/sql` reads the node-local engine, and in a cluster a partitioned
+  table's rows live in the shard engines — on a hub, and on a shard node, whose own engine is not
+  any shard's. The endpoint answered 200 with zero rows, which an operator console cannot
+  distinguish from "this table is empty"; it now answers 400 `partitioned_elsewhere`, naming the
+  placement and the node's `Cluster:Role`. Nothing changes for single-node deployments, where
+  `Cluster:Role` is `None` and placement is inert. Reported against the reference workload
+  ([#111](https://github.com/tyler-loy/MelangeDB/issues/111)).
+
 ## [0.2.0] — 2026-08-17
 
 ### Breaking

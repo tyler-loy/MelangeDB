@@ -222,6 +222,7 @@ internal static class MelangeHttpEndpoints
             }
 
             var parsed = adHoc.Rows!;
+            var clusterRole = transport.Options.Cluster.Role;
             var limits = transport.Options.Subscriptions;
             var enforced = !owner;
             var callerContext = enforced
@@ -233,6 +234,25 @@ internal static class MelangeHttpEndpoints
                     NullSink.Instance, 0, parsed, transport.Engine.Schema, limits,
                     enforced ? transport.Policies : null, callerContext,
                     allowPrivateRelational: owner);
+
+                // Placement is inert on a single node, so this fires only in a cluster — where
+                // a Partitioned table's rows live in the shard engines and this endpoint reads
+                // the node-local one: on a hub that holds Global/Replicated tables, on a shard
+                // node its own engine rather than any shard's. Refusing beats the empty result
+                // it would otherwise return, which an operator cannot distinguish from "no rows"
+                // and will read as fact. Checked after Compile on purpose: Compile answers
+                // unknown and private tables identically so the error reveals no existence, and
+                // pre-checking here would turn this refusal into that oracle.
+                if (clusterRole != ClusterRole.None && compiled.Schema.Placement == Placement.Partitioned)
+                {
+                    throw new SubscriptionRejectedException(
+                        MelangeErrorCodes.PartitionedElsewhere,
+                        $"Table '{compiled.Schema.Name}' is Placement.Partitioned, and its rows live in the shard "
+                        + $"engines rather than in this node's (Cluster:Role is {clusterRole}). Ad-hoc SQL reads the "
+                        + "node-local engine only. Reach partitioned rows through a reducer or a subscription, which "
+                        + "the gateway routes to the owning shard.");
+                }
+
                 var collected = new List<(ReadOnlyMemory<byte> Row, IReadOnlySet<string>? Columns)>();
                 long bytes = 0;
                 foreach (var pair in compiled.MatchingRows(transport.Engine.HotStore))

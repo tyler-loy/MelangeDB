@@ -190,6 +190,45 @@ public class SqlPolicyTests
         }
     }
 
+    /// <summary>
+    /// The silent-empty case (issue #111): in a cluster, a <c>Partitioned</c> table's rows live in
+    /// the shard engines, and <c>/melange/sql</c> reads the node-local one. Returning an empty
+    /// result set tells an operator console "no rows" when the truth is "wrong node" — a
+    /// successful answer that is false. Placement is inert single-node, so the same query against
+    /// the same table must still succeed there; that half is the regression this pairs against.
+    /// </summary>
+    [Fact]
+    public async Task Partitioned_tables_are_refused_in_a_cluster_and_served_single_node()
+    {
+        await using var clustered = await TransportTestHost.StartAsync(new Dictionary<string, string?>(EnabledOwner)
+        {
+            ["MelangeDb:Cluster:Role"] = "Hub",
+            ["MelangeDb:Cluster:NodeName"] = "hub",
+            ["MelangeDb:Cluster:Secret"] = "test-cluster-secret",
+        });
+        using var onHub = clustered.CreateHttp(TestTokens.For("admin", role: OwnerRole));
+        var refused = await onHub.PostAsync(
+            "/melange/sql", Json("""{"query": "SELECT * FROM Chunk"}"""), TestContext.Current.CancellationToken);
+
+        var text = await refused.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, refused.StatusCode);
+        var error = JsonDocument.Parse(text).RootElement;
+        Assert.Equal("partitioned_elsewhere", error.GetProperty("error").GetString());
+
+        // The message has to name the placement and the role: "wrong node" is only actionable if
+        // the operator learns which node would have answered.
+        var message = error.GetProperty("message").GetString()!;
+        Assert.Contains("Partitioned", message, StringComparison.Ordinal);
+        Assert.Contains("Hub", message, StringComparison.Ordinal);
+
+        // Same query, same table, no cluster role: still served, and still empty-because-empty
+        // rather than empty-because-elsewhere.
+        await using var single = await TransportTestHost.StartAsync(EnabledOwner);
+        using var onSingle = single.CreateHttp(TestTokens.For("admin", role: OwnerRole));
+        var served = await QueryAsync(onSingle, "SELECT * FROM Chunk");
+        Assert.Empty(served.GetProperty("rows").EnumerateArray());
+    }
+
     private static string[] ItemNames(JsonElement body)
     {
         var columns = body.GetProperty("columns").EnumerateArray().Select(c => c.GetString()!).ToList();

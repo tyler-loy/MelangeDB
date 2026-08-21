@@ -90,6 +90,15 @@ public static class MelangeErrorCodes
     public const string RelationalUnavailable = "relational_unavailable";
 
     /// <summary>
+    /// The query names a <c>Partitioned</c> table and this node does not hold its rows: a hub
+    /// holds <c>Global</c>/<c>Replicated</c> tables, and a shard node's own engine is not any
+    /// shard's engine. Never raised on a single-node deployment, where placement is inert. A
+    /// refusal rather than an empty result, because an operator cannot tell "no rows" from
+    /// "wrong node" and the empty answer reads as fact.
+    /// </summary>
+    public const string PartitionedElsewhere = "partitioned_elsewhere";
+
+    /// <summary>
     /// Client-synthesized, never sent by a server: a Manual-dispatch client's frame queue hit
     /// its configured limit without a tick, and the client aborted its own socket.
     /// </summary>
