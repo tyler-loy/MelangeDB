@@ -13,6 +13,54 @@ public class BorderReplicationTests
     private static readonly ulong BlockA = SpatialShardStrategy.ShardOfBlock(0, 0).Value; // Chunks x 0..3.
     private static readonly ulong BlockB = SpatialShardStrategy.ShardOfBlock(1, 0).Value; // Chunks x 4..7.
 
+    /// <summary>
+    /// What a shard would lose if it were removed, versus what a band reset would rebuild
+    /// (issue #112). Borrowed rows are a neighbour's authoritative data, so they must not count
+    /// toward a shard's own content — a reaper keying on total rows would refuse to remove an
+    /// empty shard merely because it observes a busy neighbour, and one keying on "unoccupied"
+    /// would remove a shard that still holds rows nobody is currently standing on.
+    /// </summary>
+    [Fact]
+    public async Task Authoritative_row_counts_exclude_the_neighbours_rows_a_shard_only_borrows()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(
+            shardNodes: 2, heartbeatMs: 150, failureTimeoutMs: 60_000, spatial: true);
+        var shardA = (await cluster.EnsureShardOwnedAsync(BlockA)).Runtime.TryGetShard(new ShardKey(BlockA))!;
+        var shardB = (await cluster.EnsureShardOwnedAsync(BlockB)).Runtime.TryGetShard(new ShardKey(BlockB))!;
+
+        // One critter, owned by B, standing inside A's border band. A holds a copy; B holds the row.
+        shardB.ReducerHost.Call("SpawnCritter", ClusterFixture.Caller, 1UL, Chunks.Id(4, 2));
+        await ClusterFixture.WaitUntilAsync(
+            () => shardA.BorrowedRowCount >= 1,
+            "the border copy reached the neighbouring node");
+
+        // Wait on both shards' own samples, not on "some sample arrived": B's heartbeat can land
+        // before A has taken the copy, and reading the snapshot then would compare a fresh sample
+        // against a stale one. Row counts ride the resident-bytes throttle, so the first post-spawn
+        // reading is up to that interval away — deliberately, since sampling faster would dilute
+        // the utilization measured in the same pass.
+        await ClusterFixture.WaitUntilAsync(
+            () =>
+            {
+                var byShard = cluster.Hub.Load.Snapshot().ToDictionary(load => load.Shard.Value);
+                return byShard.TryGetValue(BlockA, out var a) && a.BorrowedRows >= 1
+                    && byShard.TryGetValue(BlockB, out var b) && b.AuthoritativeRows >= 1;
+            },
+            "both shards' load samples reached the hub",
+            timeoutSeconds: 30);
+
+        var byShard = cluster.Hub.Load.Snapshot().ToDictionary(load => load.Shard.Value);
+
+        // B owns the critter, so it counts against B and nothing is borrowed there.
+        Assert.True(byShard[BlockB].AuthoritativeRows >= 1);
+        Assert.Equal(0, byShard[BlockB].BorrowedRows);
+
+        // A holds the same row as a copy: visible, reported as borrowed, and worth nothing to A's
+        // own content. This is the subtraction the reap predicate turns on.
+        Assert.True(byShard[BlockA].BorrowedRows >= 1);
+        Assert.Equal(0, byShard[BlockA].AuthoritativeRows);
+    }
+
     [Fact]
     public async Task Border_band_entities_are_visible_on_the_neighbouring_node_and_not_mutable_there()
     {

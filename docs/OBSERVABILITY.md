@@ -230,12 +230,34 @@ Meter name: `MelangeDB`.
 | `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 |
 | `melange.cluster.shard.utilization` | gauge | `{ratio}` | `shard`, `node` | 13 |
 | `melange.cluster.shard.resident_bytes` | gauge | `By` | `shard`, `node` | 13 |
+| `melange.cluster.shard.authoritative_rows` | gauge | `{row}` | `shard`, `node` | 13 |
+| `melange.cluster.shard.borrowed_rows` | gauge | `{row}` | `shard`, `node` | 13 |
 | `melange.cluster.nodes` | gauge | `{node}` | — | 14 |
 | `melange.cluster.provision.outstanding` | gauge | `{ticket}` | — | 14 |
 | `melange.cluster.provision.latency` | histogram | `ms` | — | 14 |
 | `melange.cluster.decommissions` | counter | `{node}` | — | 14 |
 | `melange.backup.bytes` | counter | `By` | `outcome` | 15 |
 | `melange.backup.duration` | histogram | `ms` | `outcome` | 15 |
+
+### Reading the two shard row gauges
+
+`melange.cluster.shard.authoritative_rows` counts only rows in `Partitioned` tables, minus the
+border-band copies the shard holds of its neighbours'. That is deliberately narrower than "rows in
+this engine", and the narrowing is the point: it answers **what would be permanently lost if this
+shard were removed.** Everything excluded comes back on its own — `Local` tables (timer rows above
+all) are rebuilt by the shard's init reducer when it next opens, `Replicated` rows are the hub's
+copies, and borrowed rows are rebuilt by a band reset. A shard holding nothing but its own timer
+row reads as zero here, which is the honest answer.
+
+`melange.cluster.shard.borrowed_rows` is the other half: how much of a neighbour's band this shard
+is carrying. Together they separate "this shard is busy" from "this shard is watching something
+busy".
+
+**Both are advisory.** They are sampled per heartbeat and can be a heartbeat old, and the pair can
+tear between two cheap reads. Anything that *acts* on emptiness — the shard reaper this pair exists
+to make possible — must re-check under the shard's own lock rather than trust a gauge. Reading low
+is the dangerous direction, which is why the row count is sampled every heartbeat rather than on the
+resident-bytes throttle beside it.
 
 ### The four that actually matter
 

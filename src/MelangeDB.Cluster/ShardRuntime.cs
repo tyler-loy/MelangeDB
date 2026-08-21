@@ -273,6 +273,7 @@ internal sealed partial class ShardRuntime : IDisposable
     private long _loadSampleBusyTicks;
     private long _loadSampleTimestamp;
     private long _residentBytes;
+    private long _authoritativeRows;
     private long _residentSampledTimestamp;
 
     /// <summary>
@@ -296,12 +297,51 @@ internal sealed partial class ShardRuntime : IDisposable
         if (_residentSampledTimestamp == 0
             || System.Diagnostics.Stopwatch.GetElapsedTime(_residentSampledTimestamp) > TimeSpan.FromSeconds(10))
         {
-            _residentBytes = Engine.ReadConsistent(_ =>
-                Engine.HotStore.Statistics().Tables.Sum(static table => table.ResidentBytes));
+            // Both readings come off the one throttled statistics pass, and the throttle is not
+            // only about the cost of the call. SampleLoad runs *inside* the interval its own
+            // utilization divides by: the ratio is write-lock busy time over start-to-start wall
+            // time, so work added here inflates the denominator and the shard reports as less
+            // loaded than it is. That direction suppresses scale-out, so a fresher row count is
+            // not worth buying with sampling time.
+            (_residentBytes, _authoritativeRows) = Engine.ReadConsistent(_ => (
+                Engine.HotStore.Statistics().Tables.Sum(static table => table.ResidentBytes),
+                PartitionedRowCount()));
             _residentSampledTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
-        return new ShardLoadDto(Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount);
+        // Borrowed rows are counted live — one field read — while the authoritative total is as
+        // fresh as the throttle above. The subtraction can therefore go negative when a band lands
+        // between the two, hence the clamp. Both numbers are advisory: whatever eventually acts on
+        // emptiness re-checks under the shard's own lock rather than trusting a sampled gauge.
+        var borrowed = BorrowedRowCount;
+
+        return new ShardLoadDto(
+            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, borrowed,
+            Math.Max(0, _authoritativeRows - borrowed));
+    }
+
+    /// <summary>
+    /// Rows in this engine's <see cref="Placement.Partitioned"/> tables — the only rows a shard
+    /// actually owns, and so the only ones whose loss would be permanent.
+    /// <para>
+    /// Everything else in a shard engine is a copy or is derived. <c>Local</c> tables are the
+    /// shard's own bookkeeping, timer rows most of all, and a shard-executed init reducer puts
+    /// them back the next time the shard opens — which is precisely why <c>Init</c> exists.
+    /// <c>Replicated</c> rows are the hub's, copied. Border-band rows are a neighbour's, and a
+    /// band reset rebuilds them. Counting any of them would mean a shard holding nothing but its
+    /// own timer row never reads as empty.
+    /// </para>
+    /// </summary>
+    private long PartitionedRowCount()
+    {
+        long rows = 0;
+        foreach (var table in Engine.HotStore.Statistics().Tables)
+        {
+            if (Engine.Schema.TryGet(table.Table, out var schema) && schema.Placement == Placement.Partitioned)
+                rows += table.RowCount;
+        }
+
+        return rows;
     }
 
     /// <summary>

@@ -10,6 +10,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **Two per-shard row gauges, `melange.cluster.shard.authoritative_rows` and
+  `melange.cluster.shard.borrowed_rows`.** The first counts only rows in `Partitioned` tables minus
+  the border-band copies a shard holds of its neighbours' — what would be *permanently* lost if the
+  shard were removed, as against what comes back on its own (`Local` timer rows are rebuilt by the
+  shard's init reducer, `Replicated` rows are the hub's, borrowed rows are rebuilt by a band reset).
+  Both ride the existing load sample, so a shard node reports them on every heartbeat at no extra
+  sampling cost. Advisory by construction — see [OBSERVABILITY.md](docs/OBSERVABILITY.md). Groundwork
+  for [#112](https://github.com/tyler-loy/MelangeDB/issues/112).
+
 ### Fixed
 
 - **Ad-hoc SQL against a `Partitioned` table is now refused in a cluster instead of returning an
