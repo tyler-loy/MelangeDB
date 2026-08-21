@@ -232,6 +232,67 @@ get either correctness bugs or a system that silently degrades into distributed 
 check should fail loudly when a transaction's write set spans shard keys, so violations surface in
 development rather than under load.
 
+### The seam: what a transaction may write across a block boundary
+
+The contract above is stated strictly, and the spatial strategy relaxes it in exactly one place. The
+question that keeps coming up — *must a transaction touching several adjacent chunks be split when
+those chunks straddle a block seam?* — has the answer **no, within the band**:
+
+> `MayCommit` admits a row whose chunk is in the executing shard's block, **or** within
+> `Cluster:BorderBandChunks` of it. A write set that stays inside that envelope is one shard's
+> business and commits normally. Beyond it, the span check has something to say.
+
+Per-chunk splitting is therefore not required, and a refactor to achieve it is wasted work.
+
+**But the widening is about ownership, not geometry**, and its docstring is doing real work that the
+signature hides:
+
+> the owner may also commit a row standing up to the band depth inside a neighbouring block — the
+> entity it still owns whose handoff has not completed yet
+
+The distinction that resolves it, and the one worth carrying away:
+
+> **`MayCommit` answers "may this shard write this row?" — not "should this row live here?"**
+
+For an entity mid-handoff those coincide: the row is the executing shard's to write, and it will be
+transferred. For **durable world data the neighbour owns**, they come apart. A row committed on
+shard S that homes to T stays authoritative in **S's log**; T only ever sees it as a *borrowed*
+copy, which T may not mutate. The authoritative copy is in the wrong engine, and nothing later
+moves it.
+
+So: gameplay writes near a seam are fine within the band. Terrain and world rows homed to a
+neighbour are not — for those, the executing shard must be the home shard.
+
+### What actually guards a commit, and what is on by default
+
+`ShardCommitGuard.Validate` runs five checks in order. **Only the last one is configurable**, which
+is the opposite of the impression `Cluster:ShardSpanCheck` alone gives:
+
+| Check | Catches | On |
+| --- | --- | --- |
+| Lease — `ShardFencedException` | Committing on a shard this node no longer holds a live lease for | Always |
+| Freeze — `TransientRejectionException` | Writing a row frozen mid-handoff | Always |
+| Borrowed — `BorderReadOnlyException` | Writing a row this node holds as a read-only border-band copy | Always |
+| Placement — `InvalidOperationException` | Writing a `Global` or `Replicated` table on a shard node | Always |
+| Span — `ShardSpanException` | A write set resolving to more than one shard, per `MayCommit` | `Cluster:ShardSpanCheck`, default `DebugOnly` |
+
+Commits with `CommitOrigin.Internal` — replication, handoff imports, saga markers — skip all of it
+by design: the write set was validated where it originated, and the applying node holds it precisely
+because its own placement rules say it may not produce it. `Bulk` is *not* internal, and is checked
+like any reducer.
+
+**The asymmetry that matters.** The borrowed-row guard is a lookup by key in the borrowed registry,
+so it only fires for a row this node is *currently holding a copy of*:
+
+- **Updating** a row homed to a neighbour and already borrowed → `BorderReadOnlyException`, always,
+  Release builds included.
+- **Inserting** a new row homed to a neighbour → nothing borrowed, nothing to look up → falls
+  through to the span check → `DebugOnly` → **silent in a Release build.**
+
+A world generator writing terrain into a neighbouring chunk is an insert, which is precisely the
+case the always-on guard does not catch. If a deployment writes world data anywhere near a seam,
+set `Cluster:ShardSpanCheck` to `Always` and pay the dictionary probe.
+
 ## Handoff
 
 Two shapes, following from the strategy:

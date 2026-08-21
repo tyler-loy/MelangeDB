@@ -285,7 +285,10 @@ Stating these plainly is part of the design, not an omission:
   input automation. Column visibility narrows what a cheat can *know*; it cannot police what a client does
   with what it legitimately receives.
 - **The shard-span contract.** Rows mutated in one transaction must resolve to one shard. MelangeDB detects
-  violations in development (`Cluster:ShardSpanCheck`) but cannot prevent them statically.
+  violations in development (`Cluster:ShardSpanCheck`) but cannot prevent them statically. The four guards
+  either side of it *are* always on — lease, freeze, borrowed-row, and placement — so the undefended case is
+  narrower than the span check's default suggests; the table in
+  [CLUSTERING.md](CLUSTERING.md#what-actually-guards-a-commit-and-what-is-on-by-default) says which is which.
 - **Existence inference through query patterns.** Even with correct row policies, a client can probe with
   `WHERE x = :guess` and learn something from hit versus miss. Mitigated by mandatory predicates and rate
   limits, not eliminated.
