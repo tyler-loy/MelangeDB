@@ -58,6 +58,13 @@ public sealed class PostgresMembershipStore : IMembershipStore
                     fencing_token bigint NOT NULL,
                     originator int NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS {Schema}.melange_cluster_originator (
+                    lock_row boolean PRIMARY KEY,
+                    next_originator int NOT NULL
+                );
+                INSERT INTO {Schema}.melange_cluster_originator (lock_row, next_originator)
+                VALUES (true, COALESCE((SELECT MAX(originator) FROM {Schema}.melange_cluster_shards), 0) + 1)
+                ON CONFLICT (lock_row) DO NOTHING;
                 """;
             command.ExecuteNonQuery();
             _schemaReady = true;
@@ -126,12 +133,27 @@ public sealed class PostgresMembershipStore : IMembershipStore
         if (ReadAssignment(connection, transaction, shard) is { } existing)
             return existing;
 
+        // A high-water mark, never MAX(originator) + 1 over the live rows. An originator prefixes
+        // every AutoInc id the shard mints, and those ids outlive the shard: an entity that walks
+        // across a border carries its id into the neighbour. Deriving the next id from the rows
+        // that still exist means removing a shard hands its originator to the next one created,
+        // which re-mints ids that are still in use elsewhere — and "unique, not dense" is the
+        // whole AutoInc contract. The counter only goes up, so a removed shard's prefix is
+        // retired with it.
         ushort originator;
         using (var next = connection.CreateCommand())
         {
             next.Transaction = transaction;
-            next.CommandText = $"SELECT COALESCE(MAX(originator), 0) + 1 FROM {Schema}.melange_cluster_shards";
-            originator = Convert.ToUInt16(next.ExecuteScalar());
+            next.CommandText = $"""
+                UPDATE {Schema}.melange_cluster_originator
+                SET next_originator = next_originator + 1
+                WHERE lock_row
+                RETURNING next_originator - 1
+                """;
+            var allocated = Convert.ToInt32(next.ExecuteScalar());
+            if (allocated > ushort.MaxValue)
+                throw new InvalidOperationException("The 16-bit originator space is exhausted.");
+            originator = (ushort)allocated;
         }
 
         var owner = LeastLoadedNode(connection, transaction, except: null);

@@ -33,6 +33,53 @@ public class PostgresMembershipTests
         return (new PostgresMembershipStore(source, new StaticOptionsMonitor(options)), options);
     }
 
+    /// <summary>
+    /// An originator prefixes every AutoInc id its shard mints, and those ids outlive the shard —
+    /// an entity that crosses a border carries its id into the neighbour. So a removed shard's
+    /// originator must be retired with it, never handed to the next shard created; otherwise the
+    /// new shard re-mints ids that are still in use and "unique, not dense" stops being true.
+    /// <para>
+    /// This is latent until something deletes a shard row, which is why it is asserted before
+    /// there is anything that does (issue #112). Deriving the next originator from the live rows
+    /// — <c>MAX(originator) + 1</c> — passes every test that never deletes one.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void A_removed_shards_originator_is_retired_rather_than_handed_to_the_next_shard()
+    {
+        _postgres.SkipUnlessAvailable();
+        var schema = PostgresContainerFixture.NewSchema();
+        var (store, options) = CreateStore(schema);
+        store.RegisterNode("a", "http://a", T0);
+
+        var first = store.EnsureShard(new ShardKey(1), T0);
+        var second = store.EnsureShard(new ShardKey(2), T0);
+
+        // Stand in for the reaper that does not exist yet: drop the newest shard's row, which is
+        // exactly what makes MAX(originator) fall back.
+        Execute(options, $"DELETE FROM {schema}.melange_cluster_shards WHERE shard = 2");
+
+        var third = store.EnsureShard(new ShardKey(3), T0);
+        Assert.NotEqual(second.Originator, third.Originator);
+        Assert.NotEqual(first.Originator, third.Originator);
+        Assert.True(third.Originator > second.Originator);
+
+        // And the mark survives a hub restart, which is the reason membership is in Postgres at
+        // all: a fresh store over the same schema must not rewind it either.
+        var (restarted, _) = CreateStore(schema);
+        var fourth = restarted.EnsureShard(new ShardKey(4), T0);
+        Assert.True(fourth.Originator > third.Originator);
+    }
+
+    private static void Execute(MelangeDbOptions options, string sql)
+    {
+        using var connection = new Npgsql.NpgsqlConnection(options.Postgres.ConnectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
     [Fact]
     public void A_new_shard_is_assigned_to_the_least_loaded_live_node_with_a_fresh_originator()
     {

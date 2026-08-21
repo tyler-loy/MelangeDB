@@ -12,6 +12,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **Postgres membership no longer derives a new shard's originator from the shards that still
+  exist.** It allocated `MAX(originator) + 1`, so deleting a shard row would hand its originator to
+  the next shard created. An originator prefixes every AutoInc id its shard mints and those ids
+  outlive the shard — an entity that crosses a border carries its id into the neighbour — so the
+  reused prefix would re-mint ids still in use, breaking AutoInc's unique-not-dense contract.
+  Allocation is now a high-water mark that only moves forward, seeded once from any existing rows.
+  Latent today because nothing removes a shard; fixed ahead of
+  [#112](https://github.com/tyler-loy/MelangeDB/issues/112), which would have made it live. The
+  in-memory store was already monotonic and is unchanged.
+
 - **Ad-hoc SQL against a `Partitioned` table is now refused in a cluster instead of returning an
   empty result.** `/melange/sql` reads the node-local engine, and in a cluster a partitioned
   table's rows live in the shard engines — on a hub, and on a shard node, whose own engine is not
