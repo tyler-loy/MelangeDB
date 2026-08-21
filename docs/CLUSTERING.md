@@ -126,6 +126,34 @@ The general form of the rule: **place tables so that transaction boundaries fall
 tables are mutated together, they belong in the same place. That single sentence is most of what a
 developer needs to get placement right.
 
+### The HTTP surface is node-local
+
+`MapMelangeSocket` maps `/call/{reducer}`, `/bulk`, `/sql`, and `/ticket` against the engine
+registered in DI — **this node's engine, not a shard's.** A shard node's `ShardRuntime` builds its
+own engine per owned shard, so the HTTP endpoints on a shard node reach none of them; the shard
+engines are reachable only over the internal `/{path}/shard/{shardKey}` sockets, which are
+hub-assertion authenticated and never exposed to clients.
+
+The consequence worth stating plainly, because it is not what a single-node deployment trains you
+to expect:
+
+> **Ad-hoc SQL against a `Partitioned` table is refused in a cluster** (`partitioned_elsewhere`),
+> on hub and shard nodes alike. `Partitioned` is the default placement, so this covers every table
+> that has not declared otherwise. `Global` and `Replicated` tables answer on the hub as usual, and
+> nothing changes single-node, where `Cluster:Role` is `None` and placement is inert.
+
+It is a refusal rather than an empty result on purpose. The endpoint *could* return zero rows and a
+200, and that is what it used to do — but an operator console cannot tell "no rows" from "wrong
+node", and the empty answer reads as fact. A refusal naming the placement is information; a
+successful lie is not.
+
+To read partitioned rows, go through a reducer or a subscription: the gateway routes both to the
+owning shard. **Bulk loading partitioned data has no cluster path today** — the endpoint writes to
+the node-local engine, which is the wrong engine for rows that belong to a shard. Seeding a
+clustered world means routed reducer calls, which forfeits bulk's measured 44× advantage over
+per-row transactions. Fanning a bulk batch out from the hub — which already holds the strategy and
+can partition by `ShardForRow` — is the natural fix and is tracked, not built.
+
 ## Sharding is user-defined
 
 MelangeDB supplies the mechanism — one writer per shard, per-shard logs, handoff, interest — and the
