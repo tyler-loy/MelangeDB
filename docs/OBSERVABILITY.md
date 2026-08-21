@@ -392,6 +392,13 @@ last one is worth an alert in a world whose shards are created by players arrivi
 otherwise completely silent, because a shard with no timers serves reads and writes perfectly and simply
 never ticks.
 
+Reaping a shard (issue #112) is the one cluster operation that destroys durable state, so both of its
+receipts are warnings and the refusal is not: `1747 ShardReaped` (node-side — the shard held nothing of
+its own, its engine closed and its directory was deleted), `1748 ShardReaped` (hub-side — the owner
+confirmed and the assignment is forgotten; the originator is retired rather than reused), and
+`1749 ShardReapRefused` at information, naming the condition that was not met. A refusal is the check
+working: the caller asks from a sampled view and the owner settles it under the shard's own lock.
+
 The planned drain (road-to-0.2 phase 13): `1724 ShardDrainCompleted` — the receipt, with the two step
 durations that matter: quiesce (snapshot + close) and destination open (recovery) — `1725 ShardDrainFailed`
 (the shard stayed with, or returned to, its origin; queued gateway calls flushed to the current owner),

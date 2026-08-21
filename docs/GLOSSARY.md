@@ -522,6 +522,12 @@ outlive their shard, since an entity that crosses a border carries its id into t
 prefix is retired with it rather than handed on. That bounds a cluster to 65,535 shards ever created, not
 65,535 at once.
 
+**Reap** — Removing a shard that holds nothing of its own: the owner verifies and deletes, then the hub
+forgets the assignment. The counterpart `EnsureShard` never had. Refused while the shard owns rows, while
+any truncation floor beyond the routine ones is present, while its events are unshipped, or mid-drain — and
+the key is not reserved afterwards, so visiting it again creates a new shard with a new
+[[Originator]]. See [CLUSTERING.md](CLUSTERING.md#reaping-a-shard-that-holds-nothing).
+
 **Out of line** — Where a large `byte[]` payload (256 bytes and up) lives in the paging store: a separate blob
 log, keyed by row and column, while the main record keeps only the column's framing. Scanning a blob table by
 key therefore faults no blobs; a blob pages in exactly when its row is materialized. The split and the splice

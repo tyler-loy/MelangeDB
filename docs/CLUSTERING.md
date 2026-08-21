@@ -293,6 +293,46 @@ A world generator writing terrain into a neighbouring chunk is an insert, which 
 case the always-on guard does not catch. If a deployment writes world data anywhere near a seam,
 set `Cluster:ShardSpanCheck` to `Always` and pay the dictionary probe.
 
+### Reaping a shard that holds nothing
+
+`EnsureShard` creates a shard the first time anyone arrives in it, and for a long time had no
+counterpart: a world where players can wander anywhere accumulated a membership row and a data
+directory per shard key ever visited, permanently. `HubRuntime.ReapShardAsync` is the counterpart.
+
+It is a **host API and not an endpoint**, deliberately. This is the only cluster operation that
+destroys durable state, and a new authenticated wire surface for it would drag the whole gating
+ladder behind a call an operator makes by hand; direct callers are the host's own code, the same
+line `BulkInsert` draws.
+
+The shape is *drain, then do not hand it anywhere*. The owner checks and deletes in one lock,
+because the two cannot be separated — a shard inspected and then closed could take a row in between,
+and a closed shard has nothing left to inspect. The hub forgets the assignment **last**, so a failure
+anywhere earlier leaves a shard that is still owned and still openable rather than a directory nobody
+owns.
+
+A reap is refused unless all of these hold, and a refusal is the ordinary answer rather than an
+error:
+
+- **No rows of its own.** Border-band copies do not count — they are a neighbour's, rebuilt by a
+  band reset — and neither do `Local` timer rows, which the shard's init reducer writes again the
+  next time the key is visited.
+- **Nothing holding its log.** Judged by which truncation floors are *present*, never by where they
+  sit: a floor whose provider has nothing outstanding returns null and is omitted from the report
+  entirely. Position carries no intent here — `PinTruncation` pins at the current base, so a
+  streaming backup and a cluster-event cursor that has never forwarded anything report the very same
+  LSN meaning opposite things.
+- **Its events are shipped.** The cluster-event cursor only advances when the pump runs, and the
+  pump only wakes on an event-bearing commit, so a resting cursor means "not asked lately" rather
+  than "nothing to send". The reap kicks the forwarder and waits for it to reach the durable
+  watermark instead of reading a floor; a cursor that will not get there means the hub is not taking
+  the events, and they would go with the directory.
+- **Not mid-drain.** A drain and a reap both decide where the shard ends up, so they cannot overlap.
+
+**The shard key is not reserved.** Arriving there again simply creates a new shard — with a new
+fencing term and a **new originator**, because originators are allocated from a high-water mark and
+a reaped shard's prefix retires with it. Ids minted under it may still be alive in a neighbour, and
+`AutoInc`'s contract is unique-not-dense.
+
 ## Handoff
 
 Two shapes, following from the strategy:

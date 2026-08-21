@@ -145,4 +145,13 @@ public sealed class InMemoryMembershipStore : IMembershipStore
             .ToList();
         return candidates.Count > 0 ? candidates[0].NodeName : null;
     }
+
+    public bool RemoveShard(ShardKey shard)
+    {
+        lock (_lock)
+        {
+            // _nextOriginator is untouched on purpose: it is a high-water mark, not a free list.
+            return _shards.Remove(shard);
+        }
+    }
 }

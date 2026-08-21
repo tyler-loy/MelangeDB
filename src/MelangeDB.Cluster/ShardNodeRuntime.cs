@@ -413,6 +413,128 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         return new ShardDrainReply(head);
     }
 
+    /// <summary>
+    /// Truncation floors that do not stand in the way of removing a shard, each for its own
+    /// reason: the snapshot is the healthy ceiling, the sidecar floor never pins, the hot store's
+    /// applier is a projection of the very log being deleted, and the resume window only keeps
+    /// records for clients reconnecting to a shard that is about to stop existing. Every other
+    /// floor — a streaming backup, an unsettled handoff, a lagging Postgres applier, an
+    /// unforwarded cluster event, or a name this build does not know — is an outstanding claim.
+    /// </summary>
+    private static readonly HashSet<string> ReapIgnorableFloors = new(StringComparer.Ordinal)
+    {
+        TruncationFloorNames.Snapshot,
+        TruncationFloorNames.ShardSidecar,
+        TruncationFloorNames.ResumeWindow,
+        TruncationFloorNames.ClusterEvents,
+        "hot-store",
+    };
+
+    /// <summary>
+    /// Removes a shard this node owns: verify it holds nothing of its own and nothing pins its
+    /// log, then close it and delete its directory. Refusing is an ordinary answer — the hub asks
+    /// from a sampled view and only the owner can settle it.
+    /// <para>
+    /// The check runs against the live engine under <c>_shardsLock</c> and the close follows in
+    /// the same lock, because the two cannot be separated: a shard inspected and then closed could
+    /// take a row in between, and a closed shard has nothing left to inspect. A snapshot is forced
+    /// first so the floors are evaluated — they are only legal to read inside a truncation
+    /// decision — which on a shard with no rows costs almost nothing.
+    /// </para>
+    /// </summary>
+    internal ShardReapReply ReapShard(ShardReap reap)
+    {
+        var shard = new ShardKey(reap.Shard);
+
+        // Ship anything this shard has published before its log is deleted. The cluster-event
+        // cursor only advances when the pump runs, and the pump only wakes on an event-bearing
+        // commit, so a resting cursor means "not asked lately" rather than "nothing to send" —
+        // which is why the floor cannot be read for this and the forwarder is kicked instead.
+        // A cursor that will not reach the durable watermark means the hub is not taking them,
+        // and the events would be lost with the directory.
+        EventForwarder? forwarder;
+        lock (_shardsLock)
+        {
+            _forwarders.TryGetValue(shard, out forwarder);
+        }
+
+        if (forwarder is not null && TryGetShard(shard) is { } pending)
+        {
+            forwarder.Kick();
+            var deadline = _time.GetUtcNow().AddSeconds(5);
+            while (forwarder.Cursor < pending.Engine.Log.DurableLsn && _time.GetUtcNow() < deadline)
+                Thread.Sleep(25);
+
+            if (forwarder.Cursor < pending.Engine.Log.DurableLsn)
+            {
+                return new ShardReapReply(
+                    false,
+                    $"{shard} has events forwarded only to LSN {forwarder.Cursor} of {pending.Engine.Log.DurableLsn}; "
+                    + "they would be deleted with the shard. Check the hub link and retry.");
+            }
+        }
+        ShardRuntime runtime;
+        string directory;
+        lock (_shardsLock)
+        {
+            if (IsDrainingLocked(shard))
+                return new ShardReapReply(false, $"{shard} is mid-drain; a reap and a drain cannot both own the outcome.");
+            runtime = RequireShard(shard, reap.FencingToken);
+            directory = runtime.Directory;
+
+            // Forces a truncation decision, which is the only place floors may be evaluated.
+            runtime.Engine.TakeSnapshot();
+            if (runtime.Engine.TruncationFloors is not { } floors)
+            {
+                return new ShardReapReply(
+                    false,
+                    $"{shard} has no truncation-floor reading, so nothing can be said about what is holding its log. "
+                    + "Snapshots:TruncateLog is off; a reap will not guess.");
+            }
+
+            // Judged by which floors are *present*, never by where they sit. A floor whose provider
+            // has nothing outstanding returns null and is omitted from the report entirely, so
+            // presence is the signal — and position is not: PinTruncation pins at the current base,
+            // so a streaming backup and a cluster-event cursor that has never forwarded anything
+            // report the very same LSN with opposite meanings.
+            //
+            // Cast to the nullable form before FirstOrDefault: TruncationFloor is a readonly record
+            // struct, so the plain overload yields default(TruncationFloor) — name "", LSN 0 — and
+            // `is { }` is true for every value of a non-nullable struct, which reads as a phantom
+            // floor and refuses every reap.
+            if (floors.Floors
+                    .Where(f => !ReapIgnorableFloors.Contains(f.Name))
+                    .Cast<TruncationFloor?>()
+                    .FirstOrDefault()
+                is { } claim)
+            {
+                return new ShardReapReply(
+                    false,
+                    $"{shard}'s log is held by '{claim.Name}' at LSN {claim.Lsn}; something still needs records "
+                    + "this would delete.");
+            }
+
+            if (runtime.SampleLoad().AuthoritativeRows is var rows and > 0)
+                return new ShardReapReply(false, $"{shard} still owns {rows} row(s) of its own.");
+
+            _draining.Remove(shard);
+            _shards.Remove(shard);
+            if (_forwarders.Remove(shard, out var shipped))
+                shipped.Dispose();
+            if (_borderPublishers.Remove(shard, out var publisher))
+                publisher.Dispose();
+            if (_boundaryMonitors.Remove(shard, out var monitor))
+                monitor.Dispose();
+            runtime.Dispose();
+        }
+
+        // Outside the lock: the engine is closed, so nothing can reopen the directory under us,
+        // and a slow delete must not hold every other shard on this node still.
+        Directory.Delete(directory, recursive: true);
+        LogShardReaped(_logger, shard.Value, NodeName, directory);
+        return new ShardReapReply(true, null);
+    }
+
     private void KickForwarders()
     {
         lock (_shardsLock)
@@ -540,6 +662,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "shard-drain":
                 return Task.FromResult<object?>(QuiesceShard(body!.Value.Deserialize<ShardDrain>()!));
+            case "shard-reap":
+                return Task.FromResult<object?>(ReapShard(body!.Value.Deserialize<ShardReap>()!));
             case "shard-drain-abort":
             {
                 var abort = body!.Value.Deserialize<ShardDrainAbort>()!;
@@ -879,6 +1003,13 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         Message = "Shard {Shard} quiesced on node '{NodeName}' for a planned drain: snapshot taken, engine closed at LSN {HeadLsn}. " +
             "The shard reopens here only if the hub abandons the drain or dies mid-drain (the draining mark expires after 2x Cluster:FailureTimeoutMs).")]
     private static partial void LogShardQuiesced(ILogger logger, ulong shard, string nodeName, ulong headLsn);
+
+    [LoggerMessage(EventId = 1747, EventName = "ShardReaped", Level = LogLevel.Warning,
+        Message = "Shard {Shard} was reaped on node '{NodeName}': it held no rows of its own and nothing pinned its log, " +
+            "so its engine was closed and '{Directory}' deleted. Warning rather than information because this is the one " +
+            "cluster operation that destroys durable state; the shard key is not reserved, and visiting it again creates a " +
+            "new shard with a new originator.")]
+    private static partial void LogShardReaped(ILogger logger, ulong shard, string nodeName, string directory);
 
     [LoggerMessage(EventId = 1727, EventName = "ShardDrainAborted", Level = LogLevel.Warning,
         Message = "The hub abandoned the drain of shard {Shard}; node '{NodeName}' cleared the draining mark and reopens the shard on its next heartbeat.")]

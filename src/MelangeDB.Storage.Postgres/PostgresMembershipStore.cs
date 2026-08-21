@@ -282,6 +282,24 @@ public sealed class PostgresMembershipStore : IMembershipStore
         return next;
     }
 
+    public bool RemoveShard(ShardKey shard)
+    {
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+        LockShards(connection, transaction);
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+
+        // Only the ownership row goes. melange_cluster_originator is untouched: it is a
+        // high-water mark rather than a free list, so this shard's prefix retires with it and the
+        // next shard created gets a number no shard has ever held.
+        command.CommandText = $"DELETE FROM {Schema}.melange_cluster_shards WHERE shard = @shard";
+        command.Parameters.AddWithValue("shard", unchecked((long)shard.Value));
+        var removed = command.ExecuteNonQuery() > 0;
+        transaction.Commit();
+        return removed;
+    }
+
     private void LockShards(NpgsqlConnection connection, NpgsqlTransaction transaction)
     {
         using var command = connection.CreateCommand();

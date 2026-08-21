@@ -72,6 +72,21 @@ internal sealed record ShardDrainReply(ulong HeadLsn);
 internal sealed record ShardDrainAbort(ulong Shard);
 
 /// <summary>
+/// The hub asking a shard's owner to remove it outright: check that it holds nothing of its own
+/// and nothing is pinning its log, then close it and delete its directory. The check and the close
+/// happen in one lock on the owner because they cannot be separated — a shard inspected and then
+/// closed could take a row in between, and once it is closed there is nothing left to inspect.
+/// </summary>
+internal sealed record ShardReap(ulong Shard, long FencingToken);
+
+/// <summary>
+/// What the owner did. <see cref="Refusal"/> is null when the shard was removed, and otherwise
+/// names the condition that was not met — a refusal is the expected answer, not an error, because
+/// the hub decides from a sampled view and the owner is the one holding the truth.
+/// </summary>
+internal sealed record ShardReapReply(bool Reaped, string? Refusal);
+
+/// <summary>
 /// The hub pushing a node's full assignment list outside the heartbeat clock — sent to a drain's
 /// destination so it opens the moved shard now rather than up to one heartbeat later. The reply
 /// waits for the open (recovery included), which is how the hub knows the shard is serving before

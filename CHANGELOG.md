@@ -12,6 +12,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`HubRuntime.ReapShardAsync` removes a shard that holds nothing of its own** — the counterpart
+  `EnsureShard` never had, closing [#112](https://github.com/tyler-loy/MelangeDB/issues/112). A host
+  API rather than an endpoint, since this is the only cluster operation that destroys durable state.
+  The owner checks and deletes in one lock (they cannot be separated) and the hub forgets the
+  assignment last, so any earlier failure leaves a shard still owned and still openable. Refused
+  while the shard owns rows, while a truncation floor beyond the routine ones is present, while its
+  cluster events are unshipped, or mid-drain. The shard key is not reserved: visiting it again
+  creates a new shard with a new originator, because a reaped prefix retires with its shard.
+
 - **Two per-shard row gauges, `melange.cluster.shard.authoritative_rows` and
   `melange.cluster.shard.borrowed_rows`.** The first counts only rows in `Partitioned` tables minus
   the border-band copies a shard holds of its neighbours' — what would be *permanently* lost if the
