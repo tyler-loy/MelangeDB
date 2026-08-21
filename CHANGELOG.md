@@ -20,6 +20,11 @@ All packages ship together at one version; there is no per-package versioning. S
   Both ride the existing load sample, so a shard node reports them on every heartbeat at no extra
   sampling cost. Advisory by construction — see [OBSERVABILITY.md](docs/OBSERVABILITY.md). Groundwork
   for [#112](https://github.com/tyler-loy/MelangeDB/issues/112).
+- **`ClusterLoadView.ShardsHoldingNothing`** narrows on those gauges: shards reporting no
+  authoritative rows, not drain-quiesced, and heard from recently enough that a silent node cannot
+  make its shards look empty. A narrowing rather than a verdict — nothing pinning the log and
+  unoccupied are deliberately absent, because neither can be answered from a sample — so a caller
+  re-checks both on the owning node under the lock.
 
 ### Fixed
 

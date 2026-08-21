@@ -59,6 +59,19 @@ public class BorderReplicationTests
         // own content. This is the subtraction the reap predicate turns on.
         Assert.True(byShard[BlockA].BorrowedRows >= 1);
         Assert.Equal(0, byShard[BlockA].AuthoritativeRows);
+
+        // The narrowing follows: A holds nothing of its own even while carrying B's band, and B is
+        // excluded because it owns the critter. Neither is a verdict — the pin and occupancy
+        // checks are not in this view — but a reaper would ask about A and never about B.
+        var now = byShard[BlockA].At > byShard[BlockB].At ? byShard[BlockA].At : byShard[BlockB].At;
+        var holdingNothing = cluster.Hub.Load.ShardsHoldingNothing(now, TimeSpan.FromSeconds(30))
+            .Select(load => load.Shard.Value)
+            .ToArray();
+        Assert.Contains(BlockA, holdingNothing);
+        Assert.DoesNotContain(BlockB, holdingNothing);
+
+        // A node that goes quiet must not make its shards look empty by falling silent.
+        Assert.Empty(cluster.Hub.Load.ShardsHoldingNothing(now.AddMinutes(5), TimeSpan.FromSeconds(30)));
     }
 
     [Fact]

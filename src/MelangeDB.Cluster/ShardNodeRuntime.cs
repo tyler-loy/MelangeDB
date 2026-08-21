@@ -230,14 +230,18 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private ShardLoadDto[] CollectLoads()
     {
         List<ShardRuntime> owned;
+        HashSet<ShardKey> draining;
         lock (_shardsLock)
         {
             owned = [.. _shards.Values];
+            // Read under the same lock as the shard set, and read here rather than on the hub:
+            // a drain mark expires on inspection, so only the owner can answer it truthfully.
+            draining = [.. owned.Select(static runtime => runtime.Shard).Where(IsDrainingLocked)];
         }
 
         var loads = new ShardLoadDto[owned.Count];
         for (var i = 0; i < owned.Count; i++)
-            loads[i] = owned[i].SampleLoad();
+            loads[i] = owned[i].SampleLoad() with { Draining = draining.Contains(owned[i].Shard) };
         return loads;
     }
 

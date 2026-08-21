@@ -253,6 +253,15 @@ row reads as zero here, which is the honest answer.
 is carrying. Together they separate "this shard is busy" from "this shard is watching something
 busy".
 
+`ClusterLoadView.ShardsHoldingNothing` narrows on the pair: shards reporting no authoritative rows,
+not drain-quiesced, and heard from recently enough that a node cannot make its shards look empty by
+going silent. **It is a narrowing, not a verdict.** Two conditions are deliberately absent — nothing
+pinning the log, and unoccupied — because neither can be answered from a sample. Truncation floors
+are evaluated only inside a truncation decision under the engine write lock (one of them writes a
+file when evaluated, and all of them race a scrape), and sessions live on the gateway. A caller that
+acts on the list re-checks both on the owning node, under the lock; the list exists so that check
+runs against a handful of shards rather than every shard the cluster has ever created.
+
 **Both are advisory.** They are sampled per heartbeat and can be a heartbeat old, and the pair can
 tear between two cheap reads. Anything that *acts* on emptiness — the shard reaper this pair exists
 to make possible — must re-check under the shard's own lock rather than trust a gauge. Reading low

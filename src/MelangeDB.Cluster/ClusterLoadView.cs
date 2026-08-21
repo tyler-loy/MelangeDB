@@ -26,6 +26,7 @@ public sealed record ShardLoad(
     long ResidentBytes,
     int BorrowedRows,
     long AuthoritativeRows,
+    bool Draining,
     DateTimeOffset At);
 
 /// <summary>
@@ -79,13 +80,45 @@ public sealed class ClusterLoadView : IDisposable
             var shard = new ShardKey(load.Shard);
             _latest[shard] = new ShardLoad(
                 shard, nodeName, load.Utilization, load.HeadLsn, load.ResidentBytes, load.BorrowedRows,
-                load.AuthoritativeRows, now);
+                load.AuthoritativeRows, load.Draining, now);
             var history = _history.GetOrAdd(shard, static _ => new ConcurrentQueue<(DateTimeOffset, double)>());
             history.Enqueue((now, load.Utilization));
             while (history.Count > MaxHistorySamples)
                 history.TryDequeue(out _);
         }
     }
+
+    /// <summary>
+    /// Shards whose most recent sample says they hold nothing of their own: no authoritative rows,
+    /// not drain-quiesced, and reported inside <paramref name="freshness"/> so a node that has gone
+    /// quiet cannot make its shards look empty by falling silent.
+    /// <para>
+    /// <b>This is a narrowing, not a verdict.</b> It answers "which shards are worth asking about",
+    /// and deliberately does not answer "which shards may be removed". Two conditions are missing
+    /// on purpose:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// <b>Nothing pinning the log</b> — a backup streaming, a lagging subscriber, an unsettled
+    /// handoff marker. Truncation floors are evaluated only inside a truncation decision, under
+    /// the engine write lock, because one of them writes a file when evaluated and all of them
+    /// race a scrape; a sampled reading of them would be wrong by construction. That check belongs
+    /// where the write lock is already held.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Unoccupied</b> — the gateway holds session state, not this view.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// So a caller that acts on this list must re-check both, on the owning node, under the lock.
+    /// The list exists so that check runs against a handful of shards instead of every shard the
+    /// cluster has ever created.
+    /// </para>
+    /// </summary>
+    public IReadOnlyList<ShardLoad> ShardsHoldingNothing(DateTimeOffset now, TimeSpan freshness) =>
+        [.. _latest.Values
+            .Where(load => load.AuthoritativeRows == 0 && !load.Draining && now - load.At <= freshness)
+            .OrderBy(static load => load.Shard)];
 
     /// <summary>Every shard's most recent sample, in shard order.</summary>
     public IReadOnlyList<ShardLoad> Snapshot() =>

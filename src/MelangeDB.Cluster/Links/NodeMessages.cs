@@ -49,7 +49,8 @@ internal sealed record ShardLoadDto(
     ulong HeadLsn,
     long ResidentBytes,
     int BorrowedRows,
-    long AuthoritativeRows);
+    long AuthoritativeRows,
+    bool Draining = false);
 
 /// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
 internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);
