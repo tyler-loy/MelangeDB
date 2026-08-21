@@ -133,13 +133,8 @@ public sealed class PostgresMembershipStore : IMembershipStore
         if (ReadAssignment(connection, transaction, shard) is { } existing)
             return existing;
 
-        // A high-water mark, never MAX(originator) + 1 over the live rows. An originator prefixes
-        // every AutoInc id the shard mints, and those ids outlive the shard: an entity that walks
-        // across a border carries its id into the neighbour. Deriving the next id from the rows
-        // that still exist means removing a shard hands its originator to the next one created,
-        // which re-mints ids that are still in use elsewhere — and "unique, not dense" is the
-        // whole AutoInc contract. The counter only goes up, so a removed shard's prefix is
-        // retired with it.
+        // A high-water mark, never derived from the live rows: ids minted under an originator
+        // outlive their shard, so a removed shard's prefix has to retire with it.
         ushort originator;
         using (var next = connection.CreateCommand())
         {
@@ -150,7 +145,16 @@ public sealed class PostgresMembershipStore : IMembershipStore
                 WHERE lock_row
                 RETURNING next_originator - 1
                 """;
-            var allocated = Convert.ToInt32(next.ExecuteScalar());
+            // No row means the singleton is missing or corrupt, and EnsureSchema will not seed it
+            // again this process. Convert.ToInt32(null) would be 0 — the hub's own originator —
+            // so the failure would surface as ids colliding with the hub's rather than as a fault.
+            if (next.ExecuteScalar() is not { } scalar || Convert.ToInt32(scalar) is var allocated && allocated <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"The originator high-water row in {Schema}.melange_cluster_originator is missing or invalid; "
+                    + "shard originators cannot be allocated. Restore the cluster schema from backup.");
+            }
+
             if (allocated > ushort.MaxValue)
                 throw new InvalidOperationException("The 16-bit originator space is exhausted.");
             originator = (ushort)allocated;

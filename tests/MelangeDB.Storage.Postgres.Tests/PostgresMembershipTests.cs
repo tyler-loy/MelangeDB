@@ -34,15 +34,8 @@ public class PostgresMembershipTests
     }
 
     /// <summary>
-    /// An originator prefixes every AutoInc id its shard mints, and those ids outlive the shard —
-    /// an entity that crosses a border carries its id into the neighbour. So a removed shard's
-    /// originator must be retired with it, never handed to the next shard created; otherwise the
-    /// new shard re-mints ids that are still in use and "unique, not dense" stops being true.
-    /// <para>
-    /// This is latent until something deletes a shard row, which is why it is asserted before
-    /// there is anything that does (issue #112). Deriving the next originator from the live rows
-    /// — <c>MAX(originator) + 1</c> — passes every test that never deletes one.
-    /// </para>
+    /// Asserted before anything can delete a shard (issue #112), because deriving the next
+    /// originator from the live rows passes every suite that never deletes one.
     /// </summary>
     [Fact]
     public void A_removed_shards_originator_is_retired_rather_than_handed_to_the_next_shard()
