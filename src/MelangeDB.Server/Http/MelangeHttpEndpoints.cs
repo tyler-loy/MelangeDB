@@ -94,6 +94,14 @@ internal static class MelangeHttpEndpoints
     /// appended as one write set, one log record, not one transaction per row. Off until
     /// <c>Bulk:Enabled</c> opts in, and requires the caller's <c>Bulk:OwnerRole</c> claim —
     /// bulk writes bypass every reducer and its policies, so any valid token is not enough.
+    /// <para>
+    /// Answers <c>{"ok", "rows", "results": [{"shard", "lsn", "rows"}]}</c> — one result per engine
+    /// that took rows, which today is always exactly one. The atomicity guarantee is <b>per
+    /// engine</b>: this path appends one write set as one transaction, and a single-node
+    /// deployment has one engine, so nothing weaker is being promised than before. The array is
+    /// the shape that survives a batch spanning shards, where there is no single LSN to report,
+    /// and it ships ahead of that so the fan-out adds elements rather than breaking callers.
+    /// </para>
     /// </summary>
     public static async Task BulkAsync(HttpContext context, MelangeTransport transport)
     {
@@ -142,11 +150,23 @@ internal static class MelangeHttpEndpoints
         try
         {
             var record = transport.Engine.BulkInsert(session.Identity, rows);
+
+            // One result per engine that took rows, even though this path only ever has one.
+            // An LSN is meaningful within a single log, so a batch that is one day fanned out
+            // across shards has no single LSN to report — the array is the shape that survives
+            // that, and emitting it now means the fan-out adds elements rather than breaking
+            // every caller. `shard` is null here because a node-local engine is not a shard's.
             await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
             {
                 writer.WriteBoolean("ok", true);
+                writer.WriteNumber("rows", rows.Count);
+                writer.WriteStartArray("results");
+                writer.WriteStartObject();
+                writer.WriteNull("shard");
                 writer.WriteNumber("lsn", record?.Lsn ?? 0);
                 writer.WriteNumber("rows", rows.Count);
+                writer.WriteEndObject();
+                writer.WriteEndArray();
             }).ConfigureAwait(false);
         }
         catch (ArgumentException exception)

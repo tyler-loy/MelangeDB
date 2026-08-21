@@ -10,6 +10,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Breaking
+
+- **`/melange/bulk` answers a per-engine results array instead of a single `lsn`.** The body is now
+  `{"ok", "rows", "results": [{"shard", "lsn", "rows"}]}`, with exactly one element today and
+  `shard` null, because a node-local engine is not a shard's. An LSN is meaningful only within one
+  log, so a batch that spans shards has no single LSN to report; the array is the shape that
+  survives that, and it ships ahead of the fan-out ([#115](https://github.com/tyler-loy/MelangeDB/issues/115))
+  so that change adds elements rather than breaking every caller. The atomicity guarantee is
+  stated as **per engine** rather than per batch — a single-node deployment has one engine, so
+  nothing weaker is promised than before.
+
 ### Added
 
 - **`HubRuntime.ReapShardAsync` removes a shard that holds nothing of its own** — the counterpart
