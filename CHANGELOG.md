@@ -23,6 +23,26 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **A fourth subscription predicate, `WHERE col <> 0` — the rows where a column has been set at
+  all**, closing [#122](https://github.com/tyler-loy/MelangeDB/issues/122). Both SQL spellings
+  (`<>` and `!=`) parse. The operand must be the column's own default, and the shape is served on
+  `bool` and unsigned integer columns, whose default is also their minimum so "not the default" is
+  a single index range; a signed column would need two and is refused by name, as
+  `unsupported_predicate`, along with an operand that is not the default.
+
+  It exists because the range shape could not express it: a counter has no bounded span, so
+  `BETWEEN 1 AND :hi` needs a clamp the client invents purely to get past `MaxRangeSpan`, and
+  callers who hit this denormalised an indexed boolean beside the counter instead. **That
+  workaround is the counterexample to its own necessity** — equality on an indexed boolean already
+  has unbounded cardinality, so it selects the same rows under the same row ceiling at the same
+  cost, and the only thing it bought was a column the schema did not need. Accordingly this shape
+  is *not* span-checked (there is no span) and *is* bounded by the row and byte ceilings (there is
+  nothing weaker about it). Restricted to the column's own default rather than generalised to
+  arbitrary inequality, because skipping the default's bucket is an index walk while "everything
+  except 7" is a table scan wearing a predicate. Aggregates do not serve it: they run on the
+  relational tier, and they refuse it by name rather than mis-report it. No typed client helper,
+  matching the projected shape.
+
 - **`HubRuntime.ReapShardAsync` removes a shard that holds nothing of its own** — the counterpart
   `EnsureShard` never had, closing [#112](https://github.com/tyler-loy/MelangeDB/issues/112). A host
   API rather than an endpoint, since this is the only cluster operation that destroys durable state.

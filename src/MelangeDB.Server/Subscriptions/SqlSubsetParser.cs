@@ -8,13 +8,28 @@ internal enum PredicateKind
     None,
     Equality,
     Range,
+
+    /// <summary>
+    /// <c>col &lt;&gt; &lt;default&gt;</c> — the sparse subset of a column that has been set at all.
+    /// The operand must be the column's own default, which is what keeps this an index scan that
+    /// steps over one value rather than an arbitrary inequality with no index affinity. Bounded by
+    /// the row and byte ceilings like any other subscription, and deliberately not by
+    /// <c>MaxRangeSpan</c>: a counter has no span, and clamping one to invent a span is the lie
+    /// this shape exists to make unnecessary (issue #122).
+    /// </summary>
+    NotDefault,
 }
 
 /// <summary>
-/// One parsed subscription (or ad-hoc row) query: exactly the four supported shapes, operands
-/// already resolved from named parameters or literals. Schema validation happens later, against
-/// the registry, so parse errors and semantic errors stay distinguishable.
+/// One parsed subscription (or ad-hoc row) query: exactly the supported shapes, operands already
+/// resolved from named parameters or literals. Schema validation happens later, against the
+/// registry, so parse errors and semantic errors stay distinguishable.
 /// </summary>
+/// <param name="EqualsValue">
+/// The single-operand comparison value: <c>=</c>'s right-hand side, or <c>&lt;&gt;</c>'s — which
+/// the compiler then requires to be the column's default. One field, because the parser's job is
+/// to read the operand, not to judge it.
+/// </param>
 internal sealed record SubscriptionQuery(
     string Table,
     IReadOnlyList<string>? Projection,
@@ -59,9 +74,10 @@ internal sealed class SqlParseException : Exception
 }
 
 /// <summary>
-/// The hand-rolled parser for the MelangeDB SQL subset. The row shapes are precisely four:
+/// The hand-rolled parser for the MelangeDB SQL subset. The row shapes are precisely five:
 /// <c>SELECT * FROM t</c>, <c>SELECT * FROM t WHERE col = :p</c>,
-/// <c>SELECT * FROM t WHERE col BETWEEN :lo AND :hi</c>, and any of those with an explicit column
+/// <c>SELECT * FROM t WHERE col BETWEEN :lo AND :hi</c>,
+/// <c>SELECT * FROM t WHERE col &lt;&gt; 0</c>, and any of those with an explicit column
 /// list. Ad-hoc SQL additionally parses aggregates — <c>COUNT(*)</c>, <c>COUNT/SUM/AVG/MIN/MAX(col)</c>,
 /// <c>DATE_TRUNC('hour', col)</c> bucketing, and <c>GROUP BY</c>. A subset this small is a
 /// feature: "valid MelangeDB SQL" stays unambiguous, every client language can target it, and no
@@ -69,7 +85,7 @@ internal sealed class SqlParseException : Exception
 /// </summary>
 internal static class SqlSubsetParser
 {
-    /// <summary>Parses a subscription query — the four row shapes only; aggregates are rejected.</summary>
+    /// <summary>Parses a subscription query — the row shapes only; aggregates are rejected.</summary>
     public static SubscriptionQuery Parse(string query, IReadOnlyDictionary<string, object?>? parameters)
     {
         var parsed = ParseAdHoc(query, parameters);
@@ -78,7 +94,7 @@ internal static class SqlSubsetParser
         return parsed.Rows;
     }
 
-    /// <summary>Parses an ad-hoc query: one of the four row shapes, or an aggregate query.</summary>
+    /// <summary>Parses an ad-hoc query: one of the row shapes, or an aggregate query.</summary>
     public static AdHocQuery ParseAdHoc(string query, IReadOnlyDictionary<string, object?>? parameters)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(query);
@@ -115,6 +131,11 @@ internal static class SqlSubsetParser
                 predicate = PredicateKind.Equality;
                 equalsValue = tokens.ExpectOperand(parameters);
             }
+            else if (tokens.TryConsumeNotEquals())
+            {
+                predicate = PredicateKind.NotDefault;
+                equalsValue = tokens.ExpectOperand(parameters);
+            }
             else if (tokens.TryConsumeKeyword("BETWEEN"))
             {
                 predicate = PredicateKind.Range;
@@ -124,7 +145,7 @@ internal static class SqlSubsetParser
             }
             else
             {
-                throw new SqlParseException("Expected '=' or BETWEEN after the WHERE column.");
+                throw new SqlParseException("Expected '=', '<>', or BETWEEN after the WHERE column.");
             }
         }
 
@@ -248,6 +269,23 @@ internal static class SqlSubsetParser
             if (_position >= _text.Length || _text[_position] != symbol)
                 return false;
             _position++;
+            return true;
+        }
+
+        /// <summary>
+        /// Consumes <c>&lt;&gt;</c> or <c>!=</c>. Both spellings are real SQL and both are accepted,
+        /// because a client generator in another language should not have to know which one this
+        /// parser happened to pick.
+        /// </summary>
+        public bool TryConsumeNotEquals()
+        {
+            SkipWhitespace();
+            if (_position + 2 > _text.Length)
+                return false;
+            var pair = _text.AsSpan(_position, 2);
+            if (!pair.SequenceEqual("<>") && !pair.SequenceEqual("!="))
+                return false;
+            _position += 2;
             return true;
         }
 

@@ -79,8 +79,14 @@ internal sealed class ServerSubscription
 
     public RowKey EqualsValue { get; private set; }
 
+    /// <summary>
+    /// The inclusive lower bound of a <see cref="PredicateKind.Range"/>, and also of a
+    /// <see cref="PredicateKind.NotDefault"/> — which compiles to the range that excludes the
+    /// default's bucket, so both shapes are served by one comparison and one index walk.
+    /// </summary>
     public RowKey RangeLow { get; private set; }
 
+    /// <summary>The inclusive upper bound; see <see cref="RangeLow"/>.</summary>
     public RowKey RangeHigh { get; private set; }
 
     /// <summary>
@@ -232,6 +238,7 @@ internal sealed class ServerSubscription
                     return key == EqualsValue;
                 return RowWire.EncodeColumn(Schema, Column!, row) is { } value && value == EqualsValue;
             case PredicateKind.Range:
+            case PredicateKind.NotDefault:
                 RowKey candidate;
                 if (ColumnIsPrimaryKey)
                 {
@@ -265,9 +272,9 @@ internal sealed class ServerSubscription
                     : [];
             case PredicateKind.Equality:
                 return store.ScanIndex(Schema.Id, Column!, EqualsValue);
-            case PredicateKind.Range when ColumnIsPrimaryKey:
+            case PredicateKind.Range or PredicateKind.NotDefault when ColumnIsPrimaryKey:
                 return ScanPrimaryKeyRange(store);
-            case PredicateKind.Range:
+            case PredicateKind.Range or PredicateKind.NotDefault:
                 return store.ScanIndexRange(Schema.Id, Column!, RangeLow, RangeHigh);
             default:
                 return [];
@@ -388,10 +395,86 @@ internal sealed class ServerSubscription
             return;
         }
 
+        if (query.Predicate == PredicateKind.NotDefault)
+        {
+            ApplyNotDefault(column, query);
+            return;
+        }
+
         CheckRangeSpan(column, query, limits);
         RangeLow = EncodeOperand(column, query.RangeLow);
         RangeHigh = EncodeOperand(column, query.RangeHigh);
     }
+
+    /// <summary>
+    /// Compiles <c>col &lt;&gt; &lt;default&gt;</c> into the index range that excludes the default's
+    /// bucket. One range, never two, because the supported kinds are exactly those whose default is
+    /// also their minimum — which is what lets this shape skip <see cref="CheckRangeSpan"/>
+    /// honestly. It is an index walk that steps over one value, not an unbounded window somebody
+    /// clamped to get past the parser, and the row and byte ceilings bound it like anything else.
+    /// <para>
+    /// Both refusals are <see cref="MelangeErrorCodes.UnsupportedPredicate"/> rather than parse
+    /// errors: the text was valid SQL, and the caller needs to hear that the shape is the problem.
+    /// </para>
+    /// </summary>
+    private void ApplyNotDefault(ColumnSchema column, SubscriptionQuery query)
+    {
+        if (NotDefaultOperands(column.Kind) is not { } operands)
+        {
+            throw new SubscriptionRejectedException(
+                MelangeErrorCodes.UnsupportedPredicate,
+                $"Table '{Schema.Name}': '<>' on column '{column.Name}' of kind {column.Kind} is not supported. "
+                + "The shape serves Bool and unsigned integer columns, whose default is also their minimum, so "
+                + "'not the default' is a single index range; a signed column would need two ranges and a string "
+                + "or byte column has no upper bound to scan to.");
+        }
+
+        // Any value that will not coerce to the column's kind is, a fortiori, not its default — so
+        // one refusal covers a bad operand and a wrong-but-valid one, and says the same useful thing.
+        object? coerced = null;
+        try
+        {
+            coerced = RowSerializer.CoerceValue(Schema, column, query.EqualsValue);
+        }
+        catch (ArgumentException)
+        {
+        }
+
+        if (!operands.Default.Equals(coerced))
+        {
+            throw new SubscriptionRejectedException(
+                MelangeErrorCodes.UnsupportedPredicate,
+                $"Table '{Schema.Name}': '<>' on column '{column.Name}' compares against the column's default "
+                + $"({(operands.Default is bool ? "false" : "0")}) only — the rows where it has been set at all. "
+                + "An arbitrary inequality has no index affinity and would be a table scan wearing a predicate.");
+        }
+
+        RangeLow = SchemaKeyCodec.Encode(column, operands.Low);
+        RangeHigh = SchemaKeyCodec.Encode(column, operands.High);
+    }
+
+    /// <summary>
+    /// For a kind that supports <c>&lt;&gt;</c>: its default, the value one step above that default,
+    /// and its maximum — the three operands the compiled range needs. Null for the kinds this first
+    /// cut refuses. Signed integers are excluded because zero is not their minimum, so "not zero"
+    /// is two ranges rather than one; <c>String</c>, <c>Bytes</c>, <c>Identity</c> and
+    /// <c>Timestamp</c> because they have no maximum worth scanning to.
+    /// <para>
+    /// The bounds are built by handing these to <see cref="SchemaKeyCodec"/> rather than by
+    /// composing key bytes here. A hand-rolled bound that is one value off produces a silently
+    /// short scan — right shape, missing rows, no error — and the only defence that scales is to
+    /// keep every byte decision in the one codec both the server and the client already run.
+    /// </para>
+    /// </summary>
+    private static (object Default, object Low, object High)? NotDefaultOperands(ColumnKind kind) => kind switch
+    {
+        ColumnKind.Bool => (false, true, true),
+        ColumnKind.UInt8 => ((byte)0, (byte)1, byte.MaxValue),
+        ColumnKind.UInt16 => ((ushort)0, (ushort)1, ushort.MaxValue),
+        ColumnKind.UInt32 => (0u, 1u, uint.MaxValue),
+        ColumnKind.UInt64 => (0ul, 1ul, ulong.MaxValue),
+        _ => null,
+    };
 
     private void RequirePredicateRule(SubscriptionQuery query, SubscriptionsOptions limits)
     {

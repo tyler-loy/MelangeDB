@@ -192,11 +192,11 @@ public class ProtocolTests
     }
 }
 
-/// <summary>The SQL subset, parsed: exactly four shapes are valid, and everything else says why not.</summary>
+/// <summary>The SQL subset, parsed: only the supported shapes are valid, and everything else says why not.</summary>
 public class SqlSubsetParserTests
 {
     [Fact]
-    public void Parses_the_four_supported_shapes()
+    public void Parses_the_supported_shapes()
     {
         var wholeTable = SqlSubsetParser.Parse("SELECT * FROM recipe", null);
         Assert.Equal("recipe", wholeTable.Table);
@@ -217,10 +217,32 @@ public class SqlSubsetParserTests
         Assert.Equal(1L, range.RangeLow);
         Assert.Equal(9L, range.RangeHigh);
 
+        var notDefault = SqlSubsetParser.Parse("SELECT * FROM terrain_chunk_data WHERE edit_count <> 0", null);
+        Assert.Equal(PredicateKind.NotDefault, notDefault.Predicate);
+        Assert.Equal("edit_count", notDefault.Column);
+        Assert.Equal(0L, notDefault.EqualsValue);
+
         var projection = SqlSubsetParser.Parse(
             "SELECT skill_id, total_xp, level FROM player_skill WHERE player_num = :id",
             new Dictionary<string, object?> { ["id"] = 3L });
         Assert.Equal(["skill_id", "total_xp", "level"], projection.Projection);
+    }
+
+    /// <summary>
+    /// Both SQL spellings of inequality parse to the same shape. A generator in another language
+    /// should not have to know which one this parser happened to pick.
+    /// </summary>
+    [Theory]
+    [InlineData("SELECT * FROM t WHERE a <> 0")]
+    [InlineData("SELECT * FROM t WHERE a != 0")]
+    [InlineData("select * from t where a<>0")]
+    [InlineData("SELECT * FROM t WHERE a <> :zero")]
+    public void Both_spellings_of_inequality_parse_to_not_default(string query)
+    {
+        var parsed = SqlSubsetParser.Parse(query, new Dictionary<string, object?> { ["zero"] = 0L });
+        Assert.Equal(PredicateKind.NotDefault, parsed.Predicate);
+        Assert.Equal("a", parsed.Column);
+        Assert.Equal(0L, parsed.EqualsValue);
     }
 
     [Fact]

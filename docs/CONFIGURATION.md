@@ -307,7 +307,7 @@ to its admin console without also serving unauthenticated-in-effect bulk writes 
 | `Subscriptions:MaxBufferedBytes` | long | `16777216` | live | 03 | Per connection; the trigger for the policy above. |
 | `Subscriptions:MaxRowsPerSubscription` | long | `100000` | live | 03 | Ceiling on an initial result set. Rejected before execution, not mid-stream. |
 | `Subscriptions:MaxBytesPerSubscription` | long | `67108864` | live | 03 | The one that actually matters for blob tables. |
-| `Subscriptions:MaxRangeSpan` | long | `1024` | live | 03 | Maximum width of a `BETWEEN` predicate. Lets a client stream a ring around itself but not the whole map. |
+| `Subscriptions:MaxRangeSpan` | long | `1024` | live | 03 | Maximum width of a `BETWEEN` predicate. Lets a client stream a ring around itself but not the whole map. Does **not** apply to `col <> 0`, which has no span by construction — that shape is bounded by the row and byte ceilings alone (issue #122). |
 | `Subscriptions:RequirePredicateOn` | string[] | — | live | 03 | Tables where an unbounded subscription is rejected. An entry is a table name (any predicate satisfies) or `Table.Column` (the predicate must constrain that column). Terrain and blob tables belong here. |
 
 ## Client dispatch (`MelangeClientOptions`)

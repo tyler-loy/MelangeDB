@@ -15,6 +15,30 @@ public partial struct Chunk
     public byte[] Data;
 }
 
+/// <summary>
+/// The issue #122 shape: a sparse counter, and beside it the boolean a caller denormalises when the
+/// counter has no predicate that fits it. Both columns are indexed and both select the identical
+/// row set — that identity is the whole argument for <c>&lt;&gt;</c> existing, so the tests assert
+/// it rather than restating it.
+/// </summary>
+[Table(Public = true)]
+public partial struct EditedChunk
+{
+    [PrimaryKey]
+    public long Id;
+
+    [Index]
+    public uint EditCount;
+
+    /// <summary>The workaround column, kept here as the counterexample to its own necessity.</summary>
+    [Index]
+    public bool IsEdited;
+
+    /// <summary>Signed, so the refusal for kinds whose default is not their minimum has a subject.</summary>
+    [Index]
+    public int Elevation;
+}
+
 /// <summary>Player-shaped: identity-keyed with an equality-indexed room.</summary>
 [Table(Public = true)]
 public partial struct PlayerState
@@ -276,6 +300,17 @@ public sealed class TransportReducers
 
     [Reducer]
     public void DeleteChunk(ReducerContext ctx, long id) => ctx.Db.Chunk.Id.Delete(id);
+
+    /// <summary>Writes the counter and the flag together, the way a caller carrying both must.</summary>
+    [Reducer]
+    public void EditChunk(ReducerContext ctx, long id, uint editCount, int elevation)
+    {
+        var chunk = new EditedChunk { Id = id, EditCount = editCount, IsEdited = editCount != 0, Elevation = elevation };
+        if (ctx.Db.EditedChunk.Id.Find(id) is not null)
+            ctx.Db.EditedChunk.Update(chunk);
+        else
+            ctx.Db.EditedChunk.Insert(chunk);
+    }
 
     [Reducer]
     public void Spawn(ReducerContext ctx, string name, int roomId)

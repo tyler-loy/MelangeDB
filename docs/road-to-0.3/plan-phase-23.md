@@ -10,6 +10,16 @@ TypeScript client that is the first thing to be held to it.
 **Depends on:** nothing new. `melange-schema.json` has been public API at format `1` since phase 12,
 and it was designed for exactly this.
 
+**Blocked this phase until it landed:** the not-default predicate,
+[#122](https://github.com/tyler-loy/MelangeDB/issues/122), now shipped. Adding a query shape is
+cheap while the SQL subset has one implementation and expensive once it has a written contract and
+a second one — and the shape had a second, sharper deadline. Callers who could not express it were
+denormalising a boolean column into a persistent schema, and columns do not un-denormalise: removing
+one is a destructive migration, refused automatically and manual by design, so the rational move
+once the workaround exists is to keep it forever. A predicate landing after that point would have
+arrived and changed nothing. The rule this leaves behind: **a query-shape change is a pre-phase-23
+decision or a no.**
+
 **This is the largest phase in 0.3.** Say so plainly: it is a second implementation of the client
 runtime in a language with no analyzer, no shared types, and no test suite to inherit.
 

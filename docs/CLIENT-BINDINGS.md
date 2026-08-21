@@ -127,11 +127,13 @@ Rows are `partial struct`s with the server's field names; enums are re-declared 
 The caches are **merged per table and refcounted per key** across every subscription — a row
 matching two subscriptions is one cached row and one event, and the server deliberately sends it
 once per subscription (the engine deduplicates nothing across subscriptions on a connection; the
-client merge is where that collapses). Subscription helpers cover three of the four SQL shapes —
-full table, equality, range — on primary-key, `[Unique]`, and `[Index]` columns, which is exactly
-the set the server accepts predicates on. The fourth shape (an explicit column list) stays on the
-untyped `MelangeClient` API: a projected row bound to a full struct would read as zeros, the
-precise trap typed bindings exist to close.
+client merge is where that collapses). Subscription helpers cover three of the SQL shapes — full
+table, equality, range — on primary-key, `[Unique]`, and `[Index]` columns, which is exactly the
+set the server accepts predicates on. Two shapes stay on the untyped `MelangeClient` API. An
+explicit column list, because a projected row bound to a full struct would read as zeros — the
+precise trap typed bindings exist to close. And `WHERE col <> 0` (the not-default shape, issue
+#122), because a helper for it would be a nullary method per indexed column on every table, and the
+shape is new enough that the demand for it should show up before the surface does.
 
 Deliberate divergences from the SpacetimeDB C# SDK, for porting hands: reducer stubs are
 `Task<ulong>`-returning `<Name>Async(...)` (the LSN, house async style) rather than fire-and-forget
