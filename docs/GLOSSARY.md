@@ -140,7 +140,9 @@ Block dimensions are the developer's geometry (`SpatialGeometry`), not MelangeDB
 holds read-only copies of so it can serve entities just beyond its own boundary. Derived from `InterestOf`,
 narrowed per row by `InterestedInRow`. The band is also the ownership *seam*: an entity its origin still owns
 may stand up to the band's depth inside a neighbouring block while its handoff is pending — beyond it, writes
-fail loudly, because that means handoffs are not keeping up.
+fail loudly, because that means handoffs are not keeping up. The seam licence is about **ownership**, not
+geometry: it says a shard *may write* such a row, never that the row *belongs* there. See
+[CLUSTERING.md](CLUSTERING.md#the-seam-what-a-transaction-may-write-across-a-block-boundary).
 
 **Border stream** — The at-least-once replication of one owner shard's border slice to one observer shard:
 owner node → hub → observer node, log-driven on the owner with the observer's durable cursor as the truth.
