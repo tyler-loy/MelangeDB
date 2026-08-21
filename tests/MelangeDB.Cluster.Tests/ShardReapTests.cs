@@ -25,7 +25,9 @@ public class ShardReapTests
         Assert.True(await cluster.Hub.ReapShardAsync(new ShardKey(BlockA), TestContext.Current.CancellationToken));
 
         Assert.Null(cluster.Hub.Membership.GetAssignment(new ShardKey(BlockA)));
-        Assert.False(Directory.Exists(directory));
+        await ClusterFixture.WaitUntilAsync(
+            () => !Directory.Exists(directory),
+            "the shard's directory went away (Windows can hold a deleted directory visible briefly)");
         Assert.Null(owner.Runtime.TryGetShard(new ShardKey(BlockA)));
 
         // The key is not reserved: arriving there again is a new shard, and it must not inherit
@@ -70,12 +72,7 @@ public class ShardReapTests
             () => ownerA.Runtime.TryGetShard(new ShardKey(BlockA))?.BorrowedRowCount >= 1,
             "A borrowed B's critter");
 
-        // Applying B's band commits to A's log, so A's cluster-event forwarder is briefly behind
-        // and holds a claim on records it has not shipped to the hub. That is a real refusal while
-        // it lasts, so the reap is retried rather than assumed — which is what an operator does.
-        await ClusterFixture.WaitUntilAsync(
-            () => cluster.Hub.ReapShardAsync(new ShardKey(BlockA)).GetAwaiter().GetResult(),
-            "A's forwarder caught up and the empty shard reaped");
+        Assert.True(await cluster.Hub.ReapShardAsync(new ShardKey(BlockA), TestContext.Current.CancellationToken));
 
         // B is untouched: it owns the critter, and losing an observer is not losing data.
         Assert.NotNull(shardB.Engine.CommittedView.Find<Critter>(SpatialReducers.CritterId(1)));
@@ -100,7 +97,9 @@ public class ShardReapTests
         // Released, the same shard reaps — the refusal was about the pin and nothing else.
         pin.Dispose();
         Assert.True(await cluster.Hub.ReapShardAsync(new ShardKey(BlockA), TestContext.Current.CancellationToken));
-        Assert.False(Directory.Exists(directory));
+        await ClusterFixture.WaitUntilAsync(
+            () => !Directory.Exists(directory),
+            "the shard's directory went away (Windows can hold a deleted directory visible briefly)");
     }
 
     [Fact]

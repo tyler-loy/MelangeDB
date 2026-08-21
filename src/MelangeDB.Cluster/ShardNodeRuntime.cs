@@ -426,6 +426,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         TruncationFloorNames.Snapshot,
         TruncationFloorNames.ShardSidecar,
         TruncationFloorNames.ResumeWindow,
+        TruncationFloorNames.ClusterEvents,
         "hot-store",
     };
 
@@ -444,6 +445,34 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     internal ShardReapReply ReapShard(ShardReap reap)
     {
         var shard = new ShardKey(reap.Shard);
+
+        // Ship anything this shard has published before its log is deleted. The cluster-event
+        // cursor only advances when the pump runs, and the pump only wakes on an event-bearing
+        // commit, so a resting cursor means "not asked lately" rather than "nothing to send" —
+        // which is why the floor cannot be read for this and the forwarder is kicked instead.
+        // A cursor that will not reach the durable watermark means the hub is not taking them,
+        // and the events would be lost with the directory.
+        EventForwarder? forwarder;
+        lock (_shardsLock)
+        {
+            _forwarders.TryGetValue(shard, out forwarder);
+        }
+
+        if (forwarder is not null && TryGetShard(shard) is { } pending)
+        {
+            forwarder.Kick();
+            var deadline = _time.GetUtcNow().AddSeconds(5);
+            while (forwarder.Cursor < pending.Engine.Log.DurableLsn && _time.GetUtcNow() < deadline)
+                Thread.Sleep(25);
+
+            if (forwarder.Cursor < pending.Engine.Log.DurableLsn)
+            {
+                return new ShardReapReply(
+                    false,
+                    $"{shard} has events forwarded only to LSN {forwarder.Cursor} of {pending.Engine.Log.DurableLsn}; "
+                    + "they would be deleted with the shard. Check the hub link and retry.");
+            }
+        }
         ShardRuntime runtime;
         string directory;
         lock (_shardsLock)
@@ -463,19 +492,26 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     + "Snapshots:TruncateLog is off; a reap will not guess.");
             }
 
-            // A floor below the snapshot still needs records the snapshot has superseded, which is
-            // an outstanding claim on data this reap would delete. Judged by name against a short
-            // allow-list rather than by "is the snapshot governing", because a live shard's floors
-            // are richer than that: an unforwarded cluster event or a lagging Postgres applier
-            // governs routinely and means real loss, while the resume window is only about clients
-            // reconnecting to a shard that is about to stop existing. Unknown names block — a floor
-            // nobody here recognises is a holder nobody here can vouch for.
-            if (floors.Floors.FirstOrDefault(f => f.Lsn < floors.SnapshotLsn && !ReapIgnorableFloors.Contains(f.Name)) is { } claim)
+            // Judged by which floors are *present*, never by where they sit. A floor whose provider
+            // has nothing outstanding returns null and is omitted from the report entirely, so
+            // presence is the signal — and position is not: PinTruncation pins at the current base,
+            // so a streaming backup and a cluster-event cursor that has never forwarded anything
+            // report the very same LSN with opposite meanings.
+            //
+            // Cast to the nullable form before FirstOrDefault: TruncationFloor is a readonly record
+            // struct, so the plain overload yields default(TruncationFloor) — name "", LSN 0 — and
+            // `is { }` is true for every value of a non-nullable struct, which reads as a phantom
+            // floor and refuses every reap.
+            if (floors.Floors
+                    .Where(f => !ReapIgnorableFloors.Contains(f.Name))
+                    .Cast<TruncationFloor?>()
+                    .FirstOrDefault()
+                is { } claim)
             {
                 return new ShardReapReply(
                     false,
-                    $"{shard}'s log is pinned by '{claim.Name}' at LSN {claim.Lsn}, below its snapshot at "
-                    + $"{floors.SnapshotLsn}; something still needs records this would delete.");
+                    $"{shard}'s log is held by '{claim.Name}' at LSN {claim.Lsn}; something still needs records "
+                    + "this would delete.");
             }
 
             if (runtime.SampleLoad().AuthoritativeRows is var rows and > 0)
@@ -483,8 +519,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             _draining.Remove(shard);
             _shards.Remove(shard);
-            if (_forwarders.Remove(shard, out var forwarder))
-                forwarder.Dispose();
+            if (_forwarders.Remove(shard, out var shipped))
+                shipped.Dispose();
             if (_borderPublishers.Remove(shard, out var publisher))
                 publisher.Dispose();
             if (_boundaryMonitors.Remove(shard, out var monitor))

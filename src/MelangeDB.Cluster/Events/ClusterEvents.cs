@@ -255,6 +255,13 @@ internal sealed class EventForwarder : ICommitObserver, IDisposable
         return upTo < head;
     }
 
+    /// <summary>
+    /// How far this shard's events have been shipped to the hub. Rests at the log's base until
+    /// something is forwarded, and only advances when the pump runs — which <see cref="Kick"/>
+    /// makes happen. A reap consults it so it can refuse to delete events nobody has received.
+    /// </summary>
+    internal ulong Cursor => ReadCursor();
+
     private ulong ReadCursor()
     {
         try
