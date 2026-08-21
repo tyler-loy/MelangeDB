@@ -69,6 +69,15 @@ public static class MelangeErrorCodes
     public const string ParseError = "parse";
     public const string PredicateRequired = "predicate_required";
     public const string RangeTooWide = "range_too_wide";
+
+    /// <summary>
+    /// The query used a supported operator in a shape the subset does not serve: <c>&lt;&gt;</c>
+    /// against something other than the column's default, on a column kind whose "not the default"
+    /// is not one index range, or inside an aggregate. Distinct from <see cref="ParseError"/> on
+    /// purpose — the text parsed, and the caller needs to know the difference between "you cannot
+    /// write that" and "you cannot ask that".
+    /// </summary>
+    public const string UnsupportedPredicate = "unsupported_predicate";
     public const string TooManyRows = "too_many_rows";
     public const string TooManyBytes = "too_many_bytes";
     public const string TooManySubscriptions = "too_many_subscriptions";

@@ -133,6 +133,18 @@ internal static class AdHocAggregateBuilder
                 MelangeErrorCodes.InvalidAggregate, $"Column '{column.Name}' of kind ScheduleAt cannot carry a predicate.");
         }
 
+        // '<>' is a hot-tier index shape (issue #122); an aggregate runs on the relational tier,
+        // where the predicate is a RelationalPredicate discriminated by which operands it carries.
+        // Refused by name rather than left to fall into the range branch, which would report a
+        // null operand and tell the caller nothing about why.
+        if (parsed.Predicate == PredicateKind.NotDefault)
+        {
+            throw new SubscriptionRejectedException(
+                MelangeErrorCodes.UnsupportedPredicate,
+                $"'<>' on column '{column.Name}' is a row-query and subscription shape; an aggregate over the "
+                + "relational tier does not serve it. Filter with '=' or BETWEEN, or select the rows and count them.");
+        }
+
         try
         {
             return parsed.Predicate == PredicateKind.Equality

@@ -195,6 +195,14 @@ Needed:
 
 This is a denial-of-service surface reachable by any authenticated client, including a guest.
 
+Note that **bounded range width was never the load-bearing limit, and the `<>` shape makes that
+explicit** (issue #122). Equality on an indexed boolean has always had unbounded cardinality —
+`WHERE is_edited = true` can match every row in the table — so the row and byte ceilings, not the
+span, are what actually stop a client draining the world. The not-default predicate is exempt from
+the span check for that reason and is bounded by the ceilings like everything else; it widens no
+surface that equality had not already opened. What the span still buys is a *narrower* answer on the
+one shape where a span is meaningful, and it keeps that job.
+
 ## Gap 4 — Rate limiting as infrastructure
 
 `PlayerRateLimit` + `RateLimit.cs` implement a token bucket **as table rows**: micro-token accounting, refill

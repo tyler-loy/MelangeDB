@@ -546,6 +546,13 @@ readers** — other nodes may hold read-only slices.
 **Policy** — A DI-resolved object deciding an access question. See the three kinds above. Because policies run
 in-process they may read private tables — the advantage over SQL-string filters.
 
+**Predicate, not-default** — The `col <> 0` subscription shape: the rows where an indexed column has been set
+at all. The operand must be the column's *own* default, which is what keeps it an index walk that steps over
+one value rather than an arbitrary inequality with no index affinity. Supported on `bool` and unsigned integer
+columns, whose default is also their minimum; a signed column would need two ranges and says so. Exempt from
+`MaxRangeSpan` by construction — a counter has no span, and inventing one to satisfy the parser is what this
+shape exists to make unnecessary.
+
 **Projection** — A derived copy of state, rebuilt by replaying the log. The hot store, the Postgres tier, and a
 client's row cache are all projections.
 

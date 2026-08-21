@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "0.2.1.0",
-  "schemaHash": "dbaee701f4bfe8413a139cbfd5d81485a453fd31c0a72dbed8e26e647529b8a1",
+  "schemaHash": "9833bdb1f8eadb2e878adabbd133226042a01e51c0ed80002bb690f938837ea2",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -207,6 +207,44 @@
       ]
     },
     {
+      "name": "EditedChunk",
+      "type": "EditedChunk",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "Int64",
+          "primaryKey": true,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "EditCount",
+          "kind": "UInt32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "IsEdited",
+          "kind": "Bool",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "Elevation",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        }
+      ]
+    },
+    {
       "name": "InventoryItem",
       "type": "InventoryItem",
       "columns": [
@@ -391,6 +429,26 @@
         {
           "name": "id",
           "kind": "Int64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "EditChunk",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "editCount",
+          "kind": "UInt32",
+          "isArray": false
+        },
+        {
+          "name": "elevation",
+          "kind": "Int32",
           "isArray": false
         }
       ]
