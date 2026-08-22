@@ -12,20 +12,35 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
-- **One unreadable row no longer takes down every client that scans it.** In the FASTER store a
-  paged row whose out-of-line blob payload disagreed with its main record's declared length threw
-  `InvalidDataException` out of a subscription's initial-set scan (`FasterHotStore.Scan` /
-  `ScanIndexRange`); the exception escaped the subscribe handler, Kestrel logged an unhandled error,
-  and the socket died — so every client whose first subscription scanned that row failed to connect
-  ([#137](https://github.com/tyler-loy/MelangeDB/issues/137)). A scan now skips such a row and logs
-  it with its key (EventId 1511 `UnreadableRowSkipped`) instead of failing; a point read of the key
-  still surfaces the fault, now carrying the key and both lengths, so one row can be repaired
-  without bisecting the table. The hot store is a projection of the commit log, so the row is intact
-  there and a restart rebuilds it — this class of disagreement cannot survive one, which is also why
-  the reported cause (a blob write outliving its commit across a restart) is not the mechanism: the
-  store opens its FASTER logs `deleteOnClose` and rebuilds from snapshot + log replay on every
-  start, splitting and writing each row's main and blob together, so recovery cannot carry a
-  main/blob disagreement forward.
+- **A shrinking overwrite of an out-of-line blob no longer leaves a stale, longer tail** — the root
+  cause of [#137](https://github.com/tyler-loy/MelangeDB/issues/137). The FASTER store's in-place
+  writer (`StoreFunctions.ConcurrentWriter`) copied the new value over the old but did not shrink
+  the record's serialized length, so a `byte[]` column written large and then rewritten smaller —
+  the reference workload's per-chunk blob, folded to fewer records by its periodic sweep — read back
+  at the *old* length with a stale tail. The out-of-line payload then no longer matched the length
+  the main record declared (a blob at 339 bytes rewritten to 315 read back as 339), and every scan
+  of that row threw. The writer now shrinks the slot to the new length in place, or sends an
+  oversized value to a fresh record; a value's stored length always equals what was written. Because
+  the hot store is rebuilt from the commit log on every start, the corrected write path also
+  **heals an already-corrupt row on the next restart** — replay re-runs the shrinking overwrite
+  correctly.
+
+  This corrects the record on the read-side fix shipped alongside it (below): the disagreement was
+  *not* unproducible through the public API, and it *did* survive a restart, because replay re-ran
+  the same faulty in-place shrink. A peer's `Insert(339)`→`Update(315)` reproduction against that
+  build is what found it. With the write path fixed, the state is genuinely no longer reachable
+  through the store — which is why `UnreadableBlobRowTests` must force it through a test seam.
+
+- **One unreadable row no longer takes down every client that scans it** (the read-side half of
+  [#137](https://github.com/tyler-loy/MelangeDB/issues/137)). Even with the write path fixed, a row
+  that is unreadable for any reason must not be a server-wide outage. A paged row whose out-of-line
+  payload disagrees with its main record threw `InvalidDataException` out of a subscription's
+  initial-set scan (`FasterHotStore.Scan` / `ScanIndexRange`); the exception escaped the subscribe
+  handler, Kestrel logged an unhandled error, and the socket died — so every client whose first
+  subscription scanned that row failed to connect. A scan now skips such a row and logs it with its
+  key (EventId 1511 `UnreadableRowSkipped`) instead of failing; a point read of the key still
+  surfaces the fault, now carrying the key and both lengths, so one row can be found and repaired
+  without bisecting the table.
 
 ## [0.2.1] — 2026-08-22
 
