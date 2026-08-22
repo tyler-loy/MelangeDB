@@ -100,6 +100,45 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The commit log seeks.** `FileCommitLog.ReadFrom(lsn)` started at the file header and read,
+  CRC-checked and decoded every record below the one it was asked for, then discarded them. The
+  answer was right; the cost was the size of the retained log, paid per call — and every incremental
+  consumer of the log calls it per batch with a cursor near the head: a client's resume replay (twice
+  per resume), the Postgres applier, the event bus's catch-up, an applier catching up one record
+  *under the engine's write lock*, and in a cluster the event forwarder, the border publisher (once
+  per observer) and the hub's replica pump (once per node). Each of them re-read the whole retained
+  log from byte zero on every batch. The same defect the primary-key range walk was — correct answers,
+  linear cost where it should be logarithmic, invisible until the thing it scales with got big —
+  found by going looking for its siblings rather than waiting for production to.
+
+  The log now keeps a sparse in-memory LSN→offset index (one entry per 32 KB of file, built by the
+  recovery walk it already does, extended by every append, rebased by every compaction), and a read
+  seeks to the entry below its LSN, verifies the record there, and hops frame headers — no CRC, no
+  decode, no allocation — to the one it wants. A compaction that moves the file under a reader fails
+  that verification and falls back to the old scan, so the race costs time, never correctness. The
+  cost of a read is now the size of its batch plus one stride. Measured on a 100,000-record log,
+  ten records read from the start, the middle and the end: **195 µs / 12.0 ms / 25.6 ms before,
+  219 µs / 262 µs / 218 µs after** — flat where it was linear, and the linear figure grows with the
+  retained log, which a pinned floor can make gigabytes (`LogSeekBenchmarks`).
+
+- **Log compaction no longer freezes the engine for the size of the log.** When a snapshot truncated
+  the log it decoded every record — removed and surviving alike — to learn its LSN, rewrote the
+  survivors one by one, and fsynced, all while holding the engine's write lock (so no commit could
+  start), the append lock and the fsync lock (so no parked commit could finish). Every snapshot was a
+  stall proportional to the *retained* log, which is by design at least the resume window and whatever
+  any floor pins — and it landed on the next commits' lock wait, where the slow-reducer diagnostics
+  deliberately bill no one. The retention floor's own scan decoded every removable record under the
+  same lock to find the first one inside the window.
+
+  The decision — every floor, and which governs — still runs under the write lock, because floors
+  are engine state and one of them writes a file when read; the retention floor is now a binary
+  search over LSNs (one seek and one record per probe) rather than a walk. The compaction then runs
+  with the lock released: it seeks to the first survivor, copies the survivors as bytes, and takes the
+  log's locks only to carry across whatever was appended meanwhile, fsync, and swap. A truncation pin
+  taken while a compaction is in flight pins at that compaction's floor, which is where the base is
+  about to stand, so the backup's guarantee is unchanged. The test for it commits from another thread
+  from inside the compaction and asserts the commit lands — which against the old code is a deadlock.
+
 - **A primary-key range subscription walked the key directory from row zero to reach its window.**
   The cost was O(keys before the window), so it grew with the table *and* with where in key order
   the client happened to be looking — a moving-window subscription got steadily more expensive the

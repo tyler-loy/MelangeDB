@@ -587,3 +587,53 @@ megabytes of buffers beside a memory budget this database reports as a computed 
 a bounded pool with a 256 KB ceiling: the steady state pools, and a rare oversized bulk record
 allocates once and stays collectable. The memory report is one of the few numbers here that is a
 promise rather than an observation, and a test that guards it earned its keep.
+
+## Round three: the siblings of the range walk
+
+The primary-key range walk (0.2.1, `ScanKeyRange`) was found by a production deployment, not by the
+suite, and the reason it was not found earlier is structural: a walk and a seek return the same rows,
+and every test table was small enough that the difference was noise. That is a *family* of defect,
+not an instance — correct answers, cost proportional to the distance to the window rather than the
+window — so the third round went looking for the rest of the family before the next deployment did.
+The method was the one the first two rounds settled on: read the hot paths with one question (what
+does this scale with, and should it?), then write the test that counts the work rather than checks
+the answer.
+
+### Found and fixed
+
+**The commit log had no seek.** `FileCommitLog.ReadFrom(lsn)` scanned from the header, reading,
+CRC-checking and decoding every record below `lsn` and throwing it away. Nine callers pay for that,
+and all but one call it per batch with a cursor near the head: the resume replay (twice — once to
+age the gap, once to replay it), the Postgres applier, the event bus's catch-up, the applier
+pipeline's catch-up (under the write lock), and in a cluster the event forwarder, the border
+publisher (per observer stream) and the hub replica pump (per node link). Every one re-read the
+retained log from byte zero per batch — with a cursor at the head and a 300-second retention window,
+that is "read the last five minutes of history to fetch the next hundred records", forever. The fix
+is a sparse LSN→offset index (`IndexStrideBytes` apart, built by the recovery walk the log already
+does, extended per append, rebased per compaction), a verified seek, and a frame-header hop for the
+remainder of the stride. `LogSeekBenchmarks` is the gate: ten records at three positions in a
+100,000-record log: before, 195 µs / 12.0 ms / 25.6 ms for Low / Middle / High; after, 219 µs /
+262 µs / 218 µs. The dev box, short job; the ratio is what travels.
+
+**Compaction held the engine for the size of the log.** `TruncateBefore` decoded every record to
+learn its LSN and rewrote every survivor, under the write lock, the append lock and the fsync lock
+— so the stall hit commits that had not started, commits mid-append, and commits parked on an fsync,
+and it scaled with the retained log rather than with what was removed. The retention floor's scan
+decoded every removable record under the same lock. Now: the floor decision stays under the write
+lock (binary search for the retention boundary, one record per probe); the compaction seeks to the
+first survivor, copies bytes off the lock, and takes the log's locks only for the tail appended
+meanwhile and the swap. A pin taken during an in-flight compaction pins at its floor. The test
+commits from another thread *inside* the compaction, through a hook between its phases, and asserts
+the commit lands — a deadlock against the old code, which is the discriminating shape the first two
+rounds taught.
+
+### The test that counts instead of checks
+
+`CommitLogSeekTests` pins the cost where it is observable: the log counts the frames a read passes
+over (`SkippedFrames`), and reading the last ten of four thousand records must pass over fewer than
+a hundred where the scan passed over 3,990. Disabling the index — making `TryFloor` return nothing —
+fails exactly the two tests that claim a cost and none of the four that claim a result, which is the
+property a cost test has to have. The truncation tests cover what an index can get wrong: every
+survivor's offset moving under it, appends landing between the copy and the swap, and a reopen
+rebuilding it from the compacted file.
+

@@ -501,9 +501,12 @@ samples/                        worker-service host + console client
   LSN beside the log, truncate behind it, never past the slowest applier, the slowest live event
   subscriber, or the Resume retention window; restart is snapshot plus tail replay. Each of those
   holders is a **named truncation floor** since road-to-0.2 phase 18, and every truncation decision
-  logs which one governed — including the decision that removes nothing. See
-  [plan-phase-07.md](road-to-0.1/plan-phase-07.md) and
-  [plan-phase-18.md](road-to-0.2/plan-phase-18.md).
+  logs which one governed — including the decision that removes nothing. The decision runs under
+  the write lock; the compaction itself — a byte copy of the survivors — runs off it, and the log
+  keeps a sparse LSN→offset index so every reader that resumes from a cursor seeks to it rather than
+  scanning the file to reach it. See [plan-phase-07.md](road-to-0.1/plan-phase-07.md),
+  [plan-phase-18.md](road-to-0.2/plan-phase-18.md), and the third round in
+  [performance-sweep.md](design/performance-sweep.md).
 - ~~**Codegen targets**~~ — **Settled in phase 12.** A real project has several client trees (game
   client, admin web, CLI tools) generating from one schema, and the answer was to invert the
   question: generation is **per consuming project**, driven by the `melange-schema.json` manifest as
