@@ -33,6 +33,7 @@ an absolute microsecond figure does not.
 | `FasterHashBenchmarks` | What does the FASTER hash table's size cost when the row count outgrows it? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `SnapshotBenchmarks` | How long does a snapshot hold the write lock, and how does that scale with the resident set? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 | `IndexRangeBenchmarks` | Does a secondary-index range scan pay for **where** its window sits in the key space? | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
+| `LogSeekBenchmarks` | Does reading the commit log from an LSN pay for **where** that LSN sits in the file? Same shape as the index suite: a rising Low→High line is the walk, a flat one is the seek. | [docs/design/performance-sweep.md](../docs/design/performance-sweep.md) |
 
 When a benchmark settles a design decision, record the number **and the decision it settled** in the
 document that decision lives in. A benchmark whose result is not written down anywhere is a benchmark

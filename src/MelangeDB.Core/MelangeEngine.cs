@@ -27,6 +27,11 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly List<(string Name, Func<ulong?> Provider)> _truncationFloors = [];
     private readonly List<TruncationPin> _truncationPins = [];
 
+    // The floor a compaction in flight will leave the log at, or zero: set under the write lock
+    // when the truncation is decided, cleared under it when the compaction has landed. A pin taken
+    // in between pins here rather than at the base the compaction is about to move.
+    private ulong _truncatingTo;
+
     /// <summary>The last truncation decision's floors; null until one has been made. See <see cref="TruncationFloors"/>.</summary>
     private TruncationFloorReport? _floorReport;
     private TableAccessGuard? _tableGuard;
@@ -797,14 +802,15 @@ public sealed partial class MelangeEngine : IDisposable
     /// counterpart to <see cref="AddTruncationFloor"/> — a floor is a permanent registration whose
     /// provider decides per tick, a pin is a scoped lease with an explicit release — and it exists
     /// for the online backup, which must stream a snapshot and the records above it while commits
-    /// continue. Taken under the write lock so no truncation can interleave between reading the
-    /// base and pinning it.
+    /// continue. Taken under the write lock so no truncation can be decided between reading the
+    /// base and pinning it; a truncation already decided and still compacting off the lock is
+    /// pinned at its floor, which is where the base is about to stand.
     /// </summary>
     public IDisposable PinTruncation()
     {
         lock (_writeLock)
         {
-            var pin = new TruncationPin(this, _log.BaseLsn);
+            var pin = new TruncationPin(this, Math.Max(_log.BaseLsn, _truncatingTo));
             _truncationPins.Add(pin);
             return pin;
         }
@@ -813,7 +819,7 @@ public sealed partial class MelangeEngine : IDisposable
     /// <summary>The pins' collective floor; registered in the constructor beside the other floors.</summary>
     private ulong? PinnedTruncationFloor()
     {
-        // Callers hold the write lock: floors are only evaluated inside TruncateLogCore.
+        // Callers hold the write lock: floors are only evaluated inside DecideTruncation.
         if (_truncationPins.Count == 0)
             return null;
         var floor = ulong.MaxValue;
@@ -899,10 +905,12 @@ public sealed partial class MelangeEngine : IDisposable
     /// view and write the snapshot file. Commits proceed while this runs, and land after the
     /// snapshot's LSN — the pin is what makes that safe.
     /// <para>
-    /// Truncation re-takes the lock afterwards. Evaluating the retention floors later than the
-    /// capture is safe in the only direction that matters: floors advance, and the result is capped
-    /// by the snapshot's own LSN, so a later evaluation can never truncate more than an earlier one
-    /// would have.
+    /// Truncation re-takes the lock afterwards for its decision only. Evaluating the retention
+    /// floors later than the capture is safe in the only direction that matters: floors advance,
+    /// and the result is capped by the snapshot's own LSN, so a later evaluation can never truncate
+    /// more than an earlier one would have. The compaction itself then runs with the lock released
+    /// — it is a copy of the surviving bytes, proportional to the retained log, and holding every
+    /// commit for it was the one part of a snapshot still on the write path.
     /// </para>
     /// </summary>
     private ulong CompleteSnapshot(PendingSnapshot pending)
@@ -932,12 +940,7 @@ public sealed partial class MelangeEngine : IDisposable
             LogMessages.SnapshotWritten(_logger, pending.Lsn, SnapshotPath);
 
             if (_options.Snapshots.TruncateLog)
-            {
-                lock (_writeLock)
-                {
-                    TruncateLogCore(pending.Lsn);
-                }
-            }
+                TruncateLog(pending.Lsn);
 
             return pending.Lsn;
         }
@@ -968,7 +971,63 @@ public sealed partial class MelangeEngine : IDisposable
     /// the interesting case, and it used to be perfectly silent.
     /// </para>
     /// </summary>
-    private void TruncateLogCore(ulong snapshotLsn)
+    private void TruncateLog(ulong snapshotLsn)
+    {
+        // The decision — every floor is engine state, and one of them writes a file when read — is
+        // made under the write lock, and the decided floor is published there so a pin taken while
+        // the compaction runs pins at it. The compaction is then a byte copy the log does on its
+        // own, with appends proceeding: it carries whatever lands meanwhile into the compacted
+        // file itself.
+        TruncationDecision decision;
+        lock (_writeLock)
+        {
+            decision = DecideTruncation(snapshotLsn);
+            if (decision.Removable)
+                _truncatingTo = decision.Floor;
+        }
+
+        var (floor, governing, floors, head, pinnedRecords) = decision;
+        if (!decision.Removable)
+        {
+            // Nothing removable. Either the log is already compacted to the floor, or a holder has
+            // stopped moving — the same shape of line, because the operator cannot tell which from
+            // silence.
+            _floorReport = new TruncationFloorReport(snapshotLsn, head, _log.BaseLsn, floor, governing, floors);
+            LogMessages.LogTruncationPinned(
+                _logger, governing.Name, governing.Lsn, _log.BaseLsn, head, pinnedRecords, _log.FileLengthBytes);
+            return;
+        }
+
+        try
+        {
+            _log.TruncateBefore(floor);
+        }
+        finally
+        {
+            lock (_writeLock)
+            {
+                _truncatingTo = 0;
+            }
+        }
+
+        _floorReport = new TruncationFloorReport(snapshotLsn, head, _log.BaseLsn, floor, governing, floors);
+        LogMessages.LogTruncated(
+            _logger, floor, snapshotLsn, governing.Name, governing.Lsn, pinnedRecords, _log.FileLengthBytes);
+    }
+
+    /// <summary>One truncation decision: the floor, who governs it, the full reading, and whether anything is removable.</summary>
+    private readonly record struct TruncationDecision(
+        ulong Floor,
+        TruncationFloor Governing,
+        List<TruncationFloor> Floors,
+        ulong Head,
+        ulong PinnedRecords)
+    {
+        public bool Removable { get; init; }
+    }
+
+    /// <summary>Reads every floor and names the governing one. Runs under the write lock.</summary>
+    private TruncationDecision DecideTruncation(ulong snapshotLsn)
     {
         // The snapshot is the ceiling and the first candidate, so a healthy log reports "snapshot"
         // as its governing floor: nothing is holding anything back.
@@ -991,23 +1050,17 @@ public sealed partial class MelangeEngine : IDisposable
             floor = Math.Min(floor, pinned);
         }
 
-        // The retention window is scanned only as far as the floor the other holders already set —
+        // The retention window is searched only as far as the floor the other holders already set —
         // the record that binds it, if any, is the oldest one still inside the window. When nothing
-        // binds, the reading is the ceiling it scanned to: "permits removing at least this much",
+        // binds, the reading is the ceiling it searched to: "permits removing at least this much",
         // which keeps the floor's tag present rather than flickering in and out of the metric.
+        // A binary search, because this runs under the write lock and the range it asks about is
+        // precisely the records about to be removed — walking them decoded every one.
         var resumeFloor = floor;
         var retentionCutoff = _time.GetUtcNow().AddSeconds(-_options.Resume.RetentionWindowSeconds);
         var cutoffMicros = Timestamp.FromDateTimeOffset(retentionCutoff).UnixTimeMicroseconds;
-        foreach (var record in _log.ReadFrom(_log.BaseLsn + 1))
-        {
-            if (record.Lsn > floor)
-                break;
-            if (record.Timestamp.UnixTimeMicroseconds >= cutoffMicros)
-            {
-                resumeFloor = record.Lsn - 1;
-                break;
-            }
-        }
+        if (_log.FirstLsnAtOrAfter(cutoffMicros, _log.BaseLsn + 1, floor) is { } oldestInWindow)
+            resumeFloor = oldestInWindow - 1;
 
         floors.Add(new TruncationFloor(TruncationFloorNames.ResumeWindow, resumeFloor));
         floor = Math.Min(floor, resumeFloor);
@@ -1021,21 +1074,10 @@ public sealed partial class MelangeEngine : IDisposable
 
         var head = _log.HeadLsn;
         var pinnedRecords = head > floor ? head - floor : 0;
-        if (floor <= _log.BaseLsn)
+        return new TruncationDecision(floor, governing, floors, head, pinnedRecords)
         {
-            // Nothing removable. Either the log is already compacted to the floor, or a holder has
-            // stopped moving — the same shape of line, because the operator cannot tell which from
-            // silence.
-            _floorReport = new TruncationFloorReport(snapshotLsn, head, _log.BaseLsn, floor, governing, floors);
-            LogMessages.LogTruncationPinned(
-                _logger, governing.Name, governing.Lsn, _log.BaseLsn, head, pinnedRecords, _log.FileLengthBytes);
-            return;
-        }
-
-        _log.TruncateBefore(floor);
-        _floorReport = new TruncationFloorReport(snapshotLsn, head, _log.BaseLsn, floor, governing, floors);
-        LogMessages.LogTruncated(
-            _logger, floor, snapshotLsn, governing.Name, governing.Lsn, pinnedRecords, _log.FileLengthBytes);
+            Removable = floor > _log.BaseLsn,
+        };
     }
 
     /// <summary>
