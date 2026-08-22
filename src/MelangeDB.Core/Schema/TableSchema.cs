@@ -97,6 +97,9 @@ public sealed class TableSchema
         Name = name;
         Id = TableId.FromName(name);
         Columns = columns;
+        _columnsByName = new Dictionary<string, ColumnSchema>(columns.Count, StringComparer.Ordinal);
+        foreach (var column in columns)
+            _columnsByName[column.Name] = column;
         AutoIncColumns = columns.Where(c => c.IsAutoInc).ToArray();
         Indexes = columns
             .Where(c => (c.IsIndexed || c.IsUnique) && !c.IsPrimaryKey)
@@ -119,6 +122,11 @@ public sealed class TableSchema
 
     /// <summary>Columns in declaration order — the order the row serializer writes them.</summary>
     public IReadOnlyList<ColumnSchema> Columns { get; }
+
+    // Column(name) is on every per-row path that reads a column by name — predicate encoding, the
+    // shard strategies' RowRef, index maintenance on the reflection path — and was a linear scan
+    // of the column list with a string compare per step.
+    private readonly Dictionary<string, ColumnSchema> _columnsByName;
 
     public ColumnSchema PrimaryKey { get; }
 
@@ -148,19 +156,41 @@ public sealed class TableSchema
 
     /// <summary>Finds a column by name, or throws.</summary>
     public ColumnSchema Column(string name) =>
-        Columns.FirstOrDefault(c => c.Name == name)
-        ?? throw new ArgumentException($"Table '{Name}' has no column '{name}'.", nameof(name));
+        _columnsByName.TryGetValue(name, out var column)
+            ? column
+            : throw new ArgumentException($"Table '{Name}' has no column '{name}'.", nameof(name));
+
+    /// <summary>
+    /// Decodes a serialized row to its boxed struct: the generated codec when the schema has one
+    /// (no reflection), the reflection serializer otherwise. One decode, shareable by reference
+    /// across anything that reads the row by column — which is the point for the paths that
+    /// evaluate one committed row on behalf of many readers.
+    /// </summary>
+    internal object DecodeBoxed(ReadOnlyMemory<byte> bytes)
+    {
+        if (Codec is { } codec)
+            return codec.DeserializeBoxed(bytes.Span);
+        try
+        {
+            return RowSerializer.Deserialize(this, bytes);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            throw RowSerializer.DecodeFailed($"Table '{Name}'", bytes.Length, column: null, exception);
+        }
+    }
 
     /// <summary>
     /// Wraps a serialized row of this table as a <see cref="RowRef"/> for the shard strategy.
-    /// Column access deserializes lazily, once, on first read.
+    /// Column access deserializes lazily, once, on first read — through the generated codec when
+    /// there is one, since strategies run per committed row, some of them under the write lock.
     /// </summary>
     public RowRef ToRowRef(ReadOnlyMemory<byte> bytes)
     {
         object? cached = null;
         return new RowRef(bytes, name =>
         {
-            cached ??= RowSerializer.Deserialize(this, bytes);
+            cached ??= DecodeBoxed(bytes);
             return Column(name).GetValue(cached);
         });
     }

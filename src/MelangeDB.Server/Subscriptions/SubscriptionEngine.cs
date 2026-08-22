@@ -97,10 +97,11 @@ internal sealed class SubscriptionEngine
 
         CheckCeilings(probe, limits);
 
+        var decoded = new DecodedRow();
         var previousKeys = new HashSet<RowKey>();
         foreach (var (key, row) in subscription.MatchingRows(_engine.HotStore))
         {
-            if (subscription.PolicyAdmits(row.Span))
+            if (subscription.PolicyAdmits(decoded.Reset(subscription.Schema, row)))
                 previousKeys.Add(key);
         }
 
@@ -110,7 +111,8 @@ internal sealed class SubscriptionEngine
         var nowKeys = new HashSet<RowKey>();
         foreach (var (key, row) in subscription.MatchingRows(_engine.HotStore))
         {
-            if (!subscription.PolicyAdmits(row.Span))
+            decoded.Reset(subscription.Schema, row);
+            if (!subscription.PolicyAdmits(decoded))
             {
                 _telemetry?.RecordRowsFiltered(subscription.Schema.Name, 1);
                 continue;
@@ -119,8 +121,8 @@ internal sealed class SubscriptionEngine
             nowKeys.Add(key);
             if (previousKeys.Contains(key))
                 continue;
-            var (bytes, mask) = subscription.WireForm(row);
-            ops.Add(new WireRowOp(RowOpKind.Insert, key.ToArray(), bytes, mask));
+            var visible = subscription.VisibleColumns(decoded);
+            ops.Add(new WireRowOp(RowOpKind.Insert, key.ToArray(), RowWire.Project(subscription.Schema, row, visible), subscription.MaskFor(visible)));
         }
 
         foreach (var key in previousKeys)
@@ -141,6 +143,8 @@ internal sealed class SubscriptionEngine
     {
         var perSink = default(Dictionary<IDeltaSink, Dictionary<ServerSubscription, List<WireRowOp>>>);
         var wire = default(WireRowMemo);
+        var before = default(DecodedRow);
+        var after = default(DecodedRow);
 
         // A record may carry several ops for one key (a border batch shipping a hot row's last
         // few ticks; reducer write sets coalesce and never do). The store's pre-image is
@@ -173,11 +177,18 @@ internal sealed class SubscriptionEngine
             // Nothing downstream writes to either: the key is a read-only frame field and the
             // column map is serialized, never mutated.
             var key = op.Key.ToArray();
-            (wire ??= new WireRowMemo()).Reset(subscriptions[0].Schema, op.Row);
+            var schema = subscriptions[0].Schema;
+            (wire ??= new WireRowMemo()).Reset(schema, op.Row);
+
+            // The pre-image and the new row, each decoded at most once for every subscriber on the
+            // table: every predicate on an indexed column and every row or column policy reads the
+            // same typed row, and only the verdict is per subscriber.
+            (before ??= new DecodedRow()).Reset(schema, oldRow, present: hasOld);
+            (after ??= new DecodedRow()).Reset(schema, op.Row, present: op.Kind != RowOpKind.Delete);
 
             foreach (var subscription in subscriptions)
             {
-                var delta = ComputeDelta(subscription, op, key, wire, hasOld, oldRow);
+                var delta = ComputeDelta(subscription, op.Key, key, wire, before, after);
                 if (delta is not { } wireOp)
                     continue;
                 perSink ??= [];
@@ -247,40 +258,40 @@ internal sealed class SubscriptionEngine
 
     private WireRowOp? ComputeDelta(
         ServerSubscription subscription,
-        in RowOp op,
+        in RowKey rowKey,
         byte[] key,
         WireRowMemo wire,
-        bool hasOld,
-        ReadOnlyMemory<byte> oldRow)
+        DecodedRow before,
+        DecodedRow after)
     {
         // Predicate AND row policy decide visibility on both sides of the change. The store still
         // holds the pre-image here (the fan-out runs before the hot store applies), and policy
         // reads of other tables see the same pre-transaction committed state — never a partially
         // applied write set.
-        var oldMatch = hasOld && subscription.Matches(op.Key, oldRow.Span);
-        var newMatch = op.Kind != RowOpKind.Delete && subscription.Matches(op.Key, op.Row.Span);
-        var oldVisible = oldMatch && subscription.PolicyAdmits(oldRow.Span);
-        var newVisible = newMatch && subscription.PolicyAdmits(op.Row.Span);
+        var oldMatch = before.Present && subscription.Matches(rowKey, before);
+        var newMatch = after.Present && subscription.Matches(rowKey, after);
+        var oldVisible = oldMatch && subscription.PolicyAdmits(before);
+        var newVisible = newMatch && subscription.PolicyAdmits(after);
         if (newMatch && !newVisible)
             _telemetry?.RecordRowsFiltered(subscription.Schema.Name, 1);
 
         if (newVisible && !oldVisible)
         {
-            var inserted = subscription.VisibleColumns(op.Row.Span);
+            var inserted = subscription.VisibleColumns(after);
             return new WireRowOp(RowOpKind.Insert, key, wire.For(inserted), subscription.MaskFor(inserted));
         }
 
         if (newVisible && oldVisible)
         {
-            var newColumns = subscription.VisibleColumns(op.Row.Span);
+            var newColumns = subscription.VisibleColumns(after);
             if (newColumns is not null)
             {
                 // A restricted subscription must not emit when only invisible columns changed:
                 // beyond wasted bandwidth, an update frame for a [ServerOnly]-column change is a
                 // timing oracle. A mask that itself changed still emits, with the new columns.
-                var oldColumns = subscription.VisibleColumns(oldRow.Span);
+                var oldColumns = subscription.VisibleColumns(before);
                 if (ColumnsEqual(oldColumns, newColumns)
-                    && RowWire.ProjectedEqual(subscription.Schema, oldRow.Span, op.Row.Span, newColumns))
+                    && RowWire.ProjectedEqual(subscription.Schema, before.Span, after.Span, newColumns))
                 {
                     return null;
                 }
@@ -352,16 +363,18 @@ internal sealed class SubscriptionEngine
             : null;
         long bytes = 0;
         var filtered = 0;
+        var decoded = new DecodedRow();
         foreach (var pair in subscription.MatchingRows(_engine.HotStore))
         {
-            if (!subscription.PolicyAdmits(pair.Value.Span))
+            decoded.Reset(subscription.Schema, pair.Value);
+            if (!subscription.PolicyAdmits(decoded))
             {
                 filtered++;
                 continue;
             }
 
             rows.Add(pair);
-            perRowColumns?.Add(subscription.VisibleColumns(pair.Value.Span));
+            perRowColumns?.Add(subscription.VisibleColumns(decoded));
             bytes += pair.Value.Length;
             EnforceCeilings(subscription, limits, rows.Count, bytes);
         }

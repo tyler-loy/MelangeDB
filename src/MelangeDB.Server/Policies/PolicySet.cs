@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using MelangeDB.Core;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -54,6 +55,15 @@ internal abstract class TablePolicyEvaluator
 
     /// <summary>Intersection across column policies: removes every column some mask hides.</summary>
     public abstract void IntersectColumns(ReadOnlySpan<byte> row, PolicyContext ctx, HashSet<string> visible);
+
+    /// <summary>
+    /// <see cref="IsRowVisible(ReadOnlySpan{byte}, PolicyContext)"/> over a row decoded once and
+    /// shared — the fan-out's form, where the same row is judged for every subscriber in turn.
+    /// </summary>
+    public abstract bool IsRowVisible(DecodedRow row, PolicyContext ctx);
+
+    /// <summary><see cref="IntersectColumns(ReadOnlySpan{byte}, PolicyContext, HashSet{string})"/> over a shared decode.</summary>
+    public abstract void IntersectColumns(DecodedRow row, PolicyContext ctx, HashSet<string> visible);
 }
 
 internal sealed class TablePolicyEvaluator<TRow> : TablePolicyEvaluator
@@ -79,6 +89,33 @@ internal sealed class TablePolicyEvaluator<TRow> : TablePolicyEvaluator
         if (_rowPolicies.Length == 0)
             return true;
         var typed = Materialize(row);
+        return AnyAdmits(in typed, ctx);
+    }
+
+    public override bool IsRowVisible(DecodedRow row, PolicyContext ctx)
+    {
+        if (_rowPolicies.Length == 0)
+            return true;
+        return AnyAdmits(in Unsafe.Unbox<TRow>(row.Typed), ctx);
+    }
+
+    public override void IntersectColumns(ReadOnlySpan<byte> row, PolicyContext ctx, HashSet<string> visible)
+    {
+        if (_columnPolicies.Length == 0)
+            return;
+        var typed = Materialize(row);
+        Intersect(in typed, ctx, visible);
+    }
+
+    public override void IntersectColumns(DecodedRow row, PolicyContext ctx, HashSet<string> visible)
+    {
+        if (_columnPolicies.Length == 0)
+            return;
+        Intersect(in Unsafe.Unbox<TRow>(row.Typed), ctx, visible);
+    }
+
+    private bool AnyAdmits(in TRow typed, PolicyContext ctx)
+    {
         foreach (var policy in _rowPolicies)
         {
             if (policy.IsVisibleTo(in typed, ctx))
@@ -88,11 +125,8 @@ internal sealed class TablePolicyEvaluator<TRow> : TablePolicyEvaluator
         return false;
     }
 
-    public override void IntersectColumns(ReadOnlySpan<byte> row, PolicyContext ctx, HashSet<string> visible)
+    private void Intersect(in TRow typed, PolicyContext ctx, HashSet<string> visible)
     {
-        if (_columnPolicies.Length == 0)
-            return;
-        var typed = Materialize(row);
         foreach (var policy in _columnPolicies)
         {
             var mask = policy.VisibleTo(in typed, ctx);

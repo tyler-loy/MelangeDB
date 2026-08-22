@@ -111,6 +111,9 @@ internal struct FanoutRow
     public float Y;
     public float Z;
     public int Health;
+
+    /// <summary>Indexed so a fan-out subscriber can predicate on it — the shape that decoded the row per subscriber.</summary>
+    [Index]
     public int Level;
 }
 
