@@ -123,6 +123,15 @@ All packages ship together at one version; there is no per-package versioning. S
   where it was linear. Both callers take the new route — subscriptions and the `FilterRange`
   a reducer runs against a primary key.
 
+  **Confirmed end to end on the workload that reported it**, which is the number that actually
+  matters — the two above are a microbenchmark of the seek, and a microbenchmark of the thing you
+  changed is the easiest measurement to be wrong about. Same 12-client acceptance run, ring
+  enabled, clean machine, fresh world, on `0.2.1-ci.189`: **120 position-reducer calls/s (from 7),
+  flat across every 10s sample; all twelve clients up in 4s (from 17s); and 0 shed sends, from
+  14,044.** The ring now costs nothing measurable — the run matches this world's reference numbers
+  with the ring disabled. Host working set moved 1.17GB idle to 1.34–1.37GB during the run and
+  returned to 1.16GB, at ~0.35 core.
+
   The key directory itself changed shape to make that possible: an `ImmutableSortedDictionary`
   cannot begin enumerating at a lower bound, so it is now one sorted set of entries, which can
   (`RowDirectory`). This is the same change `SecondaryIndex` made for the same reason — indexed
