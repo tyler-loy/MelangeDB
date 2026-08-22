@@ -134,6 +134,23 @@ noted.
   clients ≈ 1,500 calls/s and ~60k delta rows/s the driver side is real work; numbers from a
   one-machine run are a *lower bound* on what separated hardware would show. Driver saturation
   shows up as latency inflating while acked stays ≈ attempted.
+- **Comparing two builds is a different measurement from measuring one, and working set is the
+  wrong number for it.** Working set includes whatever the GC has not handed back, so it moves with
+  collection timing rather than with the program. The soak below records the size of that: GC heap
+  oscillating between ~50 and ~230 MiB with **no trend at all**. Divide a swing that size by a bot
+  count and it dwarfs the effects people go looking for — a reference-workload run reported a
+  consistent ~10% per-client regression across two package pins, from two samples against three,
+  before an interleaved re-run put settled managed heap flat to one decimal on both and working set
+  *favouring* the arm it had accused. To compare arms: interleave them in one session rather than
+  running one and then the other, force a collection at the same point in each, and compare
+  **settled managed heap**, with working set reported beside it rather than instead of it. Also
+  record whether Server GC is on and the core count, since heap count tracks cores and moves the
+  resident figure without anything in the program changing.
+- **Before attributing a regression to a range of builds, check whether the code under test changed
+  in it.** The same episode spent its effort deciding which of nine merged PRs was responsible; the
+  range contained *no* change to the client assembly or its dependency closure at all, which a diff
+  answered in a couple of minutes and no amount of bisecting would have. Declining to guess which
+  change caused it is not the same as establishing that one did.
 - **What the tool refuses to guess:** with the stats endpoint unreachable (or `--no-stats`),
   handoff counters and server memory are printed as *unavailable*, and the summary says
   `handoffs_completed=unavailable` rather than 0.

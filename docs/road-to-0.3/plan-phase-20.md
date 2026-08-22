@@ -71,10 +71,22 @@ generating from the same seed regardless.
 does not craft, so half of the four named reducers have no load behind them. That is bot work, and
 it is work on a measurement tool rather than on the product.
 
-**Concurrent players per node is currently a fact about the driver.** The fleet costs roughly 45 MB
-per bot *in the bench process*, so 200 bots is about 9 GB before the server is considered. The
-consumer's own documentation says the honest fix is more processes; multi-process fleet
-orchestration does not exist yet.
+**Concurrent players per node is currently a fact about the driver.** The fleet costs tens of MB per
+bot *in the bench process* — most recently ~38 MB of settled managed heap and ~60 MB resident, on a
+world whose largest client-held table has itself grown — so a 200-bot fleet is many GB before the
+server is considered. The consumer's own documentation says the honest fix is more processes;
+multi-process fleet orchestration does not exist yet.
+
+The per-bot figures in that sentence used to be stated precisely (45 MB) and are now stated as a
+range on purpose, because the instrument that produced them turned out not to support the precision.
+Working set was being compared across arms that were never interleaved, and the GC swing over a bot
+count is larger than the differences it was being read for; a ~10% "regression" measured that way
+evaporated under an interleaved re-run with settled managed heap. **This is the phase's own failure
+mode, caught in miniature before the phase started** — precisely the thing the honesty rule below
+exists for, and a useful reminder that the risk is not only stale numbers but numbers that were
+never as sharp as their digits implied. [LOAD-TESTING.md](../LOAD-TESTING.md) now carries the
+methodology this phase inherits: interleave arms, force a collection at the same point in each,
+compare settled managed heap with working set beside it, and record the GC mode and core count.
 
 **The reassignment window cannot come from the reference workload.** Its clustering phase is
 planned, not built — the deployment is single-node and carries no shard configuration. This
