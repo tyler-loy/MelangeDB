@@ -131,6 +131,9 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
     public IEnumerable<RowKey> ScanKeys(TableId table) =>
         _tables.TryGetValue(table, out var data) ? data.Current.Rows.Keys : [];
 
+    public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high) =>
+        _tables.TryGetValue(table, out var data) ? data.Current.Rows.KeyRange(low, high) : [];
+
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value) =>
         _tables.TryGetValue(table, out var data) ? Reads.ScanIndex(data, data.Current, table, column, value) : [];
 
@@ -197,6 +200,12 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         {
             ThrowIfDisposed();
             return tables.TryGetValue(table, out var pinned) ? pinned.Version.Rows.Keys : [];
+        }
+
+        public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high)
+        {
+            ThrowIfDisposed();
+            return tables.TryGetValue(table, out var pinned) ? pinned.Version.Rows.KeyRange(low, high) : [];
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
@@ -299,10 +308,10 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
     /// pinned view costs container nodes rather than a copy of the data.
     /// </summary>
     private sealed class TableVersion(
-        ImmutableSortedDictionary<RowKey, byte[]> rows,
+        RowDirectory<byte[]> rows,
         ImmutableArray<SecondaryIndex> indexes)
     {
-        public ImmutableSortedDictionary<RowKey, byte[]> Rows { get; } = rows;
+        public RowDirectory<byte[]> Rows { get; } = rows;
 
         public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
 
@@ -331,7 +340,7 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
                 indexes.Add(SecondaryIndex.Empty);
             }
 
-            Current = new TableVersion(ImmutableSortedDictionary<RowKey, byte[]>.Empty, indexes.MoveToImmutable());
+            Current = new TableVersion(RowDirectory<byte[]>.Empty, indexes.MoveToImmutable());
         }
 
         /// <summary>
@@ -484,7 +493,7 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
         internal sealed class BulkLoader
         {
             private readonly TableData _table;
-            private readonly ImmutableSortedDictionary<RowKey, byte[]>.Builder _rows;
+            private readonly RowDirectory<byte[]>.Builder _rows;
             private readonly SecondaryIndex.Builder[] _indexes;
 
             public BulkLoader(TableData table)

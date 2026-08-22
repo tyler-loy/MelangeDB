@@ -297,6 +297,60 @@ public class StoreContractTests
         Assert.Equal(store.Scan(table).Select(p => p.Key).ToList(), store.ScanKeys(table).ToList());
     }
 
+    /// <summary>
+    /// <c>ScanKeyRange</c> against both engines, and against both of the FASTER store's key
+    /// directories — a paged table's is its directory of hybrid-log locations, a resident table's
+    /// is its row map, and the two are different objects behind the same call.
+    /// <para>
+    /// The window is the assertion; the <em>cost</em> of reaching it cannot be seen from out here,
+    /// which is why <c>RowDirectoryTests</c> counts comparisons instead. What this pins is that
+    /// seeking did not change which rows a window holds — the failure a seek off by one would
+    /// produce is a silently short answer, and a subscription would report it as "no terrain here".
+    /// </para>
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Stores))]
+    public void Scan_key_range_answers_the_window_on_paged_and_resident_tables(StoreKind kind)
+    {
+        using var harness = new StoreHarness(kind);
+        harness.Invoke("seed", ctx =>
+        {
+            // Sparse on purpose: bounds that name no row must still land on the right neighbours.
+            for (var i = 0; i < 40; i += 2)
+            {
+                ctx.Db.Insert(new TerrainBlob { ChunkId = i, Region = 0, Data = MakeBlob(i, 500) });
+                ctx.Db.Insert(new ItemDefinition { Id = i, Name = $"item-{i}", Value = i });
+            }
+        });
+
+        var store = harness.Engine.HotStore;
+        foreach (var table in new[]
+        {
+            harness.Engine.Schema.Get(typeof(TerrainBlob)).Id,
+            harness.Engine.Schema.Get(typeof(ItemDefinition)).Id,
+        })
+        {
+            var all = store.ScanKeys(table).ToList();
+            Assert.Equal(20, all.Count);
+
+            // A window in the middle, by exact bounds and then by bounds that fall between rows.
+            var exact = store.ScanKeyRange(table, all[5], all[8]).ToList();
+            Assert.Equal(all.GetRange(5, 4), exact);
+            Assert.Equal(all.GetRange(5, 4), store.ScanKeyRange(table, all[5], all[8]).ToList());
+
+            // Both ends, a single-key window, and one past the last key.
+            Assert.Equal([all[0]], store.ScanKeyRange(table, all[0], all[0]).ToList());
+            Assert.Equal(all, store.ScanKeyRange(table, all[0], all[^1]).ToList());
+            Assert.Equal([all[^1]], store.ScanKeyRange(table, all[^1], all[^1]).ToList());
+            Assert.Empty(store.ScanKeyRange(table, all[^1], all[0]).ToList());
+
+            // And it agrees with the filtered walk it replaced, which is the regression itself.
+            Assert.Equal(
+                all.Where(k => k.CompareTo(all[3]) >= 0 && k.CompareTo(all[15]) <= 0).ToList(),
+                store.ScanKeyRange(table, all[3], all[15]).ToList());
+        }
+    }
+
     private const ulong AutoIncFirstId = 1UL;
 
     internal static byte[] MakeBlob(int seed, int length)

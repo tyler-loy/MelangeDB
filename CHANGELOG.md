@@ -88,6 +88,38 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A primary-key range subscription walked the key directory from row zero to reach its window.**
+  The cost was O(keys before the window), so it grew with the table *and* with where in key order
+  the client happened to be looking — a moving-window subscription got steadily more expensive the
+  further it travelled, which is the one shape terrain streaming guarantees. Reported against the
+  reference workload's 1.44M-row chunk table, where each client holds a nineteen-window ring
+  re-scoped on every chunk crossing: **12 clients fell from 120 position-reducer calls/s to 7, and
+  joins took 17–114s instead of 3.** Disabling only that ring restored both.
+
+  Two things made it that bad rather than merely slow. The walk runs inside
+  `MelangeEngine.ReadConsistent`, so it holds the engine's write lock — nineteen of them per client
+  per crossing stalled every writer on the node, which is why host CPU sat at one core while
+  throughput collapsed. And `FasterHotStore.ScanKeys` **copied every key of the table into an
+  array** before returning, under the store lock, on every call: a multi-megabyte large-object-heap
+  allocation per subscription evaluation. It never needed to — the version it reads is immutable, so
+  capturing the reference is enough.
+
+  Stores now answer `IHotStoreReader.ScanKeyRange(table, low, high)` by **seeking** to the lower
+  bound, so the cost is the size of the window rather than the distance to it. Measured on a
+  200,000-row table, one twenty-key window at the far end: **~19ms to ~0.01ms in the in-memory
+  store and ~21ms to ~0.01ms in the FASTER store**, or roughly 1,800–2,500x, and flat in table size
+  where it was linear. Both callers take the new route — subscriptions and the `FilterRange`
+  a reducer runs against a primary key.
+
+  The key directory itself changed shape to make that possible: an `ImmutableSortedDictionary`
+  cannot begin enumerating at a lower bound, so it is now one sorted set of entries, which can
+  (`RowDirectory`). This is the same change `SecondaryIndex` made for the same reason — indexed
+  *column* ranges have sought since then, and only the primary key was left walking. The trade is
+  one extra tree operation when a write replaces an existing key, paid in short-lived garbage
+  rather than in resident memory, which is the right currency for a store whose defining constraint
+  is the RAM ceiling.
+
+
 - **A shard node's own engine accepted bulk rows that belonged to a shard, and reported success.**
   `PlacementGuards.NodeLocalAccess` has always said that engine holds only `Local` tables, but it is
   a *table-access* guard and bulk ingestion never touches a table handle — so a batch of

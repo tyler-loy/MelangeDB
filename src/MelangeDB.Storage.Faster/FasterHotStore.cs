@@ -274,17 +274,32 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     public long Count(TableId table) =>
         _tables.TryGetValue(table, out var state) ? state.Current.RowCount : 0;
 
+    /// <summary>
+    /// The keys, lazily, off the version captured under the lock.
+    /// <para>
+    /// This used to copy every key into an array before returning — <c>[.. Current.Keys]</c> — on
+    /// the theory that the caller should not hold the lock while it enumerates. It does not need
+    /// to: the version is immutable, so capturing the reference is enough and reading it needs no
+    /// lock at all. What the copy actually bought was an allocation the size of the table on every
+    /// call, on the large-object heap for anything past a few thousand rows, taken while holding
+    /// the store lock — and a subscription re-scoping over a million-row table did it once per
+    /// subscription, under the engine's write lock, which is to say with every writer stopped.
+    /// </para>
+    /// </summary>
     public IEnumerable<RowKey> ScanKeys(TableId table)
     {
-        RowKey[] keys;
         lock (_lock)
         {
-            if (!_tables.TryGetValue(table, out var state))
-                return [];
-            keys = state.SnapshotKeys();
+            return _tables.TryGetValue(table, out var state) ? state.Current.Keys : [];
         }
+    }
 
-        return keys;
+    public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high)
+    {
+        lock (_lock)
+        {
+            return _tables.TryGetValue(table, out var state) ? state.Current.KeyRange(low, high) : [];
+        }
     }
 
     public HotStoreStatistics Statistics()
@@ -451,6 +466,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         public long Count(TableId table) => Pin(table) is { } pinned ? pinned.Version.RowCount : 0;
 
         public IEnumerable<RowKey> ScanKeys(TableId table) => Pin(table) is { } pinned ? pinned.Version.Keys : [];
+
+        public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high) =>
+            Pin(table) is { } pinned ? pinned.Version.KeyRange(low, high) : [];
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table)
         {
@@ -870,21 +888,25 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     /// </summary>
     private sealed class TableVersion(
         bool isResident,
-        ImmutableSortedDictionary<RowKey, byte[]> residentRows,
-        ImmutableSortedDictionary<RowKey, DirectoryEntry> directory,
+        RowDirectory<byte[]> residentRows,
+        RowDirectory<DirectoryEntry> directory,
         ImmutableArray<SecondaryIndex> indexes)
     {
         public bool IsResident { get; } = isResident;
 
-        public ImmutableSortedDictionary<RowKey, byte[]> ResidentRows { get; } = residentRows;
+        public RowDirectory<byte[]> ResidentRows { get; } = residentRows;
 
-        public ImmutableSortedDictionary<RowKey, DirectoryEntry> Directory { get; } = directory;
+        public RowDirectory<DirectoryEntry> Directory { get; } = directory;
 
         public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
 
         public long RowCount => IsResident ? ResidentRows.Count : Directory.Count;
 
         public IEnumerable<RowKey> Keys => IsResident ? ResidentRows.Keys : Directory.Keys;
+
+        /// <summary>The keys in [low, high], sought rather than scanned to; see IHotStoreReader.ScanKeyRange.</summary>
+        public IEnumerable<RowKey> KeyRange(RowKey low, RowKey high) =>
+            IsResident ? ResidentRows.KeyRange(low, high) : Directory.KeyRange(low, high);
 
         public bool Contains(in RowKey key) => IsResident ? ResidentRows.ContainsKey(key) : Directory.ContainsKey(key);
     }
@@ -928,8 +950,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
             _current = new TableVersion(
                 declared is Residency.Resident or Residency.Auto,
-                ImmutableSortedDictionary<RowKey, byte[]>.Empty,
-                ImmutableSortedDictionary<RowKey, DirectoryEntry>.Empty,
+                RowDirectory<byte[]>.Empty,
+                RowDirectory<DirectoryEntry>.Empty,
                 indexes.MoveToImmutable());
         }
 
@@ -958,9 +980,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         /// <summary>Whether the table's rows are currently pinned in managed memory.</summary>
         public bool IsResident => _bulk?.IsResident ?? Current.IsResident;
 
-        public ImmutableSortedDictionary<RowKey, byte[]> ResidentRows => Current.ResidentRows;
+        public RowDirectory<byte[]> ResidentRows => Current.ResidentRows;
 
-        public ImmutableSortedDictionary<RowKey, DirectoryEntry> Directory => Current.Directory;
+        public RowDirectory<DirectoryEntry> Directory => Current.Directory;
 
         public long PageFaults { get; set; }
 
@@ -1151,8 +1173,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 indexes.Add(SecondaryIndex.Empty);
             Current = new TableVersion(
                 isResident,
-                ImmutableSortedDictionary<RowKey, byte[]>.Empty,
-                ImmutableSortedDictionary<RowKey, DirectoryEntry>.Empty,
+                RowDirectory<byte[]>.Empty,
+                RowDirectory<DirectoryEntry>.Empty,
                 indexes.MoveToImmutable());
         }
 
@@ -1192,9 +1214,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             public required bool IsResident { get; set; }
 
-            public required ImmutableSortedDictionary<RowKey, byte[]>.Builder Rows { get; init; }
+            public required RowDirectory<byte[]>.Builder Rows { get; init; }
 
-            public required ImmutableSortedDictionary<RowKey, DirectoryEntry>.Builder Directory { get; init; }
+            public required RowDirectory<DirectoryEntry>.Builder Directory { get; init; }
 
             public required SecondaryIndex.Builder[] Indexes { get; init; }
         }
