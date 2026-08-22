@@ -240,6 +240,29 @@ are **not** a supported surface: they are whatever `main` was at that commit, th
 and the API may change between two consecutive ones. Use them to try a fix before a release exists,
 not to run anything you care about.
 
+**The run number is not the whole version, and the prefix moves without warning.** `-ci.N` counts
+workflow runs and never resets, so it is tempting to treat it as the version and paste a new `N`
+into an existing pin. But every release bumps `VersionPrefix` (step 5 above), and the very next push
+to `main` publishes under the new prefix — so `0.2.0-ci.179` does not exist if the prefix moved to
+`0.2.1` at run 158. The failure is a loud `NU1101` package-not-found rather than a wrong resolve,
+which is the right way for it to fail, but it costs a detour.
+
+Read the **full version string** off the run's `packages-ci.N` artifact or the GitHub Packages
+listing rather than composing it from a prefix you remember. There is no NuGet syntax for "whatever
+prefix, this suffix" — a range like `[0.0.0-ci.179,)` resolves to the *highest* matching version,
+not that build — so the version has to be carried whole. Keeping it in one MSBuild property makes
+moving the pin a single edit and makes the prefix visible while you do it:
+
+```xml
+<PropertyGroup>
+  <MelangeVersion>0.2.1-ci.179</MelangeVersion>
+</PropertyGroup>
+<ItemGroup>
+  <PackageReference Include="MelangeDB.Core" Version="$(MelangeVersion)" />
+  <PackageReference Include="MelangeDB.Server" Version="$(MelangeVersion)" />
+</ItemGroup>
+```
+
 ## CI
 
 `.github/workflows/ci.yml` is the whole pipeline. Its `test` job runs on every PR, every push to
