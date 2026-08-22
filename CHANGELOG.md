@@ -10,6 +10,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.1] — 2026-08-22
+
 ### Breaking
 
 - **`/melange/bulk` answers a per-engine results array instead of a single `lsn`.** The body is now
