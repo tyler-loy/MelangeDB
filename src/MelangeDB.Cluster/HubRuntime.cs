@@ -585,8 +585,10 @@ internal sealed partial class HubRuntime : IDisposable
     /// node at every instant: it is closed on the origin before the destination ever learns of it.
     /// </summary>
     /// <summary>
-    /// Removes a shard that holds nothing of its own: the owner verifies and deletes, then the
-    /// hub forgets the assignment. The counterpart <c>EnsureShard</c> never had.
+    /// Removes a shard that holds nothing of its own: the owner verifies and closes it, the hub
+    /// forgets the assignment, and only then is the directory deleted. The counterpart
+    /// <c>EnsureShard</c> never had; reached from a host through
+    /// <c>MelangeClusterCoordinator.ReapShardAsync</c>.
     /// <para>
     /// Deliberately a host API and not an endpoint. This is the one cluster operation that
     /// destroys durable state, and a new authenticated wire surface for it would drag the whole
@@ -594,10 +596,17 @@ internal sealed partial class HubRuntime : IDisposable
     /// own code, the same line <c>BulkInsert</c> draws.
     /// </para>
     /// <para>
-    /// <b>Ordering is the crash-safety story.</b> The membership row goes last, so a failure
-    /// anywhere before it leaves a shard that is still owned and still openable — "the reap did
-    /// not happen" — rather than a directory nobody owns. The originator is never released: ids
-    /// minted under it outlive the shard.
+    /// <b>Ordering is the crash-safety story, and the destruction goes last.</b> Three steps:
+    /// the owner seals and closes the shard, the membership row is removed, the owner deletes the
+    /// directory. Everything before the removal is undoable — the directory is untouched, so an
+    /// interruption leaves a shard that is still owned and still openable, and the owner's reap
+    /// mark expires into exactly that. The removal is what retires the originator, and it happens
+    /// while the data is still there: destroying first would leave a window where the membership
+    /// row survives its directory, and <c>ApplyAssignments</c> would open a fresh empty engine
+    /// under the same originator — re-minting ids that transfers have already carried to other
+    /// shards. After the removal, a lost delete strands a directory nobody owns, which is garbage
+    /// and is logged as garbage. The originator is never re-issued either way: ids minted under it
+    /// outlive the shard.
     /// </para>
     /// <para>
     /// Returns false when the owner refuses, which is an ordinary outcome rather than an error:
@@ -638,8 +647,30 @@ internal sealed partial class HubRuntime : IDisposable
                 return false;
             }
 
-            // Last, and only after the owner confirms the data is gone.
+            // The shard is sealed and closed but still on disk. Retiring the row here is what makes
+            // the originator unreachable before anything is destroyed.
             _membership.RemoveShard(shard);
+
+            // A reaped shard never reports again, and freshness only ages a sample out of the
+            // holding-nothing list — Snapshot() and the observable gauges would go on publishing a
+            // shard that does not exist, and would grow by one world per reap.
+            Load.Forget(shard);
+
+            // Now the data. A failure here is loud and leaves recoverable garbage, not a collision,
+            // so it is logged rather than thrown: the shard is already out of the cluster, and
+            // reporting the reap as failed would say something untrue about the state it left.
+            try
+            {
+                var deleted = await link.RequestAsync(
+                    "shard-reap-delete", new ShardReapDelete(shard.Value), ct, stepTimeoutMs).ConfigureAwait(false);
+                if (deleted?.Deserialize<ShardReapReply>() is { Reaped: false } refusal)
+                    LogShardReapDeleteFailed(_logger, shard.Value, owner, refusal.Refusal ?? "no reason given");
+            }
+            catch (Exception exception)
+            {
+                LogShardReapDeleteFailed(_logger, shard.Value, owner, exception.Message);
+            }
+
             LogShardReaped(_logger, shard.Value, owner);
             return true;
         }
@@ -1830,6 +1861,12 @@ internal sealed partial class HubRuntime : IDisposable
             "has forgotten the assignment. Its originator is retired rather than reused; visiting the shard key again " +
             "creates a new shard.")]
     private static partial void LogShardReaped(ILogger logger, ulong shard, string owner);
+
+    [LoggerMessage(EventId = 1752, EventName = "ShardReapDeleteFailed", Level = LogLevel.Error,
+        Message = "Shard {Shard} was reaped — its membership row is gone and its originator is retired — but node '{Owner}' did not confirm the " +
+            "delete of its directory ({Reason}). The shard is out of the cluster and no ids can collide; what is left is an orphaned directory on " +
+            "that node, to be removed by hand. Visiting the key again creates a new shard under a new originator.")]
+    private static partial void LogShardReapDeleteFailed(ILogger logger, ulong shard, string owner, string reason);
 
     [LoggerMessage(EventId = 1749, EventName = "ShardReapRefused", Level = LogLevel.Information,
         Message = "Reap of shard {Shard} refused by its owner '{Owner}': {Reason}. The hub asks from a sampled view and " +

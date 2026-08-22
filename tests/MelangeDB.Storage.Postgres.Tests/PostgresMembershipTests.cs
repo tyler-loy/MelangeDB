@@ -48,8 +48,9 @@ public class PostgresMembershipTests
         var first = store.EnsureShard(new ShardKey(1), T0);
         var second = store.EnsureShard(new ShardKey(2), T0);
 
-        // Stand in for the reaper that does not exist yet: drop the newest shard's row, which is
-        // exactly what makes MAX(originator) fall back.
+        // Stand in for a reap: drop the newest shard's row, which is exactly what makes
+        // MAX(originator) fall back. Driven directly rather than through ReapShardAsync because the
+        // subject here is the store's allocation, not the cluster operation that removes the row.
         Execute(options, $"DELETE FROM {schema}.melange_cluster_shards WHERE shard = 2");
 
         var third = store.EnsureShard(new ShardKey(3), T0);

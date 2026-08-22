@@ -2,10 +2,11 @@
 
 Where MelangeDB is, how it got here, and what's left.
 
-Work was sequenced as twelve phases. Eleven have shipped; one is outstanding. Each phase's full
-plan — deliverables, what was explicitly out of scope, and the reasoning behind every decision it
-settled — lives in [road-to-0.1/](road-to-0.1/). Those are the authoritative record of *why* things
-are the way they are; this page is the summary.
+0.1 was sequenced as twelve phases and all twelve have shipped; 0.2 added seven more, also shipped;
+0.3 plans five. Each phase's full plan — deliverables, what was explicitly out of scope, and the
+reasoning behind every decision it settled — lives in [road-to-0.1/](road-to-0.1/),
+[road-to-0.2/](road-to-0.2/), and [road-to-0.3/](road-to-0.3/). Those are the authoritative record
+of *why* things are the way they are; this page is the summary.
 
 ## Standing conventions
 
@@ -74,7 +75,7 @@ Phase 12 was numbered after 11 but landed first: the port's scoping pass
 ([#20](https://github.com/tyler-loy/MelangeDB/issues/20)) measured 459 client call sites that are
 mechanical against typed bindings and a rewrite without them.
 
-## M4 — 0.2: elastic capacity and operations · planned
+## M4 — 0.2: elastic capacity and operations · shipped
 
 Post-0.1 work, planned in [road-to-0.2/](road-to-0.2/). Phases 13–14 implement
 [design/elastic-rebalancing.md](design/elastic-rebalancing.md): shard boundaries stay fixed at

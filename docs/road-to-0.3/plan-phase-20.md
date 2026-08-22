@@ -107,26 +107,34 @@ bots.
 
 ## Deliverables
 
-**The phase 11 numbers that gate other work.** The two comparison-shaped ones below are struck: they moved to the deferred half, and are kept here rather than deleted because the shape they would have taken is itself the argument against running them.
+**The phase 11 numbers that gate other work.** The struck ones below moved to the deferred half, and
+are kept here rather than deleted because the shape each would have taken is itself the argument
+against running it now. What is struck is what needs a second system to compare against or a tool
+that does not exist yet; what is not struck needs neither, which is the whole basis of the split.
 
 - ~~**Memory for the 10 km world versus SpacetimeDB's**~~ — **deferred.** It would have needed **both sides pinned at the port
   commit** — the only point at which they were the same game. Everything else in this phase measures
   current MelangeDB; this one number does not, and says so where it is published. The alternative,
   live-against-frozen, biases *against* MelangeDB by thirteen tables, which is the safe direction for
   a self-run benchmark and also the direction that makes the number mean nothing.
-- ~~**Memory for the 20 km world SpacetimeDB cannot host**~~ — **deferred with its sibling**, though it is the one that survives the objection: it is a capability claim needing no baseline. (98,596 chunks) on one node within a fixed
-  budget. This is complaint 2 — the RAM ceiling — either demonstrated or not, and it needs no
-  baseline, so it is unaffected by the drift above.
-- **Reducer latency p50/p99 for gather, move, attack, and craft**, from the
-  `melange.reducer.duration` histogram rather than from the driver — the load bench deliberately does
-  not print latency, on the grounds that a reducer's span duration *is* every player frozen for that
-  long. **Includes the bot work** to arm the fleet and make it craft; without it, two of the four
-  have no load behind them.
+- **Memory for the 20 km world SpacetimeDB cannot host** — the full 20 km world (98,596 chunks) on
+  one node within a fixed budget. This is complaint 2, the RAM ceiling, either demonstrated or not.
+  **Kept in this half**, unlike its sibling above: it is a capability claim about MelangeDB alone,
+  it needs no baseline, and so none of the drift that deferred the head-to-head touches it. Report
+  it against [LOAD-TESTING.md](../LOAD-TESTING.md)'s methodology — settled managed heap, GC mode and
+  core count recorded — and not as working set.
+- **Reducer latency p50/p99 for gather and move**, from the `melange.reducer.duration` histogram
+  rather than from the driver — the load bench deliberately does not print latency, on the grounds
+  that a reducer's span duration *is* every player frozen for that long.
+- ~~**The same for attack and craft**~~ — **deferred with the comparison.** Both need the fleet
+  armed and crafting, which is bot work: a measurement tool, not the product, and the split's whole
+  point was that tool-building must not gate the cheap numbers.
 - **Terrain-streaming throughput** as a player crosses chunk boundaries. The driver already counts
   crossings; the throughput half comes from the subscription metrics.
-- **Concurrent players per node**, which requires multi-process fleet orchestration first. Until
-  that exists, any number produced is a measurement of the driver's memory, not the server's
-  capacity, and publishing it as the latter would be the exact error this phase exists to correct.
+- ~~**Concurrent players per node**~~ — **deferred with the comparison**, because it requires
+  multi-process fleet orchestration first. Until that exists, any number produced is a measurement
+  of the driver's memory, not the server's capacity, and publishing it as the latter would be the
+  exact error this phase exists to correct.
 
 **The reassignment window**, from MelangeDB's own cluster tests. Time from fence to the new owner
 serving writes, for a *crowded* shard under realistic residency — not an empty one. Reported as a
@@ -136,6 +144,24 @@ the claim being tested is that the window scales with shard heat. This is the tr
 trigger that lives inside the thing it gates never fires. **It is a synthetic number and must be
 labelled one** — the reference workload's clustering phase is planned rather than built, so no real
 deployment can produce it.
+
+**The fan-out share of lock-held time**, which is [read-side fan-out](../idea-bin/read-side-fanout.md)'s
+reopening trigger and until now has been named without being specified. The idea is a rewrite of the
+consistency core, so the bar for reopening it has to be a number rather than an intuition:
+
+- **Metric.** `melange.post_commit_ms` over `melange.locked_ms`, from the same `melange.reducer`
+  span — the fan-out runs in the post-commit half of the locked window, so the ratio *is* the share.
+  `melange.subscription.delta_rows` and the sampled `melange.subscription.delta` spans (raise
+  `Telemetry:DeltaSpanSampleRatio` for the run) attribute the share to tables and subscriber counts.
+- **Harness.** The load rig, not the reference workload: the variable is subscriber count on one
+  shard, and only the rig can hold everything else still. One crowded shard, a fixed commit rate,
+  and a subscriber sweep — 50 / 100 / 200 / 400 subscribers on the same terrain-streaming
+  subscription — each arm interleaved and reported per [LOAD-TESTING.md](../LOAD-TESTING.md).
+- **Pass/fail.** Fan-out is a *significant* share if post-commit exceeds **25% of locked time** at
+  realistic density (200 subscribers on one shard), or if the share grows faster than linearly in
+  subscriber count across the sweep — the second matters more, because it is the shape that says the
+  ceiling is subscribers rather than commits. Either result reopens the idea bin entry. Neither
+  result closes it as refused: it stays where it is, with a profile attached instead of arithmetic.
 
 **Per-tick scheduled-reducer cost against player-reducer latency.** With the reference workload's
 scheduled reducers running, the p99 of a player-initiated `Move` on the same shard, and the share of
@@ -224,9 +250,12 @@ The audit split the deliverables along a line the original plan did not see, and
 scoped separately.
 
 **Phase 20 is the decision-gating half:** the scheduled-reducer cost (start from the consumer's
-existing write-lock dashboard), the fan-out share, and the reassignment window from MelangeDB's own
-cluster tests. These unblock phase 24 and two idea-bin triggers, need no new tooling, and are days
-rather than weeks.
+existing write-lock dashboard), the fan-out share, the reassignment window from MelangeDB's own
+cluster tests, and the 20 km memory claim. The first three unblock phase 24 and two idea-bin
+triggers; the fourth unblocks nothing but costs nothing either — it is a capability claim about
+MelangeDB alone, so the drift that deferred the head-to-head does not reach it, and there is no
+reason for it to wait behind a decision it does not depend on. None of the four need new tooling,
+and all four are days rather than weeks.
 
 **The comparison half is deferred and undecided:** the head-to-head against SpacetimeDB, the
 armed-and-crafting bot fleet, and multi-process fleet orchestration. It unblocks nothing, two of the

@@ -31,8 +31,10 @@ public interface IBulkRouter
     /// <summary>
     /// Writes <paramref name="rows"/> to whichever engines own them, and reports what each one
     /// took. Throws <see cref="ArgumentException"/> for a batch this router will not route — an
-    /// unknown table, or a destination shard that does not exist — <b>before</b> writing anything,
-    /// so a refused batch is a batch that did not half-land.
+    /// unknown table, or a destination shard that does not exist — <b>before</b> writing or
+    /// creating anything, so a refused batch is a batch that did not half-land. Creating counts:
+    /// preparing destinations can bring shards and their durable directories into existence, and
+    /// a batch refused after that has left something behind.
     /// </summary>
     Task<IReadOnlyList<BulkResult>> RouteAsync(
         Identity caller, IReadOnlyList<BulkRow> rows, CancellationToken cancellationToken = default);

@@ -231,6 +231,79 @@ public class NotDefaultPredicateTests
     }
 
     /// <summary>
+    /// UInt64 is the kind that most needs its own case, and it had none. A SQL integer literal is
+    /// parsed as <c>long</c>, so <c>&lt;&gt; 0</c> is the only literal form that can name the
+    /// default of a column whose range runs past <c>long.MaxValue</c> — and the compiled range's
+    /// upper bound is <c>ulong.MaxValue</c>, which no other kind exercises. A row sitting exactly
+    /// on that bound is the one an off-by-one would silently drop.
+    /// </summary>
+    [Fact]
+    public async Task Not_default_on_a_uint64_column_reaches_the_top_of_its_range()
+    {
+        await using var host = await TransportTestHost.StartAsync();
+        host.Call("EditChunkVisited", 1L, 0u, 0, 0UL);
+        host.Call("EditChunkVisited", 2L, 0u, 0, 1UL);
+        host.Call("EditChunkVisited", 3L, 0u, 0, ulong.MaxValue);
+        host.Call("EditChunkVisited", 4L, 0u, 0, (ulong)long.MaxValue + 1);
+
+        await using var client = host.CreateClient();
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+
+        var set = await client.SubscribeAsync(
+            "SELECT * FROM EditedChunk WHERE Visits <> 0",
+            cancellationToken: TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            [2L, 3L, 4L],
+            set.Rows.Select(r => (long)r.Columns["Id"]!).Order().ToList());
+    }
+
+    /// <summary>
+    /// The operand has to <em>be</em> the default, and "coerces to it" is a weaker question that
+    /// would have widened the shape by accident. The write path's coercion rounds and reads a
+    /// missing value as the default, so borrowing it here made <c>&lt;&gt; 0.5</c> and an unbound
+    /// parameter both compile as not-default — naming a predicate no caller wrote, and hiding a
+    /// mistake in the one shape that happens to want zero.
+    /// </summary>
+    [Fact]
+    public async Task An_operand_that_merely_coerces_to_the_default_is_refused()
+    {
+        await using var host = await TransportTestHost.StartAsync();
+        await using var client = host.CreateClient();
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+
+        // 0.5 truncates to 0 on the write path; it names no value of an unsigned column here.
+        var fractional = await Assert.ThrowsAsync<MelangeSubscriptionException>(() =>
+            client.SubscribeAsync(
+                "SELECT * FROM EditedChunk WHERE EditCount <> 0.5",
+                cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(MelangeErrorCodes.UnsupportedPredicate, fractional.Code);
+
+        // A null parameter is the mistake this refusal exists to surface, not a spelling of zero.
+        var unbound = await Assert.ThrowsAsync<MelangeSubscriptionException>(() =>
+            client.SubscribeAsync(
+                "SELECT * FROM EditedChunk WHERE EditCount <> :p",
+                new Dictionary<string, object?> { ["p"] = null },
+                cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(MelangeErrorCodes.UnsupportedPredicate, unbound.Code);
+
+        // Exactly zero still compiles, however it is spelled — the rule is about the value.
+        var bound = await client.SubscribeAsync(
+            "SELECT * FROM EditedChunk WHERE EditCount <> :p",
+            new Dictionary<string, object?> { ["p"] = 0 },
+            cancellationToken: TestContext.Current.CancellationToken);
+        Assert.Equal(0, bound.Count);
+
+        // And a bool column is named by its own default, never by 0 — the shape's headline
+        // spelling is `<> 0` only where the default is 0.
+        var boolByZero = await Assert.ThrowsAsync<MelangeSubscriptionException>(() =>
+            client.SubscribeAsync(
+                "SELECT * FROM EditedChunk WHERE IsEdited <> 0",
+                cancellationToken: TestContext.Current.CancellationToken));
+        Assert.Equal(MelangeErrorCodes.UnsupportedPredicate, boolByZero.Code);
+    }
+
+    /// <summary>
     /// Ad-hoc row queries take the same compiled path subscriptions do, so the shape works there.
     /// Aggregates do not: they run on the relational tier through a predicate discriminated by
     /// which operands it carries, and this first cut refuses them by name rather than letting one

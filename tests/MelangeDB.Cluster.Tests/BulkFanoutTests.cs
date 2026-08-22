@@ -147,10 +147,12 @@ public class BulkFanoutTests
     /// existing shard-span check: <c>Cluster:ShardSpanCheck</c> defaults to <c>DebugOnly</c>, so in
     /// a Release cluster — the only kind with a bake to run — that check is off.
     ///
-    /// <para>The fixture forces the span check to <c>Always</c>, so this test would pass even
-    /// without the receiver's own check; what it is really asserting is the message and the
-    /// all-or-nothing. The reason the receiver's check has to exist anyway is what the comment on
-    /// <c>ApplyBulkGroup</c> records.</para>
+    /// <para><b>The span check is turned off for this test</b>, which is the only configuration in
+    /// which it proves anything. The fixture forces it to <c>Always</c> everywhere else, and under
+    /// that setting a misroute is caught by the span check and the assertions below — the message
+    /// and the all-or-nothing — are satisfied without the receiver's own check ever running. <c>Off</c>
+    /// is stronger than the Release default rather than merely equal to it: it removes the guard
+    /// outright instead of relying on this test assembly's build configuration to remove it.</para>
     /// </summary>
     [Fact]
     public async Task A_row_the_hub_routed_to_the_wrong_shard_is_refused_by_the_receiver()
@@ -158,7 +160,10 @@ public class BulkFanoutTests
         await using var cluster = await ClusterFixture.StartAsync(
             shardNodes: 1,
             failureTimeoutMs: 60_000,
-            extraSettings: BulkEnabled,
+            extraSettings: new Dictionary<string, string?>(BulkEnabled)
+            {
+                ["MelangeDb:Cluster:ShardSpanCheck"] = "Off",
+            },
             configureHub: static services => services.AddSingleton<IShardStrategy>(static provider =>
                 new MisroutingStrategy(new InstancingShardStrategy(
                     provider.GetRequiredService<SchemaRegistry>(),
@@ -177,8 +182,46 @@ public class BulkFanoutTests
         Assert.Contains("shard:81", message, StringComparison.Ordinal);
         Assert.Contains("shard:80", message, StringComparison.Ordinal);
 
+        // Named, so a future refactor that reinstates the span check here cannot quietly take over
+        // this test: a ShardSpanException would satisfy every assertion above.
+        Assert.DoesNotContain(nameof(ShardSpanException), message, StringComparison.Ordinal);
+
         Assert.Empty(MobsIn(cluster, 80));
         Assert.Empty(MobsIn(cluster, 81));
+    }
+
+    /// <summary>
+    /// <see cref="IBulkRouter"/> promises to throw for a batch it will not route — an unknown table
+    /// among them — <b>before</b> writing anything. The router used to hand unknown tables to the
+    /// local engine so that one place owned the wording, which read as harmless because local
+    /// writes run first. It was not quite: destination preparation runs before either, so with
+    /// <c>Bulk:CreateShards</c> on, a batch naming a table that does not exist created shards and
+    /// their durable directories on its way to being refused for the table. Refusing before any of
+    /// that is what "did not half-land" has to mean when half the landing is a directory.
+    /// </summary>
+    [Fact]
+    public async Task A_batch_naming_an_unknown_table_creates_no_shards_before_it_is_refused()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(
+            shardNodes: 1, failureTimeoutMs: 60_000, extraSettings: BulkEnabledCreatingShards);
+
+        var response = await PostBulkAsync(cluster, """
+            {"tables": {
+              "Mob": [{"InstanceId": 90, "Hp": 1}],
+              "NoSuchTable": [{"InstanceId": 91}]
+            }}
+            """);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains(
+            "NoSuchTable",
+            (await ReadJsonAsync(response)).GetProperty("message").GetString()!,
+            StringComparison.Ordinal);
+
+        // Neither shard exists: not the one the unknown table aborted on, and not the one the
+        // valid rows in the same batch would have brought into being.
+        Assert.Null(cluster.Hub.Membership.GetAssignment(new ShardKey(90)));
+        Assert.Null(cluster.Hub.Membership.GetAssignment(new ShardKey(91)));
     }
 
     /// <summary>

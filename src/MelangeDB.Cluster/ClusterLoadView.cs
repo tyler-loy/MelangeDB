@@ -147,6 +147,21 @@ public sealed class ClusterLoadView : IDisposable
                 && now - load.At <= freshness)
             .OrderBy(static load => load.Shard)];
 
+    /// <summary>
+    /// Drops a shard from the view outright — the reap's counterpart to <see cref="Record"/>, and
+    /// the one thing freshness cannot do. Freshness governs whether a sample is <em>believed</em>,
+    /// which is enough for <see cref="ShardsHoldingNothing"/> and nothing else: a stale entry is
+    /// still published by <see cref="Snapshot"/> and still measured by the observable gauges, so a
+    /// reaped shard would go on reporting a utilization and a footprint forever, and a deployment
+    /// that reaps a world a day would accumulate one dead series a day.
+    /// </summary>
+    internal void Forget(ShardKey shard)
+    {
+        _latest.TryRemove(shard, out _);
+        _history.TryRemove(shard, out _);
+        _draining.TryRemove(shard, out _);
+    }
+
     /// <summary>Every shard's most recent sample, in shard order.</summary>
     public IReadOnlyList<ShardLoad> Snapshot() =>
         [.. _latest.Values.OrderBy(static load => load.Shard)];

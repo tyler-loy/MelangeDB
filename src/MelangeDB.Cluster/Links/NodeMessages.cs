@@ -72,12 +72,22 @@ internal sealed record ShardDrainReply(ulong HeadLsn);
 internal sealed record ShardDrainAbort(ulong Shard);
 
 /// <summary>
-/// The hub asking a shard's owner to remove it outright: check that it holds nothing of its own
-/// and nothing is pinning its log, then close it and delete its directory. The check and the close
-/// happen in one lock on the owner because they cannot be separated — a shard inspected and then
-/// closed could take a row in between, and once it is closed there is nothing left to inspect.
+/// The hub asking a shard's owner for the first half of a removal: check that it holds nothing of
+/// its own and nothing is pinning its log, then seal it against further writes and close it. The
+/// emptiness check and the seal happen in one hold of the owner's <em>engine write lock</em>,
+/// because they cannot be separated — a shard found empty and then closed can take a row in
+/// between, from a reducer call that resolved it before the reap started. The directory survives
+/// this message; it is deleted by <see cref="ShardReapDelete"/>, after the membership row is gone.
 /// </summary>
 internal sealed record ShardReap(ulong Shard, long FencingToken);
+
+/// <summary>
+/// The hub telling the owner the membership row is retired and the sealed shard's directory may
+/// go. Carries no fencing token: the shard has no term any more, which is the point. Sent only
+/// after <see cref="ShardReap"/> succeeded, so that an interruption anywhere leaves a shard that
+/// is still openable rather than a retired originator that a stale assignment can re-mint under.
+/// </summary>
+internal sealed record ShardReapDelete(ulong Shard);
 
 /// <summary>
 /// What the owner did. <see cref="Refusal"/> is null when the shard was removed, and otherwise

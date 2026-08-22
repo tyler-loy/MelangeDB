@@ -1,3 +1,4 @@
+using System.Globalization;
 using MelangeDB.Core;
 using MelangeDB.Protocol;
 
@@ -429,24 +430,20 @@ internal sealed class ServerSubscription
                 + "or byte column has no upper bound to scan to.");
         }
 
-        // Any value that will not coerce to the column's kind is, a fortiori, not its default — so
-        // one refusal covers a bad operand and a wrong-but-valid one, and says the same useful thing.
-        object? coerced = null;
-        try
-        {
-            coerced = RowSerializer.CoerceValue(Schema, column, query.EqualsValue);
-        }
-        catch (ArgumentException)
-        {
-        }
-
-        if (!operands.Default.Equals(coerced))
+        // The operand has to *be* the default, which is a stricter question than "coerces to it".
+        // The write path's coercion is deliberately forgiving — it rounds, and it reads a missing
+        // value as the default — and borrowing it here would quietly widen the shape: `<> 0.5` and
+        // a null parameter both coerce to 0, and both would compile as "not the default", naming a
+        // predicate the caller did not write. So: exact, or refused. One refusal still covers a
+        // bad operand and a wrong-but-valid one, and says the same useful thing about both.
+        if (!NamesDefaultExactly(query.EqualsValue, operands.Default))
         {
             throw new SubscriptionRejectedException(
                 MelangeErrorCodes.UnsupportedPredicate,
                 $"Table '{Schema.Name}': '<>' on column '{column.Name}' compares against the column's default "
-                + $"({(operands.Default is bool ? "false" : "0")}) only — the rows where it has been set at all. "
-                + "An arbitrary inequality has no index affinity and would be a table scan wearing a predicate.");
+                + $"({(operands.Default is bool ? "false" : "0")}) only, written exactly — the rows where it has "
+                + "been set at all. An arbitrary inequality has no index affinity and would be a table scan "
+                + "wearing a predicate, and a null or fractional operand names no value at all.");
         }
 
         RangeLow = SchemaKeyCodec.Encode(column, operands.Low);
@@ -466,6 +463,28 @@ internal sealed class ServerSubscription
     /// keep every byte decision in the one codec both the server and the client already run.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Whether the operand as written names the column's default and nothing else. Numbers are
+    /// judged by value rather than by CLR type, because a literal arrives as <c>long</c> and a
+    /// JSON parameter as whatever the document held — but a value that merely <em>rounds</em> to
+    /// the default does not name it, and neither does an absent one. Null is refused rather than
+    /// read as the default: an unbound parameter is a caller's mistake, and compiling it into the
+    /// one predicate that happens to want zero would hide it.
+    /// </summary>
+    private static bool NamesDefaultExactly(object? operand, object @default) => (operand, @default) switch
+    {
+        (null, _) => false,
+        (bool value, bool expected) => value == expected,
+        (_, bool) => false,
+        (sbyte or byte or short or ushort or int or uint or long, _) =>
+            Convert.ToInt64(operand, CultureInfo.InvariantCulture) == 0,
+        (ulong value, _) => value == 0,
+        (double value, _) => value == 0,
+        (float value, _) => value == 0,
+        (decimal value, _) => value == 0,
+        _ => false,
+    };
+
     private static (object Default, object Low, object High)? NotDefaultOperands(ColumnKind kind) => kind switch
     {
         ColumnKind.Bool => (false, true, true),

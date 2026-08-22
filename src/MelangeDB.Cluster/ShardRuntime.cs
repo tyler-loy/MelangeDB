@@ -310,15 +310,87 @@ internal sealed partial class ShardRuntime : IDisposable
             // on the holding-nothing list. Both terms move together or the difference is fiction.
             (_residentBytes, _authoritativeRows) = Engine.ReadConsistent(_ => (
                 Engine.HotStore.Statistics().Tables.Sum(static table => table.ResidentBytes),
-                Math.Max(0, PartitionedRowCount() - BorrowedRowCount)));
+                AuthoritativeRowsLocked()));
             _residentSampledTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         }
 
         // The borrowed series stays live because nothing keys emptiness on it; the authoritative
-        // figure is as fresh as the throttle, and advisory either way — whatever acts on emptiness
-        // re-checks under the shard's own lock rather than trusting a sampled gauge.
+        // figure is as fresh as the throttle, and advisory either way. Nothing may *act* on
+        // emptiness from this number: it is up to ten seconds old, so a shard that took rows since
+        // the last pass still reads as empty here. The reap re-decides it under the engine write
+        // lock, in the same hold that stops further writes — see SealIfEmpty.
         return new ShardLoadDto(
             Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount, _authoritativeRows);
+    }
+
+    /// <summary>
+    /// Rows this shard owns outright: its partitioned rows less the neighbours' copies sitting in
+    /// the same tables. Both terms are read in one hold of the engine write lock, because mixing
+    /// their freshness invents an empty shard — see <see cref="SampleLoad"/>.
+    /// </summary>
+    private long AuthoritativeRowsLocked() => Math.Max(0, PartitionedRowCount() - BorrowedRowCount);
+
+    /// <summary>
+    /// The engine-level refusal a reap installs once it has decided a shard is empty. It is
+    /// registered as an ordinary commit guard, so it runs where every other write rule runs —
+    /// under the engine write lock, before the append — which is the only place a decision about
+    /// emptiness and a decision to stop accepting rows can be the same decision.
+    /// </summary>
+    private sealed class ReapSeal(ShardKey shard) : ICommitGuard
+    {
+        /// <summary>Read and written only under the engine write lock, like the guard list itself.</summary>
+        public bool Engaged { get; set; }
+
+        public void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin)
+        {
+            if (Engaged)
+            {
+                throw new InvalidOperationException(
+                    $"{shard} is being reaped: it was found to hold nothing of its own and its directory is about "
+                    + "to be deleted, so this write would be destroyed moments after it was acknowledged. The reap "
+                    + "either completes or is abandoned, and the shard then reopens from its own log.");
+            }
+        }
+    }
+
+    private ReapSeal? _seal;
+
+    /// <summary>
+    /// Reports how many rows this shard owns and, when that is none, seals the engine against
+    /// every subsequent write — both in one hold of the engine write lock, which is what makes the
+    /// answer usable. A count alone is stale the instant it is returned: the caller means to
+    /// delete a directory, and between "no rows" and the delete an in-flight reducer or bulk group
+    /// can commit rows this node has already acknowledged. Resolving the shard under the node's
+    /// shard-set lock does not help, because that lock is released before the commit runs.
+    /// <para>
+    /// A sealed engine is not a closed one — <see cref="Unseal"/> puts it back if a later check
+    /// refuses the reap — and the seal does not survive the runtime, so a shard that reopens from
+    /// its directory reopens writable.
+    /// </para>
+    /// </summary>
+    internal long SealIfEmpty() => Engine.ReadConsistent(_ =>
+    {
+        var rows = AuthoritativeRowsLocked();
+        if (rows > 0)
+            return rows;
+
+        if (_seal is null)
+        {
+            // Registered on the first reap rather than at construction: a shard that is never
+            // reaped should not pay a guard call on every commit for a rule that never fires.
+            _seal = new ReapSeal(Shard);
+            Engine.AddCommitGuard(_seal);
+        }
+
+        _seal.Engaged = true;
+        return 0L;
+    });
+
+    /// <summary>Lifts the seal <see cref="SealIfEmpty"/> engaged, for a reap that went on to refuse.</summary>
+    internal void Unseal()
+    {
+        if (_seal is { } seal)
+            Engine.ReadConsistent(_ => seal.Engaged = false);
     }
 
     /// <summary>

@@ -134,6 +134,44 @@ public class SqlPolicyTests
         Assert.Equal("no_relational_tier", missingError.GetProperty("error").GetString());
     }
 
+    /// <summary>
+    /// The other half of the silent-empty case (#111), which the row-shape fix did not cover:
+    /// placement and tier are independent axes, so a table can be both <c>Relational</c> and
+    /// <c>Partitioned</c>, and an aggregate over one on a hub counts only what the hub's own engine
+    /// wrote. That is worse than the empty result the row path refuses — an empty set at least
+    /// looks like nothing, while <c>COUNT(*) = 12</c> over a fraction of the rows looks like an
+    /// answer. Single-node it must still be served: placement is inert there.
+    /// </summary>
+    [Fact]
+    public async Task Partitioned_aggregates_are_refused_in_a_cluster_and_served_single_node()
+    {
+        await using var clustered = await TransportTestHost.StartAsync(new Dictionary<string, string?>(EnabledOwner)
+        {
+            ["MelangeDb:Cluster:Role"] = "Hub",
+            ["MelangeDb:Cluster:NodeName"] = "hub",
+            ["MelangeDb:Cluster:Secret"] = "test-cluster-secret",
+        });
+        using var onHub = clustered.CreateHttp(TestTokens.For("admin", role: OwnerRole));
+        var refused = await onHub.PostAsync(
+            "/melange/sql", Json("""{"query": "SELECT COUNT(*) FROM WorldStat"}"""), TestContext.Current.CancellationToken);
+
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, refused.StatusCode);
+        var error = JsonDocument.Parse(await refused.Content.ReadAsStringAsync(TestContext.Current.CancellationToken)).RootElement;
+        Assert.Equal("partitioned_elsewhere", error.GetProperty("error").GetString());
+        Assert.Contains("Partitioned", error.GetProperty("message").GetString()!, StringComparison.Ordinal);
+
+        // Refused for placement, not for the missing tier: neither host here has Postgres, so the
+        // single-node arm below reaches no_relational_tier and this one must not.
+        Assert.DoesNotContain("no_relational_tier", error.GetProperty("error").GetString()!, StringComparison.Ordinal);
+
+        await using var single = await TransportTestHost.StartAsync(EnabledOwner);
+        using var onNode = single.CreateHttp(TestTokens.For("admin", role: OwnerRole));
+        var served = await onNode.PostAsync(
+            "/melange/sql", Json("""{"query": "SELECT COUNT(*) FROM WorldStat"}"""), TestContext.Current.CancellationToken);
+        var servedError = JsonDocument.Parse(await served.Content.ReadAsStringAsync(TestContext.Current.CancellationToken)).RootElement;
+        Assert.Equal("no_relational_tier", servedError.GetProperty("error").GetString());
+    }
+
     [Fact]
     public async Task Aggregate_shapes_are_not_subscribable()
     {

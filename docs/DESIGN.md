@@ -332,7 +332,7 @@ need to.
 Clients send a query; the server returns an initial result set and then streams incremental deltas
 derived from the log as transactions commit.
 
-**v1 is single-table filtered subscriptions** with **column projection**. Four query shapes cover
+**v1 is single-table filtered subscriptions** with **column projection**. Five query shapes cover
 the real workload (see [REFERENCE-WORKLOAD.md](REFERENCE-WORKLOAD.md)):
 
 ```sql
@@ -343,7 +343,7 @@ SELECT * FROM terrain_chunk_data WHERE edit_count <> 0      -- not the default; 
 SELECT skill_id, total_xp, level FROM player_skill WHERE player_identity = :id  -- projection
 ```
 
-The fourth shape arrived late (issue #122) and only because the third could not express it. A
+The not-default shape arrived late (issue #122) and only because the range could not express it. A
 counter has no bounded span, so `BETWEEN 1 AND :hi` needs a clamp the client invents to satisfy the
 parser — and callers who hit this denormalised an indexed boolean beside the counter and filtered on
 that instead. **That workaround is the counterexample to its own necessity:** equality on an indexed

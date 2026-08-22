@@ -43,6 +43,22 @@ public sealed class MelangeClusterCoordinator
     public void EnsureShard(ShardKey shard) => Hub.ResolveShard(shard);
 
     /// <summary>
+    /// Removes a shard that holds nothing of its own — <see cref="EnsureShard"/>'s counterpart,
+    /// and the reason a world that is created on wander is not created forever. The owner verifies
+    /// emptiness against its live engine and refuses if the shard still owns rows, if anything
+    /// still pins its log, or if it is mid-drain; a refusal is an ordinary <c>false</c>, because
+    /// the caller decides from a sampled view (<see cref="LoadView"/>) and the owner holds the
+    /// truth. Throws when the shard was never created, has no owner, or its owner is not live.
+    /// <para>
+    /// <b>This is the one cluster operation that destroys durable state.</b> The shard key is not
+    /// reserved: arriving there again creates a new shard under a <em>new</em> originator, because
+    /// ids minted under the old one may still be alive on other shards.
+    /// </para>
+    /// </summary>
+    public Task<bool> ReapShardAsync(ShardKey shard, CancellationToken ct = default) =>
+        Hub.ReapShardAsync(shard, ct);
+
+    /// <summary>
     /// Executes one reducer on the shard owning <paramref name="shard"/> — the building block of
     /// the rare genuine cross-shard interaction, composed as a saga over the event bus:
     /// eventually consistent steps with compensating actions, <b>explicitly not ACID</b> (see
@@ -107,10 +123,12 @@ public static class MelangeClusterServiceCollectionExtensions
         services.TryAddSingleton<MelangeShardHealthCheck>();
         services.TryAddSingleton<MelangeCapacityHealthCheck>();
 
-        // The bulk endpoint's routing seam, registered only on a hub — {path}/bulk resolves
-        // IBulkRouter and writes to the local engine when there is none, which is exactly the
+        // The bulk endpoint's routing seam. Registered on every clustered node, because the role
+        // is not bound yet here — {path}/bulk gates on Cluster:Role being Hub rather than on the
+        // registration's presence, and writes to the local engine otherwise, which is exactly the
         // right behaviour on a single node and on a shard node (where the endpoint refuses
-        // Partitioned rows outright rather than writing them into the wrong engine).
+        // Partitioned rows outright rather than writing them into the wrong engine). The router
+        // resolves its HubRuntime lazily so being constructed on a shard node costs nothing.
         services.TryAddSingleton<IBulkRouter>(static provider =>
             new HubBulkRouter(provider, provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>()));
         services.Configure<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckServiceOptions>(static options =>
