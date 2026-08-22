@@ -122,6 +122,9 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
             ? Reads.TryGetRow(data.Current, key, out row)
             : Reads.Missing(out row);
 
+    public bool ContainsKey(TableId table, in RowKey key) =>
+        _tables.TryGetValue(table, out var data) && data.Current.Rows.ContainsKey(key);
+
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table) =>
         _tables.TryGetValue(table, out var data) ? Reads.Scan(data, data.Current) : [];
 
@@ -182,6 +185,12 @@ public sealed class InMemoryHotStore : IHotStore, IReadViewSource
             return tables.TryGetValue(table, out var pinned)
                 ? Reads.TryGetRow(pinned.Version, key, out row)
                 : Reads.Missing(out row);
+        }
+
+        public bool ContainsKey(TableId table, in RowKey key)
+        {
+            ThrowIfDisposed();
+            return tables.TryGetValue(table, out var pinned) && pinned.Version.Rows.ContainsKey(key);
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table)

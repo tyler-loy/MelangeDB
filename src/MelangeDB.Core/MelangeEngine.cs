@@ -1189,7 +1189,7 @@ public sealed partial class MelangeEngine : IDisposable
         var key = SchemaKeyCodec.Encode(schema.PrimaryKey, pkValue);
         var exists = writeSet.TryGetPending(schema.Id, key, out var pending)
             ? pending.Kind != RowOpKind.Delete
-            : HotStore.TryGetRow(schema.Id, key, out _);
+            : HotStore.ContainsKey(schema.Id, key);
         var bytes = RowSerializer.SerializeValues(schema, values);
         writeSet.Stage(new RowOp(exists ? RowOpKind.Update : RowOpKind.Insert, schema.Id, key, bytes));
     }

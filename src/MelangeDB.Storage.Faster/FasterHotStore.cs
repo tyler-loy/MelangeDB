@@ -179,6 +179,18 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
+    public bool ContainsKey(TableId table, in RowKey key)
+    {
+        if (!_tables.TryGetValue(table, out var state))
+            return false;
+
+        // The key directory (paged) or the resident row map answers this — no FASTER read, no
+        // out-of-line payload. The version is immutable, so no lock is needed, exactly as the
+        // resident TryGetRow fast path reasons.
+        var version = state.Current;
+        return version.IsResident ? version.ResidentRows.ContainsKey(key) : version.Directory.ContainsKey(key);
+    }
+
     public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
     {
         if (!_tables.TryGetValue(table, out var state))
@@ -462,6 +474,10 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             row = bytes;
             return bytes is not null;
         }
+
+        public bool ContainsKey(TableId table, in RowKey key) =>
+            Pin(table) is { } pinned
+            && (pinned.Version.IsResident ? pinned.Version.ResidentRows.ContainsKey(key) : pinned.Version.Directory.ContainsKey(key));
 
         public long Count(TableId table) => Pin(table) is { } pinned ? pinned.Version.RowCount : 0;
 

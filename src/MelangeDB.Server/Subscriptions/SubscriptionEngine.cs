@@ -166,7 +166,7 @@ internal sealed class SubscriptionEngine
             if (withinRecord is not null && withinRecord.TryGetValue((op.Table, op.Key), out var effect))
                 (hasOld, oldRow) = effect;
             else
-                hasOld = _engine.HotStore.TryGetRow(op.Table, op.Key, out oldRow);
+                hasOld = TryReadPreImage(op.Table, op.Key, out oldRow);
             withinRecord?[(op.Table, op.Key)] = (op.Kind != RowOpKind.Delete, op.Row);
             _telemetry?.SampleDeltaSpan(subscriptions[0].Schema.Name, subscriptions.Count);
 
@@ -254,6 +254,28 @@ internal sealed class SubscriptionEngine
         }
 
         return updates;
+    }
+
+    /// <summary>
+    /// The pre-image of a row about to change, or "absent" when its stored projection cannot be
+    /// read. The fan-out reads each op's pre-image to decide who held the row; a row whose
+    /// out-of-line payload is unreadable would otherwise throw here and fail the whole commit —
+    /// so a write that <em>repairs or removes</em> a poisoned row could never land, and the row
+    /// would be stuck until a restart. Treating an unreadable pre-image as no prior row lets the
+    /// write commit: a repairing update reaches subscribers as an insert of the corrected row, and
+    /// a delete removes it. The store logs the unreadable row on its scan path (EventId 1511).
+    /// </summary>
+    private bool TryReadPreImage(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
+    {
+        try
+        {
+            return _engine.HotStore.TryGetRow(table, key, out row);
+        }
+        catch (InvalidDataException)
+        {
+            row = default;
+            return false;
+        }
     }
 
     private WireRowOp? ComputeDelta(

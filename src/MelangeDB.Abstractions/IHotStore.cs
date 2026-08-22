@@ -10,6 +10,16 @@ public interface IHotStoreReader
     /// <summary>Looks up a row's serialized bytes by primary key.</summary>
     bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row);
 
+    /// <summary>
+    /// Whether a row with this primary key exists, without materializing it — a key-directory
+    /// probe, so it pages nothing in and, on a store that holds large columns out of line, never
+    /// touches the payload. This is what an existence check wants: <see cref="TryGetRow"/> decodes
+    /// the whole row to answer a yes/no question, and a row that is present but whose stored
+    /// projection cannot be read (a corrupt out-of-line payload) makes that decode throw — so an
+    /// existence check built on it cannot even tell that the row is there to be repaired or removed.
+    /// </summary>
+    bool ContainsKey(TableId table, in RowKey key);
+
     /// <summary>Enumerates a table's rows in primary-key order.</summary>
     IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table);
 

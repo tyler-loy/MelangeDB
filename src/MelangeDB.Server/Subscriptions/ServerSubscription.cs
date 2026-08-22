@@ -279,9 +279,7 @@ internal sealed class ServerSubscription
             case PredicateKind.None:
                 return store.Scan(Schema.Id);
             case PredicateKind.Equality when ColumnIsPrimaryKey:
-                return store.TryGetRow(Schema.Id, EqualsValue, out var row)
-                    ? [new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(EqualsValue, row)]
-                    : [];
+                return MatchSingleKey(store);
             case PredicateKind.Equality:
                 return store.ScanIndex(Schema.Id, Column!, EqualsValue);
             case PredicateKind.Range or PredicateKind.NotDefault when ColumnIsPrimaryKey:
@@ -291,6 +289,25 @@ internal sealed class ServerSubscription
             default:
                 return [];
         }
+    }
+
+    /// <summary>The single primary-key row this subscription matches, or empty — including when that one row is unreadable.</summary>
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MatchSingleKey(IHotStore store)
+    {
+        ReadOnlyMemory<byte> row;
+        try
+        {
+            if (!store.TryGetRow(Schema.Id, EqualsValue, out row))
+                return [];
+        }
+        catch (InvalidDataException)
+        {
+            // A scan for the initial set, not a point read: an unreadable row is no row here, and
+            // must not fail the subscribe. The store logs it (EventId 1511) on its Scan path.
+            return [];
+        }
+
+        return [new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(EqualsValue, row)];
     }
 
     /// <summary>
@@ -315,8 +332,23 @@ internal sealed class ServerSubscription
     {
         foreach (var key in store.ScanKeyRange(Schema.Id, RangeLow, RangeHigh))
         {
-            if (store.TryGetRow(Schema.Id, key, out var row))
-                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, row);
+            // A row whose stored projection cannot be read is skipped, not thrown: this is a scan
+            // building a subscription's initial set, and one unreadable row must not fail the
+            // subscribe and take the connection with it — the same contract the store's own Scan
+            // path holds (it logs EventId 1511 when it hits such a row). The store's point-read
+            // TryGetRow throws by design; here it is a scan, so a fault means "not a candidate".
+            ReadOnlyMemory<byte> row;
+            try
+            {
+                if (!store.TryGetRow(Schema.Id, key, out row))
+                    continue;
+            }
+            catch (InvalidDataException)
+            {
+                continue;
+            }
+
+            yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, row);
         }
     }
 
