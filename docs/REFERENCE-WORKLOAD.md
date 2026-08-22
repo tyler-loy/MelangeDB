@@ -44,6 +44,16 @@ which is how terrain streams as the player moves). **No subscription anywhere us
 decision to ship single-table filters and defer incremental join maintenance is not a compromise
 here — it covers the real workload as-is. This was the design's riskiest bet and it paid off.
 
+**The range shape's real dimensions, which are larger than they look.** Phase 33 gave the workload
+one chunk row per chunk of coordinate space, land or not, so the terrain table is **1.44M rows**
+under `FasterHotStore` with a packed `uint` primary key (`cx<<16 | cz`). Every client subscribes a
+**ring of nineteen windows** over it — a radius-9 column ring — and **re-scopes all nineteen on
+every chunk crossing**, at roughly two crossings per second across a fleet. That is the shape any
+work on primary-key ranges has to be measured against: not one window on a small table, but a
+moving band of them, far from key zero, on a table where most rows are never read. It is also what
+found the directory walk that made a range's cost O(keys before the window) — see the CHANGELOG's
+entry on `ScanKeyRange`.
+
 **The hybrid Tsavorite+Postgres split — already built by hand.** `tools/admin-web/Services/PostgresStore.cs`
 plus a `ScrapeWorker` samples `WorldStat`/`CreatureCensus` rows out of SpacetimeDB and into Postgres
 so the admin console can run time-series aggregates (`date_trunc('hour', at)`, `COUNT(*)`) that

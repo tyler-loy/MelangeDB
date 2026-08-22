@@ -34,6 +34,9 @@ internal sealed class ReadViewlessStore(IHotStore inner) : IHotStore
 
     public IEnumerable<RowKey> ScanKeys(TableId table) => inner.ScanKeys(table);
 
+    public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high) =>
+        inner.ScanKeyRange(table, low, high);
+
     private sealed class StoreProvider : IHotStoreProvider
     {
         public HotStoreEngine Engine => HotStoreEngine.InMemory;

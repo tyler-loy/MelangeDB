@@ -375,19 +375,16 @@ internal sealed class TransactionDb : IDbView
     /// <summary>
     /// Rows whose primary keys fall within [<paramref name="low"/>, <paramref name="high"/>], read
     /// through the key directory rather than a scan-and-filter: the keys are ordered, so rows below
-    /// the window were never candidates and never need reading, and the walk stops at the top of
-    /// it. Subscriptions fixed this on their side of the seam — a range near the end of a paged
-    /// table used to page in everything ahead of it, ~3s against ~5ms on a 24k-row table of 9KB
-    /// blobs — and a reducer's window query deserves the same treatment.
+    /// the window were never candidates and never need reading. The store <em>seeks</em> to the
+    /// window rather than walking to it, so the cost is the window's size and not its distance from
+    /// key zero — a reducer's window query over a large table would otherwise get slower the
+    /// further into the table it looked, and it holds the write lock while it does. Subscriptions
+    /// take the same route through the same seam; see <c>ServerSubscription.ScanPrimaryKeyRange</c>.
     /// </summary>
     private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> StoredKeyRange(TableSchema schema, RowKey low, RowKey high)
     {
-        foreach (var key in _store.ScanKeys(schema.Id))
+        foreach (var key in _store.ScanKeyRange(schema.Id, low, high))
         {
-            if (key.CompareTo(low) < 0)
-                continue;
-            if (key.CompareTo(high) > 0)
-                yield break;
             if (_store.TryGetRow(schema.Id, key, out var row))
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, row);
         }

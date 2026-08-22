@@ -283,25 +283,27 @@ internal sealed class ServerSubscription
     }
 
     /// <summary>
-    /// Walks the key directory to the range, and materializes only what falls inside it.
+    /// Seeks the key directory to the range, and materializes only what falls inside it.
     ///
-    /// <para>This used to filter <see cref="IHotStore.Scan"/>, which reads every row it passes —
-    /// so a range near the end of a paged table paged in the whole table ahead of it and threw all
-    /// of it away. The keys are ordered, so the rows below <see cref="RangeLow"/> were never
-    /// candidates and never needed reading; <see cref="IHotStore.ScanKeys"/> exists for exactly
-    /// this and touches no buffer pool. On a 24k-row table of 9KB blobs it was the difference
-    /// between ~3s and ~5ms per subscribe, and the cost scaled with how far into the table the
-    /// range sat — a moving-window subscription got slower the further it travelled from row
-    /// zero.</para>
+    /// <para>Two fixes, and the second is the one that finished the job. This used to filter
+    /// <see cref="IHotStore.Scan"/>, which reads every row it passes — so a range near the end of a
+    /// paged table paged in the whole table ahead of it and threw all of it away. The keys are
+    /// ordered, so the rows below <see cref="RangeLow"/> were never candidates and never needed
+    /// reading; <see cref="IHotStore.ScanKeys"/> touches no buffer pool. On a 24k-row table of 9KB
+    /// blobs that was the difference between ~3s and ~5ms per subscribe.</para>
+    ///
+    /// <para>But it still <em>walked</em> to the window, one key at a time, from key zero — the
+    /// cost merely fell from "read every row before the window" to "compare every key before it",
+    /// and it still grew with the table and with how far in the window sat. On a 1.4M-row terrain
+    /// table with clients holding a ring of nineteen windows, re-scoped on every chunk crossing,
+    /// that walk ran under the engine's write lock and took the whole deployment's write throughput
+    /// with it. <see cref="IHotStore.ScanKeyRange"/> asks the store to seek instead, so the cost is
+    /// the size of the window rather than the distance to it.</para>
     /// </summary>
     private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanPrimaryKeyRange(IHotStore store)
     {
-        foreach (var key in store.ScanKeys(Schema.Id))
+        foreach (var key in store.ScanKeyRange(Schema.Id, RangeLow, RangeHigh))
         {
-            if (key.CompareTo(RangeLow) < 0)
-                continue;
-            if (key.CompareTo(RangeHigh) > 0)
-                yield break;
             if (store.TryGetRow(Schema.Id, key, out var row))
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, row);
         }

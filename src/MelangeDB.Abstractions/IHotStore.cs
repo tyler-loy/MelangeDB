@@ -36,6 +36,21 @@ public interface IHotStoreReader
     /// the store's key directory only, never the buffer pool, so it faults nothing in.
     /// </summary>
     IEnumerable<RowKey> ScanKeys(TableId table);
+
+    /// <summary>
+    /// Enumerates the primary keys in [<paramref name="low"/>, <paramref name="high"/>], both
+    /// inclusive, in order — <see cref="ScanKeys"/> narrowed to a window, and the shape every
+    /// primary-key range query should ask for.
+    /// <para>
+    /// The distinction from filtering <see cref="ScanKeys"/> is the whole point, and it is a
+    /// complexity one rather than a convenience: an implementation must <b>seek</b> to
+    /// <paramref name="low"/>, so the cost is the size of the window rather than the distance to
+    /// it. Filtering a full key walk costs O(keys before the window), which grows with the table
+    /// and with where in key order the caller is looking — so a moving-window subscription over a
+    /// large table gets slower the further it travels, which is the failure this exists to remove.
+    /// </para>
+    /// </summary>
+    IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high);
 }
 
 /// <summary>
