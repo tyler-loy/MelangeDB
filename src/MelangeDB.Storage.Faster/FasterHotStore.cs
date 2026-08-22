@@ -1424,8 +1424,23 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         public override bool SingleWriter(ref SpanByte key, ref SpanByte input, ref SpanByte src, ref SpanByte dst, ref byte[] output, ref UpsertInfo upsertInfo, WriteReason reason)
             => src.TryCopyTo(ref dst);
 
+        // The in-place overwrite. dst is the existing record's value slot, sized for whatever was
+        // written before; src is the new value. TryCopyTo alone copies src's bytes but leaves the
+        // slot's serialized length unchanged, so a *shorter* new value reads back at the OLD length
+        // with a stale tail — the row grew large once and shrank, and the read returns the larger,
+        // now-wrong bytes. (That is issue #137: a blob written at 339 then rewritten at 315 read
+        // back as 339, which no longer matched the main record's declared 315, and threw out of
+        // every scan.) So a value too large for the slot goes to a fresh record (return false → the
+        // store copy-updates), and one that fits shrinks the slot's length to match before copying,
+        // so the record reads back at exactly the new length.
         public override bool ConcurrentWriter(ref SpanByte key, ref SpanByte input, ref SpanByte src, ref SpanByte dst, ref byte[] output, ref UpsertInfo upsertInfo)
-            => src.TryCopyTo(ref dst);
+        {
+            if (dst.Length < src.Length)
+                return false;
+            dst.ShrinkSerializedLength(src.Length);
+            src.CopyTo(ref dst);
+            return true;
+        }
     }
 
     private static class LogMessages

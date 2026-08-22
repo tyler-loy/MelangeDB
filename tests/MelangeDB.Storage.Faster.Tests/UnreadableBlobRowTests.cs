@@ -9,12 +9,13 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// escaped the connection handler, and killed every client whose first subscription scanned that
 /// row — a whole-server outage from a single unreadable row.
 /// <para>
-/// The disagreement is a state the public API cannot produce: a write splits the row and upserts
-/// its main record and its blob together, and recovery rebuilds both from one commit-log record,
-/// so main and blob are always the same version. It is forced here through
-/// <see cref="FasterHotStore.CorruptBlobPayloadForTest"/>, which writes a wrong-length payload the
-/// way the store itself would — the only way to exercise resilience to a state that otherwise
-/// cannot arise. What the fix guarantees: a scan skips the row and keeps going, logging it; a
+/// The disagreement had one real cause — a shrinking overwrite of an out-of-line blob that did not
+/// truncate the stored payload (see <see cref="BlobShrinkRepro137Tests"/>, which guards the write
+/// path). With that fixed, the store no longer produces the disagreement through any path, so it is
+/// forced here through <see cref="FasterHotStore.CorruptBlobPayloadForTest"/>, which writes a
+/// wrong-length payload the way it would appear on disk — the only way left to exercise resilience
+/// to a row that is unreadable for any reason (a future codec bug, a bad sector). What this half of
+/// the fix guarantees regardless of cause: a scan skips the row and keeps going, logging it; a
 /// point read of that key still tells the truth, because a caller asking for one row is owed it.
 /// </para>
 /// </summary>
@@ -81,13 +82,15 @@ public class UnreadableBlobRowTests
     [Fact]
     public void A_restart_rebuilds_the_row_from_the_log_and_the_corruption_does_not_persist()
     {
-        // This is also the answer to the issue's own hypothesis (its ask #2): that a blob write
-        // outlived its commit and survived a restart. It cannot. The store opens its FASTER logs
-        // deleteOnClose and wipes them at startup; recovery is snapshot + commit-log replay, and
-        // replay splits each committed row and upserts its main and blob together. So a restart
-        // cannot carry a main/blob disagreement forward — it rebuilds both from one log record —
-        // which makes "rebuild from the log" (a restart, or rewriting the row once the point-read
-        // path can reach it) the repair, and means the observed state was live, not persistent.
+        // A corruption confined to the live projection — as this seam produces, writing a bad
+        // payload into the blob store without a matching commit-log record — heals on restart,
+        // because recovery rebuilds the store from the log alone (deleteOnClose wipes the FASTER
+        // files at startup; replay re-splits each committed row through the now-correct write path).
+        // This is NOT the same as claiming the disagreement can never survive a restart: the write
+        // path itself could poison the committed history's replay, which is exactly what issue #137
+        // was — a shrinking overwrite reproduced deterministically on replay. That is fixed at its
+        // source, and BlobShrinkRepro137Tests.The_shrink_survives_a_restart is the guard for it;
+        // this test covers the narrower promise that a projection-only fault is not durable.
         using var harness = new StoreHarness(StoreKind.Faster, tables: [typeof(TerrainBlob)]);
         harness.Invoke("seed", ctx =>
             ctx.Db.Insert(new TerrainBlob { ChunkId = 7, Region = 1, Data = StoreContractTests.MakeBlob(7, 300) }));
