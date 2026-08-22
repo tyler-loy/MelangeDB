@@ -100,6 +100,39 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The fan-out decodes a row once per op, not once per subscriber.** A subscription predicate on
+  an indexed column — `WHERE RoomId = 7`, `WHERE OwnerId = …` — encoded that column by deserializing
+  the whole row, and did so for every subscriber on the table, for the pre-image and the new row
+  both, under the engine's write lock: N subscribers, 2N full decodes per op. Row and column
+  policies did the same to hand each policy a typed row — up to 4N. The row is identical for all of
+  them; only the verdict is per caller. A primary-key predicate was free (a key compare), which is
+  why the reference workload's rings never showed it, and the existing fan-out benchmark had no
+  predicated or policied subscribers, so it could not either.
+
+  One `DecodedRow` per op now carries the bytes, materializes the typed row on first demand and
+  hands the same instance to every predicate and policy, and memoizes each predicate column's
+  encoding. The test registers sixty subscribers and counts decodes through the table's codec: two
+  per op (the pre-image and the new row), where it was 120 and 240. On `FanoutBenchmarks`' new
+  `Predicated` axis — 500 subscribers on one indexed-column predicate, one shared projection — the
+  op went from **108 µs to 86 µs**, and now sits within 8% of the unpredicated row (79 µs) where it
+  sat 25% above it; the bench row is seven narrow columns, so the per-decode cost there is small,
+  and a real row with strings and blobs pays proportionally more per subscriber.
+
+- **A reducer's pending rows are index-overlaid, not rescanned.** `Filter`, `FilterRange` and the
+  `[Unique]` check had to consider the rows the same transaction had already staged, and did so by
+  decoding every pending row of the table per call — a reducer inserting N rows into a table with a
+  unique column decoded N²/2 of them on the way, and one that filters an indexed column once per
+  row it stages was quadratic in its own write set, all under the write lock. The transaction now
+  keeps a per-(table, column) overlay of pending values, maintained from the typed row the reducer
+  handed in (no decode) and read by seek. Four hundred inserts into a unique-column table decode
+  nothing; a `Filter` decodes exactly the rows it returns.
+
+- `TableSchema.Column(name)` is a dictionary lookup; it was a linear scan with a string compare per
+  step, on every per-row path that reads a column by name (predicate encoding, the shard
+  strategies' `RowRef`, the reflection-path index maintenance). `RowRef` also decodes through the
+  generated codec now when the schema has one, rather than reflection — it runs per committed row,
+  and in a cluster under the write lock.
+
 - **The commit log seeks.** `FileCommitLog.ReadFrom(lsn)` started at the file header and read,
   CRC-checked and decoded every record below the one it was asked for, then discarded them. The
   answer was right; the cost was the size of the retained log, paid per call — and every incremental

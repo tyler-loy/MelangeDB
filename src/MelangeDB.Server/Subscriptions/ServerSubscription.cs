@@ -187,6 +187,10 @@ internal sealed class ServerSubscription
     public bool PolicyAdmits(ReadOnlySpan<byte> row) =>
         Evaluator is null || Context is null || !Evaluator.HasRowPolicies || Evaluator.IsRowVisible(row, Context);
 
+    /// <summary><see cref="PolicyAdmits(ReadOnlySpan{byte})"/> over a row decoded once for every subscriber.</summary>
+    public bool PolicyAdmits(DecodedRow row) =>
+        Evaluator is null || Context is null || !Evaluator.HasRowPolicies || Evaluator.IsRowVisible(row, Context);
+
     /// <summary>Predicate AND policy — whether the caller receives this row at all.</summary>
     public bool RowVisible(in RowKey key, ReadOnlySpan<byte> row) =>
         Matches(key, row) && PolicyAdmits(row);
@@ -200,12 +204,25 @@ internal sealed class ServerSubscription
     {
         if (Evaluator is not { HasColumnPolicies: true } evaluator || Context is null)
             return StaticWireColumns;
-        var visible = StaticWireColumns is not null
-            ? new HashSet<string>(StaticWireColumns, StringComparer.Ordinal)
-            : new HashSet<string>(Schema.Columns.Select(c => c.Name), StringComparer.Ordinal);
+        var visible = FreshWireColumns();
         evaluator.IntersectColumns(row, Context, visible);
         return visible;
     }
+
+    /// <summary><see cref="VisibleColumns(ReadOnlySpan{byte})"/> over a row decoded once for every subscriber.</summary>
+    public IReadOnlySet<string>? VisibleColumns(DecodedRow row)
+    {
+        if (Evaluator is not { HasColumnPolicies: true } evaluator || Context is null)
+            return StaticWireColumns;
+        var visible = FreshWireColumns();
+        evaluator.IntersectColumns(row, Context, visible);
+        return visible;
+    }
+
+    private HashSet<string> FreshWireColumns() =>
+        StaticWireColumns is not null
+            ? new HashSet<string>(StaticWireColumns, StringComparer.Ordinal)
+            : new HashSet<string>(Schema.Columns.Select(c => c.Name), StringComparer.Ordinal);
 
     /// <summary>
     /// The mask that accompanies a row whose visible columns are <paramref name="visible"/>: empty
@@ -228,36 +245,30 @@ internal sealed class ServerSubscription
     }
 
     /// <summary>Whether a row belongs to this subscription. <paramref name="key"/> is the primary key.</summary>
-    public bool Matches(in RowKey key, ReadOnlySpan<byte> row)
-    {
-        switch (Predicate)
-        {
-            case PredicateKind.None:
-                return true;
-            case PredicateKind.Equality:
-                if (ColumnIsPrimaryKey)
-                    return key == EqualsValue;
-                return RowWire.EncodeColumn(Schema, Column!, row) is { } value && value == EqualsValue;
-            case PredicateKind.Range:
-            case PredicateKind.NotDefault:
-                RowKey candidate;
-                if (ColumnIsPrimaryKey)
-                {
-                    candidate = key;
-                }
-                else if (RowWire.EncodeColumn(Schema, Column!, row) is { } encoded)
-                {
-                    candidate = encoded;
-                }
-                else
-                {
-                    return false;
-                }
+    public bool Matches(in RowKey key, ReadOnlySpan<byte> row) =>
+        Predicate == PredicateKind.None
+        || Decide(ColumnIsPrimaryKey ? key : RowWire.EncodeColumn(Schema, Column!, row));
 
-                return candidate.CompareTo(RangeLow) >= 0 && candidate.CompareTo(RangeHigh) <= 0;
-            default:
-                return false;
-        }
+    /// <summary>
+    /// <see cref="Matches(in RowKey, ReadOnlySpan{byte})"/> over a row decoded once for every
+    /// subscriber — the fan-out's form. A predicate on an indexed column used to decode the whole
+    /// row per subscriber to encode one column of it; the memo encodes it once per op.
+    /// </summary>
+    public bool Matches(in RowKey key, DecodedRow row) =>
+        Predicate == PredicateKind.None
+        || Decide(ColumnIsPrimaryKey ? key : row.EncodeColumn(Column!));
+
+    /// <summary>The predicate's verdict on the encoded column value; a null value matches nothing.</summary>
+    private bool Decide(RowKey? candidate)
+    {
+        if (candidate is not { } value)
+            return false;
+        return Predicate switch
+        {
+            PredicateKind.Equality => value == EqualsValue,
+            PredicateKind.Range or PredicateKind.NotDefault => value.CompareTo(RangeLow) >= 0 && value.CompareTo(RangeHigh) <= 0,
+            _ => false,
+        };
     }
 
     /// <summary>Enumerates the store rows this subscription currently matches, in a deterministic order.</summary>

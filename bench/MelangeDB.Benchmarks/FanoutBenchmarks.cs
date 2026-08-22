@@ -40,6 +40,17 @@ public class FanoutBenchmarks : IDisposable
     [Params(1, 8)]
     public int DistinctProjections { get; set; }
 
+    /// <summary>
+    /// Whether every subscriber predicates on an indexed column (<c>WHERE Level = 1</c>). A
+    /// predicate on anything but the primary key has to encode one column of the row per
+    /// subscriber, and that used to mean decoding the whole row per subscriber; the row is now
+    /// decoded once per op and the column once per distinct predicate column. With 500 subscribers
+    /// the predicated row should cost about what the unpredicated one does, not hundreds of decodes
+    /// more.
+    /// </summary>
+    [Params(false, true)]
+    public bool Predicated { get; set; }
+
     [GlobalSetup]
     public void Setup()
     {
@@ -66,7 +77,8 @@ public class FanoutBenchmarks : IDisposable
         var projections = Projections(DistinctProjections);
         for (var i = 0; i < Subscribers; i++)
         {
-            var query = SqlSubsetParser.Parse($"SELECT {projections[i % projections.Length]} FROM FanoutRow", null);
+            var where = Predicated ? " WHERE Level = 1" : string.Empty;
+            var query = SqlSubsetParser.Parse($"SELECT {projections[i % projections.Length]} FROM FanoutRow{where}", null);
             var sink = new NullSink();
             _engine.ReadConsistent(head =>
                 _subscriptions.Register(sink, (uint)(i + 1), query, new SubscriptionsOptions(), head, computeInitialSet: false));

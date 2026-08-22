@@ -52,6 +52,7 @@ internal sealed class TransactionDb : IDbView
                 throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {key} already exists.");
             CheckUniqueConstraints(schema, codec, key, in row);
             _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, key, codec.Serialize(in row)));
+            IndexPending(schema, codec, key, in row);
             return row;
         }
 
@@ -75,6 +76,7 @@ internal sealed class TransactionDb : IDbView
             throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {boxedKey} already exists.");
         CheckUniqueConstraints(schema, boxedKey, boxed);
         _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, boxedKey, RowSerializer.Serialize(schema, boxed)));
+        IndexPending(schema, boxedKey, boxed);
         return (TRow)boxed;
     }
 
@@ -89,6 +91,7 @@ internal sealed class TransactionDb : IDbView
                 throw new InvalidOperationException($"Table '{schema.Name}': no row with primary key {key} to update.");
             CheckUniqueConstraints(schema, codec, key, in row);
             _writeSet.Stage(new RowOp(RowOpKind.Update, schema.Id, key, codec.Serialize(in row)));
+            IndexPending(schema, codec, key, in row);
             return;
         }
 
@@ -98,6 +101,7 @@ internal sealed class TransactionDb : IDbView
             throw new InvalidOperationException($"Table '{schema.Name}': no row with primary key {boxedKey} to update.");
         CheckUniqueConstraints(schema, boxedKey, boxed);
         _writeSet.Stage(new RowOp(RowOpKind.Update, schema.Id, boxedKey, RowSerializer.Serialize(schema, boxed)));
+        IndexPending(schema, boxedKey, boxed);
     }
 
     public bool Delete<TRow>(object primaryKey)
@@ -109,6 +113,7 @@ internal sealed class TransactionDb : IDbView
         if (!Exists(schema.Id, key))
             return false;
         _writeSet.Stage(new RowOp(RowOpKind.Delete, schema.Id, key));
+        UnindexPending(schema, key);
         return true;
     }
 
@@ -154,7 +159,7 @@ internal sealed class TransactionDb : IDbView
             yield break;
         }
 
-        foreach (var row in FilterCore<TRow>(schema, columnSchema, _store.ScanIndex(schema.Id, column, encoded), v => v == encoded))
+        foreach (var row in FilterCore<TRow>(schema, columnSchema, _store.ScanIndex(schema.Id, column, encoded), encoded, encoded))
             yield return row;
     }
 
@@ -177,14 +182,8 @@ internal sealed class TransactionDb : IDbView
             yield break;
         }
 
-        foreach (var row in FilterCore<TRow>(
-            schema,
-            columnSchema,
-            _store.ScanIndexRange(schema.Id, column, lowKey, highKey),
-            v => v.CompareTo(lowKey) >= 0 && v.CompareTo(highKey) <= 0))
-        {
+        foreach (var row in FilterCore<TRow>(schema, columnSchema, _store.ScanIndexRange(schema.Id, column, lowKey, highKey), lowKey, highKey))
             yield return row;
-        }
     }
 
     public bool Any<TRow>()
@@ -235,6 +234,7 @@ internal sealed class TransactionDb : IDbView
     {
         if (Exists(schema.Id, key))
             _writeSet.Stage(new RowOp(RowOpKind.Delete, schema.Id, key));
+            UnindexPending(schema, key);
     }
 
     private static ColumnSchema RequireIndexed(TableSchema schema, string column)
@@ -245,12 +245,18 @@ internal sealed class TransactionDb : IDbView
         return columnSchema;
     }
 
-    /// <summary>Store index hits with pending rows overlaid, matched by encoded column value.</summary>
+    /// <summary>
+    /// Store index hits with pending rows overlaid, for the encoded column values in
+    /// <c>[low, high]</c>. The pending side is served from the overlay index rather than by
+    /// decoding every pending row of the table and testing the column — which made a reducer that
+    /// filters once per row it stages quadratic in its own write set.
+    /// </summary>
     private IEnumerable<TRow> FilterCore<TRow>(
         TableSchema schema,
         ColumnSchema column,
         IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> storeHits,
-        Func<RowKey, bool> matches)
+        RowKey low,
+        RowKey high)
         where TRow : struct
     {
         foreach (var (key, bytes) in storeHits)
@@ -260,11 +266,9 @@ internal sealed class TransactionDb : IDbView
             yield return Materialize<TRow>(schema, bytes);
         }
 
-        foreach (var op in _writeSet.OpsFor(schema.Id))
+        foreach (var key in PendingKeysInRange(schema, column.Name, low, high))
         {
-            if (op.Kind == RowOpKind.Delete)
-                continue;
-            if (EncodePendingColumn(schema, column, op.Row) is { } pendingValue && matches(pendingValue))
+            if (_writeSet.TryGetPending(schema.Id, key, out var op) && op.Kind != RowOpKind.Delete)
                 yield return Materialize<TRow>(schema, op.Row);
         }
     }
@@ -287,15 +291,6 @@ internal sealed class TransactionDb : IDbView
         {
             throw RowSerializer.DecodeFailed($"Table '{schema.Name}'", bytes.Length, column: null, exception);
         }
-    }
-
-    private static RowKey? EncodePendingColumn(TableSchema schema, ColumnSchema column, ReadOnlyMemory<byte> rowBytes)
-    {
-        if (schema.Codec is { } codec)
-            return codec.EncodeColumnFromBytes(column.Name, rowBytes.Span);
-        var row = RowSerializer.Deserialize(schema, rowBytes);
-        var value = column.GetValue(row);
-        return value is null ? null : SchemaKeyCodec.Encode(column, value);
     }
 
     private TRow? FindByEncodedKey<TRow>(TableSchema schema, RowKey key)
@@ -350,12 +345,97 @@ internal sealed class TransactionDb : IDbView
                 throw new InvalidOperationException($"Table '{schema.Name}': unique constraint on '{column.Name}' violated.");
         }
 
-        foreach (var op in _writeSet.OpsFor(schema.Id))
+        // The pending rows holding this value, by lookup. This used to decode every pending row of
+        // the table to encode the column and compare — so a reducer inserting N rows into a table
+        // with a [Unique] column decoded N²/2 rows on the way, under the write lock.
+        foreach (var key in PendingKeysInRange(schema, column.Name, encoded, encoded))
         {
-            if (op.Kind == RowOpKind.Delete || op.Key == selfKey)
-                continue;
-            if (EncodePendingColumn(schema, column, op.Row) == encoded)
+            if (key != selfKey)
                 throw new InvalidOperationException($"Table '{schema.Name}': unique constraint on '{column.Name}' violated.");
+        }
+    }
+
+    // The write half of the index overlay: every pending, non-deleted row's indexed column values,
+    // per (table, column) in value-then-key order, plus what each pending row indexed so that
+    // re-staging or deleting it unindexes exactly that. Maintained as rows are staged from the
+    // typed row the reducer handed in — no decode — and read by Filter, FilterRange and the unique
+    // check, for which the pending side was a full decode of the table's pending rows per call.
+    private Dictionary<(TableId Table, string Column), SortedSet<IndexEntry>>? _pendingIndex;
+    private Dictionary<(TableId Table, RowKey Key), RowKey[]>? _pendingIndexed;
+
+    private void IndexPending<TRow>(TableSchema schema, RowCodec<TRow> codec, RowKey key, in TRow row)
+        where TRow : struct
+    {
+        if (schema.Indexes.Count == 0)
+            return;
+        var values = new RowKey[schema.Indexes.Count];
+        for (var i = 0; i < values.Length; i++)
+            values[i] = codec.EncodeColumn(schema.Indexes[i].Column, in row) ?? default;
+        IndexPending(schema, key, values);
+    }
+
+    private void IndexPending(TableSchema schema, RowKey key, object row)
+    {
+        if (schema.Indexes.Count == 0)
+            return;
+        var values = new RowKey[schema.Indexes.Count];
+        for (var i = 0; i < values.Length; i++)
+        {
+            var column = schema.Column(schema.Indexes[i].Column);
+            values[i] = column.GetValue(row) is { } value ? SchemaKeyCodec.Encode(column, value) : default;
+        }
+
+        IndexPending(schema, key, values);
+    }
+
+    /// <summary>Records a pending row's indexed values, replacing whatever the key indexed before. A zero-length value is null, which is unindexed.</summary>
+    private void IndexPending(TableSchema schema, RowKey key, RowKey[] values)
+    {
+        UnindexPending(schema, key);
+        _pendingIndex ??= [];
+        _pendingIndexed ??= [];
+        _pendingIndexed[(schema.Id, key)] = values;
+        for (var i = 0; i < values.Length; i++)
+        {
+            if (values[i].Length == 0)
+                continue;
+            var slot = (schema.Id, schema.Indexes[i].Column);
+            if (!_pendingIndex.TryGetValue(slot, out var entries))
+                _pendingIndex[slot] = entries = [];
+            entries.Add(new IndexEntry(values[i], key));
+        }
+    }
+
+    private void UnindexPending(TableSchema schema, RowKey key)
+    {
+        if (_pendingIndexed is null || !_pendingIndexed.Remove((schema.Id, key), out var values))
+            return;
+        for (var i = 0; i < values.Length; i++)
+        {
+            if (values[i].Length == 0)
+                continue;
+            _pendingIndex![(schema.Id, schema.Indexes[i].Column)].Remove(new IndexEntry(values[i], key));
+        }
+    }
+
+    /// <summary>The keys of pending rows whose <paramref name="column"/> value lies in <c>[low, high]</c>, in value-then-key order — a seek, not a walk.</summary>
+    private IEnumerable<RowKey> PendingKeysInRange(TableSchema schema, string column, RowKey low, RowKey high)
+    {
+        if (_pendingIndex is null || !_pendingIndex.TryGetValue((schema.Id, column), out var entries) || entries.Count == 0)
+            yield break;
+
+        // A zero-length key sorts before every real one, so (low, default) is at or before the
+        // first entry that could hold low; the view's upper bound is the set's own maximum, and the
+        // walk stops at the first value past high.
+        var lower = new IndexEntry(low, default);
+        var max = entries.Max;
+        if (max.CompareTo(lower) < 0)
+            yield break;
+        foreach (var entry in entries.GetViewBetween(lower, max))
+        {
+            if (entry.Value.CompareTo(high) > 0)
+                yield break;
+            yield return entry.Key;
         }
     }
 
