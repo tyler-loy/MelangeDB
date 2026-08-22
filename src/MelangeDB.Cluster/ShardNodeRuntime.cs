@@ -37,6 +37,16 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// mid-drain, after which the shard reopens on the next heartbeat.
     /// </summary>
     private readonly Dictionary<ShardKey, DateTimeOffset> _draining = [];
+
+    /// <summary>
+    /// Shards this node has sealed and closed for a reap but not yet deleted, with when and where.
+    /// The mark holds the door shut over the window the hub needs to retire the shard's membership
+    /// row: while it is set, an assignment still naming this node does not reopen the shard, and a
+    /// repeated <c>shard-reap</c> answers "already done" rather than starting over. It clears when
+    /// the delete arrives, or by expiry (2 x Cluster:FailureTimeoutMs) — after which the shard
+    /// reopens from its untouched directory, which is what "the reap did not happen" has to mean.
+    /// </summary>
+    private readonly Dictionary<ShardKey, (DateTimeOffset At, string Directory)> _reaping = [];
     private readonly Dictionary<ShardKey, EventForwarder> _forwarders = [];
     private readonly Dictionary<ShardKey, BorderPublisher> _borderPublishers = [];
     private readonly Dictionary<ShardKey, BoundaryMonitor> _boundaryMonitors = [];
@@ -304,11 +314,24 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     _draining.Remove(draining);
             }
 
+            // A reap mark outlives its assignment on purpose — the hub removes the membership row
+            // between the close and the delete, and the mark is what keeps the directory closed
+            // over that window. Only expiry clears it, so sweep for that here; nothing else ever
+            // asks about a shard the hub has stopped naming.
+            foreach (var reaping in _reaping.Keys.ToList())
+                IsReapingLocked(reaping);
+
             foreach (var assignment in assigned.Values)
             {
                 if (_shards.ContainsKey(assignment.Shard))
                     continue;
                 if (IsDrainingLocked(assignment.Shard))
+                    continue;
+
+                // Sealed and closed for a reap the hub has not finished. Reopening now would
+                // either race the delete or — if the hub got as far as removing the membership row
+                // and this is a stale assignment list — mint ids under a retired originator.
+                if (IsReapingLocked(assignment.Shard))
                     continue;
                 var directory = Path.Combine(Cluster.ShardDataPath, $"shard-{assignment.Shard.Value}");
                 Directory.CreateDirectory(directory);
@@ -383,6 +406,23 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     }
 
     /// <summary>
+    /// Whether the shard is sealed and closed awaiting its reap's delete, clearing an expired mark
+    /// on the way past. Caller holds <see cref="_shardsLock"/>. Expiry is the self-healing bound
+    /// for a hub that died between the close and the membership removal: the directory was never
+    /// touched, so the shard simply reopens.
+    /// </summary>
+    private bool IsReapingLocked(ShardKey shard)
+    {
+        if (!_reaping.TryGetValue(shard, out var pending))
+            return false;
+        if (_time.GetUtcNow() - pending.At <= TimeSpan.FromMilliseconds(2L * Math.Max(1, Cluster.FailureTimeoutMs)))
+            return true;
+        _reaping.Remove(shard);
+        LogReapMarkExpired(_logger, shard.Value, NodeName);
+        return false;
+    }
+
+    /// <summary>
     /// The node half of a planned drain: verify the term, mark the shard draining (so this node's
     /// own heartbeat cannot reopen it while the hub is between quiesce and reassign), close it
     /// exactly the way a reassignment closes it, take a fresh snapshot so the destination's
@@ -437,48 +477,53 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     };
 
     /// <summary>
-    /// Removes a shard this node owns: verify it holds nothing of its own and nothing pins its
-    /// log, then close it and delete its directory. Refusing is an ordinary answer — the hub asks
-    /// from a sampled view and only the owner can settle it.
+    /// The first half of removing a shard this node owns: verify it holds nothing of its own and
+    /// nothing pins its log, then seal it against further writes and close it. The directory is
+    /// left alone — <see cref="DeleteReapedShard"/> removes it once the hub has retired the
+    /// membership row. Refusing is an ordinary answer: the hub asks from a sampled view and only
+    /// the owner can settle it.
     /// <para>
-    /// The check runs against the live engine under <c>_shardsLock</c> and the close follows in
-    /// the same lock, because the two cannot be separated: a shard inspected and then closed could
-    /// take a row in between, and a closed shard has nothing left to inspect. A snapshot is forced
-    /// first so the floors are evaluated — they are only legal to read inside a truncation
-    /// decision — which on a shard with no rows costs almost nothing.
+    /// Emptiness is decided and the engine sealed in <em>one hold of the engine write lock</em>
+    /// (<see cref="ShardRuntime.SealIfEmpty"/>), because nothing weaker separates "holds nothing"
+    /// from "will still hold nothing when the directory goes". <c>_shardsLock</c> cannot do it:
+    /// it guards the shard map, and a reducer call resolves its shard under it and then commits
+    /// with it released. Nor can the heartbeat's row gauge, which is throttled to ten seconds.
+    /// </para>
+    /// <para>
+    /// A snapshot is forced first so the floors are evaluated — they are only legal to read
+    /// inside a truncation decision — which on a shard with no rows costs almost nothing.
     /// </para>
     /// </summary>
     internal ShardReapReply ReapShard(ShardReap reap)
     {
         var shard = new ShardKey(reap.Shard);
 
-        // Ship anything this shard has published before its log is deleted. The cluster-event
-        // cursor only advances when the pump runs, and the pump only wakes on an event-bearing
-        // commit, so a resting cursor means "not asked lately" rather than "nothing to send" —
-        // which is why the floor cannot be read for this and the forwarder is kicked instead.
-        // A cursor that will not reach the durable watermark means the hub is not taking them,
-        // and the events would be lost with the directory.
+        // A repeat of a reap this node already sealed and closed is answered, not redone: the hub
+        // retries after a lost reply, and there is nothing left here to inspect or refuse.
+        lock (_shardsLock)
+        {
+            if (IsReapingLocked(shard))
+                return new ShardReapReply(true, null);
+        }
+
+        // Ship anything this shard has published before its log is deleted, unsealed and before
+        // anything else, so that the backlog leaves while the shard is still serving its callers
+        // normally. Only the tail that lands during the decision is shipped under the seal.
         EventForwarder? forwarder;
         lock (_shardsLock)
         {
             _forwarders.TryGetValue(shard, out forwarder);
         }
 
-        if (forwarder is not null && TryGetShard(shard) is { } pending)
+        if (forwarder is not null && TryGetShard(shard) is { } pending
+            && !ShipEvents(forwarder, pending, TimeSpan.FromSeconds(5)))
         {
-            forwarder.Kick();
-            var deadline = _time.GetUtcNow().AddSeconds(5);
-            while (forwarder.Cursor < pending.Engine.Log.DurableLsn && _time.GetUtcNow() < deadline)
-                Thread.Sleep(25);
-
-            if (forwarder.Cursor < pending.Engine.Log.DurableLsn)
-            {
-                return new ShardReapReply(
-                    false,
-                    $"{shard} has events forwarded only to LSN {forwarder.Cursor} of {pending.Engine.Log.DurableLsn}; "
-                    + "they would be deleted with the shard. Check the hub link and retry.");
-            }
+            return new ShardReapReply(
+                false,
+                $"{shard} has events forwarded only to LSN {forwarder.Cursor} of {pending.Engine.Log.DurableLsn}; "
+                + "they would be deleted with the shard. Check the hub link and retry.");
         }
+
         ShardRuntime runtime;
         string directory;
         lock (_shardsLock)
@@ -520,8 +565,39 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     + "this would delete.");
             }
 
-            if (runtime.SampleLoad().AuthoritativeRows is var rows and > 0)
+            // Live, not sampled, and the seal engages in the same hold of the engine write lock
+            // that finds the zero — so a commit is either counted here or refused from here on.
+            if (runtime.SealIfEmpty() is var rows and > 0)
                 return new ShardReapReply(false, $"{shard} still owns {rows} row(s) of its own.");
+        }
+
+        // The tail of the shipping above, now that the seal has stopped the watermark moving. The
+        // first pass raced anything still committing, and a write touching no partitioned table
+        // leaves the row count at zero while still publishing an event whose record would go with
+        // the directory. It is a *second* pass rather than the only one because the seal refuses
+        // writes while it is engaged: doing the whole backlog under it would fail a shard's live
+        // callers for as long as the hub took, where this waits only for what landed mid-decision.
+        // Outside _shardsLock, because sleeping there holds every other shard on this node still.
+        if (forwarder is not null && !ShipEvents(forwarder, runtime, TimeSpan.FromSeconds(1)))
+        {
+            runtime.Unseal();
+            return new ShardReapReply(
+                false,
+                $"{shard} published events while the reap was deciding — forwarded to LSN {forwarder.Cursor} of "
+                + $"{runtime.Engine.Log.DurableLsn}. Retry once the hub has taken them.");
+        }
+
+        lock (_shardsLock)
+        {
+            // Reassignment could have closed the shard under us while the tail shipped. There is
+            // then nothing here to reap and nothing to unseal — that engine is already gone.
+            if (!_shards.TryGetValue(shard, out var current) || !ReferenceEquals(current, runtime))
+            {
+                return new ShardReapReply(
+                    false,
+                    $"{shard} stopped being this node's while the reap was deciding; the hub reassigned it. "
+                    + "Nothing was removed.");
+            }
 
             _draining.Remove(shard);
             _shards.Remove(shard);
@@ -532,11 +608,89 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             if (_boundaryMonitors.Remove(shard, out var monitor))
                 monitor.Dispose();
             runtime.Dispose();
+
+            // Closed but not destroyed, and marked so this node's own heartbeat cannot reopen it
+            // while the hub retires the membership row. Everything up to here is undoable.
+            _reaping[shard] = (_time.GetUtcNow(), directory);
         }
 
-        // Outside the lock: the engine is closed, so nothing can reopen the directory under us,
-        // and a slow delete must not hold every other shard on this node still.
-        Directory.Delete(directory, recursive: true);
+        LogShardSealedForReap(_logger, shard.Value, NodeName, directory);
+        return new ShardReapReply(true, null);
+    }
+
+    /// <summary>
+    /// Kicks the shard's event forwarder and waits for it to reach the durable watermark, up to
+    /// <paramref name="within"/>. False means it did not get there.
+    /// <para>
+    /// Kicked and waited on rather than read off a truncation floor, because the cluster-event
+    /// cursor only advances when the pump runs and the pump only wakes on an event-bearing commit:
+    /// a resting cursor means "not asked lately", not "nothing to send". A cursor that will not
+    /// reach the watermark means the hub is not taking the events, and they would be deleted with
+    /// the shard.
+    /// </para>
+    /// </summary>
+    private bool ShipEvents(EventForwarder forwarder, ShardRuntime runtime, TimeSpan within)
+    {
+        forwarder.Kick();
+        var deadline = _time.GetUtcNow() + within;
+        while (forwarder.Cursor < runtime.Engine.Log.DurableLsn && _time.GetUtcNow() < deadline)
+            Thread.Sleep(25);
+
+        return forwarder.Cursor >= runtime.Engine.Log.DurableLsn;
+    }
+
+    /// <summary>
+    /// The second half of a reap: delete the directory of a shard this node already sealed and
+    /// closed. Split from <see cref="ReapShard"/> so the destruction happens <em>after</em> the
+    /// hub has removed the membership row, never before — a shard whose directory is gone but
+    /// whose row survives is reopened by <see cref="ApplyAssignments"/> as a fresh empty engine
+    /// under the very originator it just retired, and ids minted under that originator are alive
+    /// elsewhere. Deleting last inverts the failure: a lost reply strands a directory nobody owns,
+    /// which is garbage rather than a collision, and is logged as such.
+    /// <para>
+    /// Idempotent, and refuses rather than guesses: a shard that reopened because the mark expired
+    /// is serving again, and its directory is not a leftover.
+    /// </para>
+    /// </summary>
+    internal ShardReapReply DeleteReapedShard(ShardReapDelete request)
+    {
+        var shard = new ShardKey(request.Shard);
+        string directory;
+        lock (_shardsLock)
+        {
+            if (_shards.ContainsKey(shard))
+            {
+                return new ShardReapReply(
+                    false,
+                    $"{shard} is open and serving on '{NodeName}'; its reap did not complete and its directory is "
+                    + "not a leftover. Reap it again from the start.");
+            }
+
+            // The path is derived, not remembered, so a node that restarted between the two halves
+            // still finishes the job rather than reporting success over a directory it left behind.
+            directory = _reaping.TryGetValue(shard, out var pending)
+                ? pending.Directory
+                : Path.Combine(Cluster.ShardDataPath, $"shard-{shard.Value}");
+
+            // Re-marked with a fresh timestamp: the delete runs outside the lock, and an assignment
+            // arriving mid-delete must not open an engine over a directory being emptied.
+            _reaping[shard] = (_time.GetUtcNow(), directory);
+        }
+
+        try
+        {
+            // Outside the lock: a slow delete must not hold every other shard on this node still.
+            if (Directory.Exists(directory))
+                Directory.Delete(directory, recursive: true);
+        }
+        finally
+        {
+            lock (_shardsLock)
+            {
+                _reaping.Remove(shard);
+            }
+        }
+
         LogShardReaped(_logger, shard.Value, NodeName, directory);
         return new ShardReapReply(true, null);
     }
@@ -670,6 +824,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 return Task.FromResult<object?>(QuiesceShard(body!.Value.Deserialize<ShardDrain>()!));
             case "shard-reap":
                 return Task.FromResult<object?>(ReapShard(body!.Value.Deserialize<ShardReap>()!));
+            case "shard-reap-delete":
+                return Task.FromResult<object?>(DeleteReapedShard(body!.Value.Deserialize<ShardReapDelete>()!));
             case "shard-drain-abort":
             {
                 var abort = body!.Value.Deserialize<ShardDrainAbort>()!;
@@ -1100,4 +1256,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         Message = "Shard {Shard}'s draining mark on node '{NodeName}' outlived 2x Cluster:FailureTimeoutMs with the assignment still naming this node — " +
             "the hub likely died between quiesce and reassign. The mark expired and the shard reopens; the interrupted drain healed itself in favour of the origin.")]
     private static partial void LogDrainMarkExpired(ILogger logger, ulong shard, string nodeName);
+
+    [LoggerMessage(EventId = 1750, EventName = "ShardSealedForReap", Level = LogLevel.Warning,
+        Message = "Shard {Shard} was sealed and closed for a reap on node '{NodeName}': it held no rows of its own and nothing pinned its log. " +
+            "'{Directory}' is untouched until the hub has retired the membership row, and the shard reopens from it if the reap does not finish.")]
+    private static partial void LogShardSealedForReap(ILogger logger, ulong shard, string nodeName, string directory);
+
+    [LoggerMessage(EventId = 1751, EventName = "ShardReapMarkExpired", Level = LogLevel.Warning,
+        Message = "Shard {Shard}'s reap mark on node '{NodeName}' outlived 2x Cluster:FailureTimeoutMs — the hub likely died between the close and the " +
+            "delete. The mark expired; the directory was never touched, so the shard reopens on the next assignment and the reap simply did not happen.")]
+    private static partial void LogReapMarkExpired(ILogger logger, ulong shard, string nodeName);
 }
