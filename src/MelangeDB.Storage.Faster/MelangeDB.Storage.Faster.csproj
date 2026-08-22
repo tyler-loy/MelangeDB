@@ -11,6 +11,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="MelangeDB.Storage.Faster.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Microsoft.FASTER.Core" Version="2.6.5" />
   </ItemGroup>
 
