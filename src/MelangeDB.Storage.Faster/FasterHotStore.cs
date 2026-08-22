@@ -242,7 +242,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             {
                 if (!_tables.TryGetValue(table, out var state))
                     yield break;
-                bytes = ReadRow(state, key);
+                bytes = TryReadRowForScan(state, key);
                 if (bytes is not null)
                     state.AddRowsScanned(1);
             }
@@ -607,7 +607,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             byte[]? bytes;
             lock (_lock)
             {
-                bytes = ReadRow(state, key);
+                bytes = TryReadRowForScan(state, key);
             }
 
             if (bytes is not null)
@@ -615,6 +615,22 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 state.AddRowsScanned(1);
                 yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
             }
+        }
+    }
+
+    /// <summary>
+    /// Test-only: overwrites one paged row's out-of-line payload with bytes of a length that
+    /// disagrees with the main record's framing — the on-disk state issue #137 observed, where a
+    /// blob and its main record came from different versions. The public API cannot produce it (a
+    /// write splits and upserts both together, and recovery rebuilds both from one log record), so
+    /// the store's resilience to it is only testable by forcing it. Composes and upserts through
+    /// the same paths a real write uses, under the same lock.
+    /// </summary>
+    internal void CorruptBlobPayloadForTest(TableId table, in RowKey key, int ordinal, byte[] payload)
+    {
+        lock (_lock)
+        {
+            UpsertValue(_blobSession!, BlobKey(table, key, ordinal), payload);
         }
     }
 
@@ -633,10 +649,46 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 $"Table '{table.Schema.Name}': key {rowKey} is in the directory but its main record is missing.");
         if (entry.BlobMask == 0)
             return main;
-        return RowBlobSplitter.Join(table.Schema, main, entry.BlobMask, ordinal =>
-            ReadValue(_blobSession!, BlobKey(table.Schema.Id, rowKey, ordinal), table)
-            ?? throw new InvalidDataException(
-                $"Table '{table.Schema.Name}': key {rowKey} is missing its out-of-line payload for bytes-column ordinal {ordinal}."));
+
+        // Every integrity fault the join can raise — a payload whose length disagrees with the
+        // main record's framing, or a missing payload — is rethrown carrying the key, because the
+        // caller that has to act on it (an operator repairing one row, or the scan wrapper logging
+        // it) needs the key, and RowBlobSplitter has only the ordinal. The splitter's own message,
+        // which names the ordinal and the two lengths, is preserved as the reason.
+        try
+        {
+            return RowBlobSplitter.Join(table.Schema, main, entry.BlobMask, ordinal =>
+                ReadValue(_blobSession!, BlobKey(table.Schema.Id, rowKey, ordinal), table)
+                ?? throw new InvalidDataException(
+                    $"out-of-line payload for bytes-column ordinal {ordinal} is missing."));
+        }
+        catch (InvalidDataException fault)
+        {
+            throw new InvalidDataException($"Table '{table.Schema.Name}': key {rowKey}: {fault.Message}", fault);
+        }
+    }
+
+    /// <summary>
+    /// Reads a row for a scan, turning an unreadable one into "absent" rather than an exception.
+    /// A scan that materializes rows — a subscription's initial set, an index range — must not let
+    /// one corrupt row take the whole operation, and through it the connection that asked for it,
+    /// down with it: the failure mode issue #137 reported, where a single row whose out-of-line
+    /// payload disagreed with its main record threw out of <see cref="Scan"/> and killed every
+    /// client whose first subscription scanned it. The row is logged with its key (EventId 1509)
+    /// and skipped; a point read (<see cref="TryGetRow"/>) still surfaces the fault, because a
+    /// caller asking for one row by key is owed the truth about that row rather than a silent miss.
+    /// </summary>
+    private byte[]? TryReadRowForScan(TableState table, in RowKey key)
+    {
+        try
+        {
+            return ReadRow(table, key);
+        }
+        catch (InvalidDataException fault)
+        {
+            LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, key.ToString(), fault.Message);
+            return null;
+        }
     }
 
     private void PutRow(TableState table, in RowKey key, ReadOnlyMemory<byte> row)
@@ -1396,5 +1448,17 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public static void ResidencyChanged(ILogger logger, string table, Residency residency, string mode) =>
             ResidencyChangedMessage(logger, table, residency, mode, null);
+
+        private static readonly Action<ILogger, string, string, string, Exception?> UnreadableRowSkippedMessage =
+            LoggerMessage.Define<string, string, string>(
+                LogLevel.Error,
+                new EventId(1511, "UnreadableRowSkipped"),
+                "Table '{Table}': row {Key} could not be read and was skipped by a scan ({Reason}). "
+                + "The row is intact in the commit log — the hot store is a projection of it — so a restart "
+                + "rebuilds it cleanly; this projection-only fault cannot survive one. A scan no longer fails, "
+                + "and no longer takes the connection that issued it down, because one row is unreadable.");
+
+        public static void UnreadableRowSkipped(ILogger logger, string table, string key, string reason) =>
+            UnreadableRowSkippedMessage(logger, table, key, reason, null);
     }
 }

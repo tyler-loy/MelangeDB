@@ -340,7 +340,7 @@ names the *governing* floor rather than the anonymous LSN it respected: floor na
 pinned behind the head, and the log file's size in bytes — `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
 `1505 AutoResidencyDemoted` — an `Auto` table crossing its threshold is the cliff arriving, and it announces
 itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, `1508 ResidencyChanged` — the careful
-per-table override being applied at runtime (07) — `1509 SnapshotAlreadyRunning`, Debug-level, the
+per-table override being applied at runtime (07) — `1511 UnreadableRowSkipped` — Error-level, a paged row whose stored projection could not be read (its out-of-line blob payload disagreed with its main record, or a payload was missing) was skipped by a scan rather than throwing and taking the scanning connection down with it; the row is intact in the commit log, so a restart rebuilds it. Names the table, the key, and the reason so the one row can be found without bisecting the table. — `1509 SnapshotAlreadyRunning`, Debug-level, the
 only signal that snapshots now write outside the write lock: an interval short enough for two to
 overlap is a configuration to raise, not an error to chase; and `1510 LogTruncationPinned` — a truncation that
 removed **nothing** because a floor pinned it, naming the holder, its LSN, the head, the pinned record count,

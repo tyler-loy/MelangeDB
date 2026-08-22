@@ -10,7 +10,22 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **One unreadable row no longer takes down every client that scans it.** In the FASTER store a
+  paged row whose out-of-line blob payload disagreed with its main record's declared length threw
+  `InvalidDataException` out of a subscription's initial-set scan (`FasterHotStore.Scan` /
+  `ScanIndexRange`); the exception escaped the subscribe handler, Kestrel logged an unhandled error,
+  and the socket died — so every client whose first subscription scanned that row failed to connect
+  ([#137](https://github.com/tyler-loy/MelangeDB/issues/137)). A scan now skips such a row and logs
+  it with its key (EventId 1511 `UnreadableRowSkipped`) instead of failing; a point read of the key
+  still surfaces the fault, now carrying the key and both lengths, so one row can be repaired
+  without bisecting the table. The hot store is a projection of the commit log, so the row is intact
+  there and a restart rebuilds it — this class of disagreement cannot survive one, which is also why
+  the reported cause (a blob write outliving its commit across a restart) is not the mechanism: the
+  store opens its FASTER logs `deleteOnClose` and rebuilds from snapshot + log replay on every
+  start, splitting and writing each row's main and blob together, so recovery cannot carry a
+  main/blob disagreement forward.
 
 ## [0.2.1] — 2026-08-22
 
