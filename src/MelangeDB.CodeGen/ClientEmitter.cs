@@ -316,8 +316,9 @@ internal static class ClientEmitter
             builder.AppendLine("        }");
         }
 
-        // Subscription helpers: the equality and range shapes the SQL subset supports, plus the
-        // typed rescope that keeps the terrain-streaming pattern a method call.
+        // Subscription helpers: the equality and range shapes, plus the typed rescope that keeps
+        // the terrain-streaming pattern a method call. Not every shape the SQL subset supports —
+        // whole-table and not-default are deliberately left on the untyped API (CLIENT-BINDINGS.md).
         var equalitySql = Literal($"SELECT * FROM {table.TableName} WHERE {column.Name} = :p");
         var rangeSql = Literal($"SELECT * FROM {table.TableName} WHERE {column.Name} BETWEEN :lo AND :hi");
         builder.AppendLine();

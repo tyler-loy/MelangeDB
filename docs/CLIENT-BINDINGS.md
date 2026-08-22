@@ -131,7 +131,7 @@ client merge is where that collapses). Subscription helpers cover three of the S
 table, equality, range — on primary-key, `[Unique]`, and `[Index]` columns, which is exactly the
 set the server accepts predicates on. Two shapes stay on the untyped `MelangeClient` API. An
 explicit column list, because a projected row bound to a full struct would read as zeros — the
-precise trap typed bindings exist to close. And `WHERE col <> 0` (the not-default shape, issue
+precise trap typed bindings exist to close. And `WHERE col <> <default>` (the not-default shape, issue
 #122), because a helper for it would be a nullary method per indexed column on every table, and the
 shape is new enough that the demand for it should show up before the surface does.
 

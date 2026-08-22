@@ -259,8 +259,8 @@ going silent. **It is a narrowing, not a verdict.** Two conditions are deliberat
 pinning the log, and unoccupied — because neither can be answered from a sample. Truncation floors
 are evaluated only inside a truncation decision under the engine write lock (one of them writes a
 file when evaluated, and all of them race a scrape), and sessions live on the gateway. A caller that
-acts on the list re-checks both on the owning node, under the lock; the list exists so that check
-runs against a handful of shards rather than every shard the cluster has ever created.
+acts on the list re-checks both on the owning node, under the engine write lock; the list exists so
+that check runs against a handful of shards rather than every shard the cluster has ever created.
 
 **Both are advisory, and the row count is throttled.** `authoritative_rows` is computed in the same
 throttled pass that samples resident bytes, so it can be as old as that interval — not one
@@ -272,7 +272,10 @@ empty shard whenever a band lands.
 
 `borrowed_rows` is read live, since nothing keys emptiness on it, so the two gauges can disagree by
 one sampling interval. Anything that *acts* on emptiness — the shard reaper this pair exists to make
-possible — must re-check under the shard's own lock rather than trusting a gauge.
+possible — must re-decide it **under the owning engine's write lock, in the same hold that stops
+further writes**. Nothing weaker will do, and a fresher count is not the missing piece: any count is
+stale the instant the lock is released, so the reaper counts and installs its refusal together
+(`ShardRuntime.SealIfEmpty`). The gauges narrow the field; they never settle it.
 
 ### The four that actually matter
 

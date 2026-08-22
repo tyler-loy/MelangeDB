@@ -13,13 +13,15 @@ All packages ship together at one version; there is no per-package versioning. S
 ### Breaking
 
 - **`/melange/bulk` answers a per-engine results array instead of a single `lsn`.** The body is now
-  `{"ok", "rows", "results": [{"shard", "lsn", "rows"}]}`, with exactly one element today and
-  `shard` null, because a node-local engine is not a shard's. An LSN is meaningful only within one
+  `{"ok", "rows", "results": [{"shard", "lsn", "rows"}]}`. An LSN is meaningful only within one
   log, so a batch that spans shards has no single LSN to report; the array is the shape that
-  survives that, and it ships ahead of the fan-out ([#115](https://github.com/tyler-loy/MelangeDB/issues/115))
-  so that change adds elements rather than breaking every caller. The atomicity guarantee is
-  stated as **per engine** rather than per batch — a single-node deployment has one engine, so
-  nothing weaker is promised than before.
+  survives that. On a single node — and for the `Global`, `Replicated` and `Local` share of any
+  batch — it is one element with `shard` null, because a node-local engine is not a shard's; a
+  batch fanned out by a hub ([#115](https://github.com/tyler-loy/MelangeDB/issues/115), below)
+  reports one element per receiving shard. The array shape landed first so that the fan-out added
+  elements rather than breaking every caller a second time. The atomicity guarantee is stated as
+  **per engine** rather than per batch — a single-node deployment has one engine, so nothing
+  weaker is promised there than before.
 
 ### Added
 
@@ -40,12 +42,14 @@ All packages ship together at one version; there is no per-package versioning. S
   that does not exist is refused whole before any engine writes, rather than turning one POST into
   thousands of durable directories. See [CLUSTERING.md](docs/CLUSTERING.md).
 
-- **A fourth subscription predicate, `WHERE col <> 0` — the rows where a column has been set at
-  all**, closing [#122](https://github.com/tyler-loy/MelangeDB/issues/122). Both SQL spellings
-  (`<>` and `!=`) parse. The operand must be the column's own default, and the shape is served on
-  `bool` and unsigned integer columns, whose default is also their minimum so "not the default" is
-  a single index range; a signed column would need two and is refused by name, as
-  `unsupported_predicate`, along with an operand that is not the default.
+- **A fourth subscription predicate, `WHERE col <> <default>` — the rows where a column has been set
+  at all**, closing [#122](https://github.com/tyler-loy/MelangeDB/issues/122). Both SQL spellings
+  (`<>` and `!=`) parse. The operand must *be* the column's own default — written exactly, so
+  neither a null parameter nor a `0.5` that would round to zero on the write path compiles as
+  not-default — and the shape is served on `bool` and unsigned integer columns, whose default is
+  also their minimum so "not the default" is a single index range; a signed column would need two
+  and is refused by name, as `unsupported_predicate`, along with any operand that is not the
+  default. `bool` is named by its own default (`<> false`), never by `0`.
 
   It exists because the range shape could not express it: a counter has no bounded span, so
   `BETWEEN 1 AND :hi` needs a clamp the client invents purely to get past `MaxRangeSpan`, and
@@ -60,14 +64,22 @@ All packages ship together at one version; there is no per-package versioning. S
   relational tier, and they refuse it by name rather than mis-report it. No typed client helper,
   matching the projected shape.
 
-- **`HubRuntime.ReapShardAsync` removes a shard that holds nothing of its own** — the counterpart
-  `EnsureShard` never had, closing [#112](https://github.com/tyler-loy/MelangeDB/issues/112). A host
-  API rather than an endpoint, since this is the only cluster operation that destroys durable state.
-  The owner checks and deletes in one lock (they cannot be separated) and the hub forgets the
-  assignment last, so any earlier failure leaves a shard still owned and still openable. Refused
-  while the shard owns rows, while a truncation floor beyond the routine ones is present, while its
-  cluster events are unshipped, or mid-drain. The shard key is not reserved: visiting it again
-  creates a new shard with a new originator, because a reaped prefix retires with its shard.
+- **`MelangeClusterCoordinator.ReapShardAsync` removes a shard that holds nothing of its own** — the
+  counterpart `EnsureShard` never had, closing [#112](https://github.com/tyler-loy/MelangeDB/issues/112).
+  A host API rather than an endpoint, since this is the only cluster operation that destroys durable
+  state, and it sits beside `EnsureShard` on the same coordinator: the verb that creates shards and
+  the verb that removes them are reachable from the same place.
+
+  Emptiness is decided and the engine sealed against further writes in **one hold of the engine
+  write lock** — nothing weaker separates "holds nothing" from "will still hold nothing when the
+  directory goes", since a reducer call resolves its shard under the node's shard-set lock and then
+  commits with it released. The destruction goes **last**: the owner seals and closes, the hub
+  retires the membership row, and only then is the directory deleted, so an interruption anywhere
+  leaves a shard that is still owned and still openable rather than a retired originator a stale
+  assignment could re-mint under. Refused while the shard owns rows, while a truncation floor beyond
+  the routine ones is present, while its cluster events are unshipped, or mid-drain. The shard key
+  is not reserved: visiting it again creates a new shard with a new originator, because a reaped
+  prefix retires with its shard.
 
 - **Two per-shard row gauges, `melange.cluster.shard.authoritative_rows` and
   `melange.cluster.shard.borrowed_rows`.** The first counts only rows in `Partitioned` tables minus
@@ -84,7 +96,7 @@ All packages ship together at one version; there is no per-package versioning. S
   authoritative rows, not drain-quiesced, and heard from recently enough that a silent node cannot
   make its shards look empty. A narrowing rather than a verdict — nothing pinning the log and
   unoccupied are deliberately absent, because neither can be answered from a sample — so a caller
-  re-checks both on the owning node under the lock.
+  re-checks both on the owning node, under the engine write lock that also stops further writes.
 
 ### Fixed
 
@@ -115,6 +127,12 @@ All packages ship together at one version; there is no per-package versioning. S
   placement and the node's `Cluster:Role`. Nothing changes for single-node deployments, where
   `Cluster:Role` is `None` and placement is inert. Reported against the reference workload
   ([#111](https://github.com/tyler-loy/MelangeDB/issues/111)).
+
+  **Aggregates are refused on the same grounds**, which the first cut missed: placement and tier are
+  independent axes, so a table can be both `Relational` and `Partitioned`, and the aggregate path
+  returned before the row path's placement check. A `COUNT(*)` over a fraction of the rows is worse
+  than the empty result — an empty set at least looks like nothing, while a number looks like an
+  answer.
 
 ## [0.2.0] — 2026-08-17
 

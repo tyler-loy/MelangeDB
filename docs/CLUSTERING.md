@@ -300,18 +300,36 @@ set `Cluster:ShardSpanCheck` to `Always` and pay the dictionary probe.
 
 `EnsureShard` creates a shard the first time anyone arrives in it, and for a long time had no
 counterpart: a world where players can wander anywhere accumulated a membership row and a data
-directory per shard key ever visited, permanently. `HubRuntime.ReapShardAsync` is the counterpart.
+directory per shard key ever visited, permanently. `MelangeClusterCoordinator.ReapShardAsync` is the
+counterpart, beside `EnsureShard` on the same coordinator.
 
 It is a **host API and not an endpoint**, deliberately. This is the only cluster operation that
 destroys durable state, and a new authenticated wire surface for it would drag the whole gating
 ladder behind a call an operator makes by hand; direct callers are the host's own code, the same
 line `BulkInsert` draws.
 
-The shape is *drain, then do not hand it anywhere*. The owner checks and deletes in one lock,
-because the two cannot be separated — a shard inspected and then closed could take a row in between,
-and a closed shard has nothing left to inspect. The hub forgets the assignment **last**, so a failure
-anywhere earlier leaves a shard that is still owned and still openable rather than a directory nobody
-owns.
+The shape is *drain, then do not hand it anywhere*.
+
+**Emptiness and the decision to stop accepting rows are one decision, taken under the engine write
+lock.** They cannot be separated: a shard found empty and then closed can take a row in between,
+from a reducer call or a bulk group that resolved the shard before the reap began and commits after
+it. The node's shard-set lock does not close that window — it guards the map of open shards, and is
+released before the commit runs — and neither does the heartbeat's authoritative-row gauge, which is
+throttled to ten seconds and is documented as advisory for exactly this reason. So the owner counts
+its partitioned rows *and* installs a commit guard refusing every subsequent write in one hold of
+the engine write lock. A write is therefore either counted, or refused with an explanation. The seal
+lifts if a later check refuses the reap, and does not survive the shard runtime: a shard that
+reopens, reopens writable.
+
+**The destruction goes last, in three steps:** the owner seals and closes the shard; the hub removes
+the membership row; the owner deletes the directory. Everything before the removal is undoable, so
+an interruption leaves a shard still owned and still openable — the owner's reap mark expires and
+the shard reopens from its untouched directory, which is what "the reap did not happen" has to mean.
+The order matters in the other direction too: deleting first would leave a window where the
+membership row outlives its data, and a stale assignment would open a fresh empty engine **under the
+retired originator**, re-minting ids that transfers have already carried to other shards. After the
+removal a lost delete strands a directory nobody owns — garbage, logged as garbage, and never a
+collision.
 
 A reap is refused unless all of these hold, and a refusal is the ordinary answer rather than an
 error:
