@@ -92,6 +92,64 @@ public class SnapshotOffLockTests
     }
 
     [Fact]
+    public void Writes_proceed_while_the_log_is_being_compacted()
+    {
+        // The snapshot's truncation used to re-take the write lock for the whole compaction, which
+        // rewrote the retained log record by record — so every snapshot froze the engine for a time
+        // proportional to the log, not to what it removed. Now only the floor decision is under the
+        // lock; the copy runs off it, and appends that land during the copy are carried across.
+        //
+        // Unlike the snapshot test above, this one does force the overlap: the log's between-phases
+        // hook runs inside the compaction, and a commit made from another thread there either
+        // completes — the lock is free — or does not, and the join below says so.
+        using var harness = new EngineHarness();
+        harness.Options.Resume.RetentionWindowSeconds = 0; // Or the retention window pins every record just written.
+        for (var i = 0; i < 200; i++)
+        {
+            var id = i;
+            harness.Invoke("Seed", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash($"p{id}"), Name = $"p{id}", RoomId = 1 }));
+        }
+
+        var baseBefore = harness.Engine.Log.BaseLsn;
+        var committedDuringCompaction = false;
+        Exception? failure = null;
+        harness.Engine.LogFile.BetweenCompactionPhases = () =>
+        {
+            var writer = new Thread(() =>
+            {
+                try
+                {
+                    harness.Invoke("DuringCompaction", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("mid"), Name = "mid", RoomId = 9 }));
+                    committedDuringCompaction = true;
+                }
+                catch (Exception exception)
+                {
+                    failure = exception;
+                }
+            });
+            writer.Start();
+            if (!writer.Join(TimeSpan.FromSeconds(10)))
+                failure = new TimeoutException("a commit issued during the log compaction did not complete: the compaction is holding the write lock");
+        };
+
+        harness.Engine.TakeSnapshot();
+        harness.Engine.LogFile.BetweenCompactionPhases = null;
+
+        Assert.Null(failure);
+        Assert.True(committedDuringCompaction);
+        Assert.True(harness.Engine.Log.BaseLsn > baseBefore, "the snapshot did not truncate the log, so nothing was tested");
+
+        // The mid-compaction commit is in the compacted log, readable and durable, and the engine
+        // restarts from snapshot plus tail with it in place.
+        var head = harness.Engine.Log.HeadLsn;
+        Assert.Equal(head, harness.Engine.Log.ReadFrom(head).Single().Lsn);
+        Assert.Equal(201, harness.Engine.CommittedView.Scan<Player>().Count());
+        harness.Restart();
+        Assert.Equal(201, harness.Engine.CommittedView.Scan<Player>().Count());
+        Assert.NotNull(harness.Engine.CommittedView.Find<Player>(Identity.Hash("mid")));
+    }
+
+    [Fact]
     public void The_engine_survives_a_restart_from_a_snapshot_written_off_the_lock()
     {
         // End to end: the file a pinned scan produced has to be a file recovery can read.

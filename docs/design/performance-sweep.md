@@ -587,3 +587,114 @@ megabytes of buffers beside a memory budget this database reports as a computed 
 a bounded pool with a 256 KB ceiling: the steady state pools, and a rare oversized bulk record
 allocates once and stays collectable. The memory report is one of the few numbers here that is a
 promise rather than an observation, and a test that guards it earned its keep.
+
+## Round three: the siblings of the range walk
+
+The primary-key range walk (0.2.1, `ScanKeyRange`) was found by a production deployment, not by the
+suite, and the reason it was not found earlier is structural: a walk and a seek return the same rows,
+and every test table was small enough that the difference was noise. That is a *family* of defect,
+not an instance — correct answers, cost proportional to the distance to the window rather than the
+window — so the third round went looking for the rest of the family before the next deployment did.
+The method was the one the first two rounds settled on: read the hot paths with one question (what
+does this scale with, and should it?), then write the test that counts the work rather than checks
+the answer.
+
+### Found and fixed
+
+**The commit log had no seek.** `FileCommitLog.ReadFrom(lsn)` scanned from the header, reading,
+CRC-checking and decoding every record below `lsn` and throwing it away. Nine callers pay for that,
+and all but one call it per batch with a cursor near the head: the resume replay (twice — once to
+age the gap, once to replay it), the Postgres applier, the event bus's catch-up, the applier
+pipeline's catch-up (under the write lock), and in a cluster the event forwarder, the border
+publisher (per observer stream) and the hub replica pump (per node link). Every one re-read the
+retained log from byte zero per batch — with a cursor at the head and a 300-second retention window,
+that is "read the last five minutes of history to fetch the next hundred records", forever. The fix
+is a sparse LSN→offset index (`IndexStrideBytes` apart, built by the recovery walk the log already
+does, extended per append, rebased per compaction), a verified seek, and a frame-header hop for the
+remainder of the stride. `LogSeekBenchmarks` is the gate: ten records at three positions in a
+100,000-record log: before, 195 µs / 12.0 ms / 25.6 ms for Low / Middle / High; after, 219 µs /
+262 µs / 218 µs. The dev box, short job; the ratio is what travels.
+
+**Compaction held the engine for the size of the log.** `TruncateBefore` decoded every record to
+learn its LSN and rewrote every survivor, under the write lock, the append lock and the fsync lock
+— so the stall hit commits that had not started, commits mid-append, and commits parked on an fsync,
+and it scaled with the retained log rather than with what was removed. The retention floor's scan
+decoded every removable record under the same lock. Now: the floor decision stays under the write
+lock (binary search for the retention boundary, one record per probe); the compaction seeks to the
+first survivor, copies bytes off the lock, and takes the log's locks only for the tail appended
+meanwhile and the swap. A pin taken during an in-flight compaction pins at its floor. The test
+commits from another thread *inside* the compaction, through a hook between its phases, and asserts
+the commit lands — a deadlock against the old code, which is the discriminating shape the first two
+rounds taught.
+
+**The fan-out decoded the row once per subscriber.** `ServerSubscription.Matches` on an indexed
+(non-primary-key) column called `RowCodec.EncodeColumnFromBytes`, which deserializes the whole row
+to encode one column — per subscriber, for the pre-image and the new row, under the write lock. Row
+and column policies materialized the typed row per subscriber the same way. The projection memo
+(round one) already existed for exactly this reason and covered only the wire bytes. Now one
+`DecodedRow` per op materializes the typed row once, hands it to every predicate and policy, and
+memoizes each predicate column's encoding; sixty subscribers cost two decodes per op where they
+cost 120 and 240. The `FanoutBenchmarks` suite gained a `Predicated` axis, which is the row the
+old suite was missing: at 500 subscribers the predicated op went from 108 µs to 86 µs (short job; StdDev 5 and 1) and
+now sits within 8% of the unpredicated 79 µs instead of 25% above it. The row is narrow — one
+short string — so that is the floor of the effect, not its size; the decode count is the claim.
+
+**The reducer's pending rows were rescanned per index read.** `CheckUniqueValue` and `FilterCore`
+decoded every pending row of the table on every call to test one column — O(P²) decodes for a
+bulk-shaped reducer. The transaction now keeps an index overlay of pending values (`SortedSet` of
+the same `IndexEntry` the store's index uses), maintained from the typed row at stage time and
+read by seek.
+
+
+### Found and not yet fixed
+
+The rest of the third round, ranked, with the fix shape each wants. Every item was read in the
+source by a reviewer and the top of each group re-read by hand; none has a production measurement
+behind it yet, which is the honest difference between this list and the three above. They are
+recorded here so that the next one a deployment finds is at least not a surprise.
+
+| # | Where | What scales wrong | Fix shape |
+|---|---|---|---|
+| 1 | `ShardRuntime.WriteBorrowedSidecar` | The whole borrowed-row registry is serialized to JSON and rewritten on **every** border batch, import and truncation-floor reading (the last under the engine write lock); cost is the band's size per batch, not the batch's. | Dirty flag and a coalesced write on a timer or threshold, or an append-only delta beside a periodic full rewrite. |
+| 2 | `BorderPublisher.SendResetAsync`, `HubRuntime.BootstrapReplicaAsync` | A reset scans every Partitioned (resp. Replicated) row under `ReadConsistent` — the write lock — once per observer, re-triggered on every owner restart or move, and ships the result as one frame that `NodeLink` refuses above 64 MB (reconnect, re-subscribe, reset again). | Scan through a pinned read view off the lock; chunk the frames. |
+| 3 | `ShardNodeRuntime.ApplyAssignments` | A shard is opened — snapshot load, log replay, init reducers — inside `_shardsLock`, on the heartbeat thread. A big shard's recovery stalls every other shard's attach and can outlast `FailureTimeoutMs`, so the hub marks the node dead while it is busy doing what the hub asked. | Open outside the lock, register when ready; or heartbeat from its own loop. |
+| 4 | `ShardNodeRuntime.ApplyReplicaBatch` | One durable `ApplyInternal` per record per shard engine; the replica cursor file is read under `_shardsLock` per batch and per heartbeat. | One record per batch per shard; cursor in memory, file written on advance. |
+| 5 | `FasterHotStore.TryGetRow` on the fan-out's pre-image | A paged table's pre-image is a synchronous FASTER read under the store lock, under the engine write lock — a disk fault per op once the table outgrows the budget, and a blob join for a predicate that wanted one column. | Keep the predicate columns in the directory entry (they are the index values already), or read the pre-image before the lock. Design-level. |
+| 6 | `FasterHotStore` read-view overlay | While a snapshot's view is open every paged write re-reads its pre-image and the undo overlay keeps a copy per key, unbounded; the snapshot thread holds the store lock across its own page faults. | Cap the overlay and fall back to re-capture; a separate session for the snapshot scan. |
+| 7 | `MelangeScheduler.ProcessDueFires` / `Rearm` | Every fire and every timer-table commit scans every timer row to find the minimum due. | A priority queue with the existing `Generation` for invalidation. |
+| 8 | `MelangeEventBus` | `List.RemoveAt(0)` on a full 10k window per event-bearing commit under the write lock; the window filtered per wake per subscriber; a JSON checkpoint file rewritten per delivered record. | A ring; binary search by LSN; coalesced checkpoints. |
+| 9 | `MelangeEngine.BulkInsert` | Coercion, column lookup and serialization of the whole batch under the write lock; only the existence check, AutoInc and append need it. | Prepare outside, reconcile inside. |
+| 10 | `AutoIncSequencer.Observe` | Reflection-deserializes every AutoInc-bearing row — on the recovery tail and on every replicated record under the write lock — to read one integer. | A positional read like `ReadScheduleAt`, or the codec. |
+| 11 | `PlacementGuards` / `BoundaryMonitor` | `Assembly.GetEntryAssembly().GetCustomAttribute` per commit under the write lock (`ShardSpanCheck = DebugOnly`); `FrozenSnapshot` copies the frozen set per commit while a handoff is in flight; strategy rows decoded through reflection. | Cache the toggle; snapshot on change; the codec (landed in this round for `RowRef`). |
+| 12 | `SubscriptionEngine.Rescope` | Three walks of the window (ceiling, old keys, new keys), two sets of window size, per re-scope — the production moving-ring pattern. | Fold the ceiling into the second walk; diff overlapping windows by range. |
+| 13 | `MelangeSocketConnection` resume | Replay buffer is unbounded and unmeasured while the replay runs (now short, since the log seeks). | Byte-account it like the live queue. |
+| 14 | `ClusterLoadView.SustainedUtilization` | Enumerating a `ConcurrentQueue` each tick freezes its segments, so a 600-sample history fragments into ~600 segments per shard. | A fixed ring under a lock. |
+| 15 | `MaintainBorderSubscriptionsAsync` | A neighbour that does not exist is re-asked every second, forever, per shard. | An exists-false backoff. |
+| 16 | Gateway `UpstreamSession` / `GatewayConnection` | A full MessagePack decode and a fresh 64 KB buffer per forwarded frame to read a type tag. | Peek the tag; pool the buffer. |
+| 17 | `PostgresMembershipStore` | `LOCK TABLE … EXCLUSIVE` plus several round trips per heartbeat per node; a `GetAssignment` query per relayed border batch; N+1 in `MarkDead` and the bulk router. | A hub-side assignment cache invalidated on mutation; one `UPDATE … FROM` for `AssignUnowned`. |
+| 18 | `MessagePackFrameSerializer` | Grows a 64-byte buffer by doubling and copies out; a 256 KB initial-set chunk is ~12 reallocations on the LOH. | Size from `Measure`, or a pool. |
+| 19 | `MelangeClient.ReestablishAsync` | Re-subscribes serially on reconnect: Σ round trips, not max. | Issue in parallel, await all. |
+
+Not on the list, checked and fine: the store seeks (`RowDirectory`, `SecondaryIndex`, `ScanKeys`),
+`Statistics()` (O(tables)), the write set's coalescing, `RowKey` hashing, the socket send path's
+backpressure, `RowWire.Project`, the parser, the HTTP endpoints, telemetry, the client cache's
+apply path, the load view's bounded history, and the append path itself.
+
+### The test that counts instead of checks
+
+`CommitLogSeekTests` pins the cost where it is observable: the log counts the frames a read passes
+over (`SkippedFrames`), and reading the last ten of four thousand records must pass over fewer than
+a hundred where the scan passed over 3,990. Disabling the index — making `TryFloor` return nothing —
+fails exactly the two tests that claim a cost and none of the four that claim a result, which is the
+property a cost test has to have. The truncation tests cover what an index can get wrong: every
+survivor's offset moving under it, appends landing between the copy and the swap, and a reopen
+rebuilding it from the compacted file.
+
+The decode tests use the same shape with a different counter: a `CountingCodec<TRow>` wrapped
+around a table's generated codec, so `PendingIndexOverlayTests` and `FanoutDecodeCostTests` assert
+how many times a row was *decoded* — zero for four hundred unique-column inserts, two per op for
+sixty subscribers — which is the number that scaled, where every result assertion stayed green.
+Disabling the memo fails both fan-out tests; disabling the index fails both log-cost tests; neither
+change fails a result test. That is the property worth building into every cost fix: a test that
+would have caught the defect, not one that confirms the fix's answers.
+

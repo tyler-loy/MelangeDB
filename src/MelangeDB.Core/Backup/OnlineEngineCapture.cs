@@ -6,9 +6,11 @@ namespace MelangeDB.Core;
 /// The online capture: streams a live engine into an archive at a fenced LSN while commits
 /// continue. Consistency costs three ordered moves and no lock:
 /// <list type="number">
-/// <item><see cref="MelangeEngine.PinTruncation"/> first — while the pin is held compaction
-/// removes nothing, so the log file is never swapped underneath the walk and every record above
-/// the snapshot stays on disk.</item>
+/// <item><see cref="MelangeEngine.PinTruncation"/> first — while the pin is held no new
+/// compaction is decided, so every record above the snapshot stays on disk. A compaction decided
+/// before the pin may still land during the walk: its floor never passes the snapshot already on
+/// disk, so it removes nothing the walk needs, and the walk's own handle keeps reading the file it
+/// opened — the log's lazy-reader convention.</item>
 /// <item>The snapshot handle opens before the fence is read, so the fence — the head LSN at
 /// capture — is always at or above the snapshot's LSN.</item>
 /// <item>The fence is read before the log's buffers are flushed, so every record at or below the

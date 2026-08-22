@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace MelangeDB.Core;
 
 /// <summary>
@@ -29,6 +31,20 @@ public abstract class RowCodec
     /// </para>
     /// </summary>
     public abstract void EncodeColumnsFromBytes(ReadOnlySpan<byte> row, IReadOnlyList<string> columns, RowKey[] destination);
+
+    /// <summary>
+    /// Deserializes a row to its boxed struct. For a caller that holds a row as bytes and needs to
+    /// hand the <em>same</em> decode to several typed consumers — the subscription fan-out, where
+    /// every subscriber's predicate and every caller's policy evaluate one committed row — so that
+    /// the row is decoded once per op rather than once per subscriber.
+    /// </summary>
+    public abstract object DeserializeBoxed(ReadOnlySpan<byte> row);
+
+    /// <summary>
+    /// Encodes one key-encodable column from a row <see cref="DeserializeBoxed"/> returned. Only
+    /// the primary key and indexed columns are supported; other names throw.
+    /// </summary>
+    public abstract RowKey? EncodeColumnBoxed(string column, object row);
 }
 
 /// <summary>
@@ -81,6 +97,21 @@ public abstract class RowCodec<TRow> : RowCodec
 
         return EncodeColumn(column, in typed);
     }
+
+    public sealed override object DeserializeBoxed(ReadOnlySpan<byte> row)
+    {
+        try
+        {
+            return Deserialize(row);
+        }
+        catch (Exception exception) when (RowSerializer.IsDecodeFault(exception))
+        {
+            throw RowSerializer.DecodeFailed($"Row type '{typeof(TRow).Name}'", row.Length, column: null, exception);
+        }
+    }
+
+    public sealed override RowKey? EncodeColumnBoxed(string column, object row) =>
+        EncodeColumn(column, in Unsafe.Unbox<TRow>(row));
 
     /// <inheritdoc cref="EncodeColumnFromBytes"/>
     public sealed override void EncodeColumnsFromBytes(ReadOnlySpan<byte> row, IReadOnlyList<string> columns, RowKey[] destination)

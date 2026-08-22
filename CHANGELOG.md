@@ -100,6 +100,78 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The fan-out decodes a row once per op, not once per subscriber.** A subscription predicate on
+  an indexed column — `WHERE RoomId = 7`, `WHERE OwnerId = …` — encoded that column by deserializing
+  the whole row, and did so for every subscriber on the table, for the pre-image and the new row
+  both, under the engine's write lock: N subscribers, 2N full decodes per op. Row and column
+  policies did the same to hand each policy a typed row — up to 4N. The row is identical for all of
+  them; only the verdict is per caller. A primary-key predicate was free (a key compare), which is
+  why the reference workload's rings never showed it, and the existing fan-out benchmark had no
+  predicated or policied subscribers, so it could not either.
+
+  One `DecodedRow` per op now carries the bytes, materializes the typed row on first demand and
+  hands the same instance to every predicate and policy, and memoizes each predicate column's
+  encoding. The test registers sixty subscribers and counts decodes through the table's codec: two
+  per op (the pre-image and the new row), where it was 120 and 240. On `FanoutBenchmarks`' new
+  `Predicated` axis — 500 subscribers on one indexed-column predicate, one shared projection — the
+  op went from **108 µs to 86 µs**, and now sits within 8% of the unpredicated row (79 µs) where it
+  sat 25% above it; the bench row is seven narrow columns, so the per-decode cost there is small,
+  and a real row with strings and blobs pays proportionally more per subscriber.
+
+- **A reducer's pending rows are index-overlaid, not rescanned.** `Filter`, `FilterRange` and the
+  `[Unique]` check had to consider the rows the same transaction had already staged, and did so by
+  decoding every pending row of the table per call — a reducer inserting N rows into a table with a
+  unique column decoded N²/2 of them on the way, and one that filters an indexed column once per
+  row it stages was quadratic in its own write set, all under the write lock. The transaction now
+  keeps a per-(table, column) overlay of pending values, maintained from the typed row the reducer
+  handed in (no decode) and read by seek. Four hundred inserts into a unique-column table decode
+  nothing; a `Filter` decodes exactly the rows it returns.
+
+- `TableSchema.Column(name)` is a dictionary lookup; it was a linear scan with a string compare per
+  step, on every per-row path that reads a column by name (predicate encoding, the shard
+  strategies' `RowRef`, the reflection-path index maintenance). `RowRef` also decodes through the
+  generated codec now when the schema has one, rather than reflection — it runs per committed row,
+  and in a cluster under the write lock.
+
+- **The commit log seeks.** `FileCommitLog.ReadFrom(lsn)` started at the file header and read,
+  CRC-checked and decoded every record below the one it was asked for, then discarded them. The
+  answer was right; the cost was the size of the retained log, paid per call — and every incremental
+  consumer of the log calls it per batch with a cursor near the head: a client's resume replay (twice
+  per resume), the Postgres applier, the event bus's catch-up, an applier catching up one record
+  *under the engine's write lock*, and in a cluster the event forwarder, the border publisher (once
+  per observer) and the hub's replica pump (once per node). Each of them re-read the whole retained
+  log from byte zero on every batch. The same defect the primary-key range walk was — correct answers,
+  linear cost where it should be logarithmic, invisible until the thing it scales with got big —
+  found by going looking for its siblings rather than waiting for production to.
+
+  The log now keeps a sparse in-memory LSN→offset index (one entry per 32 KB of file, built by the
+  recovery walk it already does, extended by every append, rebased by every compaction), and a read
+  seeks to the entry below its LSN, verifies the record there, and hops frame headers — no CRC, no
+  decode, no allocation — to the one it wants. A compaction that moves the file under a reader fails
+  that verification and falls back to the old scan, so the race costs time, never correctness. The
+  cost of a read is now the size of its batch plus one stride. Measured on a 100,000-record log,
+  ten records read from the start, the middle and the end: **195 µs / 12.0 ms / 25.6 ms before,
+  219 µs / 262 µs / 218 µs after** — flat where it was linear, and the linear figure grows with the
+  retained log, which a pinned floor can make gigabytes (`LogSeekBenchmarks`).
+
+- **Log compaction no longer freezes the engine for the size of the log.** When a snapshot truncated
+  the log it decoded every record — removed and surviving alike — to learn its LSN, rewrote the
+  survivors one by one, and fsynced, all while holding the engine's write lock (so no commit could
+  start), the append lock and the fsync lock (so no parked commit could finish). Every snapshot was a
+  stall proportional to the *retained* log, which is by design at least the resume window and whatever
+  any floor pins — and it landed on the next commits' lock wait, where the slow-reducer diagnostics
+  deliberately bill no one. The retention floor's own scan decoded every removable record under the
+  same lock to find the first one inside the window.
+
+  The decision — every floor, and which governs — still runs under the write lock, because floors
+  are engine state and one of them writes a file when read; the retention floor is now a binary
+  search over LSNs (one seek and one record per probe) rather than a walk. The compaction then runs
+  with the lock released: it seeks to the first survivor, copies the survivors as bytes, and takes the
+  log's locks only to carry across whatever was appended meanwhile, fsync, and swap. A truncation pin
+  taken while a compaction is in flight pins at that compaction's floor, which is where the base is
+  about to stand, so the backup's guarantee is unchanged. The test for it commits from another thread
+  from inside the compaction and asserts the commit lands — which against the old code is a deadlock.
+
 - **A primary-key range subscription walked the key directory from row zero to reach its window.**
   The cost was O(keys before the window), so it grew with the table *and* with where in key order
   the client happened to be looking — a moving-window subscription got steadily more expensive the

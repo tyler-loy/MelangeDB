@@ -37,6 +37,14 @@ public sealed class FileCommitLog : ICommitLog
     internal const uint MaxRecordBytes = 256 * 1024 * 1024;
 
     /// <summary>
+    /// How far apart, in file bytes, the LSN→offset index keeps its entries. A read seeks to the
+    /// nearest entry at or below the LSN it wants and hops frames from there, so this bounds the
+    /// work of reaching any record at one stride of frame headers — and it bounds the index at
+    /// sixteen bytes per stride, a few megabytes for a log of many gigabytes.
+    /// </summary>
+    internal const int IndexStrideBytes = 32 * 1024;
+
+    /// <summary>
     /// The liveness-lock sidecar's file name. Windows enforces <see cref="FileShare"/> natively,
     /// but Unix maps only <see cref="FileShare.None"/> onto an advisory lock — the log's own
     /// Read|Delete handle excludes nothing there. This empty sidecar, held exclusively for the
@@ -85,6 +93,18 @@ public sealed class FileCommitLog : ICommitLog
     private ulong _baseLsn;
     private Exception? _failure;
     private bool _disposed;
+
+    // Where records live in the file, sparsely: built by recovery's walk, extended by every
+    // append, rebased by truncation. Mutated only under _lock, and consulted under it, so a reader
+    // either sees an entry that describes the current file or falls back to scanning from the
+    // header — never an offset into a file that has since been compacted.
+    private readonly OffsetIndex _index = new();
+
+    // Serializes truncations against each other without blocking appends: the bulk of a
+    // compaction's copy runs outside _lock, and two of them interleaving would each swap the
+    // other's work away.
+    private readonly Lock _truncateLock = new();
+    private long _skippedFrames;
 
     public FileCommitLog(CommitLogOptions options, ILogger<FileCommitLog>? logger = null)
         : this(options, (ILogger?)logger, null)
@@ -235,6 +255,21 @@ public sealed class FileCommitLog : ICommitLog
     /// the window where a real disk-full failure lands.
     /// </summary>
     internal Action<FileStream>? AppendFaultInjection { get; set; }
+
+    /// <summary>
+    /// Frames a read passed over to reach the record it was asked for, over this log's lifetime —
+    /// the observable that separates seeking from scanning, since both return the same records.
+    /// Counts frame-header hops after the indexed seek and, on the fallback path, records decoded
+    /// and discarded.
+    /// </summary>
+    internal long SkippedFrames => Interlocked.Read(ref _skippedFrames);
+
+    /// <summary>
+    /// Test-only hook, invoked by a truncation after it has copied the survivors and before it
+    /// takes the locks for the swap — the window in which appends land on the old file and must be
+    /// carried across.
+    /// </summary>
+    internal Action? BetweenCompactionPhases { get; set; }
 
     /// <summary>
     /// Test-only fault injection, invoked by the group flusher immediately before the fsync — the
@@ -412,6 +447,7 @@ public sealed class FileCommitLog : ICommitLog
                 }
 
                 _headLsn = lsn;
+                _index.Observe(lsn, previousLength);
             }
             finally
             {
@@ -674,8 +710,15 @@ public sealed class FileCommitLog : ICommitLog
         using var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         if (reader.Length < HeaderSize)
             yield break;
-        reader.Seek(HeaderSize, SeekOrigin.Begin);
         var frame = new byte[FrameSize];
+
+        // Seek, don't scan. This used to start at the header and read, CRC-check and decode every
+        // record in the file, discarding the ones below firstLsn — so a reader asking for the
+        // record after its cursor paid for the whole retained log to get it, and every incremental
+        // consumer (a resume replay, a replica stream, an applier's catch-up, the cluster's event
+        // and border pumps) re-read the log from byte zero on every batch. The index puts the
+        // start within one stride of the record; Locate hops the rest by frame header alone.
+        reader.Seek(Locate(reader, firstLsn, frame), SeekOrigin.Begin);
         while (reader.Position + FrameSize <= reader.Length)
         {
             reader.ReadExactly(frame);
@@ -692,6 +735,250 @@ public sealed class FileCommitLog : ICommitLog
                 yield break;
             if (record.Lsn >= firstLsn)
                 yield return record;
+            else
+                Interlocked.Increment(ref _skippedFrames);
+        }
+    }
+
+    /// <summary>
+    /// The first LSN in <c>[fromLsn, toLsn]</c> whose record was committed at or after
+    /// <paramref name="unixTimeMicros"/>, or null when none was. A binary search over the LSN
+    /// range, each probe one seek and one record — so the cost is logarithmic in the range where a
+    /// walk was linear in it, which matters because the caller is the truncation decision, which
+    /// runs under the engine's write lock and asks this of exactly the records it is about to
+    /// remove.
+    /// <para>
+    /// The search assumes commit timestamps do not decrease with LSN, which holds for commits
+    /// stamped under one serialized write lock from one clock. A clock stepped backwards can break
+    /// it locally; the consequence is a retention floor a few records off around the step, in a
+    /// window the design already tolerates being approximate — never a wrong record.
+    /// </para>
+    /// </summary>
+    internal ulong? FirstLsnAtOrAfter(long unixTimeMicros, ulong fromLsn, ulong toLsn)
+    {
+        if (fromLsn == 0 || fromLsn > toLsn)
+            return null;
+        lock (_lock)
+        {
+            if (_disposed)
+                return null;
+            _stream.Flush();
+        }
+
+        using var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var frame = new byte[FrameSize];
+        ulong? answer = null;
+        var low = fromLsn;
+        var high = toLsn;
+        while (low <= high)
+        {
+            var mid = low + (high - low) / 2;
+            var timestamp = ReadTimestampAt(reader, mid, frame);
+            if (timestamp is { } micros && micros >= unixTimeMicros)
+            {
+                answer = mid;
+                if (mid == low)
+                    break;
+                high = mid - 1;
+            }
+            else if (timestamp is null && mid == low)
+            {
+                // Nothing at or above here is readable; the answer, if any, was already found.
+                break;
+            }
+            else if (timestamp is null)
+            {
+                high = mid - 1;
+            }
+            else
+            {
+                low = mid + 1;
+            }
+        }
+
+        return answer;
+    }
+
+    /// <summary>
+    /// The file offset of the first record whose LSN is at or after <paramref name="lsn"/> — or
+    /// the end of the readable records when there is none. Consults the index for a verified
+    /// starting point and hops frame headers from there; when the index cannot vouch for a
+    /// position (nothing indexed yet, or a compaction moved the file under the entry) it hops from
+    /// the header, which is exactly the old scan minus the decoding.
+    /// </summary>
+    private long Locate(FileStream reader, ulong lsn, byte[] frame)
+    {
+        bool indexed;
+        ulong entryLsn;
+        long entryOffset;
+        lock (_lock)
+        {
+            indexed = _index.TryFloor(lsn, out entryLsn, out entryOffset);
+        }
+
+        var start = indexed && VerifyRecordAt(reader, entryOffset, entryLsn, frame) ? entryOffset : HeaderSize;
+        return SkipBelow(reader, start, lsn, frame);
+    }
+
+    /// <summary>
+    /// Whether an intact record carrying <paramref name="lsn"/> begins at <paramref name="offset"/>
+    /// of the file behind <paramref name="reader"/>. This is what makes trusting the index safe: an
+    /// entry names a position in the file as it was when the entry was made, and a compaction
+    /// between the lookup and the seek would leave it naming a position in a different file. A
+    /// CRC-valid frame carrying the expected LSN at the expected offset is not something a
+    /// different file produces.
+    /// </summary>
+    private static bool VerifyRecordAt(FileStream reader, long offset, ulong lsn, byte[] frame)
+    {
+        if (offset < HeaderSize || offset + FrameSize > reader.Length)
+            return false;
+        reader.Seek(offset, SeekOrigin.Begin);
+        reader.ReadExactly(frame);
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+        var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(4));
+        if (length < LsnOffsetInPayload + sizeof(ulong) || length > MaxRecordBytes || reader.Position + length > reader.Length)
+            return false;
+        var payload = new byte[length];
+        reader.ReadExactly(payload);
+        return Crc32.Compute(payload) == expectedCrc
+            && BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(LsnOffsetInPayload)) == lsn;
+    }
+
+    /// <summary>
+    /// From a record boundary at <paramref name="start"/>, the offset of the first record whose LSN
+    /// is at or after <paramref name="lsn"/>. Reads each frame's length and its payload's LSN and
+    /// nothing else — no CRC, no decode, no allocation — because these are records the caller has
+    /// already decided it does not want. Stops at anything that is not a well-formed frame; the
+    /// caller's own loop applies the torn-tail rules from there.
+    /// </summary>
+    private long SkipBelow(FileStream reader, long start, ulong lsn, byte[] frame)
+    {
+        Span<byte> head = stackalloc byte[LsnOffsetInPayload + sizeof(ulong)];
+        var position = start;
+        var length = reader.Length;
+        while (position + FrameSize + head.Length <= length)
+        {
+            reader.Seek(position, SeekOrigin.Begin);
+            reader.ReadExactly(frame);
+            var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+            if (payloadLength < (uint)head.Length || payloadLength > MaxRecordBytes || position + FrameSize + payloadLength > length)
+                return position;
+            reader.ReadExactly(head);
+            if (BinaryPrimitives.ReadUInt64LittleEndian(head[LsnOffsetInPayload..]) >= lsn)
+                return position;
+            position += FrameSize + payloadLength;
+            Interlocked.Increment(ref _skippedFrames);
+        }
+
+        return position;
+    }
+
+    /// <summary>
+    /// The commit timestamp of the record at <paramref name="lsn"/>, or null when no intact record
+    /// with that LSN is readable. One seek and one record.
+    /// </summary>
+    private long? ReadTimestampAt(FileStream reader, ulong lsn, byte[] frame)
+    {
+        var offset = Locate(reader, lsn, frame);
+        if (offset + FrameSize > reader.Length)
+            return null;
+        reader.Seek(offset, SeekOrigin.Begin);
+        reader.ReadExactly(frame);
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+        var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(4));
+        if (length < TimestampOffsetInPayload + sizeof(long) || length > MaxRecordBytes || reader.Position + length > reader.Length)
+            return null;
+        var payload = new byte[length];
+        reader.ReadExactly(payload);
+        if (Crc32.Compute(payload) != expectedCrc)
+            return null;
+        if (BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(LsnOffsetInPayload)) != lsn)
+            return null;
+        return BinaryPrimitives.ReadInt64LittleEndian(payload.AsSpan(TimestampOffsetInPayload));
+    }
+
+    // The payload's fixed prefix, identical in every record format version: u16 format, u64 LSN,
+    // i64 commit timestamp. LogFileFormat.WalkRecords reads the LSN at the same offset.
+    private const int LsnOffsetInPayload = sizeof(ushort);
+    private const int TimestampOffsetInPayload = LsnOffsetInPayload + sizeof(ulong);
+
+    /// <summary>
+    /// The sparse LSN→offset index over the log file. Entries are one stride of file bytes apart,
+    /// in LSN order (which is file order: an append assigns the next LSN and writes at the end).
+    /// Sparse because a dense index costs sixteen bytes per record for the whole retained log,
+    /// and the reach it buys over a stride is one stride of frame-header hops.
+    /// </summary>
+    private sealed class OffsetIndex
+    {
+        private readonly List<ulong> _lsns = [];
+        private readonly List<long> _offsets = [];
+        private long _lastOffset = -1;
+
+        public int Count => _lsns.Count;
+
+        public void Clear()
+        {
+            _lsns.Clear();
+            _offsets.Clear();
+            _lastOffset = -1;
+        }
+
+        /// <summary>Notes that the record at <paramref name="lsn"/> begins at <paramref name="offset"/>; keeps it if a stride has passed.</summary>
+        public void Observe(ulong lsn, long offset)
+        {
+            if (_lsns.Count != 0 && offset - _lastOffset < IndexStrideBytes)
+                return;
+            _lsns.Add(lsn);
+            _offsets.Add(offset);
+            _lastOffset = offset;
+        }
+
+        /// <summary>The entry with the greatest LSN at or below <paramref name="lsn"/>, if any.</summary>
+        public bool TryFloor(ulong lsn, out ulong entryLsn, out long offset)
+        {
+            var low = 0;
+            var high = _lsns.Count - 1;
+            var found = -1;
+            while (low <= high)
+            {
+                var mid = low + (high - low) / 2;
+                if (_lsns[mid] <= lsn)
+                {
+                    found = mid;
+                    low = mid + 1;
+                }
+                else
+                {
+                    high = mid - 1;
+                }
+            }
+
+            if (found < 0)
+            {
+                entryLsn = 0;
+                offset = 0;
+                return false;
+            }
+
+            entryLsn = _lsns[found];
+            offset = _offsets[found];
+            return true;
+        }
+
+        /// <summary>
+        /// Reflects a compaction that removed every record at or below <paramref name="removedThrough"/>
+        /// and with them <paramref name="removedBytes"/> of file ahead of the survivors.
+        /// </summary>
+        public void Rebase(ulong removedThrough, long removedBytes)
+        {
+            var survivors = 0;
+            while (survivors < _lsns.Count && _lsns[survivors] <= removedThrough)
+                survivors++;
+            _lsns.RemoveRange(0, survivors);
+            _offsets.RemoveRange(0, survivors);
+            for (var i = 0; i < _offsets.Count; i++)
+                _offsets[i] -= removedBytes;
+            _lastOffset = _offsets.Count == 0 ? -1 : _offsets[^1];
         }
     }
 
@@ -758,6 +1045,7 @@ public sealed class FileCommitLog : ICommitLog
 
     private void Recover()
     {
+        _index.Clear();
         if (_stream.Length < HeaderSize)
         {
             _stream.SetLength(0);
@@ -839,6 +1127,7 @@ public sealed class FileCommitLog : ICommitLog
             // Max, not assignment: a crash between writing the base sidecar and swapping the
             // compacted file can leave already-truncated records on disk below the base.
             _headLsn = Math.Max(_headLsn, record.Lsn);
+            _index.Observe(record.Lsn, position);
             intactEnd = position + FrameSize + payloadLength;
         }
     }
@@ -883,10 +1172,12 @@ public sealed class FileCommitLog : ICommitLog
     /// </summary>
     internal void TruncateBefore(ulong upToLsn)
     {
-        ulong head;
-        long newLength;
-        lock (_fsyncLock)
+        lock (_truncateLock)
         {
+            // Phase one, under the append lock only long enough to read the decision's inputs:
+            // what to remove, and how much of the file is already there to be copied.
+            long copiedThrough;
+            ulong baseAtStart;
             lock (_lock)
             {
                 if (_disposed || _failure is not null)
@@ -894,52 +1185,109 @@ public sealed class FileCommitLog : ICommitLog
                 upToLsn = Math.Min(upToLsn, _headLsn);
                 if (upToLsn <= _baseLsn)
                     return;
-
                 _stream.Flush();
-                var tempPath = FilePath + ".compact";
-                using (var compact = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    Span<byte> header = stackalloc byte[HeaderSize];
-                    BinaryPrimitives.WriteUInt32LittleEndian(header, Magic);
-                    BinaryPrimitives.WriteUInt16LittleEndian(header[4..], FileFormatVersion);
-                    BinaryPrimitives.WriteUInt16LittleEndian(header[6..], 0);
-                    compact.Write(header);
+                copiedThrough = _stream.Length;
+                baseAtStart = _baseLsn;
+            }
 
-                    var frame = new byte[FrameSize];
-                    _stream.Seek(HeaderSize, SeekOrigin.Begin);
-                    while (_stream.Position + FrameSize <= _stream.Length)
+            // Phase two, with no lock held: find where the survivors begin and copy them as bytes.
+            // This used to decode every record in the file — removed and surviving alike — to
+            // learn its LSN, and did so holding the append lock and the fsync lock, so every
+            // snapshot froze the engine for as long as it took to rewrite the whole retained log.
+            // The index puts the first survivor within a stride; the survivors need no decoding
+            // to be copied; and appends that land during the copy are picked up in phase three.
+            var tempPath = FilePath + ".compact";
+            var frame = new byte[FrameSize];
+            var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var compact = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None);
+            long firstSurviving;
+            try
+            {
+                firstSurviving = Math.Min(Locate(reader, upToLsn + 1, frame), copiedThrough);
+
+                Span<byte> header = stackalloc byte[HeaderSize];
+                BinaryPrimitives.WriteUInt32LittleEndian(header, Magic);
+                BinaryPrimitives.WriteUInt16LittleEndian(header[4..], FileFormatVersion);
+                BinaryPrimitives.WriteUInt16LittleEndian(header[6..], 0);
+                compact.Write(header);
+                CopyRange(reader, firstSurviving, copiedThrough, compact);
+            }
+            catch
+            {
+                reader.Dispose();
+                compact.Dispose();
+                File.Delete(tempPath);
+                throw;
+            }
+
+            BetweenCompactionPhases?.Invoke();
+
+            // Phase three, under both locks: the tail appended meanwhile, the fsync, the swap.
+            // Only this part stalls an append, and it is proportional to what arrived during the
+            // copy, not to the log.
+            ulong head;
+            long newLength;
+            lock (_fsyncLock)
+            {
+                lock (_lock)
+                {
+                    // A poisoned log rolled its file back to the durable length, possibly below
+                    // what was copied; a concurrent base change means another truncation won the
+                    // race. Either way this compaction describes a file that no longer exists.
+                    if (_disposed || _failure is not null || _baseLsn != baseAtStart || _stream.Length < copiedThrough)
                     {
-                        _stream.ReadExactly(frame);
-                        var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
-                        if (length == 0 || length > MaxRecordBytes || _stream.Position + length > _stream.Length)
-                            break;
-                        var payload = new byte[length];
-                        _stream.ReadExactly(payload);
-                        var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + length));
-                        if (record.Lsn > upToLsn)
-                        {
-                            compact.Write(frame);
-                            compact.Write(payload);
-                        }
+                        reader.Dispose();
+                        compact.Dispose();
+                        File.Delete(tempPath);
+                        return;
                     }
 
-                    compact.Flush(flushToDisk: true);
+                    _stream.Flush();
+                    try
+                    {
+                        CopyRange(reader, copiedThrough, _stream.Length, compact);
+                        compact.Flush(flushToDisk: true);
+                    }
+                    finally
+                    {
+                        reader.Dispose();
+                        compact.Dispose();
+                    }
+
+                    WriteBaseLsn(upToLsn);
+                    _flushHandle.Dispose();
+                    _stream.Dispose();
+                    File.Move(tempPath, FilePath, overwrite: true);
+                    _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+                    _stream.Seek(0, SeekOrigin.End);
+                    _flushHandle = OpenFlushHandle();
+                    _baseLsn = upToLsn;
+                    _index.Rebase(upToLsn, firstSurviving - HeaderSize);
+                    head = _headLsn;
+                    newLength = _stream.Length;
                 }
-
-                WriteBaseLsn(upToLsn);
-                _flushHandle.Dispose();
-                _stream.Dispose();
-                File.Move(tempPath, FilePath, overwrite: true);
-                _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
-                _stream.Seek(0, SeekOrigin.End);
-                _flushHandle = OpenFlushHandle();
-                _baseLsn = upToLsn;
-                head = _headLsn;
-                newLength = _stream.Length;
             }
-        }
 
-        AdvanceDurable(head, newLength);
+            AdvanceDurable(head, newLength);
+        }
+    }
+
+    /// <summary>Copies <c>[start, end)</c> of <paramref name="from"/> onto the end of <paramref name="to"/>, as bytes.</summary>
+    private static void CopyRange(FileStream from, long start, long end, FileStream to)
+    {
+        if (end <= start)
+            return;
+        from.Seek(start, SeekOrigin.Begin);
+        var buffer = new byte[(int)Math.Min(end - start, 1024 * 1024)];
+        var remaining = end - start;
+        while (remaining > 0)
+        {
+            var read = from.Read(buffer, 0, (int)Math.Min(buffer.Length, remaining));
+            if (read <= 0)
+                throw new EndOfStreamException($"'{from.Name}' ended {remaining} bytes before the range a compaction was copying.");
+            to.Write(buffer, 0, read);
+            remaining -= read;
+        }
     }
 
     private ulong ReadBaseLsn()
