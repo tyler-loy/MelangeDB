@@ -17,24 +17,35 @@ namespace MelangeDB.Cluster;
 /// </summary>
 internal sealed class HubBulkRouter : IBulkRouter
 {
-    private readonly HubRuntime _hub;
-    private readonly IShardStrategy _strategy;
+    private readonly IServiceProvider _services;
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
+
+    // Resolved on first use rather than in the constructor. The registration is unconditional
+    // (the role is not bound yet when AddMelangeCluster runs), so this type is constructed on
+    // shard nodes too, where standing a HubRuntime up would be both wrong and expensive — and
+    // where the absence of an IShardStrategy is not an error to throw at DI resolution time.
+    private HubRuntime? _hub;
+
+    private HubRuntime Hub => _hub ??= _services.GetRequiredService<HubRuntime>();
+
+    private IShardStrategy Strategy =>
+        _services.GetService<IShardStrategy>()
+        ?? throw new InvalidOperationException(
+            "No IShardStrategy is registered; a hub cannot route bulk rows to shards without one.");
 
     public HubBulkRouter(IServiceProvider services, IOptionsMonitor<MelangeDbOptions> options)
     {
-        _hub = services.GetRequiredService<HubRuntime>();
+        _services = services;
         _options = options;
-        _strategy = services.GetService<IShardStrategy>()
-            ?? throw new InvalidOperationException(
-                "No IShardStrategy is registered; a hub cannot route bulk rows to shards without one.");
     }
 
     public async Task<IReadOnlyList<BulkResult>> RouteAsync(
         Identity caller, IReadOnlyList<BulkRow> rows, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(rows);
-        var schema = _hub.Engine.Schema;
+        var hub = Hub;
+        var schema = hub.Engine.Schema;
+        var strategy = Strategy;
         List<BulkRow> local = [];
         Dictionary<ShardKey, List<BulkRowDto>> groups = [];
 
@@ -42,10 +53,13 @@ internal sealed class HubBulkRouter : IBulkRouter
         {
             if (!schema.TryGetByName(row.Table, out var table))
             {
-                // Let the local engine raise it: one message for an unknown table, from the one
-                // place that owns the wording, rather than a second one that drifts from it.
-                local.Add(row);
-                continue;
+                // Refused here rather than deferred to the local engine, which would raise the
+                // same message but only after PrepareDestinationsAsync had already run — and with
+                // Bulk:CreateShards on, that step creates shards and their data directories. A
+                // batch this router will not route must not create anything on its way to being
+                // refused. The wording matches the engine's for the same reason it always did.
+                throw new ArgumentException(
+                    $"No table named '{row.Table}' is registered.", nameof(rows));
             }
 
             if (table.Placement != Placement.Partitioned)
@@ -55,7 +69,7 @@ internal sealed class HubBulkRouter : IBulkRouter
             }
 
             var (bytes, supplied) = Preimage(table, row);
-            var shard = _strategy.ShardForRow(table.Id, table.ToRowRef(bytes));
+            var shard = strategy.ShardForRow(table.Id, table.ToRowRef(bytes));
             (groups.TryGetValue(shard, out var group) ? group : groups[shard] = [])
                 .Add(new BulkRowDto(table.Name, bytes, supplied));
         }
@@ -65,7 +79,7 @@ internal sealed class HubBulkRouter : IBulkRouter
         List<BulkResult> results = [];
         if (local.Count > 0)
         {
-            var record = _hub.Engine.BulkInsert(caller, local);
+            var record = hub.Engine.BulkInsert(caller, local);
             results.Add(new BulkResult(Shard: null, record?.Lsn ?? 0, local.Count));
         }
 
@@ -76,7 +90,7 @@ internal sealed class HubBulkRouter : IBulkRouter
         // batch is sound, because rows are upserts and [AutoInc] is originator-prefixed.
         foreach (var (shard, group) in groups.OrderBy(static g => g.Key.Value))
         {
-            var reply = await _hub.BulkToShardAsync(shard, caller, [.. group], cancellationToken).ConfigureAwait(false);
+            var reply = await hub.BulkToShardAsync(shard, caller, [.. group], cancellationToken).ConfigureAwait(false);
             results.Add(new BulkResult(shard.Value, reply.Lsn, reply.Rows));
         }
 
@@ -119,7 +133,7 @@ internal sealed class HubBulkRouter : IBulkRouter
     /// </summary>
     private async Task PrepareDestinationsAsync(IEnumerable<ShardKey> shards, CancellationToken ct)
     {
-        var missing = shards.Where(shard => _hub.Membership.GetAssignment(shard) is null).ToList();
+        var missing = shards.Where(shard => Hub.Membership.GetAssignment(shard) is null).ToList();
         if (missing.Count == 0)
             return;
 
@@ -130,7 +144,7 @@ internal sealed class HubBulkRouter : IBulkRouter
             // same breath. Doing it up front also keeps the all-or-nothing promise — if a shard
             // cannot be brought up, nothing has been written yet.
             foreach (var shard in missing)
-                await _hub.EnsureShardOpenAsync(shard, ct).ConfigureAwait(false);
+                await Hub.EnsureShardOpenAsync(shard, ct).ConfigureAwait(false);
             return;
         }
 

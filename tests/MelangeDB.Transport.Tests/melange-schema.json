@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "0.2.1.0",
-  "schemaHash": "9833bdb1f8eadb2e878adabbd133226042a01e51c0ed80002bb690f938837ea2",
+  "schemaHash": "7b4f4c4014f14a7d15bcdfd70bc381ff401d9fcaeebed0b8e1672cb23033a227",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -241,6 +241,14 @@
           "autoInc": false,
           "unique": false,
           "indexed": true
+        },
+        {
+          "name": "Visits",
+          "kind": "UInt64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
         }
       ]
     },
@@ -449,6 +457,31 @@
         {
           "name": "elevation",
           "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "EditChunkVisited",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "editCount",
+          "kind": "UInt32",
+          "isArray": false
+        },
+        {
+          "name": "elevation",
+          "kind": "Int32",
+          "isArray": false
+        },
+        {
+          "name": "visits",
+          "kind": "UInt64",
           "isArray": false
         }
       ]

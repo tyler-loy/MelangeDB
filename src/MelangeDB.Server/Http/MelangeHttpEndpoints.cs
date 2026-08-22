@@ -403,6 +403,25 @@ internal static class MelangeHttpEndpoints
         }
 
         var built = AdHocAggregateBuilder.Build(aggregate, transport.Engine.Schema);
+
+        // Placement and tier are independent axes, so closing the empty-result lie for row shapes
+        // (#114) did not close it here: a Partitioned table can also be Relational, and this node's
+        // relational tier holds only what this node's engine wrote. On a hub that is every shard's
+        // rows except the partitioned ones — the aggregate would answer a confident number over a
+        // subset, which is worse than the empty result the row path refuses. Checked after Build
+        // for the same reason the row path checks after Compile: Build answers unknown and
+        // wrong-tier tables first, so this refusal is never an existence oracle.
+        var clusterRole = transport.Options.Cluster.Role;
+        if (clusterRole != ClusterRole.None && built.Table.Placement == Placement.Partitioned)
+        {
+            await WriteErrorAsync(
+                context, StatusCodes.Status400BadRequest, MelangeErrorCodes.PartitionedElsewhere,
+                $"Table '{built.Table.Name}' is Placement.Partitioned, and its rows live in the shard engines rather "
+                + $"than in this node's (Cluster:Role is {clusterRole}). An aggregate here would count only what this "
+                + "node wrote and report it as the total.").ConfigureAwait(false);
+            return;
+        }
+
         var executor = (Core.IRelationalQueryExecutor?)context.RequestServices.GetService(typeof(Core.IRelationalQueryExecutor));
         if (executor is null)
         {

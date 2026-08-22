@@ -37,6 +37,15 @@ public partial struct EditedChunk
     /// <summary>Signed, so the refusal for kinds whose default is not their minimum has a subject.</summary>
     [Index]
     public int Elevation;
+
+    /// <summary>
+    /// Unsigned 64-bit, which is the kind the literal path cannot otherwise reach: a SQL integer
+    /// literal parses as <c>long</c>, so <c>&lt;&gt; 0</c> is the only literal form that can name
+    /// the default of a column whose range runs past <c>long.MaxValue</c>. Its upper bound is also
+    /// the only one where an off-by-one in the compiled range would drop a real row.
+    /// </summary>
+    [Index]
+    public ulong Visits;
 }
 
 /// <summary>Player-shaped: identity-keyed with an equality-indexed room.</summary>
@@ -317,8 +326,20 @@ public sealed class TransportReducers
     /// <summary>Writes the counter and the flag together, the way a caller carrying both must.</summary>
     [Reducer]
     public void EditChunk(ReducerContext ctx, long id, uint editCount, int elevation)
+        => EditChunkVisited(ctx, id, editCount, elevation, 0);
+
+    /// <summary>As <see cref="EditChunk"/>, plus the UInt64 counter, for the top-of-range cases.</summary>
+    [Reducer]
+    public void EditChunkVisited(ReducerContext ctx, long id, uint editCount, int elevation, ulong visits)
     {
-        var chunk = new EditedChunk { Id = id, EditCount = editCount, IsEdited = editCount != 0, Elevation = elevation };
+        var chunk = new EditedChunk
+        {
+            Id = id,
+            EditCount = editCount,
+            IsEdited = editCount != 0,
+            Elevation = elevation,
+            Visits = visits,
+        };
         if (ctx.Db.EditedChunk.Id.Find(id) is not null)
             ctx.Db.EditedChunk.Update(chunk);
         else
