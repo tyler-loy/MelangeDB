@@ -22,6 +22,8 @@ internal sealed class ReadViewlessStore(IHotStore inner) : IHotStore
     public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row) =>
         inner.TryGetRow(table, key, out row);
 
+    public bool ContainsKey(TableId table, in RowKey key) => inner.ContainsKey(table, key);
+
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table) => inner.Scan(table);
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value) =>

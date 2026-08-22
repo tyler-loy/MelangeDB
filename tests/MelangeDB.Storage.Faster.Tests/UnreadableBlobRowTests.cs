@@ -108,4 +108,53 @@ public class UnreadableBlobRowTests
         Assert.NotNull(rebuilt);
         Assert.Equal(StoreContractTests.MakeBlob(7, 300), rebuilt!.Value.Data);
     }
+
+    [Fact]
+    public void ContainsKey_is_true_for_a_corrupt_row_without_reading_it()
+    {
+        using var harness = new StoreHarness(StoreKind.Faster, tables: [typeof(TerrainBlob)]);
+        harness.Invoke("seed", ctx =>
+            ctx.Db.Insert(new TerrainBlob { ChunkId = 5, Region = 1, Data = StoreContractTests.MakeBlob(5, 300) }));
+
+        var store = (FasterHotStore)harness.Engine.HotStore;
+        var table = harness.Engine.Schema.Tables.Single(t => t.RowType == typeof(TerrainBlob));
+        var key = SchemaKeyCodec.Encode(table.PrimaryKey, 5L);
+        store.CorruptBlobPayloadForTest(table.Id, key, ordinal: 0, StoreContractTests.MakeBlob(9, 339));
+
+        // The row is present and must be reportable as present, without decoding it — a point read
+        // throws on the corrupt payload, but existence is a directory question.
+        Assert.True(store.ContainsKey(table.Id, key));
+        Assert.Throws<InvalidDataException>(() => store.TryGetRow(table.Id, key, out _));
+        Assert.False(store.ContainsKey(table.Id, SchemaKeyCodec.Encode(table.PrimaryKey, 999L)));
+    }
+
+    [Fact]
+    public void A_corrupt_row_can_be_deleted_and_rewritten_live()
+    {
+        // With no subscription on the table (so the commit fan-out reads no pre-image), a reducer's
+        // existence check no longer decodes the row, and the store's delete works off the directory
+        // — so a poisoned row is removable and re-insertable while the store is live, rather than
+        // stuck until a restart. (The subscribed case, where the fan-out reads the pre-image, is
+        // covered at the SubscriptionEngine layer.)
+        using var harness = new StoreHarness(StoreKind.Faster, tables: [typeof(TerrainBlob)]);
+        harness.Invoke("seed", ctx =>
+        {
+            ctx.Db.Insert(new TerrainBlob { ChunkId = 1, Region = 1, Data = StoreContractTests.MakeBlob(1, 300) });
+            ctx.Db.Insert(new TerrainBlob { ChunkId = 2, Region = 1, Data = StoreContractTests.MakeBlob(2, 300) });
+        });
+
+        var store = (FasterHotStore)harness.Engine.HotStore;
+        var table = harness.Engine.Schema.Tables.Single(t => t.RowType == typeof(TerrainBlob));
+        store.CorruptBlobPayloadForTest(table.Id, SchemaKeyCodec.Encode(table.PrimaryKey, 1L), ordinal: 0, StoreContractTests.MakeBlob(9, 339));
+
+        // Delete the poisoned row live.
+        harness.Invoke("purge", ctx => Assert.True(ctx.Db.Delete<TerrainBlob>(1L)));
+        Assert.Null(harness.Engine.CommittedView.Find<TerrainBlob>(1L));
+
+        // And a fresh insert of the same key writes a clean row that reads back.
+        harness.Invoke("reinsert", ctx =>
+            ctx.Db.Insert(new TerrainBlob { ChunkId = 1, Region = 2, Data = StoreContractTests.MakeBlob(11, 300) }));
+        Assert.Equal(StoreContractTests.MakeBlob(11, 300), harness.Engine.CommittedView.Find<TerrainBlob>(1L)!.Value.Data);
+        Assert.Equal(2, harness.Engine.HotStore.Scan(table.Id).Count());
+    }
 }

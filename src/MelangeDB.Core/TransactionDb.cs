@@ -305,7 +305,7 @@ internal sealed class TransactionDb : IDbView
     {
         if (_writeSet.TryGetPending(table, key, out var pending))
             return pending.Kind != RowOpKind.Delete;
-        return _store.TryGetRow(table, key, out _);
+        return _store.ContainsKey(table, key);
     }
 
     private void CheckUniqueConstraints<TRow>(TableSchema schema, RowCodec<TRow> codec, RowKey selfKey, in TRow row)

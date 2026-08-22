@@ -10,6 +10,31 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **`IHotStore.ContainsKey(table, key)`** — a key-directory existence probe that reads no row. The
+  follow-up to [#137](https://github.com/tyler-loy/MelangeDB/issues/137): an existence check used
+  `TryGetRow`, which decodes the whole row, so a row that is present but whose stored projection
+  cannot be read (a corrupt out-of-line blob) made the check throw — and every write path probes
+  existence first (`Insert`/`Update`/`Delete`, bulk staging), so a single poisoned row wedged the
+  whole table until a restart. `TransactionDb.Exists` and bulk staging now use `ContainsKey`, and
+  the FASTER store answers it from the directory (paged) or the resident map without touching the
+  out-of-line payload.
+
+### Fixed
+
+- **A poisoned row no longer wedges the reducers and subscriptions on its table.** Beyond the
+  existence probe above, the two remaining places that read a row's bytes on behalf of *others*
+  now tolerate one that cannot be read: a subscription's initial-set materialization for a
+  primary-key equality or range predicate skips an unreadable row (the gap the read-side #137 fix
+  left — it covered full and index scans but not the point-read-per-key path), and the commit
+  fan-out treats an unreadable pre-image as "no prior row" so a write that repairs or removes the
+  poisoned row commits (reaching subscribers as an insert of the corrected row, or a delete). With
+  these, a scheduled sweep that rewrites the row heals it live rather than failing on it — the
+  world-wide wedge the reference workload hit off one `GrowFlora` row. Point reads (`Find`, HTTP)
+  still surface the fault by design; a caller asking for one row by key is owed the truth about it.
+
+
 ### Fixed
 
 - **A shrinking overwrite of an out-of-line blob no longer leaves a stale, longer tail** — the root
