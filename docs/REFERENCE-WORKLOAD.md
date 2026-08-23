@@ -51,8 +51,17 @@ under `FasterHotStore` with a packed `uint` primary key (`cx<<16 | cz`). Every c
 every chunk crossing**, at roughly two crossings per second across a fleet. That is the shape any
 work on primary-key ranges has to be measured against: not one window on a small table, but a
 moving band of them, far from key zero, on a table where most rows are never read. It is also what
-found the directory walk that made a range's cost O(keys before the window) — see the CHANGELOG's
-entry on `ScanKeyRange`.
+found the directory walk that made a range's cost O(keys before the window), and then confirmed the
+fix: 12 clients went from 7 position-reducer calls/s back to 120, and from 14,044 shed sends to
+none. See the CHANGELOG's entry on `ScanKeyRange`.
+
+This is the sixth defect the port has found that the suite did not (see [ROADMAP.md](ROADMAP.md)'s
+phase 11 row for the other five), and the first of them that is a *performance* defect rather than a
+correctness one. Worth noting why the suite could not have: every
+range test in the repo runs over a table small enough that the distance to the window is not
+distinguishable from the window itself, so the walk returned the right rows quickly and looked
+correct. What exposed it was a table three orders of magnitude larger with clients reading the far
+end of it — a property of the deployment, not of the query.
 
 **The hybrid Tsavorite+Postgres split — already built by hand.** `tools/admin-web/Services/PostgresStore.cs`
 plus a `ScrapeWorker` samples `WorldStat`/`CreatureCensus` rows out of SpacetimeDB and into Postgres
