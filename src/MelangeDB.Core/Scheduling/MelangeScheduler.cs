@@ -27,6 +27,10 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
     private readonly ILogger _logger;
     private readonly Lock _lock = new();
     private readonly Dictionary<TableId, TimerTable> _tables = [];
+
+    // The floor on a re-arm delay: the platform timer's practical resolution. Below this a
+    // positive delay is re-armed to it, so an early wake cannot spin the fire/re-arm loop. See Rearm.
+    private static readonly TimeSpan RearmFloor = TimeSpan.FromMilliseconds(16);
     private ITimer? _timer;
     private IDisposable? _reload;
     private int _processing;
@@ -349,6 +353,19 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
             var delay = earliest.Value - _time.GetUtcNow();
             if (delay < TimeSpan.Zero)
                 delay = TimeSpan.Zero;
+            else if (delay > TimeSpan.Zero && delay < RearmFloor)
+            {
+                // Never re-arm for a sub-resolution residual. A platform timer routinely wakes a
+                // fraction of a millisecond before the delay it was given; the drain then finds
+                // nothing due (the entry's time has not quite arrived) and, without this floor,
+                // re-arms on the tiny remainder — waking early again on a smaller remainder, tens
+                // of times a second, until the due time finally passes. Waiting at least the
+                // timer's own resolution guarantees the next wake lands at or after the due time,
+                // so it fires rather than spinning. A fire is therefore at most one resolution
+                // late, which is nothing against any real interval.
+                delay = RearmFloor;
+            }
+
             LogMessages.SchedulerRearmed(_logger, delay.TotalMilliseconds);
             _timer?.Change(delay, Timeout.InfiniteTimeSpan);
         }

@@ -496,6 +496,34 @@ public class SchedulerTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task The_scheduler_never_re_arms_for_a_sub_resolution_residual()
+    {
+        // The hot re-arm spin: a platform timer wakes a fraction of a millisecond before its due
+        // time, the drain finds nothing due, and the scheduler re-arms on the tiny remainder —
+        // waking early again on a smaller one, tens of times a second, until the due time passes.
+        // The floor makes a positive re-arm delay at least the timer resolution, so a sub-resolution
+        // remainder is never armed. Here a 1ms-interval timer would ask for a 1ms re-arm; it must be
+        // floored instead.
+        var probe = new SchedulerProbe();
+        using var host = TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+
+        host.Reducers().Call("ScheduleTick", TestApp.Caller, 1L, 0); // 1ms interval — the residual case.
+
+        // Every finite re-arm the scheduler made is either "now" (0, something already due) or at
+        // least the resolution floor — never a sub-floor positive delay that would spin.
+        var floor = TimeSpan.FromMilliseconds(16);
+        Assert.Contains(_time.ArmDelays, d => d >= floor);
+        Assert.DoesNotContain(_time.ArmDelays, d => d > TimeSpan.Zero && d < floor);
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
     private static MeterListener OverrunListener(Action onOverrun)
     {
         var listener = new MeterListener
