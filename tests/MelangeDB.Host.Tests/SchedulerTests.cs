@@ -409,6 +409,93 @@ public class SchedulerTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task Two_scheduled_tables_both_keep_firing_after_a_restart()
+    {
+        // The reference-workload report: after a restart of a world with several scheduled tables,
+        // one keeps firing and the rest go silent. Two interval timers on their own tables, both
+        // alive on the first boot, both must still fire after a plain restart.
+        var probe = new SchedulerProbe();
+        IHost Build() => TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+
+        using (var host = Build())
+        {
+            await host.StartAsync(TestContext.Current.CancellationToken);
+            host.Reducers().Call("ScheduleTick", TestApp.Caller, 2_000L, 0);
+            host.Reducers().Call("ScheduleSecond", TestApp.Caller, 5_000L);
+
+            _time.Advance(TimeSpan.FromSeconds(20));
+            Assert.True(probe.WorldTicks > 0, "world tick never fired on the first boot");
+            Assert.True(probe.SecondTicks > 0, "second tick never fired on the first boot");
+            await host.StopAsync(TestContext.Current.CancellationToken);
+        }
+
+        var worldBefore = probe.WorldTicks;
+        var secondBefore = probe.SecondTicks;
+
+        using (var restarted = Build())
+        {
+            await restarted.StartAsync(TestContext.Current.CancellationToken);
+
+            // Both timers are in the log; both must resume after the restart.
+            Assert.Equal(1, restarted.Engine().CommittedView.Count<WorldTickTimer>());
+            Assert.Equal(1, restarted.Engine().CommittedView.Count<SecondTickTimer>());
+
+            _time.Advance(TimeSpan.FromSeconds(20));
+            Assert.True(probe.WorldTicks > worldBefore, "world tick stopped firing after the restart");
+            Assert.True(probe.SecondTicks > secondBefore, "second tick stopped firing after the restart");
+            await restarted.StopAsync(TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task Two_scheduled_tables_both_keep_firing_after_a_restart_from_a_snapshot()
+    {
+        // A migrated store restarts from the sealing snapshot the migration took, not from a full
+        // log replay. This is the same two-timer restart, but the store is snapshotted (and the log
+        // truncated) before the stop, so the restart bootstraps from the snapshot — the shape a
+        // post-migration restart actually has.
+        var probe = new SchedulerProbe();
+        IHost Build() => TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+
+        using (var host = Build())
+        {
+            await host.StartAsync(TestContext.Current.CancellationToken);
+            host.Reducers().Call("ScheduleTick", TestApp.Caller, 2_000L, 0);
+            host.Reducers().Call("ScheduleSecond", TestApp.Caller, 5_000L);
+
+            _time.Advance(TimeSpan.FromSeconds(20));
+            Assert.True(probe.WorldTicks > 0 && probe.SecondTicks > 0);
+
+            // Seal a snapshot (and truncate) so the next boot bootstraps from it, like a migrated store.
+            host.Engine().TakeSnapshot();
+            await host.StopAsync(TestContext.Current.CancellationToken);
+        }
+
+        var worldBefore = probe.WorldTicks;
+        var secondBefore = probe.SecondTicks;
+
+        using (var restarted = Build())
+        {
+            await restarted.StartAsync(TestContext.Current.CancellationToken);
+            Assert.Equal(1, restarted.Engine().CommittedView.Count<WorldTickTimer>());
+            Assert.Equal(1, restarted.Engine().CommittedView.Count<SecondTickTimer>());
+
+            _time.Advance(TimeSpan.FromSeconds(20));
+            Assert.True(probe.WorldTicks > worldBefore, "world tick stopped firing after a snapshot restart");
+            Assert.True(probe.SecondTicks > secondBefore, "second tick stopped firing after a snapshot restart");
+            await restarted.StopAsync(TestContext.Current.CancellationToken);
+        }
+    }
+
     private static MeterListener OverrunListener(Action onOverrun)
     {
         var listener = new MeterListener

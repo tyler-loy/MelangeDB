@@ -399,6 +399,14 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
                 case ColumnKind.ScheduleAt:
                     _ = reader.ReadScheduleAt();
                     break;
+                default:
+                    // Every ColumnKind must advance the reader, or the columns after it read from
+                    // the wrong offset and the ScheduleAt at the end decodes as garbage — silently,
+                    // with no fire and no error. A kind this switch does not handle (a future 17th)
+                    // must fail loudly here rather than mis-time every timer on the table.
+                    throw new NotSupportedException(
+                        $"Table '{schema.Name}': column '{schema.Columns[i].Name}' has kind {schema.Columns[i].Kind}, "
+                        + "which the scheduler's ScheduleAt walk does not handle; the timer cadence cannot be read.");
             }
         }
 
