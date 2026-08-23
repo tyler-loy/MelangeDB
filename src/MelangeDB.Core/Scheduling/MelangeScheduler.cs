@@ -253,8 +253,11 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
                 catch (Exception exception)
                 {
                     // One faulting drain must not wedge every timer, and must not skip the re-arm
-                    // below. Latent-safe: the fire path contains its own telemetry so a drain here
-                    // throws only on something unexpected, which is logged rather than propagated.
+                    // below. It also must not crash the process: the timer callback (see Start) is a
+                    // bare delegate with no handler of its own, so an exception propagating out of
+                    // here would terminate the process rather than fail one tick. Caught, logged,
+                    // and re-armed. Latent-safe: the fire path contains its own telemetry, so a
+                    // drain reaches here only on something genuinely unexpected.
                     LogMessages.SchedulerDrainFaulted(_logger, exception);
                 }
 

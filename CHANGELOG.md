@@ -41,7 +41,10 @@ All packages ship together at one version; there is no per-package versioning. S
   swallowed and logged (EventId 1312) rather than propagating out of the fire — which used to skip
   the timer's reschedule and its re-arm. Telemetry must never affect dispatch. As defence in depth,
   a drain that throws for any other reason is now caught, logged (1311), and the timer re-armed
-  regardless (EventId list: 1310 re-entry, 1311 drain fault, 1312 telemetry fault).
+  regardless — which also **prevents a process crash**: the timer callback is a bare delegate with
+  no exception handling of its own, so before this an unhandled exception in a drain terminated the
+  process; it is now a logged, recovered event (EventId list: 1310 re-entry, 1311 drain fault,
+  1312 telemetry fault).
 
 
 - **The scheduler no longer spins re-arming its timer.** A platform timer routinely wakes a
