@@ -524,6 +524,84 @@ public class SchedulerTests : IDisposable
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 
+    [Fact]
+    public async Task A_faulting_drain_re_arms_and_keeps_firing_instead_of_wedging()
+    {
+        // The prod stall: the dispatch drain threw, and because Rearm ran AFTER the try/finally the
+        // timer was left unarmed — only the next commit's OnCommit re-armed it, so on an idle world
+        // the scheduler sat idle for tens of seconds between fires. Rearm now runs in the finally,
+        // and a faulting drain is swallowed and logged rather than wedging every timer. A fault
+        // injected into one drain must not stop the timer from firing on the next tick.
+        var probe = new SchedulerProbe();
+        using var host = TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        host.Reducers().Call("ScheduleTick", TestApp.Caller, 5_000L, 0);
+
+        _time.Advance(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, probe.WorldTicks);
+
+        // The next drain throws once, then clears itself.
+        var scheduler = host.Services.GetRequiredService<MelangeScheduler>();
+        scheduler.DrainFaultInjection = () =>
+        {
+            scheduler.DrainFaultInjection = null;
+            throw new InvalidOperationException("injected drain fault");
+        };
+
+        // Advancing triggers the faulting drain. It must not propagate (no crash), and the timer
+        // must still be armed afterward — so the next interval fires.
+        var thrown = Record.Exception(() => _time.Advance(TimeSpan.FromSeconds(5)));
+        Assert.Null(thrown);
+        Assert.Equal(2, probe.WorldTicks);
+
+        // And it keeps going on the interval after the fault, not just the one recovery fire.
+        _time.Advance(TimeSpan.FromSeconds(5));
+        Assert.Equal(3, probe.WorldTicks);
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task A_re_entrant_drain_request_is_not_dropped()
+    {
+        // The prod idle-stall: a ProcessDueFires that re-enters while another drain holds the guard
+        // used to return having armed nothing, dropping its re-arm. On a committing world the next
+        // commit's OnCommit re-armed within milliseconds and hid it; on an idle world nothing
+        // committed, so the timer went dark. The guard now records the request and the in-flight
+        // drain honours it — so a re-entrant call causes a rescan (the drain runs again) rather than
+        // being lost. Observed by counting drains: the injected re-entry must produce a second one.
+        var probe = new SchedulerProbe();
+        using var host = TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        host.Reducers().Call("ScheduleTick", TestApp.Caller, 10_000L, 0);
+
+        var scheduler = host.Services.GetRequiredService<MelangeScheduler>();
+        var drains = 0;
+        scheduler.DrainFaultInjection = () =>
+        {
+            drains++;
+            if (drains == 1)
+                scheduler.PumpForTest(); // re-enter while this drain holds the guard
+        };
+
+        // The timer fires, the drain runs, and its first iteration re-enters the scheduler. With the
+        // request honoured, the drain runs a second time (the rescan); with the old bare guard the
+        // re-entry was dropped and the drain ran exactly once.
+        _time.Advance(TimeSpan.FromSeconds(10));
+        Assert.True(drains >= 2, $"a re-entrant drain request was dropped: the drain ran {drains} time(s), no rescan");
+
+        scheduler.DrainFaultInjection = null;
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
     private static MeterListener OverrunListener(Action onOverrun)
     {
         var listener = new MeterListener
