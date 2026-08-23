@@ -23,6 +23,27 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The scheduler no longer goes dark on an idle world after dropping a re-arm.** Its dispatch runs
+  one drain at a time behind a guard; a call that arrived while a drain was running returned having
+  armed nothing, dropping its re-arm. On a world that was committing (players online) the next
+  commit's timer-observer re-armed within milliseconds and hid it — but on an idle world, where the
+  only commits come from scheduled ticks, the thing that would re-arm the scheduler is the tick it
+  just failed to run, so it stayed dark until some incidental commit and fired erratically, tens of
+  seconds apart, with the process otherwise idle. The guard now records the request and the
+  in-flight drain honours it (a rescan flag re-checked after each drain), so a re-entrant request is
+  never lost and liveness never depends on a commit an idle world does not produce. Found by
+  instrumenting a real restored store; the drain also logs a start summary (EventId 1303) and its
+  registration and re-arm decisions at Debug (1304–1309).
+
+- **A scheduler tick's telemetry can no longer stall dispatch.** Every `StartSchedulerTick` /
+  `RecordSchedulerTick` / `RecordSchedulerOverrun` / span dispose in the fire path is contained: a
+  metric or span export that throws (an exporter in a bad state, a meter disposed under load) is
+  swallowed and logged (EventId 1312) rather than propagating out of the fire — which used to skip
+  the timer's reschedule and its re-arm. Telemetry must never affect dispatch. As defence in depth,
+  a drain that throws for any other reason is now caught, logged (1311), and the timer re-armed
+  regardless (EventId list: 1310 re-entry, 1311 drain fault, 1312 telemetry fault).
+
+
 - **The scheduler no longer spins re-arming its timer.** A platform timer routinely wakes a
   fraction of a millisecond before the delay it was armed with; the dispatch drain then found
   nothing due (the entry's time had not quite arrived) and re-armed on the tiny remainder — waking

@@ -34,6 +34,13 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
     private ITimer? _timer;
     private IDisposable? _reload;
     private int _processing;
+    private bool _rescanRequested;
+
+    /// <summary>Test-only: invoked at the top of each drain iteration; throwing exercises the fault path.</summary>
+    internal Action? DrainFaultInjection { get; set; }
+
+    /// <summary>Test-only: runs a drain the way the timer callback does, to exercise re-entrancy.</summary>
+    internal void PumpForTest() => ProcessDueFires();
     private volatile bool _started;
     private volatile bool _stopped;
 
@@ -201,129 +208,205 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
     /// Reentrant invocations (a fire advancing a manual clock, an options reload mid-loop) fold
     /// into the running loop, which re-scans after every fire.
     /// </summary>
+    /// <summary>
+    /// The dispatch loop: fire every due entry, then re-arm the timer at the next earliest.
+    /// <para>
+    /// Only one drain runs at a time, and it never loses a wake. Every caller (the timer callback,
+    /// an options reload, a start) requests a scan; whoever wins the guard drains and keeps draining
+    /// while any request arrived while it was working. A caller that finds the guard already held
+    /// does <b>not</b> just return and drop its re-arm — it leaves the request flag set, and the
+    /// in-flight drainer picks it up before it exits. That closes the bug behind the reference
+    /// workload's idle stall: the bare guard dropped the re-entrant caller's re-arm, and on a world
+    /// that was committing (players online) the very next commit's <see cref="OnCommit"/> re-armed
+    /// within milliseconds, hiding it — but on an <em>idle</em> world, where the only commits come
+    /// from scheduled ticks, the thing that would re-arm the scheduler is the tick the scheduler
+    /// just failed to run, so it stayed dark until some incidental commit, firing erratically for
+    /// tens of seconds at a time with the process otherwise idle.
+    /// </para>
+    /// </summary>
     private void ProcessDueFires()
     {
         if (!_started || _stopped)
             return;
-        if (Interlocked.Exchange(ref _processing, 1) == 1)
-            return;
-        try
+
+        // Request a scan, then drain while requests keep arriving. The flag is set before the guard
+        // is tested, so a caller that loses the guard has already recorded its request for the
+        // winner to honour.
+        Volatile.Write(ref _rescanRequested, true);
+        while (Volatile.Read(ref _rescanRequested))
         {
-            while (!_stopped)
+            if (Interlocked.Exchange(ref _processing, 1) == 1)
             {
-                var options = _options.CurrentValue.Scheduler;
-                if (!options.Enabled)
-                    break;
-                TimerTable? dueTable = null;
-                TimerEntry? dueEntry = null;
-                lock (_lock)
+                // Another drain holds the guard; it will see the flag we set above before it exits,
+                // so this request is not lost. (This is the ~per-minute re-entry the stall traced to.)
+                LogMessages.SchedulerDrainReentered(_logger);
+                return;
+            }
+
+            try
+            {
+                Volatile.Write(ref _rescanRequested, false);
+                try
                 {
-                    var now = _time.GetUtcNow();
-                    foreach (var table in _tables.Values)
+                    Drain();
+                }
+                catch (Exception exception)
+                {
+                    // One faulting drain must not wedge every timer, and must not skip the re-arm
+                    // below. Latent-safe: the fire path contains its own telemetry so a drain here
+                    // throws only on something unexpected, which is logged rather than propagated.
+                    LogMessages.SchedulerDrainFaulted(_logger, exception);
+                }
+
+                Rearm();
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _processing, 0);
+            }
+
+            // Loop: if a caller set the flag while we were draining or re-arming, drain again.
+        }
+    }
+
+    /// <summary>Fires every currently-due entry, earliest first, until none remain.</summary>
+    private void Drain()
+    {
+        DrainFaultInjection?.Invoke();
+        while (!_stopped)
+        {
+            var options = _options.CurrentValue.Scheduler;
+            if (!options.Enabled)
+                break;
+            TimerTable? dueTable = null;
+            TimerEntry? dueEntry = null;
+            lock (_lock)
+            {
+                var now = _time.GetUtcNow();
+                foreach (var table in _tables.Values)
+                {
+                    foreach (var entry in table.Entries.Values)
                     {
-                        foreach (var entry in table.Entries.Values)
+                        if (entry.Due <= now && (dueEntry is null || entry.Due < dueEntry.Due))
                         {
-                            if (entry.Due <= now && (dueEntry is null || entry.Due < dueEntry.Due))
-                            {
-                                dueTable = table;
-                                dueEntry = entry;
-                            }
+                            dueTable = table;
+                            dueEntry = entry;
                         }
                     }
                 }
-
-                if (dueEntry is null)
-                {
-                    // Nothing due. If timers exist, record how far the earliest one is from now —
-                    // the number that says whether a "dead" timer is parked in the future (a Due
-                    // problem) or simply between fires. Debug: one line per drain that finds nothing.
-                    LogMessages.SchedulerNothingDue(_logger, EarliestDelayMillis());
-                    break;
-                }
-
-                LogMessages.SchedulerFiring(_logger, dueTable!.Schema.Name);
-
-                // Never fire while holding the state lock: the fire takes the engine's write
-                // lock, and committing threads inside that lock call OnCommit, which takes the
-                // state lock — holding both here would be a lock-order inversion.
-                Fire(dueTable!, dueEntry, options.OverrunPolicy);
             }
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _processing, 0);
-        }
 
-        Rearm();
+            if (dueEntry is null)
+            {
+                LogMessages.SchedulerNothingDue(_logger, EarliestDelayMillis());
+                break;
+            }
+
+            LogMessages.SchedulerFiring(_logger, dueTable!.Schema.Name);
+
+            // Never fire while holding the state lock: the fire takes the engine's write lock, and
+            // committing threads inside that lock call OnCommit, which takes the state lock —
+            // holding both here would be a lock-order inversion.
+            Fire(dueTable!, dueEntry, options.OverrunPolicy);
+        }
     }
 
     private void Fire(TimerTable table, TimerEntry entry, SchedulerOverrunPolicy policy)
     {
         var generation = entry.Generation;
         var reducerName = table.Schema.Scheduled!;
-        using var tick = _engine.Telemetry?.StartSchedulerTick(reducerName);
+
+        // Every telemetry interaction is contained, so none can propagate out of the fire, skip the
+        // reschedule (leaving the timer's Due un-advanced, which would then re-fire in a hot loop)
+        // or fault the drain. Telemetry must never affect dispatch — a metric or span export that
+        // throws (an OTEL exporter in a bad state, a meter disposed under load) is swallowed and
+        // logged (EventId 1312), and the reschedule always runs.
+        Activity? tick = null;
+        SafeTelemetry(() => tick = _engine.Telemetry?.StartSchedulerTick(reducerName));
         var started = Stopwatch.GetTimestamp();
         var failed = false;
         try
         {
-            _host.CallScheduled(table.Schema, entry.Key, entry.Row, deleteOnFire: entry.Interval is null);
+            try
+            {
+                _host.CallScheduled(table.Schema, entry.Key, entry.Row, deleteOnFire: entry.Interval is null);
+            }
+            catch (Exception exception)
+            {
+                failed = true;
+                SafeTelemetry(() => tick?.SetStatus(ActivityStatusCode.Error, exception.Message));
+                LogMessages.TickFailed(_logger, reducerName, exception);
+            }
+
+            SafeTelemetry(() => _engine.Telemetry?.RecordSchedulerTick(reducerName, Stopwatch.GetElapsedTime(started).TotalMilliseconds));
+
+            lock (_lock)
+            {
+                // A successful one-shot removed its own row — the observer already dropped the entry.
+                // A commit during the fire that rewrote this timer bumped the generation and owns the
+                // schedule now. Either way there is nothing left to reschedule here.
+                if (!table.Entries.TryGetValue(entry.Key, out var current)
+                    || !ReferenceEquals(current, entry)
+                    || current.Generation != generation)
+                {
+                    return;
+                }
+
+                if (entry.Interval is not { } interval)
+                {
+                    // A one-shot whose fire aborted: the row survives (nothing committed), but
+                    // retrying on a hot loop would re-fail forever. Drop it from the pending set;
+                    // the row is still data, so a restart re-arms it.
+                    table.Entries.Remove(entry.Key);
+                    return;
+                }
+
+                var now = _time.GetUtcNow();
+                if (!failed && entry.CatchUpRemaining > 0)
+                {
+                    entry.CatchUpRemaining--;
+                    entry.Due = now;
+                    return;
+                }
+
+                entry.CatchUpRemaining = 0;
+                var next = entry.Due + interval;
+                if (next <= now)
+                {
+                    var missed = (now - entry.Due).Ticks / interval.Ticks;
+                    SafeTelemetry(() => _engine.Telemetry?.RecordSchedulerOverrun(reducerName));
+                    LogMessages.Overrun(_logger, reducerName, missed, policy);
+                    entry.Due = policy switch
+                    {
+                        SchedulerOverrunPolicy.RunImmediately => next,
+                        SchedulerOverrunPolicy.Coalesce => now,
+                        _ => now + interval,
+                    };
+                }
+                else
+                {
+                    entry.Due = next;
+                }
+
+                LogMessages.SchedulerRescheduled(_logger, reducerName, (entry.Due - now).TotalMilliseconds, interval.TotalMilliseconds);
+            }
+        }
+        finally
+        {
+            SafeTelemetry(() => tick?.Dispose());
+        }
+    }
+
+    /// <summary>Runs one telemetry interaction, swallowing and logging any fault so it never reaches dispatch.</summary>
+    private void SafeTelemetry(Action telemetry)
+    {
+        try
+        {
+            telemetry();
         }
         catch (Exception exception)
         {
-            failed = true;
-            tick?.SetStatus(ActivityStatusCode.Error, exception.Message);
-            LogMessages.TickFailed(_logger, reducerName, exception);
-        }
-
-        _engine.Telemetry?.RecordSchedulerTick(reducerName, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
-
-        lock (_lock)
-        {
-            // A successful one-shot removed its own row — the observer already dropped the entry.
-            // A commit during the fire that rewrote this timer bumped the generation and owns the
-            // schedule now. Either way there is nothing left to reschedule here.
-            if (!table.Entries.TryGetValue(entry.Key, out var current)
-                || !ReferenceEquals(current, entry)
-                || current.Generation != generation)
-            {
-                return;
-            }
-
-            if (entry.Interval is not { } interval)
-            {
-                // A one-shot whose fire aborted: the row survives (nothing committed), but
-                // retrying on a hot loop would re-fail forever. Drop it from the pending set;
-                // the row is still data, so a restart re-arms it.
-                table.Entries.Remove(entry.Key);
-                return;
-            }
-
-            var now = _time.GetUtcNow();
-            if (!failed && entry.CatchUpRemaining > 0)
-            {
-                entry.CatchUpRemaining--;
-                entry.Due = now;
-                return;
-            }
-
-            entry.CatchUpRemaining = 0;
-            var next = entry.Due + interval;
-            if (next <= now)
-            {
-                var missed = (now - entry.Due).Ticks / interval.Ticks;
-                _engine.Telemetry?.RecordSchedulerOverrun(reducerName);
-                LogMessages.Overrun(_logger, reducerName, missed, policy);
-                entry.Due = policy switch
-                {
-                    SchedulerOverrunPolicy.RunImmediately => next,
-                    SchedulerOverrunPolicy.Coalesce => now,
-                    _ => now + interval,
-                };
-            }
-            else
-            {
-                entry.Due = next;
-            }
+            LogMessages.SchedulerTelemetryFaulted(_logger, exception);
         }
     }
 
@@ -581,5 +664,41 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
 
         public static void SchedulerRearmed(ILogger logger, double delayMs) =>
             SchedulerRearmedMessage(logger, delayMs, null);
+
+        private static readonly Action<ILogger, string, double, double, Exception?> SchedulerRescheduledMessage =
+            LoggerMessage.Define<string, double, double>(
+                LogLevel.Debug,
+                new EventId(1309, "SchedulerRescheduled"),
+                "Timer '{Reducer}' rescheduled its next fire to {NextInMs}ms out (interval {IntervalMs}ms).");
+
+        public static void SchedulerRescheduled(ILogger logger, string reducer, double nextInMs, double intervalMs) =>
+            SchedulerRescheduledMessage(logger, reducer, nextInMs, intervalMs, null);
+
+        private static readonly Action<ILogger, Exception?> SchedulerDrainReenteredMessage =
+            LoggerMessage.Define(
+                LogLevel.Debug,
+                new EventId(1310, "SchedulerDrainReentered"),
+                "A scheduler drain re-entered while one was already running and returned; the in-flight drain will re-arm.");
+
+        public static void SchedulerDrainReentered(ILogger logger) =>
+            SchedulerDrainReenteredMessage(logger, null);
+
+        private static readonly Action<ILogger, Exception?> SchedulerDrainFaultedMessage =
+            LoggerMessage.Define(
+                LogLevel.Error,
+                new EventId(1311, "SchedulerDrainFaulted"),
+                "A scheduler drain threw; it was swallowed and the timer re-armed so one bad tick does not wedge every timer. See the exception.");
+
+        public static void SchedulerDrainFaulted(ILogger logger, Exception exception) =>
+            SchedulerDrainFaultedMessage(logger, exception);
+
+        private static readonly Action<ILogger, Exception?> SchedulerTelemetryFaultedMessage =
+            LoggerMessage.Define(
+                LogLevel.Error,
+                new EventId(1312, "SchedulerTelemetryFaulted"),
+                "A scheduler telemetry call threw and was ignored so it could not affect dispatch. See the exception.");
+
+        public static void SchedulerTelemetryFaulted(ILogger logger, Exception exception) =>
+            SchedulerTelemetryFaultedMessage(logger, exception);
     }
 }
