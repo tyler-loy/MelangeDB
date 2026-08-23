@@ -60,6 +60,17 @@ public partial struct WorldTickTimer
     public int Payload;
 }
 
+/// <summary>A second repeating timer on its own table — the sibling that reveals a multi-scheduled-table dispatch bug.</summary>
+[Table(Scheduled = nameof(TickReducers.SecondTick), Residency = Residency.Resident)]
+public partial struct SecondTickTimer
+{
+    [PrimaryKey]
+    [AutoInc]
+    public ulong Id;
+
+    public ScheduleAt ScheduledAt;
+}
+
 /// <summary>One-shot timer rows; each fire deletes its row transactionally with its work.</summary>
 [Table(Scheduled = nameof(TickReducers.RunOnce), Residency = Residency.Resident)]
 public partial struct OneShotTimer
@@ -93,6 +104,12 @@ public sealed class SchedulerProbe
     public int WorldTicks => Volatile.Read(ref _worldTicks);
 
     public int OneShots => Volatile.Read(ref _oneShots);
+
+    private int _secondTicks;
+
+    public int SecondTicks => Volatile.Read(ref _secondTicks);
+
+    public void CountSecondTick() => Interlocked.Increment(ref _secondTicks);
 
     /// <summary>Whether tick reducers write a TickLog row — off makes a fire write nothing.</summary>
     public bool WriteRows { get; set; } = true;
@@ -128,6 +145,18 @@ public sealed class TickReducers(SchedulerProbe probe)
         if (probe.WriteRows)
             ctx.Db.TickLog.Insert(new TickLog { Entry = $"tick:{timer.Id}:{timer.Payload}" });
     }
+
+    [Reducer]
+    public void SecondTick(ReducerContext ctx, SecondTickTimer timer)
+    {
+        probe.CountSecondTick();
+        if (probe.WriteRows)
+            ctx.Db.TickLog.Insert(new TickLog { Entry = $"second:{timer.Id}" });
+    }
+
+    [Reducer]
+    public void ScheduleSecond(ReducerContext ctx, long intervalMs) =>
+        ctx.Db.SecondTickTimer.Insert(new SecondTickTimer { ScheduledAt = ScheduleAt.Interval(TimeSpan.FromMilliseconds(intervalMs)) });
 
     [Reducer]
     public void RunOnce(ReducerContext ctx, OneShotTimer timer)

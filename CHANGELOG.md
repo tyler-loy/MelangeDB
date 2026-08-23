@@ -23,6 +23,21 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The scheduler no longer spins re-arming its timer.** A platform timer routinely wakes a
+  fraction of a millisecond before the delay it was armed with; the dispatch drain then found
+  nothing due (the entry's time had not quite arrived) and re-armed on the tiny remainder — waking
+  early again on a smaller one, tens of times a second, until the due time finally passed. `Rearm`
+  now floors a positive re-arm delay at the timer's resolution (16ms), so a sub-resolution remainder
+  is never armed and the next wake lands at or after the due time and fires. A fire is at most one
+  resolution late, which is nothing against any real interval. Found by instrumenting a real
+  migrated store; the scheduler now also logs a start summary (EventId 1303) and, at Debug, its
+  per-table registration and per-fire/drain/re-arm decisions (1304–1308).
+
+- `MelangeScheduler.ReadScheduleAt`'s column-kind walk now throws on an unhandled kind rather than
+  silently failing to advance the reader — which would mis-time every timer on that table with no
+  error. Safe today (all kinds handled); a guard against a future one.
+
+
 - **A poisoned row no longer wedges the reducers and subscriptions on its table.** Beyond the
   existence probe above, the two remaining places that read a row's bytes on behalf of *others*
   now tolerate one that cannot be read: a subscription's initial-set materialization for a

@@ -9,6 +9,9 @@ internal sealed class ManualTimeProvider : TimeProvider
 {
     private readonly Lock _lock = new();
     private readonly List<ManualTimer> _timers = [];
+
+    /// <summary>Every finite delay a timer was (re-)armed with — lets a test see the scheduler's re-arm decisions.</summary>
+    public List<TimeSpan> ArmDelays { get; } = [];
     private DateTimeOffset _now = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
     public override DateTimeOffset GetUtcNow()
@@ -88,6 +91,8 @@ internal sealed class ManualTimeProvider : TimeProvider
             {
                 _period = period;
                 DueAt = dueTime == Timeout.InfiniteTimeSpan ? null : owner._now + dueTime;
+                if (dueTime != Timeout.InfiniteTimeSpan)
+                    owner.ArmDelays.Add(dueTime);
             }
 
             return true;

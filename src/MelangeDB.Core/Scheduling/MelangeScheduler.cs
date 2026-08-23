@@ -27,6 +27,10 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
     private readonly ILogger _logger;
     private readonly Lock _lock = new();
     private readonly Dictionary<TableId, TimerTable> _tables = [];
+
+    // The floor on a re-arm delay: the platform timer's practical resolution. Below this a
+    // positive delay is re-armed to it, so an early wake cannot spin the fire/re-arm loop. See Rearm.
+    private static readonly TimeSpan RearmFloor = TimeSpan.FromMilliseconds(16);
     private ITimer? _timer;
     private IDisposable? _reload;
     private int _processing;
@@ -94,6 +98,32 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
 
             _engine.AddCommitObserver(this);
         });
+
+        // What the pending set looks like at start: how many timers each scheduled table
+        // registered, and for the earliest, how far out its first fire is. A scheduled table that
+        // scanned zero rows, or whose next fire is implausibly far out, is diagnosable here rather
+        // than by inferring it from a reducer's side effects. Info for the summary, Debug for the
+        // per-table and per-entry detail (enable MelangeDB's scheduler logger at Debug to get it).
+        lock (_lock)
+        {
+            var totalTimers = 0;
+            foreach (var table in _tables.Values)
+            {
+                totalTimers += table.Entries.Count;
+                LogMessages.SchedulerTableRegistered(_logger, table.Schema.Name, table.Schema.Scheduled!, table.Entries.Count);
+                foreach (var entry in table.Entries.Values)
+                {
+                    LogMessages.SchedulerEntryRegistered(
+                        _logger,
+                        table.Schema.Name,
+                        (entry.Due - now).TotalMilliseconds,
+                        entry.Interval?.TotalMilliseconds ?? -1,
+                        entry.CatchUpRemaining);
+                }
+            }
+
+            LogMessages.SchedulerStarted(_logger, totalTimers, _tables.Count, anchor, now);
+        }
 
         _timer = _time.CreateTimer(
             static state => ((MelangeScheduler)state!).ProcessDueFires(),
@@ -203,7 +233,15 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
                 }
 
                 if (dueEntry is null)
+                {
+                    // Nothing due. If timers exist, record how far the earliest one is from now —
+                    // the number that says whether a "dead" timer is parked in the future (a Due
+                    // problem) or simply between fires. Debug: one line per drain that finds nothing.
+                    LogMessages.SchedulerNothingDue(_logger, EarliestDelayMillis());
                     break;
+                }
+
+                LogMessages.SchedulerFiring(_logger, dueTable!.Schema.Name);
 
                 // Never fire while holding the state lock: the fire takes the engine's write
                 // lock, and committing threads inside that lock call OnCommit, which takes the
@@ -315,8 +353,38 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
             var delay = earliest.Value - _time.GetUtcNow();
             if (delay < TimeSpan.Zero)
                 delay = TimeSpan.Zero;
+            else if (delay > TimeSpan.Zero && delay < RearmFloor)
+            {
+                // Never re-arm for a sub-resolution residual. A platform timer routinely wakes a
+                // fraction of a millisecond before the delay it was given; the drain then finds
+                // nothing due (the entry's time has not quite arrived) and, without this floor,
+                // re-arms on the tiny remainder — waking early again on a smaller remainder, tens
+                // of times a second, until the due time finally passes. Waiting at least the
+                // timer's own resolution guarantees the next wake lands at or after the due time,
+                // so it fires rather than spinning. A fire is therefore at most one resolution
+                // late, which is nothing against any real interval.
+                delay = RearmFloor;
+            }
+
+            LogMessages.SchedulerRearmed(_logger, delay.TotalMilliseconds);
             _timer?.Change(delay, Timeout.InfiniteTimeSpan);
         }
+    }
+
+    /// <summary>Milliseconds until the earliest pending fire, or <c>-1</c> when nothing is pending. Caller holds <see cref="_lock"/>.</summary>
+    private double EarliestDelayMillis()
+    {
+        DateTimeOffset? earliest = null;
+        foreach (var table in _tables.Values)
+        {
+            foreach (var entry in table.Entries.Values)
+            {
+                if (earliest is null || entry.Due < earliest)
+                    earliest = entry.Due;
+            }
+        }
+
+        return earliest is null ? -1 : (earliest.Value - _time.GetUtcNow()).TotalMilliseconds;
     }
 
     private TimerEntry RecoveredEntry(
@@ -399,6 +467,14 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
                 case ColumnKind.ScheduleAt:
                     _ = reader.ReadScheduleAt();
                     break;
+                default:
+                    // Every ColumnKind must advance the reader, or the columns after it read from
+                    // the wrong offset and the ScheduleAt at the end decodes as garbage — silently,
+                    // with no fire and no error. A kind this switch does not handle (a future 17th)
+                    // must fail loudly here rather than mis-time every timer on the table.
+                    throw new NotSupportedException(
+                        $"Table '{schema.Name}': column '{schema.Columns[i].Name}' has kind {schema.Columns[i].Kind}, "
+                        + "which the scheduler's ScheduleAt walk does not handle; the timer cadence cannot be read.");
             }
         }
 
@@ -451,5 +527,59 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
 
         public static void TickFailed(ILogger logger, string reducer, Exception failure) =>
             TickFailedMessage(logger, reducer, failure);
+
+        private static readonly Action<ILogger, int, int, DateTimeOffset, DateTimeOffset, Exception?> SchedulerStartedMessage =
+            LoggerMessage.Define<int, int, DateTimeOffset, DateTimeOffset>(
+                LogLevel.Information,
+                new EventId(1303, "SchedulerStarted"),
+                "Scheduler started: {Timers} timer(s) across {Tables} scheduled table(s); downtime anchor {Anchor}, now {Now}.");
+
+        public static void SchedulerStarted(ILogger logger, int timers, int tables, DateTimeOffset anchor, DateTimeOffset now) =>
+            SchedulerStartedMessage(logger, timers, tables, anchor, now, null);
+
+        private static readonly Action<ILogger, string, string, int, Exception?> SchedulerTableRegisteredMessage =
+            LoggerMessage.Define<string, string, int>(
+                LogLevel.Debug,
+                new EventId(1304, "SchedulerTableRegistered"),
+                "Scheduled table '{Table}' (reducer '{Reducer}') registered {Timers} timer(s) at start.");
+
+        public static void SchedulerTableRegistered(ILogger logger, string table, string reducer, int timers) =>
+            SchedulerTableRegisteredMessage(logger, table, reducer, timers, null);
+
+        private static readonly Action<ILogger, string, double, double, int, Exception?> SchedulerEntryRegisteredMessage =
+            LoggerMessage.Define<string, double, double, int>(
+                LogLevel.Debug,
+                new EventId(1305, "SchedulerEntryRegistered"),
+                "Timer on '{Table}': first fire in {DueInMs}ms, interval {IntervalMs}ms (-1 = one-shot), catch-up {CatchUp}.");
+
+        public static void SchedulerEntryRegistered(ILogger logger, string table, double dueInMs, double intervalMs, int catchUp) =>
+            SchedulerEntryRegisteredMessage(logger, table, dueInMs, intervalMs, catchUp, null);
+
+        private static readonly Action<ILogger, string, Exception?> SchedulerFiringMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Debug,
+                new EventId(1306, "SchedulerFiring"),
+                "Scheduler firing the due timer on '{Table}'.");
+
+        public static void SchedulerFiring(ILogger logger, string table) =>
+            SchedulerFiringMessage(logger, table, null);
+
+        private static readonly Action<ILogger, double, Exception?> SchedulerNothingDueMessage =
+            LoggerMessage.Define<double>(
+                LogLevel.Debug,
+                new EventId(1307, "SchedulerNothingDue"),
+                "Scheduler drain found nothing due; earliest pending fire in {EarliestMs}ms (-1 = no timers pending).");
+
+        public static void SchedulerNothingDue(ILogger logger, double earliestMs) =>
+            SchedulerNothingDueMessage(logger, earliestMs, null);
+
+        private static readonly Action<ILogger, double, Exception?> SchedulerRearmedMessage =
+            LoggerMessage.Define<double>(
+                LogLevel.Debug,
+                new EventId(1308, "SchedulerRearmed"),
+                "Scheduler re-armed its timer to fire in {DelayMs}ms.");
+
+        public static void SchedulerRearmed(ILogger logger, double delayMs) =>
+            SchedulerRearmedMessage(logger, delayMs, null);
     }
 }
