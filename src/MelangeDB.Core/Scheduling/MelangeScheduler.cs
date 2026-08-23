@@ -324,6 +324,12 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
             {
                 entry.Due = next;
             }
+
+            // The next fire this timer just scheduled for itself. If a repeating timer's own
+            // reschedule ever puts its next fire far past one interval, this is where it becomes
+            // visible — the over-large-delay face of the dispatch bug the spin fix's trace could
+            // not show.
+            LogMessages.SchedulerRescheduled(_logger, reducerName, (entry.Due - now).TotalMilliseconds, interval.TotalMilliseconds);
         }
     }
 
@@ -581,5 +587,14 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
 
         public static void SchedulerRearmed(ILogger logger, double delayMs) =>
             SchedulerRearmedMessage(logger, delayMs, null);
+
+        private static readonly Action<ILogger, string, double, double, Exception?> SchedulerRescheduledMessage =
+            LoggerMessage.Define<string, double, double>(
+                LogLevel.Debug,
+                new EventId(1309, "SchedulerRescheduled"),
+                "Timer '{Reducer}' rescheduled its next fire to {NextInMs}ms out (interval {IntervalMs}ms).");
+
+        public static void SchedulerRescheduled(ILogger logger, string reducer, double nextInMs, double intervalMs) =>
+            SchedulerRescheduledMessage(logger, reducer, nextInMs, intervalMs, null);
     }
 }
