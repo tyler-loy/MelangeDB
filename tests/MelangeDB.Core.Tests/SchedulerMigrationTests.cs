@@ -204,6 +204,49 @@ public class SchedulerMigrationTests : IDisposable
         }
     }
 
+    // A scheduled table's own shape changing in the migration: a column added before the
+    // ScheduleAt, so its byte position shifts and the row is re-encoded by the real shape mapper.
+    public struct GrowthTickV1
+    {
+        public ulong Id;
+        public ScheduleAt Tick;
+    }
+
+    public struct GrowthTickV2
+    {
+        public ulong Id;
+        public uint NextChunk; // added mid-struct, ahead of Tick
+        public ScheduleAt Tick;
+    }
+
+    [Fact]
+    public void A_scheduled_table_that_gains_a_column_keeps_a_readable_interval_after_the_migration()
+    {
+        var root = NewRoot();
+        var options = OptionsFor(root);
+        var interval = ScheduleAt.Interval(TimeSpan.FromSeconds(5));
+
+        using (var v1 = Boot(options, Declare<GrowthTickV1>("GrowthTick", "Id", scheduled: "GrowthTickReducer", residency: Residency.Resident)))
+        {
+            v1.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new GrowthTickV1 { Id = 1, Tick = interval }));
+        }
+
+        // N+1: the scheduled table gains NextChunk before Tick — its shape changed, so the shape
+        // mapper re-encodes the stored row, moving where Tick's bytes sit.
+        using var v2 = Boot(options, Declare<GrowthTickV2>("GrowthTick", "Id", scheduled: "GrowthTickReducer", residency: Residency.Resident));
+
+        var table = v2.Schema.Get(typeof(GrowthTickV2));
+        var pair = Assert.Single(v2.HotStore.Scan(table.Id));
+        var row = (GrowthTickV2)RowSerializer.Deserialize(table, pair.Value);
+
+        // The added column defaulted, and the ScheduleAt still reads as the 5s interval where the
+        // scheduler's column walk expects it — index 2 now, not index 1.
+        Assert.Equal(0u, row.NextChunk);
+        Assert.True(row.Tick.IsInterval, "the migrated scheduled row lost its interval — the scheduler would read garbage and never fire");
+        Assert.Equal(TimeSpan.FromSeconds(5), row.Tick.Every);
+        Assert.Equal(2, ScheduleAtIndex(table));
+    }
+
     private static int ScheduleAtIndex(TableSchema schema)
     {
         for (var i = 0; i < schema.Columns.Count; i++)
@@ -260,6 +303,7 @@ public class SchedulerMigrationTests : IDisposable
     private static ColumnKind KindOf(Type type) => type switch
     {
         _ when type == typeof(ulong) => ColumnKind.UInt64,
+        _ when type == typeof(uint) => ColumnKind.UInt32,
         _ when type == typeof(long) => ColumnKind.Int64,
         _ when type == typeof(ScheduleAt) => ColumnKind.ScheduleAt,
         _ => throw new NotSupportedException(type.Name),
