@@ -23,28 +23,26 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
-- **The scheduler no longer goes dark on an idle world after dropping a re-arm.** Its dispatch runs
-  one drain at a time behind a guard; a call that arrived while a drain was running returned having
-  armed nothing, dropping its re-arm. On a world that was committing (players online) the next
-  commit's timer-observer re-armed within milliseconds and hid it — but on an idle world, where the
-  only commits come from scheduled ticks, the thing that would re-arm the scheduler is the tick it
-  just failed to run, so it stayed dark until some incidental commit and fired erratically, tens of
-  seconds apart, with the process otherwise idle. The guard now records the request and the
-  in-flight drain honours it (a rescan flag re-checked after each drain), so a re-entrant request is
-  never lost and liveness never depends on a commit an idle world does not produce. Found by
-  instrumenting a real restored store; the drain also logs a start summary (EventId 1303) and its
-  registration and re-arm decisions at Debug (1304–1309).
+- **The scheduler's dispatch closes a re-entrancy race that could drop a re-arm.** Dispatch runs one
+  drain at a time behind a guard; a call that arrived while a drain was already running returned
+  having armed nothing. Whether the in-flight drain's own re-arm then covered that dropped request
+  depended on the interleaving — a world committing regularly re-armed on the next commit's
+  timer-observer anyway — but the race is real. The guard now records the request and the in-flight
+  drain honours it (a rescan flag re-checked after each drain), so a re-entrant request is never
+  lost. The drain also logs a start summary (EventId 1303) and its registration and re-arm decisions
+  at Debug (1304–1309). (Found while investigating a reported scheduled-reducer stall on the
+  reference workload that turned out to be a measurement artifact — the scheduler was dispatching at
+  rate the whole time — so this is latent-correctness hardening, not an observed outage.)
 
-- **A scheduler tick's telemetry can no longer stall dispatch.** Every `StartSchedulerTick` /
-  `RecordSchedulerTick` / `RecordSchedulerOverrun` / span dispose in the fire path is contained: a
-  metric or span export that throws (an exporter in a bad state, a meter disposed under load) is
-  swallowed and logged (EventId 1312) rather than propagating out of the fire — which used to skip
-  the timer's reschedule and its re-arm. Telemetry must never affect dispatch. As defence in depth,
-  a drain that throws for any other reason is now caught, logged (1311), and the timer re-armed
-  regardless — which also **prevents a process crash**: the timer callback is a bare delegate with
-  no exception handling of its own, so before this an unhandled exception in a drain terminated the
-  process; it is now a logged, recovered event (EventId list: 1310 re-entry, 1311 drain fault,
-  1312 telemetry fault).
+- **A scheduler tick's telemetry can no longer break dispatch, and a faulting drain can no longer
+  crash the process.** Every `StartSchedulerTick` / `RecordSchedulerTick` / `RecordSchedulerOverrun`
+  / span dispose in the fire path is contained (EventId 1312 on fault): the reschedule is downstream
+  of `RecordSchedulerTick`, so a metric or span export that threw would skip the timer's reschedule
+  and re-arm — telemetry must never affect dispatch. And a drain that throws for any reason is now
+  caught, logged (1311), and the timer re-armed regardless, which **prevents a process crash**: the
+  timer callback is a bare delegate with no handler of its own, so an unhandled exception in a drain
+  would otherwise terminate the process (EventId list: 1310 re-entry, 1311 drain fault, 1312
+  telemetry fault).
 
 
 - **The scheduler no longer spins re-arming its timer.** A platform timer routinely wakes a

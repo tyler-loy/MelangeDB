@@ -215,13 +215,11 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
     /// an options reload, a start) requests a scan; whoever wins the guard drains and keeps draining
     /// while any request arrived while it was working. A caller that finds the guard already held
     /// does <b>not</b> just return and drop its re-arm — it leaves the request flag set, and the
-    /// in-flight drainer picks it up before it exits. That closes the bug behind the reference
-    /// workload's idle stall: the bare guard dropped the re-entrant caller's re-arm, and on a world
-    /// that was committing (players online) the very next commit's <see cref="OnCommit"/> re-armed
-    /// within milliseconds, hiding it — but on an <em>idle</em> world, where the only commits come
-    /// from scheduled ticks, the thing that would re-arm the scheduler is the tick the scheduler
-    /// just failed to run, so it stayed dark until some incidental commit, firing erratically for
-    /// tens of seconds at a time with the process otherwise idle.
+    /// in-flight drainer picks it up before it exits. That closes a real re-entrancy race: the bare
+    /// guard let a caller that lost the guard return having armed nothing, and whether the in-flight
+    /// drain's own re-arm then covered it depended on the interleaving. A world committing regularly
+    /// re-armed on the next <see cref="OnCommit"/> regardless, which is why the race is not urgent —
+    /// but the flag makes it impossible to lose a request at all.
     /// </para>
     /// </summary>
     private void ProcessDueFires()
@@ -238,7 +236,8 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
             if (Interlocked.Exchange(ref _processing, 1) == 1)
             {
                 // Another drain holds the guard; it will see the flag we set above before it exits,
-                // so this request is not lost. (This is the ~per-minute re-entry the stall traced to.)
+                // so this request is not lost. (Re-entry here is normal — a few times a minute under
+                // load — and now always honoured rather than dropped.)
                 LogMessages.SchedulerDrainReentered(_logger);
                 return;
             }
