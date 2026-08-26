@@ -1,3 +1,5 @@
+using System.Net;
+using System.Net.Http.Headers;
 using MelangeDB.Protocol;
 
 namespace MelangeDB.Client;
@@ -87,7 +89,14 @@ public enum DispatchMode
     Manual,
 }
 
-/// <summary>Thrown when a reducer call fails; <see cref="Code"/> is a <see cref="MelangeErrorCodes"/> value.</summary>
+/// <summary>
+/// Thrown when a reducer call fails; <see cref="Code"/> is a <see cref="MelangeErrorCodes"/> value.
+/// When the failure came from an HTTP step rather than a socket frame — today that is the connect
+/// ticket in <see cref="MelangeClient.ConnectAsync"/> — <see cref="Status"/>,
+/// <see cref="ResponseHeaders"/>, and <see cref="Reference"/> carry the server's side of it, so a
+/// client can show the player something that finds the request in the server's logs instead of
+/// leaving them with "it didn't work".
+/// </summary>
 public sealed class MelangeCallException : Exception
 {
     public MelangeCallException(string code, string message)
@@ -103,6 +112,27 @@ public sealed class MelangeCallException : Exception
     /// to change, and nothing went wrong on the server.
     /// </summary>
     public bool IsTransient => Code == MelangeErrorCodes.Transient;
+
+    /// <summary>
+    /// The HTTP status of the failed response, or null when the failure arrived as a socket frame
+    /// (every path but the connect ticket).
+    /// </summary>
+    public HttpStatusCode? Status { get; init; }
+
+    /// <summary>
+    /// The failed response's headers, or null for a socket-frame failure. Held rather than copied,
+    /// so a caller that wants a header this type does not name — a proxy's own correlation id, a
+    /// <c>Retry-After</c> — can read it.
+    /// </summary>
+    public HttpResponseHeaders? ResponseHeaders { get; init; }
+
+    /// <summary>
+    /// The id to quote when reporting this failure: the server's <c>traceId</c> where it is
+    /// tracing, otherwise its request id. Null when the server sent neither — an older build, or a
+    /// failure produced by something in front of it that stamps nothing. It also appears in
+    /// <see cref="Exception.Message"/>, so a client that only logs the message still carries it.
+    /// </summary>
+    public string? Reference { get; init; }
 }
 
 /// <summary>Thrown when the server rejects a subscription; <see cref="Code"/> is a <see cref="MelangeErrorCodes"/> value.</summary>

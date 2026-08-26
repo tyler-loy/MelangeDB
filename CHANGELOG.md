@@ -394,6 +394,23 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Every HTTP error carries an id the caller can quote** ([#136](https://github.com/tyler-loy/MelangeDB/issues/136)).
+  A player whose connect failed could report "couldn't connect around nine" and nothing in that report found the
+  server's side of the request — the server was tracing the whole time, so the id existed and simply never
+  reached the caller. Error bodies now carry `traceId` (`Activity.Current`, where the host configured tracing)
+  and `requestId` (`HttpContext.TraceIdentifier`, always), and stamp the same values on `X-Trace-Id` /
+  `X-Request-Id` for a caller that never reads the body. A host whose own middleware already stamps those names
+  keeps its values; MelangeDB fills the gap rather than overwriting.
+
+  On the client, the connect ticket — the step ahead of the socket, and the one a player hits first — no longer
+  swallows the response. `MelangeCallException` gains `Status`, `ResponseHeaders`, and `Reference`, the id worth
+  putting on a boot screen; `Reference` is also interpolated into `Message` ahead of the response body, so a
+  client that only logs the message keeps the id through a truncated log line. A ticket step that gets a success
+  status with a body that is not the ticket JSON — a captive portal, a proxy's own page — now fails as the ticket
+  step failing, with the same id, instead of surfacing a raw `JsonException` from inside the SDK. All three
+  members are additive and null on socket-frame failures. See
+  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md#correlating-a-failure-a-user-reports).
+
 - **Backup, second pass: `--check`, `clone`, and `--at-lsn`**
   ([road-to-0.2 phase 19](docs/road-to-0.2/plan-phase-19.md)) — the three verbs phase 15 recorded
   as next, now with the shipped archive underneath them.

@@ -1,5 +1,8 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Xunit;
 
 namespace MelangeDB.Transport.Tests;
@@ -170,6 +173,69 @@ public class HttpEndpointTests
         await using var client = host.CreateClient();
         await client.ConnectAsync(TestContext.Current.CancellationToken);
         await client.CallReducerAsync("Noop", null, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task Error_responses_carry_a_request_id_a_caller_can_quote()
+    {
+        // Issue #136: a client that fails here could report "it didn't work" and nothing in the
+        // report found the server's side of it. The request id exists in every deployment,
+        // traced or not, so an error is never unquotable.
+        await using var host = await TransportTestHost.StartAsync();
+        using var http = host.CreateHttp(token: null);
+
+        var response = await http.PostAsync("/melange/ticket", Json("{}"), TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, response.StatusCode);
+
+        var body = await ReadJsonAsync(response);
+        Assert.Equal("unauthorized", body.GetProperty("error").GetString());
+        var requestId = body.GetProperty("requestId").GetString();
+        Assert.False(string.IsNullOrEmpty(requestId));
+        // Also on the headers, for a caller that never reads the body.
+        Assert.Equal(requestId, Assert.Single(response.Headers.GetValues("X-Request-Id")));
+        // Untraced: the id that only exists under a listener is absent rather than empty.
+        Assert.False(body.TryGetProperty("traceId", out _));
+    }
+
+    [Fact]
+    public async Task A_traced_error_response_carries_the_trace_id_of_its_own_request()
+    {
+        // A listener is what makes ASP.NET create the request Activity at all, which is the
+        // deployment this matters in: the id in the body is the one the server's spans are
+        // filed under, so pasting it into the log store finds this request.
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == "Microsoft.AspNetCore",
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllDataAndRecorded,
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        await using var host = await TransportTestHost.StartAsync();
+        using var http = host.CreateHttp(token: null);
+
+        var response = await http.PostAsync("/melange/ticket", Json("{}"), TestContext.Current.CancellationToken);
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, response.StatusCode);
+
+        var traceId = (await ReadJsonAsync(response)).GetProperty("traceId").GetString();
+        Assert.Matches("^[0-9a-f]{32}$", traceId);
+        Assert.Equal(traceId, Assert.Single(response.Headers.GetValues("X-Trace-Id")));
+    }
+
+    [Fact]
+    public async Task A_host_that_stamps_its_own_correlation_ids_keeps_them()
+    {
+        // The reference host's middleware already stamps these names. Ours fills a gap; it does
+        // not overwrite a value the host chose, and does not append a second header the client
+        // would then have to disambiguate.
+        await using var host = await TransportTestHost.StartAsync(middleware: app => app.Use(async (context, next) =>
+        {
+            context.Response.Headers["X-Request-Id"] = "host-stamped";
+            await next(context);
+        }));
+        using var http = host.CreateHttp(token: null);
+
+        var response = await http.PostAsync("/melange/ticket", Json("{}"), TestContext.Current.CancellationToken);
+        Assert.Equal("host-stamped", Assert.Single(response.Headers.GetValues("X-Request-Id")));
     }
 
     private static StringContent Json(string json) => new(json, Encoding.UTF8, "application/json");

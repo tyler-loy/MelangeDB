@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.WebSockets;
+using System.Text.Json;
 using MelangeDB.Protocol;
 
 namespace MelangeDB.Client;
@@ -359,10 +360,77 @@ public sealed class MelangeClient : IAsyncDisposable
         using var response = await SharedInvoker.SendAsync(request, cancellationToken).ConfigureAwait(false);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
-            throw new MelangeCallException(MelangeErrorCodes.Unauthorized, $"The ticket endpoint answered {(int)response.StatusCode}: {body}");
-        using var json = System.Text.Json.JsonDocument.Parse(body);
-        return json.RootElement.GetProperty("ticket").GetString()
-            ?? throw new MelangeCallException(MelangeErrorCodes.Internal, "The ticket endpoint returned no ticket.");
+            throw Failed(MelangeErrorCodes.Unauthorized, $"The ticket endpoint answered {(int)response.StatusCode}", body);
+
+        try
+        {
+            using var json = JsonDocument.Parse(body);
+            if (json.RootElement.TryGetProperty("ticket", out var element)
+                && element.ValueKind == JsonValueKind.String
+                && element.GetString() is { Length: > 0 } ticket)
+                return ticket;
+        }
+        catch (JsonException)
+        {
+            // A success status whose body is not the ticket JSON means something answered in the
+            // server's place — a captive portal, a proxy's own page. That is the ticket step
+            // failing, and it deserves the same id as any other failure of it, rather than a raw
+            // JsonException surfacing from inside the SDK.
+            throw Failed(MelangeErrorCodes.Internal, "The ticket endpoint returned a non-JSON body", body);
+        }
+
+        throw Failed(MelangeErrorCodes.Internal, "The ticket endpoint returned no ticket", detail: null);
+
+        // Reading the reference re-parses the body, so it is deferred to the failure paths: the
+        // exchange that works — every connect that works — should not pay for it.
+        MelangeCallException Failed(string code, string message, string? detail)
+        {
+            var reference = TicketReference(response, body);
+            // The reference goes ahead of the detail rather than after it: a body can be a whole
+            // proxy error page, and the id has to survive the log line that gets truncated.
+            var where = reference is null ? string.Empty : $" (ref {reference})";
+            return new MelangeCallException(code, detail is null ? $"{message}{where}." : $"{message}{where}: {detail}")
+            {
+                Status = response.StatusCode,
+                ResponseHeaders = response.Headers,
+                Reference = reference,
+            };
+        }
+    }
+
+    /// <summary>
+    /// The id to quote for a failed ticket response: the server's own <c>traceId</c> — or its
+    /// request id, where the host configured no tracing — from the error body, else the
+    /// correlation headers it or a proxy in front of it stamped. Every source is optional, so an
+    /// older server (or one behind something that stamps nothing) yields null rather than an
+    /// invented id.
+    /// </summary>
+    private static string? TicketReference(HttpResponseMessage response, string body)
+    {
+        try
+        {
+            using var json = JsonDocument.Parse(body);
+            if (json.RootElement.ValueKind == JsonValueKind.Object)
+                foreach (var name in (string[])["traceId", "requestId"])
+                    if (json.RootElement.TryGetProperty(name, out var value)
+                        && value.ValueKind == JsonValueKind.String
+                        && value.GetString() is { Length: > 0 } id)
+                        return id;
+        }
+        catch (JsonException)
+        {
+            // Not JSON at all — the headers are the only place left to look.
+        }
+
+        // TryGetValues matches case-insensitively, which this relies on: a server normalizes a
+        // known header's casing on the way out (Kestrel sends X-Request-Id as X-Request-ID), and
+        // a proxy in front of it may use its own.
+        foreach (var header in (string[])["X-Trace-Id", "X-Request-Id"])
+            if (response.Headers.TryGetValues(header, out var values)
+                && values.FirstOrDefault() is { Length: > 0 } id)
+                return id;
+
+        return null;
     }
 
     /// <summary>
