@@ -1,4 +1,6 @@
 using MelangeDB.Client;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using MelangeDB.Protocol;
 using Xunit;
 
@@ -87,6 +89,69 @@ public class AuthTests
         await client.ConnectAsync(TestContext.Current.CancellationToken);
         await client.CallReducerAsync("Spawn", ["BrowserKid", 2], TestContext.Current.CancellationToken);
         Assert.Equal([TransportTestHost.Caller], PlayerIdentities(host));
+    }
+
+    [Fact]
+    public async Task A_failed_ticket_hands_the_client_something_to_quote()
+    {
+        // Issue #136: the ticket step is inside the SDK, and it used to swallow the response —
+        // so a player whose connect failed could say "it didn't work around nine" and nothing in
+        // that report found the server's side of the request. Status, headers, and the reference
+        // now ride the exception, and the reference is in the message too, for the client that
+        // only logs that.
+        await using var host = await TransportTestHost.StartAsync();
+        await using var client = host.CreateClient(o =>
+        {
+            o.UseTicket = true;
+            o.Token = TestTokens.For("expired-kid", expires: DateTimeOffset.UtcNow.AddHours(-1));
+        });
+
+        var failure = await Assert.ThrowsAsync<MelangeCallException>(
+            () => client.ConnectAsync(TestContext.Current.CancellationToken));
+
+        Assert.Equal(MelangeErrorCodes.Unauthorized, failure.Code);
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, failure.Status);
+        Assert.NotNull(failure.Reference);
+        Assert.Contains($"(ref {failure.Reference})", failure.Message);
+        Assert.NotNull(failure.ResponseHeaders);
+        // Whichever id the server had to offer — a concurrently traced run makes it the trace id
+        // rather than the request id — the same value is on the headers.
+        // Whichever id the server had to offer — a concurrently traced run makes it the trace id
+        // rather than the request id — the same value is on the headers. Looked up rather than
+        // enumerated because Kestrel normalizes a known header's casing on the way out
+        // (X-Request-Id leaves as X-Request-ID) and header names are case-insensitive anyway.
+        Assert.True(
+            (failure.ResponseHeaders.TryGetValues("X-Trace-Id", out var traced) && traced.Contains(failure.Reference))
+            || (failure.ResponseHeaders.TryGetValues("X-Request-Id", out var requested) && requested.Contains(failure.Reference)),
+            "The reference should be one of the correlation headers the server stamped.");
+    }
+
+    [Fact]
+    public async Task A_reference_is_read_off_the_headers_when_the_body_is_not_the_server_s()
+    {
+        // The other half of the failure mode: a proxy answers in the server's place with a body
+        // that has no ids in it. The correlation headers are the only source left, and a raw
+        // JsonException out of the SDK's own parse would have been the least useful outcome.
+        await using var host = await TransportTestHost.StartAsync(middleware: app => app.Use(async (context, next) =>
+        {
+            if (context.Request.Path.StartsWithSegments("/melange/ticket"))
+            {
+                context.Response.StatusCode = 502;
+                context.Response.Headers["X-Trace-Id"] = "proxy-trace-7";
+                await context.Response.WriteAsync("<html>Bad Gateway</html>");
+                return;
+            }
+
+            await next(context);
+        }));
+        await using var client = host.CreateClient(o => o.UseTicket = true);
+
+        var failure = await Assert.ThrowsAsync<MelangeCallException>(
+            () => client.ConnectAsync(TestContext.Current.CancellationToken));
+
+        Assert.Equal(System.Net.HttpStatusCode.BadGateway, failure.Status);
+        Assert.Equal("proxy-trace-7", failure.Reference);
+        Assert.Contains("(ref proxy-trace-7)", failure.Message);
     }
 
     [Fact]

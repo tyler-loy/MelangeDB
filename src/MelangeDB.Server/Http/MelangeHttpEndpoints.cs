@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using MelangeDB.Core;
 using MelangeDB.Protocol;
@@ -572,12 +573,47 @@ internal static class MelangeHttpEndpoints
         }
     }
 
-    internal static Task WriteErrorAsync(HttpContext context, int status, string code, string message) =>
-        WriteJsonAsync(context, status, writer =>
+    /// <summary>
+    /// The header names an error response is correlated by. They are the de-facto convention a
+    /// host's own middleware already stamps, so a caller reads one name whether the failure came
+    /// from here or from something in front of us.
+    /// </summary>
+    private const string TraceIdHeader = "X-Trace-Id";
+    private const string RequestIdHeader = "X-Request-Id";
+
+    /// <summary>
+    /// Writes the error body, and stamps the ids that make this exact request findable in the
+    /// server's log store. A failed call is the one a player reports, and "it didn't work around
+    /// nine" is unfindable without an id — the server is already tracing, so the id existed all
+    /// along and simply never reached the caller. It goes in both places on purpose: in the body
+    /// so a client that only has the response text can still quote it, and in the headers so one
+    /// that never reads the body — or that got a non-JSON failure from a proxy — has it too.
+    /// <see cref="Activity"/> is absent when the host configured no tracing, which is why
+    /// <see cref="HttpContext.TraceIdentifier"/> is always written as well: something quotable
+    /// exists in every deployment.
+    /// </summary>
+    internal static Task WriteErrorAsync(HttpContext context, int status, string code, string message)
+    {
+        var traceId = Activity.Current?.TraceId.ToHexString();
+        var requestId = context.TraceIdentifier;
+        var headers = context.Response.Headers;
+        // Assigned only when absent: a host that stamps its own correlation ids owns the value,
+        // and the indexer would otherwise replace it with ours rather than duplicating it.
+        if (traceId is not null && !headers.ContainsKey(TraceIdHeader))
+            headers[TraceIdHeader] = traceId;
+        if (!string.IsNullOrEmpty(requestId) && !headers.ContainsKey(RequestIdHeader))
+            headers[RequestIdHeader] = requestId;
+
+        return WriteJsonAsync(context, status, writer =>
         {
             writer.WriteString("error", code);
             writer.WriteString("message", message);
+            if (traceId is not null)
+                writer.WriteString("traceId", traceId);
+            if (!string.IsNullOrEmpty(requestId))
+                writer.WriteString("requestId", requestId);
         });
+    }
 
     private static async Task WriteJsonAsync(HttpContext context, int status, Action<Utf8JsonWriter> write)
     {

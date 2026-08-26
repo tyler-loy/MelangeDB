@@ -26,16 +26,23 @@ internal sealed class TransportTestHost : IAsyncDisposable
     private readonly Dictionary<string, string?> _settings;
     private readonly string _root;
     private readonly Action<IServiceCollection>? _services;
+    private readonly Action<WebApplication>? _middleware;
     private WebApplication? _app;
     private int _http1Port;
     private int _http2Port;
 
-    private TransportTestHost(string root, Dictionary<string, string?> settings, ManualTimeProvider? time, Action<IServiceCollection>? services)
+    private TransportTestHost(
+        string root,
+        Dictionary<string, string?> settings,
+        ManualTimeProvider? time,
+        Action<IServiceCollection>? services,
+        Action<WebApplication>? middleware)
     {
         _root = root;
         _settings = settings;
         Time = time;
         _services = services;
+        _middleware = middleware;
     }
 
     public ManualTimeProvider? Time { get; }
@@ -60,13 +67,18 @@ internal sealed class TransportTestHost : IAsyncDisposable
 
     public IServiceProvider Services => _app!.Services;
 
+    /// <summary>
+    /// <paramref name="middleware"/> runs ahead of the MelangeDB endpoints, standing in for the
+    /// host application's own pipeline — the reference workload wraps MelangeDB in one.
+    /// </summary>
     public static async Task<TransportTestHost> StartAsync(
         Dictionary<string, string?>? settings = null,
         bool manualTime = false,
-        Action<IServiceCollection>? services = null)
+        Action<IServiceCollection>? services = null,
+        Action<WebApplication>? middleware = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-transport-").FullName;
-        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null, services);
+        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null, services, middleware);
         await host.StartAppAsync();
         return host;
     }
@@ -223,6 +235,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
 
         var app = builder.Build();
         app.UseWebSockets();
+        _middleware?.Invoke(app);
         app.MapMelangeSocket();
         try
         {

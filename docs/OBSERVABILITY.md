@@ -185,6 +185,47 @@ Two places, both of which need explicit protocol support:
   the server-side reducer span. Without this, client and server traces are two disconnected stories.
 - **Node → node.** Handoff and cross-shard sagas propagate context, so a player transfer is one trace across
   both nodes rather than two unrelated spans. A handoff bug is close to undebuggable otherwise.
+- **Server → client, on failure.** Every HTTP error response carries the ids that find it again, so a user
+  reporting a failure hands over something that resolves to the server's own side of it.
+
+### Correlating a failure a user reports
+
+The failure that costs the most to debug is the one a *person* reports: "couldn't connect around nine." The
+server was tracing the whole time, so the id existed — it just never reached the caller. Every error body from
+the MelangeDB HTTP endpoints carries it, and the same values are stamped on the response headers for a caller
+that never reads the body:
+
+```json
+{ "error": "unauthorized", "message": "...", "traceId": "4bf92f...", "requestId": "0HN7...:00000001" }
+```
+
+| Field | Header | Present when |
+| --- | --- | --- |
+| `traceId` | `X-Trace-Id` | The host configured tracing — it is `Activity.Current`'s trace id, so it is the id the server's own spans are filed under |
+| `requestId` | `X-Request-Id` | Always — it is `HttpContext.TraceIdentifier`, which exists whether or not anything is exporting traces |
+
+Both are written because a deployment that exports no traces still needs *something* quotable, and a deployment
+that does export them needs the id its trace store is keyed by. Neither header overwrites one the host's own
+middleware already set: a host with its own correlation convention keeps it, and the client is looking the value
+up case-insensitively either way.
+
+On the client, a failure of the connect ticket — the step that runs before the socket exists, and so the one a
+player hits first — surfaces all of it on `MelangeCallException`:
+
+```csharp
+catch (MelangeCallException failure)
+{
+    // "Couldn't connect (ref 4bf92f...)" — the string worth putting on a boot screen.
+    ShowBootError(failure.Message, failure.Reference);
+    // failure.Status and failure.ResponseHeaders carry the rest, for a client that wants
+    // a header this type does not name.
+}
+```
+
+`Reference` is the server's `traceId` where it is tracing and its `requestId` otherwise, read from the error body
+or, when a proxy answered in the server's place with a body of its own, from the correlation headers. It is null
+only when nothing in the chain stamped anything. It also appears in `Message`, ahead of the response body, so a
+client that only logs the message still carries the id into a log line that gets truncated.
 
 ### Parent vs. link, and why it matters
 
