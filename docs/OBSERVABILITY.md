@@ -106,15 +106,16 @@ Source name: `MelangeDB`.
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
-A `melange.reducer` span whose **locked portion** exceeds `Telemetry:SlowReducerMs` additionally carries a
+A `melange.reducer` span that exceeds `Telemetry:SlowReducerMs` additionally carries a
 `melange.slow_reducer` span event and produces a warning log entry (`1003`) — shipped with phase 02,
 threshold live-reloadable. Both carry the same split, because a slow transaction has more than one cause
 and they call for opposite responses:
 
 | Field | Span event tag | Log field | What a large value means |
 | --- | --- | --- | --- |
-| Locked | `melange.locked_ms` | `LockedMs` | How long the write lock was held — the threshold fires on this, and it is global write latency. |
-| Total | `melange.duration_ms` | `DurationMs` | The whole transaction, durability wait included. Since phase 17 it exceeds `LockedMs` by that wait even under `Isolation.Serialized`. |
+| Locked | `melange.locked_ms` | `LockedMs` | How long the write lock was held — global write latency, and what a snapshot transaction is thresholded on. |
+| Total | `melange.duration_ms` | `DurationMs` | The whole transaction, durability wait included — and what a serialized transaction is thresholded on. Since phase 17 it exceeds `LockedMs` by that wait even under `Isolation.Serialized`. |
+| Fired measure | `melange.fired_measure` | `FiredMeasure` | Which of the two above crossed the threshold: `total` or `write-lock hold`. |
 | Body | `melange.body_ms` | `BodyMs` | The module does too much per transaction — narrow the window. |
 | Commit | `melange.commit_ms` | `CommitMs` | The log append — buffered since phase 17, so the disk no longer appears here. |
 | Fsync | `melange.fsync_ms` | `FsyncMs` | The durability wait this caller experienced — under group commit the shared flush's cost from this transaction's seat. Disk contention on this host — infrastructure, not application. |
@@ -125,10 +126,21 @@ and they call for opposite responses:
 **`LockedMs` is the stall; `DurationMs` is the experience.** Under the default `Isolation.Serialized` the
 two differ only by the durability wait (phase 17 moved the fsync outside the lock), so a large gap between
 them on a serialized transaction reads as disk, not contention. Under `Isolation.Snapshot` the body also
-ran outside the lock, so the gap is the body plus the wait — and a 500 ms snapshot body does not warn at
-all, because it froze nothing. That is the point of thresholding on the locked half: an alert built to catch
-write stalls should not fire on a reducer that caused none. `melange.isolation` is also a tag on the
+ran outside the lock, so the gap is the body plus the wait. `melange.isolation` is also a tag on the
 `melange.reducer` span itself, so the two populations can be separated before any warning is involved.
+
+**The threshold fires on a different number per isolation level, and the line says which.** A serialized
+transaction is thresholded on the **total**: its body ran under the lock, and the durability wait after it
+is latency the caller paid, so a stalled disk behind a trivial body still warns — telling those two apart is
+what this warning is for. A snapshot transaction is thresholded on the **locked portion** alone, because a
+long body is precisely what that isolation level exists to allow; a 500 ms snapshot body does not warn at
+all, since it froze nothing, and an alert built to catch write stalls should not fire on a reducer that
+caused none.
+
+Both numbers are always printed, and `FiredMeasure` names the one that crossed. That field exists because
+the message previously asserted the locked portion had crossed the threshold on both paths, which was false
+on the serialized one whenever an fsync wait sat between the two numbers — a line reading "held the write
+lock 48.9ms, over the … threshold of 50ms" ([#150](https://github.com/tyler-loy/MelangeDB/issues/150)).
 
 `76.9ms body / 2.3ms commit` and `0.5ms body / 141.7ms commit (141.6ms fsync)` are the two failures that
 used to produce identical warnings — one fixed in the module, one on the host. Body time is measured

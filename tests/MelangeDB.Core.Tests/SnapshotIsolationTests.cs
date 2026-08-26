@@ -331,7 +331,10 @@ public class SnapshotIsolationTests : IDisposable
         // what the reducer cost. A dashboard that cannot tell them apart cannot tell a 500 ms
         // serialized transaction from a 500 ms snapshot one that stalled nothing.
         Assert.True(entry.Number("LockedMs") <= entry.Number("DurationMs"));
-        Assert.Contains("held the write lock", entry.Message);
+        Assert.Contains("write lock held", entry.Message);
+        // And the line says the locked portion is what crossed — on this path it is (#150).
+        Assert.Equal("write-lock hold", entry.Fields["FiredMeasure"]);
+        Assert.True(entry.Number("LockedMs") > entry.Number("ThresholdMs"));
     }
 
     private RowOpKind LastOpKind()
