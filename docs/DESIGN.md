@@ -327,6 +327,35 @@ carries cross-shard sagas and world events once clustering exists (see
 [CLUSTERING.md](CLUSTERING.md)). Because the log already provides ordering and replay, the bus does not
 need to.
 
+### Shutdown: the announced LSN is the last one
+
+Graceful shutdown is four steps, in this order: stop the scheduler, stop the event bus, drain the
+engine, checkpoint. The host then logs `1102 MelangeStopped` naming the LSN it flushed at, and that
+number is a promise — nothing appends after it, and the next boot recovers to exactly it.
+
+Keeping that promise takes more than waiting. Waiting is a *barrier*: it establishes that nothing is
+being written at that instant, and says nothing about a caller who is already past every check and
+merely queued on the write lock. A scheduled fire, for instance, clears its own stopping check, then
+creates a DI scope and resolves its reducer before it ever reaches the lock — a window wide enough to
+lose, and one that widens with GC pauses on a large heap. So the drain is a **one-way close**: after
+it, a write is refused with `TransientRejectionException`, reported to the caller as `transient`,
+whose contract is to retry unchanged against the next process.
+
+The two stops ahead of it are the graceful half. Each waits out its own in-flight work — the
+scheduler for a fire already running on the timer's thread, the bus for its dispatch loops — so that
+work *finishes and is counted* in the announced LSN rather than being refused by the gate. Each waits
+ten seconds and then says so (`1313 SchedulerStopAbandonedFire`, `1405 EventDispatchLoopsStillRunning`)
+rather than waiting forever: a shutdown that hangs is worse than one that abandons a reducer the gate
+will refuse anyway. Neither is configurable, deliberately — the numbers only matter on a path that is
+already going down, and a knob here would be one more thing to get wrong.
+
+The engine is a DI singleton, so it is disposed *after* every hosted service has stopped — which is
+why the gate matters beyond bookkeeping. Without it, a writer can still be inside the hot store when
+the store's own teardown begins, and for a native store that is a crash rather than an exception.
+
+Reads are unaffected: checkpointing runs after the drain and has to read, so the close gates writes
+only.
+
 ## 6. Subscriptions
 
 Clients send a query; the server returns an initial result set and then streams incremental deltas

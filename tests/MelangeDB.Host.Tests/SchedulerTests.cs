@@ -602,6 +602,77 @@ public class SchedulerTests : IDisposable
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 
+    [Fact]
+    public async Task Stopping_waits_for_a_fire_that_is_already_in_flight()
+    {
+        // Issue #145. Stop() used to set a flag and dispose the timer, neither of which recalls a
+        // fire already running on the timer's thread. That fire then committed after the host had
+        // drained, checkpointed, and logged the LSN it flushed at — the two unaccounted LSNs in the
+        // report. Stop now waits it out, so the fire is counted in the announced LSN.
+        var probe = new SchedulerProbe();
+        using var host = TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        host.Reducers().Call("ScheduleTick", TestApp.Caller, 10_000L, 0);
+
+        var scheduler = host.Services.GetRequiredService<MelangeScheduler>();
+        using var inDrain = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        scheduler.DrainFaultInjection = () =>
+        {
+            scheduler.DrainFaultInjection = null;
+            inDrain.Set();
+            release.Wait(TimeSpan.FromSeconds(30));
+        };
+
+        // Hold a drain open on another thread, so Stop() meets a fire genuinely in flight.
+        var firing = Task.Run(() => scheduler.PumpForTest(), TestContext.Current.CancellationToken);
+        Assert.True(inDrain.Wait(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken), "the drain never started");
+
+        var stopping = Task.Run(() => scheduler.Stop(), TestContext.Current.CancellationToken);
+        var raced = await Task.WhenAny(stopping, Task.Delay(500, TestContext.Current.CancellationToken));
+        Assert.NotSame(stopping, raced);
+
+        release.Set();
+        await stopping.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        await firing;
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task The_lsn_the_host_announces_at_shutdown_is_the_last_one()
+    {
+        // The property the report is really about: whatever the stop line says was flushed, nothing
+        // appends after it. Here the scheduler is mid-fire when shutdown begins — the exact shape of
+        // issue #145 — and the head must not move once StopAsync has returned.
+        var probe = new SchedulerProbe();
+        using var host = TestApp.Build(_root, null, builder =>
+        {
+            builder.Services.AddSingleton<TimeProvider>(_time);
+            builder.Services.AddSingleton(probe);
+        });
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        host.Reducers().Call("ScheduleTick", TestApp.Caller, 10_000L, 0);
+        _time.Advance(TimeSpan.FromSeconds(10));
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+        var announced = host.Engine().Log.HeadLsn;
+
+        // A scheduled fire arriving now is exactly the race: past its own stopping check, queued on
+        // the write lock, landing after the flush. It is refused, and the head stands.
+        Assert.Throws<TransientRejectionException>(() =>
+            host.Engine().Invoke("LateFire", TestApp.Caller, ctx => ctx.Db.Insert(new TickLog
+            {
+                Id = 0,
+                Entry = "after-the-announcement",
+            })));
+        Assert.Equal(announced, host.Engine().Log.HeadLsn);
+    }
+
     private static MeterListener OverrunListener(Action onOverrun)
     {
         var listener = new MeterListener

@@ -142,12 +142,36 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
         ProcessDueFires();
     }
 
-    /// <summary>Stops arming and firing. Pending timer rows are data; they survive to the next start.</summary>
+    /// <summary>How long <see cref="Stop"/> waits for a fire that was already in flight.</summary>
+    private static readonly TimeSpan StopDrainTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Stops arming and firing. Pending timer rows are data; they survive to the next start.
+    /// <para>
+    /// Setting the flag is not enough on its own: a fire that already passed the guard runs on the
+    /// timer's thread, and disposing the timer does not recall it. Left alone it commits after the
+    /// host has drained, checkpointed, and announced the LSN it flushed at — so this waits it out,
+    /// and the fire is counted in that announcement instead of arriving behind it. The engine
+    /// refuses a post-drain write regardless (see <see cref="MelangeEngine.Drain"/>); waiting is
+    /// what lets the fire finish and be included rather than be refused.
+    /// </para>
+    /// </summary>
     internal void Stop()
     {
         _stopped = true;
         _reload?.Dispose();
         _timer?.Dispose();
+
+        var deadline = Stopwatch.GetTimestamp() + (long)(StopDrainTimeout.TotalSeconds * Stopwatch.Frequency);
+        var spin = new SpinWait();
+        while (Volatile.Read(ref _processing) == 1 && Stopwatch.GetTimestamp() < deadline)
+            spin.SpinOnce();
+
+        // Timed out: the fire is still running and will be refused by the engine's gate rather
+        // than land after the flush. Said out loud, because a shutdown that had to abandon a
+        // reducer mid-flight is worth knowing about.
+        if (Volatile.Read(ref _processing) == 1)
+            LogMessages.SchedulerStopAbandonedFire(_logger, StopDrainTimeout.TotalSeconds);
     }
 
     public void Dispose() => Stop();
@@ -675,6 +699,16 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
 
         public static void SchedulerRescheduled(ILogger logger, string reducer, double nextInMs, double intervalMs) =>
             SchedulerRescheduledMessage(logger, reducer, nextInMs, intervalMs, null);
+
+        private static readonly Action<ILogger, double, Exception?> SchedulerStopAbandonedFireMessage =
+            LoggerMessage.Define<double>(
+                LogLevel.Warning,
+                new EventId(1313, "SchedulerStopAbandonedFire"),
+                "The scheduler stopped with a fire still in flight after {Seconds}s; it is abandoned rather than waited for, " +
+                "and the engine refuses its commit if it arrives after the drain.");
+
+        public static void SchedulerStopAbandonedFire(ILogger logger, double seconds) =>
+            SchedulerStopAbandonedFireMessage(logger, seconds, null);
 
         private static readonly Action<ILogger, Exception?> SchedulerDrainReenteredMessage =
             LoggerMessage.Define(

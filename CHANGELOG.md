@@ -23,6 +23,34 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **Shutdown's drain is now a one-way close, so the LSN the host announces is the last one**
+  ([#145](https://github.com/tyler-loy/MelangeDB/issues/145)). `MelangeEngine.Drain()` took the write
+  lock and released it — a barrier, which establishes that nothing is being written *at that instant*
+  and says nothing about a caller already past every check and merely queued on the lock. A scheduled
+  fire clears its own stopping check, then creates a DI scope and resolves its reducer before it ever
+  reaches the lock; a shutdown that runs `Drain` → `Checkpoint` → `1102 MelangeStopped` inside that
+  window leaves the fire to commit *after* the announced LSN. That is the two unaccounted LSNs in the
+  report — a repeating fire commits its own writes plus the timer-row reschedule.
+
+  Three changes. The drain now closes the engine to writes, and a write arriving after it is refused
+  with `TransientRejectionException` — reported to callers as `transient`, whose contract is already
+  "retry unchanged", which is exactly right for a node on its way down. `MelangeScheduler.Stop()`
+  waits out a fire already running on the timer's thread instead of only setting a flag and disposing
+  the timer, so that fire finishes and is *counted* in the announced LSN rather than refused. And
+  `MelangeEventBus.Stop()` no longer discards the result of its ten-second `Task.WaitAll`, which had
+  made a timeout silent while dispatch loops stayed alive with handlers free to call reducers. Both
+  waits are bounded at ten seconds and say so when they expire
+  (`1313 SchedulerStopAbandonedFire`, `1405 EventDispatchLoopsStillRunning`); neither is configurable,
+  because the numbers only matter on a path already going down. Reads are untouched — checkpointing
+  runs after the drain and has to read.
+
+  This is filed against the SIGSEGV report because it is the mechanism behind that issue's clearest
+  lead, and because the engine is a DI singleton disposed *after* every hosted service stops: without
+  the gate a writer can still be inside the hot store when the store's teardown begins, which for a
+  native store is a crash rather than an exception. **It is not confirmed as the cause of the
+  crash** — that still wants a backtrace — but a commit landing after "flushed at LSN N" makes that
+  line false on its own terms. See [docs/DESIGN.md](docs/DESIGN.md#shutdown-the-announced-lsn-is-the-last-one).
+
 - **The scheduler's dispatch closes a re-entrancy race that could drop a re-arm.** Dispatch runs one
   drain at a time behind a guard; a call that arrived while a drain was already running returned
   having armed nothing. Whether the in-flight drain's own re-arm then covered that dropped request

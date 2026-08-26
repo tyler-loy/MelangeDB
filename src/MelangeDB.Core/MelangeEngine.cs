@@ -53,6 +53,9 @@ public sealed partial class MelangeEngine : IDisposable
     private Timestamp? _tailTimestamp;
     private bool _disposed;
 
+    /// <summary>Set by <see cref="Drain"/>; read and written only under <see cref="_writeLock"/>.</summary>
+    private bool _closed;
+
     /// <summary>Cumulative Stopwatch ticks of write-lock work; see <see cref="WriteLockBusyTicks"/>.</summary>
     private long _writeLockBusyTicks;
 
@@ -558,6 +561,7 @@ public sealed partial class MelangeEngine : IDisposable
         CommitRecord record;
         lock (_writeLock)
         {
+            ThrowIfClosed(reducerName);
             var lockStarted = Stopwatch.GetTimestamp();
             try
             {
@@ -718,6 +722,7 @@ public sealed partial class MelangeEngine : IDisposable
         CommitRecord bulkRecord;
         lock (_writeLock)
         {
+            ThrowIfClosed(BulkReducerName);
             using var busy = TrackWriteLockBusy();
             using var activity = _telemetry?.StartReducer(BulkReducerName, caller, arguments: null, encodedArguments: default);
             var started = Stopwatch.GetTimestamp();
@@ -1130,12 +1135,42 @@ public sealed partial class MelangeEngine : IDisposable
             _logger, residentTables, residentBytes, overheadBytes, statistics.BufferPoolCapacityBytes, total, lines.ToString());
     }
 
-    /// <summary>Blocks until any in-flight invocation has completed. Used by graceful shutdown.</summary>
+    /// <summary>
+    /// Blocks until any in-flight invocation has completed, then closes the engine to further
+    /// writes. Graceful shutdown's first step, and a one-way door: there is no reopening, because
+    /// the only caller is a host on its way down.
+    /// <para>
+    /// Closing is the point. Waiting alone is a barrier — it establishes that nothing is being
+    /// written <em>now</em>, and says nothing about the next caller, who may already be past every
+    /// check this engine has and merely waiting for the lock. A write that lands after the drain
+    /// lands after <see cref="Checkpoint"/> flushed and after the host announced the LSN it
+    /// flushed at, which makes that announcement false; worse, it can still be inside the store
+    /// when the host disposes it. Refusing here is what makes the announced LSN the real one.
+    /// </para>
+    /// </summary>
     public void Drain()
     {
         lock (_writeLock)
         {
+            _closed = true;
         }
+    }
+
+    /// <summary>
+    /// Refuses a write that arrives after <see cref="Drain"/> closed the engine. Called at the top
+    /// of every locked region that can append, so the refusal happens before a reducer body runs
+    /// and before anything is staged. <see cref="TransientRejectionException"/> because that is
+    /// precisely what this is from the caller's side: a condition the system designed, which
+    /// clears on the next process, and whose contract is to retry unchanged rather than to report
+    /// a fault.
+    /// </summary>
+    private void ThrowIfClosed(string reducerName)
+    {
+        if (!_closed)
+            return;
+        throw new TransientRejectionException(
+            $"This database has been drained for shutdown and accepts no further writes; " +
+            $"'{reducerName}' arrived after the drain. Retry against the next process.");
     }
 
     /// <summary>
@@ -1278,6 +1313,7 @@ public sealed partial class MelangeEngine : IDisposable
         int rowCount;
         lock (_writeLock)
         {
+            ThrowIfClosed(reducerName);
             using var busy = TrackWriteLockBusy();
             // Read inside the lock: waiting for the lock is not holding it, and billing the wait
             // to this transaction would blame the queue on whoever happened to be last in it.
@@ -1450,6 +1486,10 @@ public sealed partial class MelangeEngine : IDisposable
         {
             lock (_writeLock)
             {
+                // The body already ran against a pinned view; refusing here discards that work and
+                // commits nothing, which is the right trade against a commit landing after the
+                // announced flush.
+                ThrowIfClosed(reducerName);
                 // Measured from inside: waiting for the lock is not holding it, and billing the wait
                 // to this transaction would blame the queue on whoever happened to be last in it.
                 using var busy = TrackWriteLockBusy();
