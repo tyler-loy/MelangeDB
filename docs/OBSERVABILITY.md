@@ -372,9 +372,9 @@ over a non-empty directory: a new world naming its first shape reinterprets noth
 nothing. Seeing 1008 at all means `Schema:AllowAdoption` was turned on for that boot: it defaults
 to `false`, which refuses instead of adopting — `1203 HeartbeatTimeout`,
 `1204 ReducerCallFailed` (03); `1104 UnpolicedReducers` (04); `1205 LifecycleReducerFailed`,
-`1301 SchedulerOverrun`, `1302 SchedulerTickFailed` (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,
+`1301 SchedulerOverrun`, `1302 SchedulerTickFailed`, and `1313 SchedulerStopAbandonedFire` — a fire still running ten seconds after the scheduler was told to stop, abandoned rather than waited for; its commit is refused by the engine's drain gate rather than landing after the announced LSN (05); `1401 EventHandlerRetry`, `1402 EventDeadLettered`,
 `1403 SubscriberCheckpointEvicted` — the loud eviction the expiry design promises — and
-`1404 SubscriberLostPlace`, how a returning subscriber is told it starts from current state (06);
+`1404 SubscriberLostPlace`, how a returning subscriber is told it starts from current state, and `1405 EventDispatchLoopsStillRunning` — the bus's stop timed out with loops alive, which used to be silent because the wait discarded its result; a handler still in flight redelivers from its checkpoint next start (06);
 `1501 ResidencyReport` — the startup residency report: per resident table row count and measured bytes, the
 buffer-pool cap, and the total they sum to — `1502 SnapshotWritten`, `1503 LogTruncated` — since phase 18 it
 names the *governing* floor rather than the anonymous LSN it respected: floor name, floor LSN, records still

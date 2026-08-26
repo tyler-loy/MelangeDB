@@ -194,6 +194,9 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
     /// checkpoints. An event mid-delivery at shutdown is not checkpointed and redelivers on the
     /// next start — at-least-once, honestly.
     /// </summary>
+    /// <summary>How long <see cref="Stop"/> waits for the dispatch loops to finish.</summary>
+    private static readonly TimeSpan StopDrainTimeout = TimeSpan.FromSeconds(10);
+
     internal void Stop()
     {
         if (_stopped)
@@ -201,14 +204,23 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
         _stopped = true;
         _cts.Cancel();
         _sweepTimer?.Dispose();
+        var drained = false;
         try
         {
-            Task.WaitAll([.. _loops], TimeSpan.FromSeconds(10));
+            // The return value is the whole point: on timeout this does not throw, and discarding
+            // it left a dispatch loop alive past Stop with a handler free to call a reducer — a
+            // commit arriving after the host announced the LSN it flushed at.
+            drained = Task.WaitAll([.. _loops], StopDrainTimeout);
         }
         catch (AggregateException)
         {
-            // A loop observed cancellation mid-await; its checkpoint simply stays put.
+            // A loop observed cancellation mid-await; its checkpoint simply stays put. Distinct
+            // from timing out: the loops did finish.
+            drained = true;
         }
+
+        if (!drained)
+            LogMessages.DispatchLoopsStillRunning(_logger, StopDrainTimeout.TotalSeconds);
 
         lock (_checkpointLock)
         {
@@ -583,6 +595,17 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
 
         public static void DeadLettered(ILogger logger, string subscriber, string eventType, ulong lsn, int attempts, Exception failure) =>
             DeadLetteredMessage(logger, subscriber, eventType, lsn, attempts, failure);
+
+        private static readonly Action<ILogger, double, Exception?> DispatchLoopsStillRunningMessage =
+            LoggerMessage.Define<double>(
+                LogLevel.Warning,
+                new EventId(1405, "EventDispatchLoopsStillRunning"),
+                "Event dispatch loops were still running {Seconds}s after the bus was told to stop; shutdown continues without " +
+                "them. A handler still in flight redelivers from its checkpoint next start, and the engine refuses its commit " +
+                "if it arrives after the drain.");
+
+        public static void DispatchLoopsStillRunning(ILogger logger, double seconds) =>
+            DispatchLoopsStillRunningMessage(logger, seconds, null);
 
         private static readonly Action<ILogger, string, ulong, double, int, Exception?> CheckpointEvictedMessage =
             LoggerMessage.Define<string, ulong, double, int>(
