@@ -10,7 +10,28 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.2] — 2026-08-26
+
 ### Added
+
+- **Every HTTP error carries an id the caller can quote** ([#136](https://github.com/tyler-loy/MelangeDB/issues/136)).
+  A player whose connect failed could report "couldn't connect around nine" and nothing in that report found the
+  server's side of the request — the server was tracing the whole time, so the id existed and simply never
+  reached the caller. Error bodies now carry `traceId` (`Activity.Current`, where the host configured tracing)
+  and `requestId` (`HttpContext.TraceIdentifier`, always), and stamp the same values on `X-Trace-Id` /
+  `X-Request-Id` for a caller that never reads the body. A host whose own middleware already stamps those names
+  keeps its values; MelangeDB fills the gap rather than overwriting.
+
+  On the client, the connect ticket — the step ahead of the socket, and the one a player hits first — no longer
+  swallows the response. `MelangeCallException` gains `Status`, `ResponseHeaders`, and `Reference`, the id worth
+  putting on a boot screen; `Reference` is also interpolated into `Message` ahead of the response body, so a
+  client that only logs the message keeps the id through a truncated log line. A ticket step that gets a success
+  status with a body that is not the ticket JSON — a captive portal, a proxy's own page — now fails as the ticket
+  step failing, with the same id, instead of surfacing a raw `JsonException` from inside the SDK. All three
+  members are additive and null on socket-frame failures. See
+  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md#correlating-a-failure-a-user-reports).
 
 - **`IHotStore.ContainsKey(table, key)`** — a key-directory existence probe that reads no row. The
   follow-up to [#137](https://github.com/tyler-loy/MelangeDB/issues/137): an existence check used
@@ -72,7 +93,6 @@ All packages ship together at one version; there is no per-package versioning. S
   would otherwise terminate the process (EventId list: 1310 re-entry, 1311 drain fault, 1312
   telemetry fault).
 
-
 - **The scheduler no longer spins re-arming its timer.** A platform timer routinely wakes a
   fraction of a millisecond before the delay it was armed with; the dispatch drain then found
   nothing due (the entry's time had not quite arrived) and re-armed on the tiny remainder — waking
@@ -87,7 +107,6 @@ All packages ship together at one version; there is no per-package versioning. S
   silently failing to advance the reader — which would mis-time every timer on that table with no
   error. Safe today (all kinds handled); a guard against a future one.
 
-
 - **A poisoned row no longer wedges the reducers and subscriptions on its table.** Beyond the
   existence probe above, the two remaining places that read a row's bytes on behalf of *others*
   now tolerate one that cannot be read: a subscription's initial-set materialization for a
@@ -98,9 +117,6 @@ All packages ship together at one version; there is no per-package versioning. S
   these, a scheduled sweep that rewrites the row heals it live rather than failing on it — the
   world-wide wedge the reference workload hit off one `GrowFlora` row. Point reads (`Find`, HTTP)
   still surface the fault by design; a caller asking for one row by key is owed the truth about it.
-
-
-### Fixed
 
 - **A shrinking overwrite of an out-of-line blob no longer leaves a stale, longer tail** — the root
   cause of [#137](https://github.com/tyler-loy/MelangeDB/issues/137). The FASTER store's in-place
@@ -421,23 +437,6 @@ All packages ship together at one version; there is no per-package versioning. S
     is requalified automatically; hand-written references need the namespace change.
 
 ### Added
-
-- **Every HTTP error carries an id the caller can quote** ([#136](https://github.com/tyler-loy/MelangeDB/issues/136)).
-  A player whose connect failed could report "couldn't connect around nine" and nothing in that report found the
-  server's side of the request — the server was tracing the whole time, so the id existed and simply never
-  reached the caller. Error bodies now carry `traceId` (`Activity.Current`, where the host configured tracing)
-  and `requestId` (`HttpContext.TraceIdentifier`, always), and stamp the same values on `X-Trace-Id` /
-  `X-Request-Id` for a caller that never reads the body. A host whose own middleware already stamps those names
-  keeps its values; MelangeDB fills the gap rather than overwriting.
-
-  On the client, the connect ticket — the step ahead of the socket, and the one a player hits first — no longer
-  swallows the response. `MelangeCallException` gains `Status`, `ResponseHeaders`, and `Reference`, the id worth
-  putting on a boot screen; `Reference` is also interpolated into `Message` ahead of the response body, so a
-  client that only logs the message keeps the id through a truncated log line. A ticket step that gets a success
-  status with a body that is not the ticket JSON — a captive portal, a proxy's own page — now fails as the ticket
-  step failing, with the same id, instead of surfacing a raw `JsonException` from inside the SDK. All three
-  members are additive and null on socket-frame failures. See
-  [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md#correlating-a-failure-a-user-reports).
 
 - **Backup, second pass: `--check`, `clone`, and `--at-lsn`**
   ([road-to-0.2 phase 19](docs/road-to-0.2/plan-phase-19.md)) — the three verbs phase 15 recorded
