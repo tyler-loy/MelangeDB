@@ -1400,8 +1400,12 @@ public sealed partial class MelangeEngine : IDisposable
         activity?.SetTag("melange.writeset.rows", rowCount);
         var elapsed = Elapsed(started);
         _telemetry?.RecordTransaction(reducerName, "commit", elapsed, rowCount);
+        // The measure travels with the comparison that fired, rather than being inferred inside the
+        // warning: the two paths deliberately fire on different numbers, and a message that named
+        // the wrong one is exactly what issue #150 reported. Serialized fires on the total, because
+        // the body ran under the lock and the durability wait after it is latency this caller paid.
         if (elapsed > _options.Telemetry.SlowReducerMs)
-            WarnSlowReducer(activity, reducerName, elapsed, committedBodyMs, commitMs, durabilityWaitMs, postCommitMs, rowCount, lockedMs, Isolation.Serialized);
+            WarnSlowReducer(activity, reducerName, "total", elapsed, committedBodyMs, commitMs, durabilityWaitMs, postCommitMs, rowCount, lockedMs, Isolation.Serialized);
 
         return committedLsn;
     }
@@ -1536,8 +1540,11 @@ public sealed partial class MelangeEngine : IDisposable
         activity?.SetTag("melange.writeset.rows", ops.Count);
         var elapsed = Elapsed(started);
         _telemetry?.RecordTransaction(reducerName, "commit", elapsed, ops.Count);
+        // Snapshot fires on the locked portion alone: its body ran outside the lock, and a long body
+        // is what this isolation level exists to allow. Firing on the total would warn about every
+        // reducer that chose it.
         if (lockedMs > _options.Telemetry.SlowReducerMs)
-            WarnSlowReducer(activity, reducerName, elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count, lockedMs, Isolation.Snapshot);
+            WarnSlowReducer(activity, reducerName, "write-lock hold", elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count, lockedMs, Isolation.Snapshot);
 
         return committedLsn;
     }
@@ -1569,6 +1576,7 @@ public sealed partial class MelangeEngine : IDisposable
     private void WarnSlowReducer(
         Activity? activity,
         string reducerName,
+        string firedMeasure,
         double elapsed,
         double bodyMs,
         double commitMs,
@@ -1587,10 +1595,15 @@ public sealed partial class MelangeEngine : IDisposable
                 ["melange.commit_ms"] = commitMs,
                 ["melange.post_commit_ms"] = postCommitMs,
                 ["melange.writeset.rows"] = rows,
-                // The number the threshold actually fired on, and the one an alert about write
-                // latency wants. For a serialized transaction it equals melange.duration_ms; for a
-                // snapshot one the gap between them is the stall the feature removed.
+                // The portion that held the write lock — the number an alert about global write
+                // latency wants. It is *not* melange.duration_ms on a serialized transaction: the
+                // durability wait happens after the lock is released, so the two differ by exactly
+                // that wait. On a snapshot one the gap is the body, which is the stall the level
+                // removed.
                 ["melange.locked_ms"] = lockedMs,
+                // Which of the two crossed the threshold, since the isolation levels fire on
+                // different ones. Carried so a span reader need not re-derive the rule.
+                ["melange.fired_measure"] = firedMeasure,
                 ["melange.isolation"] = IsolationTag(isolation),
             };
             // The durability wait this caller actually experienced — under group commit that is
@@ -1606,9 +1619,9 @@ public sealed partial class MelangeEngine : IDisposable
         var threshold = _options.Telemetry.SlowReducerMs;
         var tag = IsolationTag(isolation);
         if (fsyncMs is { } inlineFsync)
-            LogMessages.SlowReducer(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, inlineFsync, postCommitMs, rows, lockedMs, tag);
+            LogMessages.SlowReducer(_logger, reducerName, firedMeasure, elapsed, threshold, bodyMs, commitMs, inlineFsync, postCommitMs, rows, lockedMs, tag);
         else
-            LogMessages.SlowReducerDeferredFsync(_logger, reducerName, elapsed, threshold, bodyMs, commitMs, postCommitMs, rows, lockedMs, tag);
+            LogMessages.SlowReducerDeferredFsync(_logger, reducerName, firedMeasure, elapsed, threshold, bodyMs, commitMs, postCommitMs, rows, lockedMs, tag);
     }
 
     private static string IsolationTag(Isolation isolation) =>
@@ -1660,25 +1673,34 @@ public sealed partial class MelangeEngine : IDisposable
         /// <summary>
         /// 1003, in-line fsync: the whole split, including what durability cost.
         /// <para>
-        /// <c>LockedMs</c> is the number the threshold fired on and the one that is global write
-        /// latency; <c>DurationMs</c> is the whole transaction. Under
-        /// <c>Isolation.Serialized</c> they are equal by construction. Under
-        /// <c>Isolation.Snapshot</c> the gap between them is exactly the stall the isolation level
-        /// removed, which makes a 500 ms serialized transaction and a 500 ms snapshot one
-        /// distinguishable on the line rather than only in a trace.
+        /// <c>DurationMs</c> is the whole transaction; <c>LockedMs</c> is the portion that held the
+        /// write lock, which is the part that is global write latency. Both are always printed, and
+        /// <c>FiredMeasure</c> names which of them crossed the threshold — because the two isolation
+        /// levels deliberately fire on different ones.
+        /// </para>
+        /// <para>
+        /// Under <c>Isolation.Serialized</c> the threshold is the total: the body ran under the lock,
+        /// and the durability wait after it is latency this caller paid. The two are <em>not</em>
+        /// equal there — they differ by exactly that wait, which happens outside the lock so the next
+        /// transaction's body can run while this one waits (the batching that forms fsync groups).
+        /// Under <c>Isolation.Snapshot</c> the threshold is the locked portion alone, since a long
+        /// body is what that isolation level exists to allow; the gap between the two is then exactly
+        /// the stall the level removed, which is what makes a 500 ms serialized transaction and a
+        /// 500 ms snapshot one distinguishable on the line rather than only in a trace.
         /// </para>
         /// </summary>
         [LoggerMessage(
             EventId = 1003,
             EventName = "SlowReducer",
             Level = LogLevel.Warning,
-            Message = "Reducer '{Reducer}' held the write lock {LockedMs:F1}ms, over the Telemetry:SlowReducerMs " +
-                      "threshold of {ThresholdMs}ms — {Isolation} isolation, {DurationMs:F1}ms in total, body " +
+            Message = "Reducer '{Reducer}' exceeded Telemetry:SlowReducerMs ({ThresholdMs}ms) on {FiredMeasure} — " +
+                      "{Isolation} isolation, {DurationMs:F1}ms in total, write lock held {LockedMs:F1}ms, body " +
                       "{BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync {FsyncMs:F1}ms), post-commit " +
                       "{PostCommitMs:F1}ms, {Rows} row ops.")]
         public static partial void SlowReducer(
             ILogger logger,
             string reducer,
+            string firedMeasure,
             double durationMs,
             int thresholdMs,
             double bodyMs,
@@ -1699,13 +1721,14 @@ public sealed partial class MelangeEngine : IDisposable
             EventId = 1003,
             EventName = "SlowReducerDeferredFsync",
             Level = LogLevel.Warning,
-            Message = "Reducer '{Reducer}' held the write lock {LockedMs:F1}ms, over the Telemetry:SlowReducerMs " +
-                      "threshold of {ThresholdMs}ms — {Isolation} isolation, {DurationMs:F1}ms in total, body " +
+            Message = "Reducer '{Reducer}' exceeded Telemetry:SlowReducerMs ({ThresholdMs}ms) on {FiredMeasure} — " +
+                      "{Isolation} isolation, {DurationMs:F1}ms in total, write lock held {LockedMs:F1}ms, body " +
                       "{BodyMs:F1}ms, commit {CommitMs:F1}ms (fsync deferred by CommitLog:FsyncPolicy), " +
                       "post-commit {PostCommitMs:F1}ms, {Rows} row ops.")]
         public static partial void SlowReducerDeferredFsync(
             ILogger logger,
             string reducer,
+            string firedMeasure,
             double durationMs,
             int thresholdMs,
             double bodyMs,

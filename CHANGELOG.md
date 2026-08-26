@@ -10,7 +10,29 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`1003 SlowReducer` no longer reports a number that did not cross the threshold**
+  ([#150](https://github.com/tyler-loy/MelangeDB/issues/150)). The line read *"held the write lock 48.9ms,
+  over the Telemetry:SlowReducerMs threshold of 50ms"* — 48.9 is not over 50, and a warning that contradicts
+  itself gets the measurement distrusted rather than the code.
+
+  Two call sites reached one message. The serialized path fires on the **total** and the snapshot path on the
+  **locked portion**, and the shared message asserted the locked portion had crossed — true on the snapshot
+  path, false on the serialized one. It rested on an invariant stated in the code, that the two are "equal by
+  construction" under `Isolation.Serialized`; they are not, and have not been since phase 17 moved the
+  durability wait outside the write lock precisely so the next transaction's body can run while this one
+  waits. The gap between the two numbers *is* that wait.
+
+  The asymmetry is kept, because each level fires on the only number that makes sense for it: a serialized
+  body ran under the lock, so a stalled disk behind a trivial body still warns — telling a wide body from a
+  slow disk is what this warning is for — while a snapshot body ran outside it, and thresholding a 500 ms
+  snapshot body would defeat the isolation level. What changes is that the line now names which measure
+  crossed, as a structured `FiredMeasure` field (`melange.fired_measure` on the span event) alongside both
+  numbers, and the label travels from the comparison that produced it rather than being inferred. **No
+  transaction that warned before stops warning, and none starts.** The docs carried the same stale invariant
+  in three places and are corrected with it.
+
 
 ## [0.2.2] — 2026-08-26
 

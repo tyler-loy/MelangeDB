@@ -349,6 +349,90 @@ public class TelemetryTests : IDisposable
         Assert.True(entry.Number("BodyMs") < 30, "but it is not the body's");
     }
 
+    [Fact]
+    public void The_1003_line_names_the_measure_that_actually_crossed_the_threshold()
+    {
+        // Issue #150: the message said "held the write lock 48.9ms, over the ... threshold of 50ms".
+        // 48.9 is not over 50 — the serialized path fires on the total, which includes the
+        // durability wait taken *after* the lock is released, but the sentence reported the locked
+        // portion. Held hostage here: an 80ms fsync behind a trivial body puts the two numbers
+        // either side of the threshold on purpose.
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 50;
+        logged.Engine.LogFile.FlushFaultInjection = () => Thread.Sleep(80);
+
+        logged.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+        logged.Engine.LogFile.FlushFaultInjection = null;
+
+        var entry = logs.Single(1003);
+        Assert.Equal("total", entry.Fields["FiredMeasure"]);
+        Assert.True(entry.Number("DurationMs") > 50, $"the total should have crossed: {entry.Message}");
+        Assert.True(
+            entry.Number("LockedMs") < 50,
+            $"this test is only meaningful while the lock hold stays under the threshold: {entry.Message}");
+
+        // The heart of it: whatever the line names as having fired must actually exceed the
+        // threshold. Before the fix this held for snapshot and was false for serialized.
+        var fired = (string)entry.Fields["FiredMeasure"]!;
+        var firedMs = fired == "total" ? entry.Number("DurationMs") : entry.Number("LockedMs");
+        Assert.True(firedMs > entry.Number("ThresholdMs"), $"the line contradicts itself: {entry.Message}");
+
+        // And it no longer claims the locked number is what crossed.
+        Assert.DoesNotContain("held the write lock", entry.Message);
+        Assert.Contains("on total", entry.Message);
+    }
+
+    [Fact]
+    public void Both_numbers_stay_on_the_line_so_the_reader_never_has_to_pick_one()
+    {
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 50;
+        logged.Engine.LogFile.FlushFaultInjection = () => Thread.Sleep(80);
+
+        logged.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+        logged.Engine.LogFile.FlushFaultInjection = null;
+
+        var entry = logs.Single(1003);
+        // The gap between them is the durability wait, and it is the whole diagnosis: a wide body
+        // and a stalled disk are different problems, and the line has to separate them.
+        Assert.Contains("in total", entry.Message);
+        Assert.Contains("write lock held", entry.Message);
+        Assert.True(entry.Number("DurationMs") - entry.Number("LockedMs") > 40,
+            $"the durability wait should show up as the gap: {entry.Message}");
+    }
+
+    [Fact]
+    public void A_serialized_transaction_still_warns_when_only_the_disk_was_slow()
+    {
+        // The signal the alternative fix would have dropped. The lock hold is trivial — this
+        // transaction stalled no other writer — but the caller waited 80ms on fsync, and 1003 exists
+        // to tell a wide body from a stalled disk. It has to fire.
+        using var logs = new LogCapture();
+        using var logged = new EngineHarness(loggerFactory: logs);
+        logged.Options.Telemetry.SlowReducerMs = 50;
+        logged.Engine.LogFile.FlushFaultInjection = () => Thread.Sleep(80);
+
+        logged.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+        logged.Engine.LogFile.FlushFaultInjection = null;
+
+        var entry = logs.Single(1003);
+        Assert.True(entry.Number("FsyncMs") > 40, $"the fsync should be the bulk of it: {entry.Message}");
+        Assert.True(entry.Number("BodyMs") < 40, $"and the body should not be: {entry.Message}");
+    }
+
+    [Fact]
+    public void The_slow_reducer_span_event_carries_the_fired_measure_too()
+    {
+        _harness.Options.Telemetry.SlowReducerMs = 0;
+        _harness.Invoke("Join", ctx => ctx.Db.Insert(new Player { Id = Identity.Hash("p"), RoomId = 1, Name = "P" }));
+
+        var slow = SlowReducerEvent();
+        Assert.Equal("total", slow.Tags.Single(t => t.Key == "melange.fired_measure").Value);
+        Assert.Equal("serialized", slow.Tags.Single(t => t.Key == "melange.isolation").Value);
+    }
+
     private ActivityEvent SlowReducerEvent()
     {
         var reducer = Stopped().Last(a => a.OperationName == "melange.reducer");

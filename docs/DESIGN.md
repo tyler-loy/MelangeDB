@@ -230,9 +230,11 @@ Two smaller consequences of the body no longer being alone:
 - **AutoInc ids are reserved as they are allocated**, not staged until commit, because two
   concurrent bodies staging against one sequence would hand out the same id. An aborted snapshot
   transaction therefore leaves a gap. Ids are unique, not dense — see §1.
-- **`Telemetry:SlowReducerMs` thresholds on the locked portion**, at every isolation level. For a
-  serialized transaction that is the whole transaction, so nothing about that path changed; for a
-  snapshot one it is the commit alone, because the body stalled nobody.
+- **`Telemetry:SlowReducerMs` thresholds on the locked portion under snapshot isolation**, because
+  the body stalled nobody and a long body is what the level exists to allow. The serialized path is
+  unchanged and still thresholds on the whole transaction — which is *not* the same number as its
+  locked portion, since phase 17 moved the durability wait outside the lock. The `1003` line prints
+  both and names which one fired; see [OBSERVABILITY.md](OBSERVABILITY.md).
 
 The full design record, including what was deliberately left out (`Isolation.ReadOnly`, optimistic
 concurrency with read-set validation, cross-tier isolation) and what remains open, is in
