@@ -423,7 +423,8 @@ public sealed partial class MelangeEngine : IDisposable
         Action<ReducerContext> body,
         ConnectionId connectionId = default,
         ActivityContext parentContext = default,
-        Isolation isolation = Isolation.Serialized)
+        Isolation isolation = Isolation.Serialized,
+        CallerClaims? claims = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(reducerName);
         ArgumentNullException.ThrowIfNull(body);
@@ -441,7 +442,7 @@ public sealed partial class MelangeEngine : IDisposable
                 _inReducer.Value = true;
                 try
                 {
-                    return InvokeSnapshot(reducerName, caller, body, encodedArguments, connectionId, parentContext, source);
+                    return InvokeSnapshot(reducerName, caller, body, encodedArguments, connectionId, parentContext, source, claims);
                 }
                 finally
                 {
@@ -459,7 +460,7 @@ public sealed partial class MelangeEngine : IDisposable
             _inReducer.Value = true;
             try
             {
-                return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext);
+                return InvokeCore(reducerName, caller, body, arguments: null, encodedArguments, connectionId, parentContext, claims);
             }
             finally
             {
@@ -1300,7 +1301,8 @@ public sealed partial class MelangeEngine : IDisposable
         IReadOnlyList<object?>? arguments,
         ReadOnlyMemory<byte> encodedArguments,
         ConnectionId connectionId,
-        ActivityContext parentContext = default)
+        ActivityContext parentContext = default,
+        CallerClaims? claims = null)
     {
         using var activity = _telemetry?.StartReducer(reducerName, caller, arguments, encodedArguments, parentContext);
         activity?.SetTag("melange.isolation", "serialized");
@@ -1323,7 +1325,7 @@ public sealed partial class MelangeEngine : IDisposable
             var stage = _sequencer.BeginStage();
             var random = new Random(unchecked((int)timestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
             var events = new EventStage(_options.Events);
-            var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events);
+            var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events, claims);
 
             IReadOnlyList<RowOp> ops;
             // Measured directly rather than as (total - commit): everything after the append —
@@ -1432,7 +1434,8 @@ public sealed partial class MelangeEngine : IDisposable
         ReadOnlyMemory<byte> encodedArguments,
         ConnectionId connectionId,
         ActivityContext parentContext,
-        IReadViewSource source)
+        IReadViewSource source,
+        CallerClaims? claims = null)
     {
         using var activity = _telemetry?.StartReducer(reducerName, caller, arguments: null, encodedArguments, parentContext);
         activity?.SetTag("melange.isolation", "snapshot");
@@ -1465,7 +1468,8 @@ public sealed partial class MelangeEngine : IDisposable
                     bodyTimestamp,
                     random,
                     new TransactionDb(Schema, view, writeSet, stage, _tableGuard),
-                    events);
+                    events,
+                    claims);
                 body(context);
             }
 

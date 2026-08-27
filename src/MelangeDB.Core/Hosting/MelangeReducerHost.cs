@@ -86,7 +86,8 @@ public sealed class MelangeReducerHost
         ConnectionId connectionId,
         ReadOnlyMemory<byte> encodedArguments,
         System.Diagnostics.ActivityContext parentContext = default,
-        CallSource source = default)
+        CallSource source = default,
+        CallerClaims? claims = null)
     {
         if (_stopping)
             throw new InvalidOperationException("MelangeDB is shutting down; no further reducer calls are accepted.");
@@ -131,7 +132,8 @@ public sealed class MelangeReducerHost
             },
             connectionId,
             parentContext,
-            descriptor.Isolation);
+            descriptor.Isolation,
+            claims);
     }
 
     internal void SignalStopping() => _stopping = true;

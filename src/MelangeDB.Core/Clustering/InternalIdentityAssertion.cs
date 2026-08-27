@@ -20,7 +20,13 @@ public static class InternalIdentityAssertion
     // B (bulk owner) and K (backup owner) are additive and fail-closed: an assertion minted
     // before either field existed deserializes it to false, so an old token can never confer the
     // new capability.
-    private sealed record Payload(string I, bool G, long E, bool O, bool L, bool B, bool K = false);
+    // C carries the Auth:CaptureClaims allow-list's claims as type -> values, so a shard node reads
+    // the same claims the hub read off the client's real token. Additive and fail-closed like the
+    // flags: an assertion minted before it existed deserializes to no claims, which is the same
+    // thing a host that captures none produces.
+    private sealed record Payload(
+        string I, bool G, long E, bool O, bool L, bool B, bool K = false,
+        Dictionary<string, string[]>? C = null);
 
     /// <summary>
     /// Mints an assertion for one identity, valid until <paramref name="expiresAt"/>.
@@ -36,11 +42,14 @@ public static class InternalIdentityAssertion
         bool isBulkOwner,
         DateTimeOffset expiresAt,
         bool firesLifecycle = false,
-        bool isBackupOwner = false)
+        bool isBackupOwner = false,
+        CallerClaims? claims = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(secret);
         var payload = JsonSerializer.SerializeToUtf8Bytes(
-            new Payload(identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle, isBulkOwner, isBackupOwner));
+            new Payload(
+                identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle, isBulkOwner, isBackupOwner,
+                Encode(claims)));
         var signature = HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), payload);
         return Prefix + Convert.ToBase64String(payload) + "." + Convert.ToBase64String(signature);
     }
@@ -54,7 +63,7 @@ public static class InternalIdentityAssertion
     /// a reason on any failure — a tampered or expired assertion must read as "not authenticated",
     /// never as a different identity.
     /// </summary>
-    public static (Identity Identity, bool IsGuest, bool IsSqlOwner, bool IsBulkOwner, bool IsBackupOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle)? Validate(
+    public static (Identity Identity, bool IsGuest, bool IsSqlOwner, bool IsBulkOwner, bool IsBackupOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle, CallerClaims Claims)? Validate(
         string secret,
         string token,
         DateTimeOffset now,
@@ -119,6 +128,30 @@ public static class InternalIdentityAssertion
             return null;
         }
 
-        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, parsed.K, expiresAt, parsed.L);
+        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, parsed.K, expiresAt, parsed.L, Decode(parsed.C));
+    }
+
+    private static Dictionary<string, string[]>? Encode(CallerClaims? claims)
+    {
+        if (claims is null || claims.Count == 0)
+            return null;
+        var encoded = new Dictionary<string, string[]>(claims.Count, StringComparer.Ordinal);
+        foreach (var type in claims.Types)
+            encoded[type] = [.. claims.GetValues(type)];
+        return encoded;
+    }
+
+    private static CallerClaims Decode(Dictionary<string, string[]>? encoded)
+    {
+        if (encoded is null || encoded.Count == 0)
+            return CallerClaims.Empty;
+        List<KeyValuePair<string, string>> pairs = [];
+        foreach (var (type, values) in encoded)
+        {
+            foreach (var value in values)
+                pairs.Add(new KeyValuePair<string, string>(type, value));
+        }
+
+        return CallerClaims.From(pairs);
     }
 }

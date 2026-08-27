@@ -27,11 +27,17 @@ internal static class TestTokens
         string subject,
         string issuer = Issuer,
         DateTimeOffset? expires = null,
-        string? role = null)
+        string? role = null,
+        IDictionary<string, object>? extraClaims = null)
     {
         var claims = new Dictionary<string, object> { ["sub"] = subject };
         if (role is not null)
             claims["role"] = role;
+        if (extraClaims is not null)
+        {
+            foreach (var (type, value) in extraClaims)
+                claims[type] = value;
+        }
         return new JsonWebTokenHandler().CreateToken(new SecurityTokenDescriptor
         {
             Issuer = issuer,

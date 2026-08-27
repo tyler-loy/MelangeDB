@@ -295,6 +295,69 @@ public class InternalIdentityAssertionTests
     }
 
     [Fact]
+    public void Captured_claims_ride_the_assertion_so_a_shard_node_reads_what_the_hub_read()
+    {
+        // Issue #152: the gateway vouches for a client with this assertion, not the client's JWT,
+        // so a reducer on a shard node sees whatever the assertion carries. Without the claims here
+        // capture would work on a single node and silently produce nothing the moment the
+        // deployment clustered — the same failure the issue rejected the middleware workaround for.
+        var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);
+        var claims = CallerClaims.From(
+        [
+            new KeyValuePair<string, string>("account_id", "acct-42"),
+            new KeyValuePair<string, string>("groups", "moderators"),
+            new KeyValuePair<string, string>("groups", "beta"),
+        ]);
+
+        var token = InternalIdentityAssertion.Mint(
+            "secret", Player, isGuest: false, isSqlOwner: false, isBulkOwner: false, expires,
+            firesLifecycle: true, isBackupOwner: false, claims);
+
+        var result = InternalIdentityAssertion.Validate("secret", token, expires.AddMinutes(-1), out var failure);
+
+        Assert.Null(failure);
+        Assert.Equal("acct-42", result!.Value.Claims["account_id"]);
+        Assert.Equal(["moderators", "beta"], result.Value.Claims.GetValues("groups"));
+    }
+
+    [Fact]
+    public void An_assertion_minted_with_no_claims_validates_with_none()
+    {
+        var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);
+        var token = InternalIdentityAssertion.Mint(
+            "secret", Player, isGuest: false, isSqlOwner: false, isBulkOwner: false, expires);
+
+        var result = InternalIdentityAssertion.Validate("secret", token, expires.AddMinutes(-1), out _);
+
+        // Empty, not null: a reducer reads the same shape whether the deployment captures claims,
+        // clusters, or neither. An assertion minted before the field existed lands here too.
+        Assert.Equal(0, result!.Value.Claims.Count);
+    }
+
+    [Fact]
+    public void Tampering_with_a_claim_fails_the_signature()
+    {
+        // The claims are inside the signed payload, so they carry the same guarantee the identity
+        // does: a shard node that accepts an assertion accepts its claims on the hub's authority.
+        var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);
+        var claims = CallerClaims.From([new KeyValuePair<string, string>("account_id", "acct-42")]);
+        var token = InternalIdentityAssertion.Mint(
+            "secret", Player, isGuest: false, isSqlOwner: false, isBulkOwner: false, expires,
+            firesLifecycle: false, isBackupOwner: false, claims);
+
+        var parts = token[InternalIdentityAssertion.Prefix.Length..].Split('.');
+        var payload = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(parts[0]))
+            .Replace("acct-42", "acct-99", StringComparison.Ordinal);
+        var forged = InternalIdentityAssertion.Prefix
+            + Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(payload)) + "." + parts[1];
+
+        var result = InternalIdentityAssertion.Validate("secret", forged, expires.AddMinutes(-1), out var failure);
+
+        Assert.Null(result);
+        Assert.Contains("signature", failure);
+    }
+
+    [Fact]
     public void An_assertion_minted_without_bulk_owner_validates_without_it()
     {
         var expires = DateTimeOffset.UnixEpoch.AddDays(10_000);

@@ -260,11 +260,23 @@ internal sealed partial class HubRuntime : IDisposable
     }
 
     /// <summary>Mints the internal identity assertion the gateway attaches to upstream sessions.</summary>
-    public string MintAssertion(Identity identity, bool isGuest, bool isSqlOwner, bool isBulkOwner, DateTimeOffset tokenExpiresAt, bool firesLifecycle, bool isBackupOwner = false)
+    public string MintAssertion(
+        Identity identity,
+        bool isGuest,
+        bool isSqlOwner,
+        bool isBulkOwner,
+        DateTimeOffset tokenExpiresAt,
+        bool firesLifecycle,
+        bool isBackupOwner = false,
+        CallerClaims? claims = null)
     {
         var ttlCap = _time.GetUtcNow().AddSeconds(Cluster.AssertionTtlSeconds);
         var expires = tokenExpiresAt < ttlCap ? tokenExpiresAt : ttlCap;
-        return InternalIdentityAssertion.Mint(Cluster.Secret, identity, isGuest, isSqlOwner, isBulkOwner, expires, firesLifecycle, isBackupOwner);
+        // The captured claims travel with the identity they were read alongside: a reducer running
+        // on a shard node reads what the hub read off the client's real token, so claims do not
+        // quietly become empty the moment a deployment clusters.
+        return InternalIdentityAssertion.Mint(
+            Cluster.Secret, identity, isGuest, isSqlOwner, isBulkOwner, expires, firesLifecycle, isBackupOwner, claims);
     }
 
     /// <summary>

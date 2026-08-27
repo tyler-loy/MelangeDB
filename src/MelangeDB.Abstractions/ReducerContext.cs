@@ -14,7 +14,8 @@ public sealed class ReducerContext
         Timestamp timestamp,
         Random random,
         IDbView db,
-        IEventCollector? events = null)
+        IEventCollector? events = null,
+        CallerClaims? claims = null)
     {
         Caller = caller;
         ConnectionId = connectionId;
@@ -22,6 +23,7 @@ public sealed class ReducerContext
         Random = random;
         Db = db;
         _events = events;
+        Claims = claims ?? CallerClaims.Empty;
     }
 
     /// <summary>Who is acting. Stable across reconnects and restarts.</summary>
@@ -38,6 +40,20 @@ public sealed class ReducerContext
 
     /// <summary>The transactional view: write set overlaid on the store, read-your-writes included.</summary>
     public IDbView Db { get; }
+
+    /// <summary>
+    /// The claims captured from the caller's token — those named by <c>Auth:CaptureClaims</c>, and
+    /// only those. Empty for work with no caller token behind it: a scheduled fire, an in-process
+    /// call, or a host that captures none.
+    /// <para>
+    /// These are validated claims, not client-supplied arguments, which is the point: an
+    /// application can record who a caller <em>is</em> according to the IdP — the account behind a
+    /// character, a tenant, an entitlement — without trusting the client to say so. They are fixed
+    /// for the connection's lifetime, captured once at authentication, and identical whether the
+    /// token arrived as a header, in the <c>Hello</c> frame, or behind a connect ticket.
+    /// </para>
+    /// </summary>
+    public CallerClaims Claims { get; }
 
     /// <summary>
     /// Publishes a domain event. <b>No I/O happens here</b> — the event is staged into the write

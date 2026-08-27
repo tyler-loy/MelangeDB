@@ -334,6 +334,20 @@ public sealed class AuthOptions
     public string GuestRole { get; set; } = "guest";
 
     /// <summary>
+    /// Claim types to capture from a validated token and expose on <c>ReducerContext.Claims</c>.
+    /// Empty by default: nothing is captured until a host names what it reads.
+    /// <para>
+    /// An allow-list rather than the whole principal, because captured claims are connection-scoped
+    /// state held for the life of a session, stored against a connect ticket, and — in a cluster —
+    /// carried inside every internal identity assertion the gateway mints. Naming the handful an
+    /// application actually reads keeps that bounded and makes the dependency visible here rather
+    /// than only in a reducer. Matching is ordinal on the claim type as the token spells it, so an
+    /// IdP emitting a URI-shaped type wants that URI, not its short name.
+    /// </para>
+    /// </summary>
+    public IList<string> CaptureClaims { get; } = new List<string>();
+
+    /// <summary>
     /// Lifetime of a connect ticket. Tickets are single-use and short-lived so a leaked one is
     /// near-worthless; they exist because browsers cannot set WebSocket headers.
     /// </summary>
