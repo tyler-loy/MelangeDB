@@ -137,17 +137,17 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
     /// its handshake — a real session start, which an HTTP one-shot call, ad-hoc SQL, or a ticket
     /// mint is not. Each fire is its own transaction.
     /// </summary>
-    public void FireClientConnected(Identity caller, ConnectionId connectionId) =>
-        FireLifecycle(_clientConnectedReducers, caller, connectionId);
+    public void FireClientConnected(Identity caller, ConnectionId connectionId, CallerClaims? claims = null) =>
+        FireLifecycle(_clientConnectedReducers, caller, connectionId, claims);
 
     /// <summary>
     /// Fires every <see cref="ReducerKind.ClientDisconnected"/> reducer for a session that ends —
     /// graceful close and heartbeat-detected drop alike. Each fire is its own transaction.
     /// </summary>
-    public void FireClientDisconnected(Identity caller, ConnectionId connectionId) =>
-        FireLifecycle(_clientDisconnectedReducers, caller, connectionId);
+    public void FireClientDisconnected(Identity caller, ConnectionId connectionId, CallerClaims? claims = null) =>
+        FireLifecycle(_clientDisconnectedReducers, caller, connectionId, claims);
 
-    private void FireLifecycle(string[] reducers, Identity caller, ConnectionId connectionId)
+    private void FireLifecycle(string[] reducers, Identity caller, ConnectionId connectionId, CallerClaims? claims)
     {
         foreach (var reducer in reducers)
         {
@@ -155,7 +155,7 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
                 return;
             try
             {
-                Reducers.Call(reducer, caller, connectionId, ReadOnlyMemory<byte>.Empty);
+                Reducers.Call(reducer, caller, connectionId, ReadOnlyMemory<byte>.Empty, claims: claims);
             }
             catch (Exception exception)
             {

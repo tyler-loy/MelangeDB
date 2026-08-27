@@ -45,7 +45,8 @@ internal static class MelangeHttpEndpoints
                 session.Identity,
                 ConnectionId.None,
                 ReducerArguments.Encode(arguments),
-                source: CallSource.Client(session.IsGuest));
+                source: CallSource.Client(session.IsGuest),
+                claims: session.CapturedClaims);
             await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
             {
                 writer.WriteBoolean("ok", true);

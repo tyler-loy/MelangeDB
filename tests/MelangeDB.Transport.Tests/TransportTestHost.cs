@@ -65,6 +65,9 @@ internal sealed class TransportTestHost : IAsyncDisposable
     /// <summary>Lifecycle-fire record shared across restarts, so pairing asserts survive a bounce.</summary>
     public SessionEvents SessionEvents { get; } = new();
 
+    /// <summary>What reducers saw on <c>ReducerContext.Claims</c>, shared across restarts.</summary>
+    public ClaimsProbe Claims { get; } = new();
+
     public IServiceProvider Services => _app!.Services;
 
     /// <summary>
@@ -228,6 +231,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
         });
         builder.Services.AddSingleton<MelangeSessions>();
         builder.Services.AddSingleton(SessionEvents);
+        builder.Services.AddSingleton(Claims);
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Chunk).Assembly)
             .AddReducersFrom(typeof(TransportReducers).Assembly));

@@ -106,7 +106,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             // The session ended — by close frame, aborted socket, or heartbeat-detected drop
             // alike; ClientDisconnected pairs with the ClientConnected the handshake fired.
             if (_lifecycleConnected)
-                _transport.FireClientDisconnected(Caller, ConnectionId);
+                _transport.FireClientDisconnected(Caller, ConnectionId, _session?.CapturedClaims);
             if (_slotReserved)
             {
                 _transport.ReleaseConnectionSlot(Caller);
@@ -418,7 +418,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         // attachment) — shard attachments are plumbing, and firing there would double-count.
         if (_session is null || !_session.IsInternal || _session.FiresLifecycle)
         {
-            _transport.FireClientConnected(Caller, ConnectionId);
+            _transport.FireClientConnected(Caller, ConnectionId, _session?.CapturedClaims);
             _lifecycleConnected = true;
         }
     }
@@ -484,7 +484,10 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 ConnectionId,
                 call.Arguments,
                 parentContext,
-                CallSource.Client(_session?.IsGuest ?? false));
+                CallSource.Client(_session?.IsGuest ?? false),
+                // Read off the session rather than the frame: claims are what the IdP said at
+                // authentication, and a client must not be able to assert its own.
+                _session?.CapturedClaims);
         }
         catch (Exception exception)
         {

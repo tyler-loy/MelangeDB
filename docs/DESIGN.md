@@ -404,6 +404,18 @@ subject, so two token sources can never collide into one identity. Every connect
 token: **the IdP is the gate.** Guest play is a token the IdP issues with a guest role, not a parallel
 identity system — MelangeDB mints nothing.
 
+**Claims the application reads travel with the identity, by allow-list.** The IdP being the gate is
+exactly why an external one is the thing most likely to carry application-specific claims —
+`account_id` naming the account behind a character, a tenant, an entitlement — and validation used to
+drop every one of them. `Auth:CaptureClaims` names the types to keep; they reach a reducer on
+`ReducerContext.Claims`, from `ClientConnected` onward. An allow-list rather than the whole principal
+because these are connection-scoped state: read once at authentication, held for the session, stored
+against a connect ticket, and — clustered — carried inside every internal identity assertion the
+gateway mints on the client's behalf, so a reducer on a shard node reads what the hub read off the real
+token. An unbounded principal riding every gateway hop is a cost nobody declared. The claims are
+validated, not client-supplied, which is the whole value: an application can record who a caller *is*
+according to the IdP without trusting the client to say so.
+
 Row-level access rules are **policy objects resolved from DI**, not a bespoke rules language. Two
 properties are load-bearing:
 

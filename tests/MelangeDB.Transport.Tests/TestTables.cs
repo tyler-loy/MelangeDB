@@ -308,8 +308,11 @@ public sealed class PolicyReducers
     }
 }
 
-public sealed class TransportReducers
+public sealed class TransportReducers(ClaimsProbe claims)
 {
+    [Reducer]
+    public void RecordClaims(ReducerContext ctx) => claims.Seen.Enqueue(("call", ctx.Claims));
+
     [Reducer]
     public void SetChunk(ReducerContext ctx, long id, long x, byte[] data)
     {
@@ -438,6 +441,16 @@ public partial struct SessionLog
 /// In-memory record of lifecycle fires. Recording costs no log records, so unrelated tests keep
 /// their LSN arithmetic; <see cref="WriteRows"/> opts a test into row-writing lifecycle reducers.
 /// </summary>
+/// <summary>What a reducer saw on <c>ReducerContext.Claims</c>, for the capture tests.</summary>
+public sealed class ClaimsProbe
+{
+    public ConcurrentQueue<(string Where, CallerClaims Claims)> Seen { get; } = [];
+
+    public CallerClaims Last(string where) => Seen.Last(e => e.Where == where).Claims;
+
+    public bool Saw(string where) => Seen.Any(e => e.Where == where);
+}
+
 public sealed class SessionEvents
 {
     public ConcurrentQueue<(string Kind, Identity Caller, ConnectionId Connection)> Events { get; } = [];
@@ -448,12 +461,13 @@ public sealed class SessionEvents
         Events.Count(e => e.Kind == kind && e.Caller == caller);
 }
 
-public sealed class LifecycleReducers(SessionEvents events)
+public sealed class LifecycleReducers(SessionEvents events, ClaimsProbe claims)
 {
     /// <summary>Not client-callable; a client naming it is told "unknown", never "forbidden".</summary>
     [Reducer(ReducerKind.ClientConnected)]
     public void OnConnect(ReducerContext ctx)
     {
+        claims.Seen.Enqueue(("connect", ctx.Claims));
         events.Events.Enqueue(("connect", ctx.Caller, ctx.ConnectionId));
         if (events.WriteRows)
             ctx.Db.SessionLog.Insert(new SessionLog { Kind = "connect", Who = ctx.Caller });

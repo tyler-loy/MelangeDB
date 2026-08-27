@@ -10,6 +10,33 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **`ReducerContext.Claims` — reducers can read allow-listed claims from the caller's token**
+  ([#152](https://github.com/tyler-loy/MelangeDB/issues/152)). Validation built a full `ClaimsIdentity`, read
+  the four roles whose *names* are configuration off it, and dropped the rest: anything else the IdP put on the
+  token was invisible to the application. Since MelangeDB deliberately owns no issuer or audience settings —
+  the IdP is the gate — an external OIDC provider is precisely the thing most likely to carry
+  application-specific claims, which is what made the gap bite.
+
+  `Auth:CaptureClaims` names the claim types to keep. They reach a reducer as `ReducerContext.Claims`,
+  available from `ClientConnected` onward — where a workload first learns a session exists — and identically
+  however the token was presented: as an `Authorization` header, in the `Hello` frame, or behind a connect
+  ticket. The ticket path matters most, because a browser's WebSocket API cannot set headers, and host
+  middleware reading claims off the upgrade request covers only the header case.
+
+  **Clustered deployments carry them too.** A gateway vouches for a client to a shard node with an internal
+  identity assertion rather than the client's JWT, so captured claims now ride inside that signed payload —
+  additive and fail-closed like the capability flags before them, so an assertion minted by an older node
+  deserializes to no claims. Without this, capture would have worked on a single node and silently produced
+  nothing the moment a deployment clustered.
+
+  An allow-list rather than the whole principal: claims are connection-scoped state held for a session's life,
+  stored against a ticket, and carried on every gateway hop, so an unbounded `ClaimsPrincipal` would make a
+  large token a per-connection cost nobody declared. A repeated claim — `role` and `groups` routinely repeat —
+  keeps every value through `GetValues`, while the indexer answers the first, which is what a single-valued
+  claim like an account id wants. Nothing is captured until a host names it.
+
 ### Fixed
 
 - **`1003 SlowReducer` no longer reports a number that did not cross the threshold**

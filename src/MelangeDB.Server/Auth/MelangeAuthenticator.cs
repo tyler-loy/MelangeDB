@@ -26,8 +26,17 @@ internal sealed record AuthResult(
     bool IsBulkOwner = false,
     bool IsInternal = false,
     bool FiresLifecycle = true,
-    bool IsBackupOwner = false)
+    bool IsBackupOwner = false,
+    CallerClaims? Claims = null)
 {
+    /// <summary>
+    /// The claims named by <c>Auth:CaptureClaims</c>, captured once here and carried for the life
+    /// of whatever this credential authenticates. Held on the result rather than re-read per call
+    /// because a token's claims cannot change under a connection — a new token means
+    /// re-authentication, which produces a new result.
+    /// </summary>
+    public CallerClaims CapturedClaims => Claims ?? CallerClaims.Empty;
+
     /// <summary>A validation failure, carrying a reason safe to send to the client.</summary>
     public static AuthFailure Failure(string reason) => new(reason);
 }
@@ -108,7 +117,11 @@ internal sealed class MelangeAuthenticator
                 return AuthResult.Failure(reason ?? "The assertion is invalid.");
             return new AuthResult(
                 valid.Identity, valid.IsGuest, valid.ExpiresAt, valid.IsSqlOwner, valid.IsBulkOwner,
-                IsInternal: true, FiresLifecycle: valid.FiresLifecycle, IsBackupOwner: valid.IsBackupOwner);
+                IsInternal: true, FiresLifecycle: valid.FiresLifecycle, IsBackupOwner: valid.IsBackupOwner,
+                // Signed with the cluster secret alongside the identity itself, so a shard node
+                // reads the same claims the hub read off the real token. Without this a reducer
+                // would see claims on a single node and none the moment the deployment clustered.
+                Claims: valid.Claims);
         }
 
         var options = _services.GetRequiredService<IOptionsMonitor<JwtBearerOptions>>().Get(_options().Scheme);
@@ -149,7 +162,30 @@ internal sealed class MelangeAuthenticator
             expires,
             HasRole(result.ClaimsIdentity, _sqlOptions().OwnerRole),
             HasRole(result.ClaimsIdentity, _bulkOptions().OwnerRole),
-            IsBackupOwner: HasRole(result.ClaimsIdentity, _backupOptions().OwnerRole));
+            IsBackupOwner: HasRole(result.ClaimsIdentity, _backupOptions().OwnerRole),
+            Claims: Capture(result.ClaimsIdentity, _options().CaptureClaims));
+    }
+
+    /// <summary>
+    /// Copies the allow-listed claims off the validated identity. Read here, at the one place a
+    /// token is proven genuine, because this is the only point where the claims and the decision to
+    /// trust them exist together — everything downstream carries the result, never the token.
+    /// </summary>
+    private static CallerClaims Capture(ClaimsIdentity? claims, IList<string> capture)
+    {
+        if (claims is null || capture.Count == 0)
+            return CallerClaims.Empty;
+        var wanted = capture as ISet<string> ?? new HashSet<string>(capture, StringComparer.Ordinal);
+        List<KeyValuePair<string, string>>? captured = null;
+        foreach (var claim in claims.Claims)
+        {
+            if (!wanted.Contains(claim.Type))
+                continue;
+            captured ??= [];
+            captured.Add(new KeyValuePair<string, string>(claim.Type, claim.Value));
+        }
+
+        return captured is null ? CallerClaims.Empty : CallerClaims.From(captured);
     }
 
     private static bool HasRole(ClaimsIdentity? claims, string role)
