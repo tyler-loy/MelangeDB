@@ -349,6 +349,22 @@ change that adds them. Added by the frame-tick pump, issue #26.
 | `Scheduler:CatchUpAfterDowntime` | enum | `FireOnce` | restart | 05 | `FireOnce` \| `CatchUpAll`, applied to repeating timers overdue at recovery. `FireOnce` is right for a simulation (the world was paused); `CatchUpAll` fires once per missed interval and is right for billing. Downtime is measured from the recovered log's tail record, since repeating timers persist no per-fire bookkeeping. Was planned `live`; corrected — it acts at scheduler start only. |
 | `Scheduler:MaxConcurrentTicks` | int | `1` | live | 05 | Default 1 keeps transactions serialized. Shipped accepted-and-reserved: dispatch is a single-threaded loop because the engine's single-writer lock serializes tick transactions anyway; see the phase 05 note above. |
 
+**There is no key for the tick cadence, and the one that matters is not configurable: the platform
+timer's quantum.** A wait is rounded up to it — 15.625ms on Windows at the default system timer
+resolution, finer on Linux — which is the real floor under `ScheduleAt.Interval`. Above one quantum
+a repeating timer holds its cadence: the next fire is scheduled from the entry's *due* time, not
+from when the tick finished, so a body costing less than the interval accumulates no lag. Below one
+quantum it cannot: the fires arrive in small bursts at quantum boundaries, and
+`Scheduler:OverrunPolicy` governs the rest. A 60Hz (16.67ms) interval is above the Windows quantum
+and does hold.
+
+Buying that costs a fire being **up to 2ms early** — including a one-shot `ScheduleAt.Instant`,
+which may run just before the instant it names. A residual smaller than that cannot be waited for
+on any of these platforms, only spun on, so the scheduler fires instead. Until it did, the re-arm
+delay was rounded *up* to 16ms, one tick above the Windows quantum, so every short wait took two
+quanta (~31ms) and a 16.67ms interval logged EventId 1301 on every other fire — an overrun invented
+by the waiter after the reducer had already finished ([#154](https://github.com/tyler-loy/MelangeDB/issues/154)).
+
 ## Event bus
 
 | Key | Type | Default | Reload | Phase | Notes |

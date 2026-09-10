@@ -14,6 +14,13 @@ namespace MelangeDB.Core;
 /// — reducer transactions serialize on the engine's write lock regardless, so a worker pool would
 /// buy nothing (see <c>Scheduler:MaxConcurrentTicks</c>). Its failure mode is deliberate: one
 /// slow tick delays every other timer, made visible by <c>melange.scheduler.overruns</c>.
+/// <para>
+/// A fire may land up to two milliseconds <em>early</em>, and an interval shorter than the
+/// platform's timer quantum (~15.6ms on Windows) fires in small bursts rather than on cadence.
+/// Both follow from the wait being quantized; the alternative to firing early is spinning on a
+/// residual no timer can wait for. Rescheduling is anchored to the entry's due time either way,
+/// so nothing drifts.
+/// </para>
 /// </summary>
 public sealed class MelangeScheduler : ICommitObserver, IDisposable
 {
@@ -28,9 +35,11 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
     private readonly Lock _lock = new();
     private readonly Dictionary<TableId, TimerTable> _tables = [];
 
-    // The floor on a re-arm delay: the platform timer's practical resolution. Below this a
-    // positive delay is re-armed to it, so an early wake cannot spin the fire/re-arm loop. See Rearm.
-    private static readonly TimeSpan RearmFloor = TimeSpan.FromMilliseconds(16);
+    // How early a fire may be. An entry due within this window is fired now rather than waited
+    // for, and Rearm never arms a delay below it — together those stop the early-wake spin (see
+    // Rearm) without lengthening any wait. Two milliseconds because ITimer.Change truncates its
+    // delay to whole milliseconds, so a wake is already up to 1ms early before any platform jitter.
+    private static readonly TimeSpan FireTolerance = TimeSpan.FromMilliseconds(2);
     private ITimer? _timer;
     private IDisposable? _reload;
     private int _processing;
@@ -308,12 +317,17 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
             TimerEntry? dueEntry = null;
             lock (_lock)
             {
-                var now = _time.GetUtcNow();
+                // Due within FireTolerance counts as due. A platform timer routinely wakes a
+                // fraction of a millisecond early (and Change truncates the delay it was given to
+                // whole milliseconds, which is another millisecond of it), so the alternative to
+                // firing here is re-arming on the remainder — and a remainder that small cannot be
+                // waited for, only spun on. Firing is what ends the loop.
+                var cutoff = _time.GetUtcNow() + FireTolerance;
                 foreach (var table in _tables.Values)
                 {
                     foreach (var entry in table.Entries.Values)
                     {
-                        if (entry.Due <= now && (dueEntry is null || entry.Due < dueEntry.Due))
+                        if (entry.Due <= cutoff && (dueEntry is null || entry.Due < dueEntry.Due))
                         {
                             dueTable = table;
                             dueEntry = entry;
@@ -460,19 +474,22 @@ public sealed class MelangeScheduler : ICommitObserver, IDisposable
             if (earliest is null)
                 return;
             var delay = earliest.Value - _time.GetUtcNow();
-            if (delay < TimeSpan.Zero)
-                delay = TimeSpan.Zero;
-            else if (delay > TimeSpan.Zero && delay < RearmFloor)
+            if (delay <= FireTolerance)
             {
-                // Never re-arm for a sub-resolution residual. A platform timer routinely wakes a
-                // fraction of a millisecond before the delay it was given; the drain then finds
-                // nothing due (the entry's time has not quite arrived) and, without this floor,
-                // re-arms on the tiny remainder — waking early again on a smaller remainder, tens
-                // of times a second, until the due time finally passes. Waiting at least the
-                // timer's own resolution guarantees the next wake lands at or after the due time,
-                // so it fires rather than spinning. A fire is therefore at most one resolution
-                // late, which is nothing against any real interval.
-                delay = RearmFloor;
+                // Never re-arm for a residual the drain would accept as due. Below the tolerance
+                // there is nothing left to wait for: arm zero, and the drain fires. This is what
+                // stops the hot re-arm spin — a timer wakes a hair early, the drain finds nothing
+                // due, and the residual is re-armed, waking early again on a smaller one, tens of
+                // times a second until the due time finally passes.
+                //
+                // Rounding the delay *up* to the platform resolution stops that spin too, and used
+                // to: the floor was 16ms. But it buys the quiet by making every short wait long.
+                // On Windows the timer quantum is 15.625ms, so a 16ms re-arm rounds to two quanta
+                // — a measured ~30.7ms median. Against a 16.67ms interval that is an overrun on
+                // every other fire, invented after the tick returned and charged to it (#154).
+                // Firing early costs a fraction of a millisecond of accuracy; waiting cost half
+                // the cadence.
+                delay = TimeSpan.Zero;
             }
 
             LogMessages.SchedulerRearmed(_logger, delay.TotalMilliseconds);
