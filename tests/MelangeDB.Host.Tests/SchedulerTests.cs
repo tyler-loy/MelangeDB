@@ -502,9 +502,8 @@ public class SchedulerTests : IDisposable
         // The hot re-arm spin: a platform timer wakes a fraction of a millisecond before its due
         // time, the drain finds nothing due, and the scheduler re-arms on the tiny remainder —
         // waking early again on a smaller one, tens of times a second, until the due time passes.
-        // The floor makes a positive re-arm delay at least the timer resolution, so a sub-resolution
-        // remainder is never armed. Here a 1ms-interval timer would ask for a 1ms re-arm; it must be
-        // floored instead.
+        // A residual too small to wait for is armed as zero instead, and the drain fires: the
+        // tolerance is what ends the loop. Here a 1ms-interval timer would ask for a 1ms re-arm.
         var probe = new SchedulerProbe();
         using var host = TestApp.Build(_root, null, builder =>
         {
@@ -515,11 +514,87 @@ public class SchedulerTests : IDisposable
 
         host.Reducers().Call("ScheduleTick", TestApp.Caller, 1L, 0); // 1ms interval — the residual case.
 
-        // Every finite re-arm the scheduler made is either "now" (0, something already due) or at
-        // least the resolution floor — never a sub-floor positive delay that would spin.
-        var floor = TimeSpan.FromMilliseconds(16);
-        Assert.Contains(_time.ArmDelays, d => d >= floor);
-        Assert.DoesNotContain(_time.ArmDelays, d => d > TimeSpan.Zero && d < floor);
+        // Every finite re-arm the scheduler made is either "now" — the 1ms residual, armed as zero
+        // so the drain fires it — or a delay long enough to be worth waiting for. Never a
+        // sub-tolerance positive delay, which is the one that spins.
+        var tolerance = TimeSpan.FromMilliseconds(2);
+        Assert.DoesNotContain(_time.ArmDelays, d => d > TimeSpan.Zero && d < tolerance);
+        Assert.Contains(_time.ArmDelays, d => d == TimeSpan.Zero);
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task A_sixty_hertz_interval_holds_its_cadence_instead_of_overrunning()
+    {
+        // Issue #154. The re-arm delay used to be floored at 16ms "the platform timer's practical
+        // resolution", which is fine against a 10s sweep and fatal against a 16.67ms simulation
+        // tick: a tick that costs 1ms leaves a 15.67ms residual, the floor rounds it up to 16, and
+        // the wake lands 0.33ms after the next due time. That lateness accumulates one residual at
+        // a time until a fire is a whole interval behind, and the scheduler charges the resulting
+        // overrun to the reducer — which did nothing wrong and was long since finished. (On Windows
+        // it is worse than the arithmetic: a 16ms request rounds to two 15.625ms quanta, ~31ms.)
+        //
+        // The cadence must therefore survive a tick whose body costs less than the interval.
+        using var host = await StartHostAsync();
+        var overruns = 0L;
+        using var listener = OverrunListener(() => overruns++);
+
+        var probe = Probe(host);
+        probe.OnWorldTick = _ => _time.Advance(TimeSpan.FromMilliseconds(1)); // A 1ms body.
+
+        var interval = TimeSpan.FromSeconds(1.0 / 60.0);
+        host.Engine().Invoke("ScheduleSixtyHertz", TestApp.Caller, ctx => ctx.Db.WorldTickTimer.Insert(new WorldTickTimer
+        {
+            ScheduledAt = ScheduleAt.Interval(interval),
+            Payload = 60,
+        }));
+
+        _time.Advance(TimeSpan.FromSeconds(1));
+
+        // A full second of a 60Hz timer whose body costs 1ms: 60 fires, none of them late. Before
+        // the fix this drifted 0.33ms per fire and logged its first 1301 inside the same second.
+        Assert.Equal(60, probe.WorldTicks);
+        Assert.Equal(0, Interlocked.Read(ref overruns));
+
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task A_fire_may_be_early_but_never_by_more_than_the_tolerance()
+    {
+        // The other half of #154: what the scheduler now does with a residual instead of inflating
+        // it. A tick that eats all but 1.67ms of its own interval leaves nothing worth waiting for,
+        // so the next fire happens on the same wake rather than a timer quantum later. Early, by
+        // less than the tolerance, and — the part that matters — still anchored: the fire after it
+        // is scheduled from the due time, not from when the early one actually ran.
+        using var host = await StartHostAsync();
+        var probe = Probe(host);
+        var fires = new List<DateTimeOffset>();
+        probe.OnWorldTick = _ =>
+        {
+            fires.Add(_time.GetUtcNow());
+            _time.Advance(TimeSpan.FromMilliseconds(15)); // Body eats 15 of the 16.67ms interval.
+        };
+
+        var interval = TimeSpan.FromSeconds(1.0 / 60.0);
+        var scheduled = _time.GetUtcNow();
+        host.Engine().Invoke("ScheduleSixtyHertz", TestApp.Caller, ctx => ctx.Db.WorldTickTimer.Insert(new WorldTickTimer
+        {
+            ScheduledAt = ScheduleAt.Interval(interval),
+            Payload = 60,
+        }));
+
+        _time.Advance(TimeSpan.FromMilliseconds(100));
+
+        Assert.NotEmpty(fires);
+        for (var i = 0; i < fires.Count; i++)
+        {
+            // Fire i was due at scheduled + (i + 1) intervals. Never late, never more than the
+            // tolerance early — so the cadence is the interval's, not the platform quantum's.
+            var due = scheduled + interval * (i + 1);
+            Assert.InRange(fires[i], due - TimeSpan.FromMilliseconds(2), due);
+        }
 
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
