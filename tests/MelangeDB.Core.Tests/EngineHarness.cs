@@ -21,6 +21,8 @@ internal sealed class EngineHarness : IDisposable
     private readonly bool _useReflectionSchema;
     private readonly ILoggerFactory? _loggerFactory;
     private readonly IHotStoreProvider? _storeProvider;
+    private readonly TimeProvider? _timeProvider;
+    private readonly IReducerRandomProvider? _randomProvider;
 
     public EngineHarness(
         FsyncPolicy fsyncPolicy = FsyncPolicy.OnCommit,
@@ -28,9 +30,13 @@ internal sealed class EngineHarness : IDisposable
         Type[]? tables = null,
         bool useReflectionSchema = false,
         ILoggerFactory? loggerFactory = null,
-        IHotStoreProvider? storeProvider = null)
+        IHotStoreProvider? storeProvider = null,
+        TimeProvider? timeProvider = null,
+        IReducerRandomProvider? randomProvider = null)
     {
         _storeProvider = storeProvider;
+        _timeProvider = timeProvider;
+        _randomProvider = randomProvider;
         _tables = tables ?? DefaultTables;
         _useReflectionSchema = useReflectionSchema;
         _loggerFactory = loggerFactory;
@@ -126,5 +132,5 @@ internal sealed class EngineHarness : IDisposable
         new(new MelangeDB.Generated.MelangeModel().Tables().Where(t => tables.Contains(t.RowType)));
 
     private MelangeEngine CreateEngine() =>
-        new(Options, CreateRegistry(), _loggerFactory, hotStoreProvider: _storeProvider);
+        new(Options, CreateRegistry(), _loggerFactory, _timeProvider, _storeProvider, randomProvider: _randomProvider);
 }

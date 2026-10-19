@@ -55,7 +55,7 @@ public static class Diagnostics
     public static readonly DiagnosticDescriptor AmbientRandomInReducer = new(
         "MELANGE0006",
         "Reducer bodies must draw randomness from ctx.Random",
-        "Reducer '{0}' constructs a new Random; use ctx.Random, which is seeded per commit, so the transaction stays deterministic and replayable",
+        "Reducer '{0}' constructs a new Random; use ctx.Random, which is seeded per transaction, so the transaction stays deterministic and testable",
         Category,
         DiagnosticSeverity.Warning,
         isEnabledByDefault: true);

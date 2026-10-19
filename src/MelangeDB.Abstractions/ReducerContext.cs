@@ -35,7 +35,12 @@ public sealed class ReducerContext
     /// <summary>The transaction's timestamp. The only clock a reducer may read.</summary>
     public Timestamp Timestamp { get; }
 
-    /// <summary>A random source seeded per commit. The only randomness a reducer may use.</summary>
+    /// <summary>
+    /// The transaction attempt's random source, from the registered <see cref="IReducerRandomProvider"/>.
+    /// The only randomness a reducer may use. The default, <see cref="SeededReducerRandomProvider"/>,
+    /// draws the same numbers for the same calls in the same order in every process, and different
+    /// numbers for every attempt — it is not cryptographic, so it is no source for keys or secrets.
+    /// </summary>
     public Random Random { get; }
 
     /// <summary>The transactional view: write set overlaid on the store, read-your-writes included.</summary>

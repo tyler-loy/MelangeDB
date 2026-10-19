@@ -15,6 +15,7 @@ public sealed partial class MelangeEngine : IDisposable
 {
     private readonly MelangeDbOptions _options;
     private readonly TimeProvider _time;
+    private readonly IReducerRandomProvider _randomProvider;
     private readonly ILogger _logger;
     private readonly FileCommitLog _log;
     private readonly AutoIncSequencer _sequencer;
@@ -59,19 +60,24 @@ public sealed partial class MelangeEngine : IDisposable
     /// <summary>Cumulative Stopwatch ticks of write-lock work; see <see cref="WriteLockBusyTicks"/>.</summary>
     private long _writeLockBusyTicks;
 
+    /// <summary>Transaction attempts so far; <see cref="ReducerRandomSeed.Sequence"/>. Snapshot bodies take one outside the lock.</summary>
+    private long _randomSequence;
+
     public MelangeEngine(
         MelangeDbOptions options,
         SchemaRegistry schema,
         ILoggerFactory? loggerFactory = null,
         TimeProvider? timeProvider = null,
         IHotStoreProvider? hotStoreProvider = null,
-        ushort originator = 0)
+        ushort originator = 0,
+        IReducerRandomProvider? randomProvider = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(schema);
         _options = options;
         Schema = schema;
         _time = timeProvider ?? TimeProvider.System;
+        _randomProvider = randomProvider ?? SeededReducerRandomProvider.Instance;
         var loggers = loggerFactory ?? NullLoggerFactory.Instance;
         _logger = loggers.CreateLogger<MelangeEngine>();
 
@@ -1322,8 +1328,8 @@ public sealed partial class MelangeEngine : IDisposable
             started = Stopwatch.GetTimestamp();
             var timestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
             var writeSet = new WriteSet();
+            var random = CreateRandom(reducerName, caller, timestamp);
             var stage = _sequencer.BeginStage();
-            var random = new Random(unchecked((int)timestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
             var events = new EventStage(_options.Events);
             var context = new ReducerContext(caller, connectionId, timestamp, random, new TransactionDb(Schema, HotStore, writeSet, stage, _tableGuard), events, claims);
 
@@ -1449,8 +1455,8 @@ public sealed partial class MelangeEngine : IDisposable
         // however long the body happened to take.
         var bodyTimestamp = Timestamp.FromDateTimeOffset(_time.GetUtcNow());
         var writeSet = new WriteSet();
+        var random = CreateRandom(reducerName, caller, bodyTimestamp);
         var stage = _sequencer.BeginStage(reserveEagerly: true);
-        var random = new Random(unchecked((int)bodyTimestamp.UnixTimeMicroseconds ^ caller.GetHashCode()));
         var events = new EventStage(_options.Events);
 
         IReadOnlyList<RowOp> ops;
@@ -1551,6 +1557,19 @@ public sealed partial class MelangeEngine : IDisposable
             WarnSlowReducer(activity, reducerName, "write-lock hold", elapsed, bodyMs.GetValueOrDefault(), commitMs, fsyncMs, postCommitMs, ops.Count, lockedMs, Isolation.Snapshot);
 
         return committedLsn;
+    }
+
+    /// <summary>
+    /// One attempt's <see cref="ReducerContext.Random"/>. The sequence is taken here, before the body,
+    /// so an attempt that aborts still consumes one — a retry is a new attempt and draws new numbers.
+    /// Called before the AutoInc stage opens, so a provider that throws has reserved no ids.
+    /// </summary>
+    private Random CreateRandom(string reducerName, Identity caller, Timestamp timestamp)
+    {
+        var sequence = unchecked((ulong)Interlocked.Increment(ref _randomSequence));
+        return _randomProvider.Create(new ReducerRandomSeed(reducerName, caller, timestamp, sequence))
+            ?? throw new InvalidOperationException(
+                $"{_randomProvider.GetType().Name}.Create returned null for reducer '{reducerName}'; an IReducerRandomProvider must return a Random.");
     }
 
     /// <summary>Shared abort reporting for the snapshot path's two failure points.</summary>

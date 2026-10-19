@@ -70,7 +70,8 @@ public static class ServiceCollectionExtensions
             provider.GetRequiredService<SchemaRegistry>(),
             provider.GetService<ILoggerFactory>(),
             provider.GetService<TimeProvider>(),
-            provider.GetService<IHotStoreProvider>()));
+            provider.GetService<IHotStoreProvider>(),
+            randomProvider: provider.GetService<IReducerRandomProvider>()));
         services.TryAddSingleton<MelangeReducerHost>();
         services.TryAddSingleton(provider => new MelangeScheduler(
             provider.GetRequiredService<MelangeEngine>(),
