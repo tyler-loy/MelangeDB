@@ -39,6 +39,29 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **`ctx.Random` draws the same numbers in every process, and different numbers for every transaction**
+  ([#156](https://github.com/tyler-loy/MelangeDB/issues/156)). It was seeded from
+  `(int)micros ^ caller.GetHashCode()`, and `Identity.GetHashCode` is `HashCode.Combine`, which .NET randomizes
+  per process. So the same call against a frozen test clock rolled different dice in every test run — an
+  RNG-dependent balance test failed about one run in sixteen — while two calls by one caller in one microsecond
+  rolled *identical* dice, which cost a store sale whose idempotency key came from `ctx.Random`. The `int` cast
+  also discarded the timestamp's high half.
+
+  The default is now `SeededReducerRandomProvider`: SplitMix64 behind the `Random` surface, seeded from a
+  stable 64-bit hash of the caller's bytes, the full timestamp, and the engine's **attempt sequence** — a
+  per-engine counter that aborted attempts also consume, so a retry draws anew. A 64-bit generator rather than
+  `new Random(int)`, because 32 bits of seed collide every ~77,000 transactions. The LSN was the obvious
+  discriminator and is not available: it is assigned at append, after the body runs, and a snapshot-isolated
+  body holds no lock to reserve one under.
+
+  **`IReducerRandomProvider` is new, and resolved from DI.** Registering one replaces the default for every
+  reducer, and it is handed the reducer name, caller, timestamp, and sequence — so a test can force a crit
+  through real dispatch rather than hunting for a seed. `ctx.Random` stays a `Random`; no module code changes.
+
+  **Behaviour change:** every reducer's random outcomes differ from before. Tests that pinned specific rolls
+  under the old seeding — which could only have passed by luck of the process's hash seed — will see new
+  numbers. The generator is not cryptographic; a key handed to another system should not come from it.
+
 - **`1003 SlowReducer` no longer reports a number that did not cross the threshold**
   ([#150](https://github.com/tyler-loy/MelangeDB/issues/150)). The line read *"held the write lock 48.9ms,
   over the Telemetry:SlowReducerMs threshold of 50ms"* — 48.9 is not over 50, and a warning that contradicts

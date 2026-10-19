@@ -113,7 +113,8 @@ internal sealed partial class ShardRuntime : IDisposable
             loggerFactory,
             time,
             services.GetService<IHotStoreProvider>(),
-            originator);
+            originator,
+            services.GetService<IReducerRandomProvider>());
         Engine.SetTableAccessGuard(PlacementGuards.ShardAccess(shard, nodeName));
         Engine.AddCommitGuard(new ShardCommitGuard(
             schema,

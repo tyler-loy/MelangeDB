@@ -153,9 +153,18 @@ public sealed class CombatReducers(
 ```
 
 `ReducerContext` supplies everything ambient so that reducers stay deterministic and replayable:
-`ctx.Caller` (identity), `ctx.ConnectionId`, `ctx.Timestamp`, `ctx.Random` (seeded per commit), and
-`ctx.Db` (the transactional view). Using `DateTime.Now` or `new Random()` directly is a bug, and the
+`ctx.Caller` (identity), `ctx.ConnectionId`, `ctx.Timestamp`, `ctx.Random` (seeded per transaction attempt),
+and `ctx.Db` (the transactional view). Using `DateTime.Now` or `new Random()` directly is a bug, and the
 analyzer should say so.
+
+`ctx.Random` comes from an `IReducerRandomProvider` resolved from DI. The default seeds a 64-bit generator
+from a stable hash of the caller, the full timestamp, and the engine's attempt sequence, which buys two
+promises: the same calls in the same order draw the same numbers in every process, and no two attempts
+draw the same stream. It once seeded from `(int)micros ^ caller.GetHashCode()`, which broke both — .NET
+randomizes `GetHashCode` per process, and one caller in one microsecond repeated (issue #156). Recovery
+depends on neither promise, because the log records row operations and a restart never re-runs a body;
+they exist for tests and debugging. A test that needs a particular roll registers its own provider
+rather than searching for a seed.
 
 **No I/O in a reducer body.** Reads are served from an overlay — write set on top of the store — and
 writes accumulate in the write set. A reducer either returns (commit) or throws (abort, nothing

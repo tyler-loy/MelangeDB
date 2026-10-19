@@ -564,6 +564,12 @@ synchronous and perform no I/O.
 `Caller`, `ConnectionId`, `Timestamp`, `Random`, `Db`, and `Publish`. Reaching for `DateTime.Now` or
 `new Random()` instead is a bug the analyzer reports.
 
+**Reducer random provider (`IReducerRandomProvider`)** — The DI seam that creates `ctx.Random`, once per
+transaction attempt, from a `ReducerRandomSeed`: the reducer name, caller, timestamp, and **attempt sequence** —
+the engine's count of attempts since it opened, aborted ones included, which is what separates two calls by one
+caller in one microsecond. The default, `SeededReducerRandomProvider`, is reproducible across processes and
+distinct per attempt, and not cryptographic. Registering another is how a test scripts a roll.
+
 **Reducer descriptor** — One generated reducer registration: the public name the dispatcher keys on, the
 DI-resolved class the body lives on, and the generated argument decode/validate delegates. There is no
 reflection fallback for reducers.
