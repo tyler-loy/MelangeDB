@@ -10,6 +10,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.3] — 2026-10-19
+
 ### Added
 
 - **`ReducerContext.Claims` — reducers can read allow-listed claims from the caller's token**
@@ -61,6 +65,25 @@ All packages ship together at one version; there is no per-package versioning. S
   **Behaviour change:** every reducer's random outcomes differ from before. Tests that pinned specific rolls
   under the old seeding — which could only have passed by luck of the process's hash seed — will see new
   numbers. The generator is not cryptographic; a key handed to another system should not come from it.
+
+- **A 60 Hz scheduled reducer runs at 60 Hz** ([#154](https://github.com/tyler-loy/MelangeDB/issues/154)). A
+  repeating timer at `ScheduleAt.Interval(TimeSpan.FromSeconds(1.0 / 60.0))` overran on every other fire even
+  when its body and commit took a millisecond. The overrun was invented by the scheduler after the tick returned,
+  and charged to the reducer.
+
+  The re-arm floored any positive delay at 16 ms, "the platform timer's practical resolution", so a 1 ms tick
+  out of a 16.67 ms interval left a 15.67 ms residual that was rounded up to 16 — a wake already past the next
+  due time. And 16 ms sits one tick *above* the 15.625 ms Windows quantum, so every floored re-arm waited two:
+  measured on Windows 11, requesting 16 ms returns a median 30.68 ms. The loop ran at 32.6 Hz with 81 overruns
+  in 163 fires.
+
+  The floor existed to stop a real spin — an early wake finding nothing due and re-arming on an ever-smaller
+  residual — and a **fire tolerance** now ends that loop instead: an entry due within 2 ms counts as due and
+  fires, and a residual that small is armed as zero. The same replay runs at 59.9 Hz with no overruns.
+
+  **Behaviour change:** a fire, one-shot `ScheduleAt.Instant` included, may now land up to 2 ms early.
+  Rescheduling stays anchored to the entry's due time, so nothing drifts. The practical minimum interval is one
+  platform quantum (15.625 ms on Windows), which `docs/CONFIGURATION.md` now states.
 
 - **`1003 SlowReducer` no longer reports a number that did not cross the threshold**
   ([#150](https://github.com/tyler-loy/MelangeDB/issues/150)). The line read *"held the write lock 48.9ms,
