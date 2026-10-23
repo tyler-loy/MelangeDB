@@ -71,6 +71,12 @@ All packages ship together at one version; there is no per-package versioning. S
   the table is created; turning it on later refuses boot, turning it off doesn't. MELANGE0027 refuses
   it on any other tier.
 
+- **A wallet sample, `samples/MelangeDB.Sample.Wallet`: the archive tier's worked example.** A hot
+  balance, a hot recent ledger keyed by the caller's idempotency key, a `KeepKeys` archive, a
+  scheduled sweep that moves entries past the hot window (an index range on `At`, one atomic write set
+  per batch), a credit/debit reducer that stays idempotent across both, and an HTTP endpoint that
+  pages archived history through `IArchiveReader`. Needs Postgres.
+
 - **`IArchiveReader`: reading archive history outside a reducer.** Registered by `AddPostgres`.
   Keyset-paginated pages of an archive table, ordered by primary key (ascending or newest first),
   filtered on the key or one indexed column by value or inclusive range, values in the columns' own
