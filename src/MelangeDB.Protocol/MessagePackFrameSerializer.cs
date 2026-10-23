@@ -1,7 +1,7 @@
 namespace MelangeDB.Protocol;
 
 /// <summary>
-/// Protocol version 2 framing: every frame is one MessagePack array of
+/// Protocol version 2 and 3 framing: every frame is one MessagePack array of
 /// <c>[type, channel, ...fields]</c>. Parameter maps use native MessagePack types;
 /// <see cref="Identity"/> travels as 32-byte binary and <see cref="Timestamp"/> as its microsecond
 /// integer.
@@ -21,8 +21,24 @@ namespace MelangeDB.Protocol;
 /// </summary>
 public sealed class MessagePackFrameSerializer : IMelangeSerializer
 {
-    /// <summary>The protocol version this serializer implements.</summary>
-    public const int ProtocolVersion = 2;
+    /// <summary>The newest protocol version this serializer implements, and the one a client offers first.</summary>
+    public const int ProtocolVersion = 3;
+
+    /// <summary>
+    /// The oldest version still accepted. Version 2 is version 3 without the producer frames, so a
+    /// version-2 peer is served exactly as before and refused only if it sends one.
+    /// </summary>
+    public const int MinProtocolVersion = 2;
+
+    /// <summary>
+    /// The version a handshake settles on: the highest both sides speak, or null when the offered
+    /// range and <see cref="MinProtocolVersion"/>–<see cref="ProtocolVersion"/> do not overlap.
+    /// </summary>
+    public static int? Negotiate(int offeredMin, int offeredMax)
+    {
+        var version = Math.Min(offeredMax, ProtocolVersion);
+        return version >= MinProtocolVersion && version >= offeredMin ? version : null;
+    }
 
     public string Name => "MessagePack";
 
@@ -73,6 +89,22 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 writer.WriteUInt64(f.RequestId);
                 writer.WriteBool(f.Ok);
                 writer.WriteUInt64(f.Lsn);
+                writer.WriteString(f.ErrorCode);
+                writer.WriteString(f.Message);
+                break;
+            case CallProducerFrame f:
+                Header(ref writer, f, 4);
+                writer.WriteUInt64(f.RequestId);
+                writer.WriteString(f.Producer);
+                writer.WriteBinary(f.Arguments);
+                writer.WriteString(f.TraceParent);
+                break;
+            case ProducerResultFrame f:
+                Header(ref writer, f, 6);
+                writer.WriteUInt64(f.RequestId);
+                writer.WriteBool(f.Ok);
+                writer.WriteUInt64(f.Lsn);
+                writer.WriteBinary(f.Payload.Span);
                 writer.WriteString(f.ErrorCode);
                 writer.WriteString(f.Message);
                 break;
@@ -205,6 +237,18 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 (uint)reader.ReadUInt64(),
                 reader.ReadBool(),
                 reader.ReadUInt64(),
+                reader.ReadString(),
+                reader.ReadString()),
+            FrameType.CallProducer => new CallProducerFrame(
+                (uint)reader.ReadUInt64(),
+                reader.ReadString() ?? throw new MelangeProtocolException("CallProducer requires a producer name."),
+                reader.ReadBinary(),
+                reader.ReadString()),
+            FrameType.ProducerResult => new ProducerResultFrame(
+                (uint)reader.ReadUInt64(),
+                reader.ReadBool(),
+                reader.ReadUInt64(),
+                reader.ReadBinary(),
                 reader.ReadString(),
                 reader.ReadString()),
             FrameType.Subscribe => new SubscribeFrame(

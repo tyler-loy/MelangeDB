@@ -42,6 +42,10 @@ internal sealed class CommittedReadView : IDbView
         where TRow : struct
         => _reads.FilterRange<TRow>(column, low, high);
 
+    public bool ContainsKey<TRow>(object primaryKey)
+        where TRow : struct
+        => _reads.ContainsKey<TRow>(primaryKey);
+
     public bool Any<TRow>()
         where TRow : struct
         => _reads.Any<TRow>();

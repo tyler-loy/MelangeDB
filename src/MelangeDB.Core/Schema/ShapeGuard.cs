@@ -44,7 +44,15 @@ public static class ShapeCompatibility
 
         foreach (var (name, shape) in persisted.Tables.OrderBy(static p => p.Key, StringComparer.Ordinal))
         {
-            if (!schema.TryGetByName(name, out var table))
+            if (!schema.TryGetByName(name, out var table) && ArchiveKeySet.IsKeySet(name, out var keptFor))
+            {
+                // A key set is derived from the archive's ops, never the only copy of anything:
+                // dropping it loses nothing but the ability to ask.
+                additive.Add($"table '{keptFor}': its key set ('{name}') is no longer kept");
+                continue;
+            }
+
+            if (table is null)
             {
                 destructive.Add(
                     $"table '{name}' was removed; its rows are still in the log and dropping a table's " +
@@ -84,12 +92,24 @@ public static class ShapeCompatibility
                     ? $"table '{name}': added column(s) {string.Join(", ", added.Select(c => $"'{c.Name}' ({c.Kind})"))}"
                     : $"table '{name}': columns reordered");
             }
+
+            CompareTier(name, shape.Tier, current.Tier!, destructive, additive);
         }
 
         foreach (var table in schema.Tables)
         {
-            if (!persisted.Tables.ContainsKey(table.Name))
-                additive.Add($"new table '{table.Name}'");
+            if (persisted.Tables.ContainsKey(table.Name))
+                continue;
+            if (ArchiveKeySet.IsKeySet(table.Name, out var archive) && persisted.Tables.ContainsKey(archive))
+            {
+                destructive.Add(
+                    $"table '{archive}' now declares KeepKeys, but it already existed: the keys it has archived so far live " +
+                    "only in Postgres, so its key set would start incomplete and Contains would answer false for them. " +
+                    "Declare KeepKeys on a new archive table and move to it, or keep this one without");
+                continue;
+            }
+
+            additive.Add($"new table '{table.Name}'");
         }
 
         return new ShapeDiff
@@ -99,6 +119,54 @@ public static class ShapeCompatibility
             AdditiveChanges = additive,
         };
     }
+
+    /// <summary>
+    /// A tier change is classified by whether the rows stay in the hot store across it. Between
+    /// <c>Hot</c> and <c>HotWithRelationalBackplane</c> they do — only the Postgres copy appears or
+    /// stops being maintained — so the change is additive and recorded as a new reign. A change
+    /// into or out of <c>Archive</c> moves rows across the hot store's boundary and is refused,
+    /// with the supported path named; a recorded tier this build does not know was written by a
+    /// newer one and is refused too. A recorded tier of null predates tier recording and compares
+    /// as unchanged.
+    /// </summary>
+    private static void CompareTier(string name, string? recorded, string current, List<string> destructive, List<string> additive)
+    {
+        if (recorded is null || recorded == current)
+            return;
+
+        if (IsHotResident(recorded) && IsHotResident(current))
+        {
+            additive.Add(current == ShapeTiers.HotWithRelationalBackplane
+                ? $"table '{name}': tier {recorded} -> {current} (Postgres copies its existing rows on its next start)"
+                : $"table '{name}': tier {recorded} -> {current} (its Postgres table is no longer maintained and is left as is)");
+            return;
+        }
+
+        if (current == ShapeTiers.Archive && IsHotResident(recorded))
+        {
+            destructive.Add(
+                $"table '{name}': tier {recorded} -> Archive would drop its rows from the hot store, and Postgres is not " +
+                "guaranteed to hold all of them. Declare a new Archive table instead and move rows into it with a reducer " +
+                "(Insert into the archive, Delete from this table, in batches) — the move is one write set, so it is atomic");
+            return;
+        }
+
+        if (recorded == ShapeTiers.Archive && IsHotResident(current))
+        {
+            destructive.Add(
+                $"table '{name}': tier Archive -> {current} would present an empty hot table as the whole truth: an archive " +
+                "table's rows live only in Postgres. Keep it Archive; to bring rows back, read them outside a reducer and " +
+                "insert them into a hot table through a reducer");
+            return;
+        }
+
+        destructive.Add(
+            $"table '{name}': tier {recorded} -> {current} is not a supported change; the recorded tier " +
+            "decides where this table's rows live, and moving them across the hot store's boundary would lose them");
+    }
+
+    private static bool IsHotResident(string tier) =>
+        tier is ShapeTiers.Hot or ShapeTiers.HotWithRelationalBackplane;
 }
 
 /// <summary>
@@ -265,7 +333,8 @@ internal static class ShapeGuard
         ulong baseLsn,
         ulong headLsn = 0,
         bool allowAdoption = true,
-        Action<ulong>? onAdoptedOverExistingRecords = null)
+        Action<ulong>? onAdoptedOverExistingRecords = null,
+        Action<int>? onTiersRecorded = null)
     {
         var path = Path.Combine(logDirectory, ShapeHistory.FileName);
         var history = ShapeHistory.Load(path);
@@ -306,8 +375,12 @@ internal static class ShapeGuard
             return new ShapeResolution(history, schema, path);
         }
 
-        if (history.Compact(baseLsn))
+        var compacted = history.Compact(baseLsn);
+        var tiersRecorded = history.RecordMissingTiers(schema);
+        if (compacted || tiersRecorded > 0)
             history.Save(path);
+        if (tiersRecorded > 0)
+            onTiersRecorded?.Invoke(tiersRecorded);
 
         var diff = ShapeCompatibility.Compare(history.Current, schema);
         if (diff.IsDestructive)

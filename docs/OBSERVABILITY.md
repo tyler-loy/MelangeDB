@@ -104,6 +104,7 @@ Source name: `MelangeDB`.
 | `melange.subscription.delta` | 03 | `melange.table`, `melange.subscribers` | Sampled — this is the highest-frequency operation in the system and must not be traced per row op at full rate. |
 | `melange.event.handle` | 06 | `melange.event.type`, `melange.handler` | **Linked, not parented** — see below. |
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
+| `melange.producer` | 26 | `melange.producer.name`, `melange.producer.outcome` (`ok`/`invalid_args`/`rate_limited`/`denied`/`rejected`/`timeout`/`too_many_bytes`/`error`); `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off | Parented to the client's `traceparent` when one was sent, as `melange.reducer` is. Producers write nothing, so no `melange.commit` span ever sits under one. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
 A `melange.reducer` span that exceeds `Telemetry:SlowReducerMs` additionally carries a
@@ -272,11 +273,15 @@ Meter name: `MelangeDB`.
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |
 | `melange.connections.active` | gauge | `{conn}` | — | 03 |
 | `melange.ratelimit.rejected` | counter | `{call}` | `reducer` | 04 |
+| `melange.producer.calls` | counter | `{call}` | `producer`, `outcome` | 26 |
+| `melange.producer.duration` | histogram | `ms` | `producer` | 26 |
+| `melange.producer.pin.duration` | histogram | `ms` | `producer` | 26 |
 | `melange.policy.rows_filtered` | counter | `{row}` | `table` | 04 |
 | `melange.scheduler.overruns` | counter | `{tick}` | `reducer` | 05 |
 | `melange.scheduler.tick.duration` | histogram | `ms` | `reducer` | 05 |
 | `melange.events.queue_depth` | gauge | `{event}` | — | 06 |
 | `melange.events.deadlettered` | counter | `{event}` | `event_type` | 06 |
+| `melange.archive.dead_lettered` | counter | `{row}` | `table` | 25 |
 | `melange.handoff.duration` | histogram | `ms` | — | 09 |
 | `melange.handoff.failed` | counter | `{handoff}` | `reason` | 09 |
 | `melange.shard.owned` | gauge | `{shard}` | — | 09 |
@@ -336,7 +341,7 @@ Most of the table is routine. These four are the ones this architecture specific
 corresponds to a documented silent failure mode:
 
 - **`melange.applier.lag`** — the whole two-tier design rests on appliers being allowed to lag. The dangerous
-  failure is a *silently stalled* Postgres applier: writes keep succeeding while the relational tier falls hours
+  failure is a *silently stalled* Postgres applier: writes keep succeeding while the relational backplane falls hours
   behind and nobody notices until an admin query returns stale data. This metric is that alarm.
 - **`melange.store.resident_bytes`** — turns the residency budget from a startup log line into something
   continuously observable. "Does a 20km world fit in 8GB" becomes a dashboard rather than an argument.
@@ -357,8 +362,8 @@ the **live** head, which is exactly the number that grows while a stuck holder s
 published at all until a decision has been made — snapshots off, `Snapshots:TruncateLog` off, or no snapshot
 yet: an absent series says "never evaluated", where a zero would say "healthy". The floor names are a small
 static set by construction (they name mechanisms, not instances), which is what keeps the `floor` tag on the
-right side of the cardinality rule: `snapshot`, `resume-window`, `event-bus`, `backup-pin`, `shard-freeze`,
-`shard-import`, `shard-sidecar`, `cluster-events`, one per applier name, and `unnamed` for a third-party floor
+right side of the cardinality rule: `snapshot`, `resume-window`, `archive-retention`, `event-bus`, `backup-pin`,
+`shard-freeze`, `shard-import`, `shard-sidecar`, `cluster-events`, one per applier name, and `unnamed` for a third-party floor
 registered through the overload that takes no name.
 
 ## Logs
@@ -376,7 +381,9 @@ also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flus
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`,
 `1006 ShapeMigrated` — an additive schema migration at boot: the changes, the rebuild, and the
 marker LSN the new shape governs from; Warning-level because automatic must never mean silent
-(road-to-0.2 phase 16, [MIGRATION.md](MIGRATION.md)) — `1008 ShapeAdopted` — a boot that *adopted*
+(road-to-0.2 phase 16, [MIGRATION.md](MIGRATION.md)) — `1009 ShapeTiersRecorded` — a boot that filled in each table's tier in a shape sidecar written before
+tiers were recorded, taking it from the running code; Information, and once per data directory
+(road-to-0.3 phase 25) — `1008 ShapeAdopted` — a boot that *adopted*
 the running code's schema as the meaning of records already on disk, because no shape sidecar
 existed: the only possible reading of those bytes, correct only if the upgrade rule was followed,
 and until it had an id the one step in this area that happened in silence. Warning, and only ever
@@ -403,11 +410,31 @@ is already compacted from one that has stopped compacting, and the second is the
 risk register demands: first failure always, then every 30 seconds under `Diagnostics:ReportApplierLag` with
 the growing lag — `1602 PostgresApplierRecovered`, `1603 PostgresSchemaMigrated` (the DDL AutoMigrate
 applied — automatic must not mean silent), `1604 PostgresMigrationRefused` (carrying the exact pending DDL,
-so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (LSNs are meaningless across log
+so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (since road-to-0.3 phase 25, only for
+an epoch the restored log's lineage does not name — a restore of the projection's own world reconciles under
+1613 instead; LSNs are meaningless across log
 epochs; the applier stalls rather than guesses), `1606 PostgresTierBootstrapped` (a tier attached after log
 truncation is rebuilt from the hot store at one consistent LSN), and `1607 RelationalTablesWithoutPostgres` —
-tables declared `Tier = Relational` in a deployment that configured no Postgres run fine in the hot store,
-and are told what they are missing (08); `1700 ClusterHubStarted` (naming the node-link listener's bound
+tables declared `Tier = HotWithRelationalBackplane` in a deployment that configured no Postgres run fine in the hot store,
+and are told what they are missing (08); `1609 PostgresTableCopied` — a table new to the relational
+backplane (switched from `Hot`, or a table Postgres never held) was filled from the hot store at one
+consistent LSN before the applier resumed, with its row count; Warning, because a whole table was replaced
+automatically — and `1610 PostgresTableUnprojected` — a table left the backplane, and its Postgres table is
+left as is and no longer maintained — and `1611 PostgresArchiveUnrecoverable` — the applier has no
+checkpoint and the log is truncated while archive tables are declared, so it stalls rather than start an
+archive with a hole: their rows below the truncation base exist only in a Postgres backup — and
+`1612 PostgresArchiveRowDeadLettered` — an archive insert whose primary key Postgres already held was set
+aside in `__melange_archive_dead_letter`, in the batch's own transaction, rather than overwrite the archived
+row or stall the applier. Error, once per row, naming the table, key, LSN and reducer and never the row's
+values; the dead-letter table holds those (as `row_values` jsonb), and `melange.archive.dead_lettered` counts
+them. A collision is a bug in key allocation: find the source, fix it, then re-apply or delete each row
+deliberately — the `melange-applier` check stays Degraded until the table is empty — and
+`1613 PostgresRestoreReconciled` — after a restore, the projection's epoch was an ancestor in the
+restored log's lineage, so the applier reconciled it: archive rows outside the restored history moved to
+`__melange_archive_rewound` (not deleted), backplane tables that ran past the fork re-copied, the resume
+LSN named; Warning, because rows moved automatically — and `1614 PostgresCloneArchiveEmpty` — a clone's
+archive starts without the source's history (road-to-0.3 phase 25);
+`1700 ClusterHubStarted` (naming the node-link listener's bound
 port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
 loud: how long the silence was and how many shards moved under bumped fencing tokens —
 `1703 ClusterLinkAuthFailed` (a link that could not prove the cluster secret; a rogue dialer or a
@@ -447,6 +474,12 @@ tick) — and `1723 ShardHasNoTimerRows`, a shard that opened holding no rows in
 last one is worth an alert in a world whose shards are created by players arriving: the state it names is
 otherwise completely silent, because a shard with no timers serves reads and writes perfectly and simply
 never ticks.
+
+Since phase 26: `1107 UnpolicedProducers`, the unpoliced report's producer half — producers with no
+`[Producer(Policy = ...)]`, each an open read of whatever it returns. It is logged beside `1104` under the same
+`Policies:UnpolicedReducerReport` setting, and `Fail` refuses to start naming reducers and producers together. `1206 ProducerCallFailed`
+is `1204`'s producer twin: a producer threw something other than a rejection, a timeout, or an oversized
+result during a socket or HTTP call, and the caller was told only to see the logs.
 
 Reaping a shard (issue #112) is the one cluster operation that destroys durable state, so both of its
 receipts are warnings and the refusal is not: `1747 ShardReaped` (node-side — the shard held nothing of
@@ -548,7 +581,7 @@ host to register into, so the first one landed with phase 02's host integration 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
 | `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
-| `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form | 08 |
+| `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form. **Degraded** while an applier reports a condition lag cannot show (`IApplierCondition`): the Postgres applier does so while `__melange_archive_dead_letter` holds rows, because a dead-lettered row leaves the checkpoint advancing and the lag at zero (road-to-0.3 phase 25) | 08 |
 | `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
 | `melange-capacity` | Two provision attempts failed or expired and the loop has stopped asking (**shipped, 14**) — EventId 1738 in health-endpoint form, cleared when a ticket-named node joins. Degraded while a ticket is outstanding; healthy off the hub or with no provisioner registered. | 14 |
 | `melange-retention` | More records are pinned above the log's truncation floor than `HealthChecks:RetentionPinnedThreshold` allows (**shipped, 18**) — the disk-filling alarm, with the governing floor's name and LSN in the description. `melange.log.pinned_records` is its metric form. Healthy trivially when snapshots or truncation are not configured, and while no truncation has been decided yet. The applier check overlaps by one holder deliberately: an applier is one of seven, and it fires far earlier at its own threshold. | 18 |
@@ -568,7 +601,7 @@ disk. This is the sequence of looks that names the cause.
 2. **Which holder?** `melange.log.truncation_floor`, broken out by the `floor` tag. The lowest series is the
    one governing. `snapshot` being lowest means nothing is holding the log back at all; anything else names a
    mechanism: `event-bus` (the slowest live subscriber's checkpoint), an applier name such as `postgres`,
-   `resume-window`, `backup-pin`, `shard-freeze` / `shard-import` (a handoff saga that never resolved),
+   `resume-window`, `archive-retention`, `backup-pin`, `shard-freeze` / `shard-import` (a handoff saga that never resolved),
    `cluster-events`, or `unnamed` for a floor some third-party code registered without naming.
 3. **Confirm against the log line.** Every truncation decision says the same thing at Information level:
    `1503 LogTruncated` when records went, `1510 LogTruncationPinned` when the decision removed nothing because
@@ -580,7 +613,9 @@ disk. This is the sequence of looks that names the cause.
    stopped; `backup-pin` → a backup stream that never finished (`Backup:StreamStallTimeoutMs`);
    `shard-freeze` / `shard-import` → an unresolved handoff saga, visible in the cluster events;
    `resume-window` → `Resume:RetentionWindowSeconds` is simply larger than the truncation interval, which is
-   configuration rather than a fault.
+   configuration rather than a fault; `archive-retention` → `Postgres:ArchiveLogRetentionHours` keeping the
+   log long enough for a Postgres dump restore to catch up, also configuration — the one floor whose holder
+   is an operator's backup schedule rather than a process.
 
 `melange-retention` is the same finding as an alert: unhealthy once the pinned distance passes
 `HealthChecks:RetentionPinnedThreshold`, with the governing floor named in its description. Truncation

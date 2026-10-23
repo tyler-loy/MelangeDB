@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>MelangeDB.Sample.Wallet</RootNamespace>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <Description>The archive tier's worked example: a wallet whose recent entries stay hot and whose old ones move to a Postgres-only archive, with idempotency keys checked across both.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The same development-only signing key the Worker sample uses; never ship it. -->
+    <Compile Include="..\MelangeDB.Sample.Worker\DevIdentity.cs" Link="DevIdentity.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.Server\MelangeDB.Server.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.Storage.Postgres\MelangeDB.Storage.Postgres.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

@@ -4,7 +4,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace MelangeDB.CodeGen;
 
 /// <summary>Turns attributed symbols into equatable models, collecting structural diagnostics.</summary>
-internal static class ModelExtractor
+internal static partial class ModelExtractor
 {
     public static TableModel? ExtractTable(GeneratorAttributeSyntaxContext context)
     {
@@ -16,10 +16,12 @@ internal static class ModelExtractor
         var isPublic = false;
         var tier = "Hot";
         var residency = "Paged";
+        var residencyDeclared = false;
         var placement = "Partitioned";
         string? declaredPlacement = null;
         string? shardBy = null;
         string? scheduled = null;
+        var keepKeys = false;
         foreach (var named in attribute.NamedArguments)
         {
             switch (named.Key)
@@ -31,10 +33,11 @@ internal static class ModelExtractor
                     isPublic = named.Value.Value is true;
                     break;
                 case "Tier":
-                    tier = named.Value.Value is int t && t == 1 ? "Relational" : "Hot";
+                    tier = named.Value.Value is int t ? t switch { 1 => "HotWithRelationalBackplane", 2 => "Archive", _ => "Hot" } : "Hot";
                     break;
                 case "Residency":
                     residency = named.Value.Value is int r ? r switch { 1 => "Resident", 2 => "Auto", _ => "Paged" } : "Paged";
+                    residencyDeclared = true;
                     break;
                 case "Placement":
                     placement = named.Value.Value is int p ? p switch { 1 => "Replicated", 2 => "Global", 3 => "Local", _ => "Partitioned" } : "Partitioned";
@@ -45,6 +48,9 @@ internal static class ModelExtractor
                     break;
                 case "Scheduled":
                     scheduled = named.Value.Value as string;
+                    break;
+                case "KeepKeys":
+                    keepKeys = named.Value.Value is true;
                     break;
             }
         }
@@ -79,6 +85,45 @@ internal static class ModelExtractor
             shardBy = null;
         }
 
+        // A key set is kept for an archive table's rows; no other table's rows live anywhere else.
+        if (keepKeys && tier != "Archive")
+        {
+            diagnostics.Add(new DiagnosticInfo("MELANGE0027", typeLocation, new EquatableArray<string>([tableName, $"Tier = {tier}"])));
+            keepKeys = false;
+        }
+
+        // An archive table lives only in Postgres: nothing of it is in the hot store, so anything
+        // that would need it there — a subscription, a residency, timer rows, a copy on every
+        // node — cannot be honoured, and saying so here beats a table that silently isn't.
+        if (tier == "Archive")
+        {
+            if (isPublic)
+                diagnostics.Add(new DiagnosticInfo("MELANGE0024", typeLocation, new EquatableArray<string>([tableName])));
+            if (residencyDeclared)
+            {
+                diagnostics.Add(new DiagnosticInfo(
+                    "MELANGE0026",
+                    typeLocation,
+                    new EquatableArray<string>([tableName, $"Residency.{residency}", "none of its rows are in the hot store, so there is no residency to declare"])));
+            }
+
+            if (scheduled is not null)
+            {
+                diagnostics.Add(new DiagnosticInfo(
+                    "MELANGE0026",
+                    typeLocation,
+                    new EquatableArray<string>([tableName, "Scheduled", "the scheduler reads timer rows from the hot store, and an archive table has none there"])));
+            }
+
+            if (placement == "Replicated")
+            {
+                diagnostics.Add(new DiagnosticInfo(
+                    "MELANGE0026",
+                    typeLocation,
+                    new EquatableArray<string>([tableName, "Placement.Replicated", "a replicated table is a copy held on every node, and an archive table is held on none"])));
+            }
+        }
+
         var columns = new List<ColumnModel>();
         var enums = new List<EnumModel>();
 
@@ -87,13 +132,13 @@ internal static class ModelExtractor
         foreach (var member in type.GetMembers())
         {
             if (member is IFieldSymbol { IsStatic: false, IsConst: false, DeclaredAccessibility: Accessibility.Public, IsImplicitlyDeclared: false } field)
-                AddColumn(columns, diagnostics, enums, tableName, isPublic, placement, field, field.Type, isProperty: false);
+                AddColumn(columns, diagnostics, enums, tableName, isPublic, tier, placement, field, field.Type, isProperty: false);
         }
 
         foreach (var member in type.GetMembers())
         {
             if (member is IPropertySymbol { IsStatic: false, DeclaredAccessibility: Accessibility.Public, GetMethod: not null, SetMethod: not null, IsIndexer: false } property)
-                AddColumn(columns, diagnostics, enums, tableName, isPublic, placement, property, property.Type, isProperty: true);
+                AddColumn(columns, diagnostics, enums, tableName, isPublic, tier, placement, property, property.Type, isProperty: true);
         }
 
         var primaryKeys = columns.Count(static c => c.IsPrimaryKey);
@@ -143,7 +188,8 @@ internal static class ModelExtractor
             Scheduled: scheduled,
             Columns: new EquatableArray<ColumnModel>([.. columns]),
             Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]),
-            Enums: new EquatableArray<EnumModel>([.. enums]));
+            Enums: new EquatableArray<EnumModel>([.. enums]),
+            KeepKeys: keepKeys);
     }
 
     public static ReducerModel? ExtractReducer(GeneratorAttributeSyntaxContext context)
@@ -386,6 +432,7 @@ internal static class ModelExtractor
         List<EnumModel> enums,
         string tableName,
         bool isPublic,
+        string tier,
         string placement,
         ISymbol member,
         ITypeSymbol memberType,
@@ -429,7 +476,9 @@ internal static class ModelExtractor
                 new EquatableArray<string>([tableName, member.Name, memberType.ToDisplayString()])));
         }
 
-        if (isUnique && placement == "Partitioned")
+        if (isUnique && tier == "Archive")
+            diagnostics.Add(new DiagnosticInfo("MELANGE0025", location, new EquatableArray<string>([tableName, member.Name])));
+        else if (isUnique && placement == "Partitioned")
             diagnostics.Add(new DiagnosticInfo("MELANGE0003", location, new EquatableArray<string>([tableName, member.Name])));
 
         if (isServerOnly && !isPublic)

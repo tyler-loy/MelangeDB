@@ -50,6 +50,23 @@ public static class ShardSpanCheck
 /// <summary>The placement visibility rules each node role installs on its engines.</summary>
 internal static class PlacementGuards
 {
+    /// <summary>
+    /// An archive table's rows reach Postgres only through the applier on the engine that wrote
+    /// them, and shard nodes run none: a shard-side archive write would sit in the shard's log
+    /// until truncation dropped it. Archive tables are written on the hub — declare them
+    /// Placement.Global. Partitioned archive tables are a recorded follow-up (plan-phase-25.md).
+    /// </summary>
+    private static void RefuseArchiveWrite(TableSchema table, TableAccess access, string nodeName)
+    {
+        if (table.Tier == StorageTier.Archive && access == TableAccess.Write)
+        {
+            throw new InvalidOperationException(
+                $"Table '{table.Name}' is an archive table, and shard node '{nodeName}' runs no Postgres applier to carry its " +
+                "rows out of the log. Archive tables are written on the hub: declare the table Placement.Global and write it " +
+                "from a hub-executed reducer.");
+        }
+    }
+
     /// <summary>The hub engine: Global, Replicated, and Local tables; Partitioned lives on shards.</summary>
     public static TableAccessGuard HubAccess() => static (table, access) =>
     {
@@ -68,6 +85,7 @@ internal static class PlacementGuards
     /// </summary>
     public static TableAccessGuard ShardAccess(ShardKey shard, string nodeName) => (table, access) =>
     {
+        RefuseArchiveWrite(table, access, nodeName);
         switch (table.Placement)
         {
             case Placement.Global:
@@ -90,6 +108,7 @@ internal static class PlacementGuards
     /// </summary>
     public static TableAccessGuard NodeLocalAccess(string nodeName) => (table, access) =>
     {
+        RefuseArchiveWrite(table, access, nodeName);
         if (table.Placement != Placement.Local)
         {
             throw new InvalidOperationException(

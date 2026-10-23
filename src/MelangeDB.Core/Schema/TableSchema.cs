@@ -16,13 +16,30 @@ public sealed class TableSchema
         Placement placement = Placement.Partitioned,
         string? shardBy = null,
         string? scheduled = null,
-        RowCodec? codec = null)
+        RowCodec? codec = null,
+        bool keepKeys = false)
     {
         ArgumentNullException.ThrowIfNull(rowType);
         ArgumentException.ThrowIfNullOrEmpty(name);
         ArgumentNullException.ThrowIfNull(columns);
         if (columns.Count == 0)
             throw new ArgumentException($"Table '{name}' has no columns.", nameof(columns));
+
+        // The runtime mirror of MELANGE0024-0026 for the reflection path: an archive table lives
+        // only in Postgres, so anything that needs its rows in the hot store cannot be honoured.
+        if (keepKeys && tier != StorageTier.Archive)
+            throw new NotSupportedException($"Table '{name}' declares KeepKeys, which only an archive table can (MELANGE0027).");
+        if (tier == StorageTier.Archive)
+        {
+            if (isPublic)
+                throw new NotSupportedException($"Table '{name}' is Tier = Archive and Public; no subscription can serve rows that live only in Postgres (MELANGE0024).");
+            if (scheduled is not null)
+                throw new NotSupportedException($"Table '{name}' is Tier = Archive and declares Scheduled; the scheduler reads timer rows from the hot store (MELANGE0026).");
+            if (placement == Placement.Replicated)
+                throw new NotSupportedException($"Table '{name}' is Tier = Archive and Placement.Replicated; an archive table is held on no node (MELANGE0026).");
+            if (columns.FirstOrDefault(static c => c.IsUnique) is { } unique)
+                throw new NotSupportedException($"Table '{name}': [Unique] column '{unique.Name}' on an archive table cannot be checked by a reducer (MELANGE0025).");
+        }
 
         // A table declaring Scheduled holds timer rows: exactly one ScheduleAt column, implicitly
         // private, and always Local — which on a shard node's per-shard engine means per-shard,
@@ -112,7 +129,11 @@ public sealed class TableSchema
         ShardBy = shardBy;
         Scheduled = scheduled;
         Codec = codec;
+        KeepKeys = keepKeys;
     }
+
+    /// <summary>For an archive table: whether a key-only set is kept in the hot store. See <see cref="ArchiveKeySet"/>.</summary>
+    public bool KeepKeys { get; }
 
     public Type RowType { get; }
 

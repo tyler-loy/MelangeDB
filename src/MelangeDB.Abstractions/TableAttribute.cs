@@ -6,8 +6,28 @@ public enum StorageTier
     /// <summary>The in-process log-structured store holding world state. The default.</summary>
     Hot,
 
-    /// <summary>Opt-in Postgres storage. Eventually consistent with the log by design.</summary>
-    Relational,
+    /// <summary>
+    /// A hot table with a relational backplane: rows live in the hot store, where reducers read and
+    /// write them, and the Postgres applier projects a copy for SQL access. The copy is eventually
+    /// consistent with the log by design and can always be rebuilt from it. Requires
+    /// <c>AddPostgres(...)</c> for the copy to exist; without it the table is an ordinary hot table.
+    /// </summary>
+    HotWithRelationalBackplane = 1,
+
+    /// <summary>The 0.2 name for <see cref="HotWithRelationalBackplane"/>; same value, same behaviour.</summary>
+    [Obsolete("Renamed to StorageTier.HotWithRelationalBackplane in 0.3: rows live in the hot store and Postgres " +
+        "holds a copy. Nothing on disk changes. See docs/MIGRATION.md.", error: true)]
+    Relational = 1,
+
+    /// <summary>
+    /// Postgres only. Rows ride the commit log like any write and the Postgres applier projects
+    /// them, but they never occupy the hot store, a snapshot, or a backup archive — once the log
+    /// truncates past a row, Postgres holds the only copy. Reducers can append (<c>Insert</c>) and
+    /// delete by key, and cannot read: a reducer body does no I/O. For unbounded history — a wallet
+    /// ledger, a trade log — whose recent rows stay in a hot table. Requires <c>AddPostgres(...)</c>.
+    /// See docs/road-to-0.3/plan-phase-25.md.
+    /// </summary>
+    Archive = 2,
 }
 
 /// <summary>Whether a table must stay wholly in memory.</summary>
@@ -85,4 +105,16 @@ public sealed class TableAttribute : Attribute
     /// it is not client-callable.
     /// </summary>
     public string? Scheduled { get; set; }
+
+    /// <summary>
+    /// For an <see cref="StorageTier.Archive"/> table only: keep a key-only set in the hot store,
+    /// one key per archived row and no payload. The generated accessor then offers
+    /// <c>Contains(key)</c> — so a reducer can ask whether a key was ever archived, which an
+    /// idempotency check needs — and an insert refuses a duplicate key before commit instead of
+    /// it being dead-lettered in Postgres after. The cost is the key set itself, which grows with
+    /// history at the size of a key. Off by default. Must be declared when the table is first
+    /// created: turning it on later would start the set without the keys already archived, so boot
+    /// refuses it. Declaring it on any other tier is compile error MELANGE0027.
+    /// </summary>
+    public bool KeepKeys { get; set; }
 }

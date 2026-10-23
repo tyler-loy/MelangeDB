@@ -68,6 +68,15 @@ public interface IDbView
     }
 
     /// <summary>
+    /// Whether a row with this primary key exists, overlay included. For an archive table this is
+    /// the only question a reducer may ask, and only when the table declares <c>KeepKeys</c>: the
+    /// answer comes from the key set in the hot store, never from Postgres.
+    /// </summary>
+    bool ContainsKey<TRow>(object primaryKey)
+        where TRow : struct
+        => Find<TRow>(primaryKey) is not null;
+
+    /// <summary>
     /// The first row in primary-key order, or null for an empty table. Materializes exactly one
     /// row, never the table.
     /// </summary>

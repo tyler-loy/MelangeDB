@@ -1,6 +1,10 @@
 namespace MelangeDB.Protocol;
 
-/// <summary>The frame types of protocol version 2. Wire values are contract; never renumber.</summary>
+/// <summary>
+/// The frame types of protocol version 3. Wire values are contract; never renumber. Version 3 is
+/// version 2 plus <see cref="CallProducer"/> and <see cref="ProducerResult"/>, which a version-2
+/// connection may not send.
+/// </summary>
 public enum FrameType : byte
 {
     Hello = 1,
@@ -19,6 +23,8 @@ public enum FrameType : byte
     ResumeResult = 14,
     Reauthenticate = 15,
     ReauthenticateResult = 16,
+    CallProducer = 17,
+    ProducerResult = 18,
 }
 
 /// <summary>
@@ -31,7 +37,7 @@ public static class MelangeChannels
     /// <summary>Handshake, heartbeat, resume, re-auth, and connection-scoped errors.</summary>
     public const int Control = 0;
 
-    /// <summary>Reducer calls and their results — the interactive lane.</summary>
+    /// <summary>Reducer and producer calls and their results — the interactive lane.</summary>
     public const int Calls = 1;
 
     /// <summary>Committed deltas, in LSN order, for every subscription on the connection.</summary>
@@ -51,6 +57,12 @@ public static class MelangeErrorCodes
     public const string Protocol = "protocol";
     public const string MessageTooLarge = "message_too_large";
     public const string UnknownReducer = "unknown_reducer";
+
+    /// <summary>The name does not resolve to a registered producer.</summary>
+    public const string UnknownProducer = "unknown_producer";
+
+    /// <summary>A producer call ran past <c>Producers:TimeoutSeconds</c>.</summary>
+    public const string Timeout = "timeout";
     public const string InvalidArguments = "invalid_args";
     public const string Rejected = "rejected";
 
@@ -157,6 +169,27 @@ public sealed record CallReducerFrame(uint RequestId, string Reducer, byte[] Arg
 public sealed record ReducerResultFrame(uint RequestId, bool Ok, ulong Lsn, string? ErrorCode, string? Message) : Frame
 {
     public override FrameType Type => FrameType.ReducerResult;
+}
+
+/// <summary>
+/// Calls a producer (protocol version 3): a typed, read-only server call answered with a value.
+/// <see cref="Arguments"/> uses the reducer-argument encoding; <see cref="TraceParent"/> is a W3C
+/// traceparent, as on <see cref="CallReducerFrame"/>. Request ids share one space with reducer calls.
+/// </summary>
+public sealed record CallProducerFrame(uint RequestId, string Producer, byte[] Arguments, string? TraceParent) : Frame
+{
+    public override FrameType Type => FrameType.CallProducer;
+}
+
+/// <summary>
+/// The outcome of one producer call. On success <see cref="Payload"/> is the result — one tagged
+/// value in the reducer-argument encoding, decoded against the producer's return type in the schema
+/// manifest — and <see cref="Lsn"/> the commit the answer reflects. On failure the payload is empty
+/// and <see cref="ErrorCode"/> says why.
+/// </summary>
+public sealed record ProducerResultFrame(uint RequestId, bool Ok, ulong Lsn, ReadOnlyMemory<byte> Payload, string? ErrorCode, string? Message) : Frame
+{
+    public override FrameType Type => FrameType.ProducerResult;
 }
 
 /// <summary>

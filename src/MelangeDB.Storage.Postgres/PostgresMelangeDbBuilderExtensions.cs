@@ -7,12 +7,12 @@ using Microsoft.Extensions.Options;
 
 namespace MelangeDB.Storage.Postgres;
 
-/// <summary>Registers the Postgres relational tier on the MelangeDB builder.</summary>
+/// <summary>Registers the Postgres relational backplane on the MelangeDB builder.</summary>
 public static class PostgresMelangeDbBuilderExtensions
 {
     /// <summary>
-    /// Adds the relational tier over <paramref name="connectionString"/>: the log applier that
-    /// projects <c>Tier = Relational</c> tables into Postgres with its own durable checkpoint, and
+    /// Adds the relational backplane over <paramref name="connectionString"/>: the log applier that
+    /// projects <c>Tier = HotWithRelationalBackplane</c> tables into Postgres with its own durable checkpoint, and
     /// the executor behind ad-hoc SQL aggregates. <b>Opt-in</b> — a deployment that never calls
     /// this needs no Postgres and loses nothing but the relational projection.
     /// </summary>
@@ -23,7 +23,7 @@ public static class PostgresMelangeDbBuilderExtensions
     }
 
     /// <summary>
-    /// Adds the relational tier, configuring <see cref="PostgresOptions"/> in code — sugar over
+    /// Adds the relational backplane, configuring <see cref="PostgresOptions"/> in code — sugar over
     /// the same <c>MelangeDb:Postgres:*</c> section configuration binds, where code wins because
     /// it runs last.
     /// </summary>
@@ -43,6 +43,7 @@ public static class PostgresMelangeDbBuilderExtensions
             provider.GetService<ILoggerFactory>(),
             provider.GetService<TimeProvider>()));
         builder.Services.TryAddSingleton<IRelationalQueryExecutor, PostgresQueryExecutor>();
+        builder.Services.TryAddSingleton<IArchiveReader, PostgresArchiveReader>();
         builder.Services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<PostgresRelationalTier>());
         return builder;
     }

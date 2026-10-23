@@ -229,3 +229,17 @@ public sealed class PlayerStateHandoffSet : IHandoffSet
             rows.Add(state);
     }
 }
+
+/// <summary>
+/// Producers on both sides of the cluster: one reads only a Global table, so it runs on the hub;
+/// one reads a Partitioned table, so it runs on the caller's shard.
+/// </summary>
+public sealed class ClusterProducers
+{
+    [Producer]
+    public long GlobalValue(ProducerContext ctx) => ctx.Db.GlobalCounter.Id.Find(1L)?.Value ?? 0;
+
+    [Producer]
+    public List<int> MobHps(ProducerContext ctx, uint instanceId) =>
+        ctx.Db.Mob.InstanceId.Filter(instanceId).Select(static mob => mob.Hp).Order().ToList();
+}

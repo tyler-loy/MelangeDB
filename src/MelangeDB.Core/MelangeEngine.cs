@@ -20,6 +20,9 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly FileCommitLog _log;
     private readonly AutoIncSequencer _sequencer;
     private readonly ShapeResolution _shapes;
+
+    /// <summary>Tables whose rows live only in Postgres; see <see cref="WithoutArchiveOps"/>.</summary>
+    private readonly HashSet<TableId> _archiveTables;
     private readonly EngineTelemetry? _telemetry;
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
@@ -76,6 +79,7 @@ public sealed partial class MelangeEngine : IDisposable
         ArgumentNullException.ThrowIfNull(schema);
         _options = options;
         Schema = schema;
+        _archiveTables = schema.Tables.Where(static t => t.Tier == StorageTier.Archive).Select(static t => t.Id).ToHashSet();
         _time = timeProvider ?? TimeProvider.System;
         _randomProvider = randomProvider ?? SeededReducerRandomProvider.Instance;
         var loggers = loggerFactory ?? NullLoggerFactory.Instance;
@@ -103,6 +107,7 @@ public sealed partial class MelangeEngine : IDisposable
                 _telemetry,
                 SnapshotFile.DurableFloor(options.CommitLog.Path));
             _sequencer = new AutoIncSequencer(originator);
+            Lineage = EpochLineage.Load(options.CommitLog.Path);
 
             // Shape governance before any row byte is interpreted: load (or adopt) the shape
             // sidecar, refuse a destructive schema change, and hold the additive transform that
@@ -113,7 +118,8 @@ public sealed partial class MelangeEngine : IDisposable
                 _log.BaseLsn,
                 _log.HeadLsn,
                 options.Schema.AllowAdoption,
-                lsn => LogMessages.ShapeAdopted(_logger, options.CommitLog.Path, lsn));
+                lsn => LogMessages.ShapeAdopted(_logger, options.CommitLog.Path, lsn),
+                count => LogMessages.ShapeTiersRecorded(_logger, count, options.CommitLog.Path));
             var store = CreateStore(options, schema, hotStoreProvider, loggers);
             _storeLifetime = store as IDisposable;
 
@@ -130,7 +136,7 @@ public sealed partial class MelangeEngine : IDisposable
             foreach (var record in _log.ReadFrom(replayFrom))
             {
                 var replay = _shapes.TransformRecord(record);
-                store.Apply(replay);
+                store.Apply(WithoutArchiveOps(replay));
                 _sequencer.Observe(replay, schema);
                 RecoveredTailTimestamp = replay.Timestamp;
             }
@@ -141,7 +147,7 @@ public sealed partial class MelangeEngine : IDisposable
             HotStore = store;
             _readViewSource = store as IReadViewSource;
             Appliers = new ApplierPipeline(_log, _telemetry, _shapes.TransformRecord, _log.ReadUncapped);
-            Appliers.Register(new HotStoreApplier(store));
+            Appliers.Register(new HotStoreApplier(store, WithoutArchiveOps));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
             _truncationFloors.Add((TruncationFloorNames.BackupPin, PinnedTruncationFloor));
             ReportCloneProvenance(options.CommitLog.Path);
@@ -201,6 +207,62 @@ public sealed partial class MelangeEngine : IDisposable
     /// unambiguously the one governing its own LSN — without the marker, a snapshot taken at
     /// exactly the pre-migration head could be either shape and recovery could not tell.
     /// </summary>
+    /// <summary>
+    /// The record as the hot store sees it: archive-tier ops removed, because those rows live only
+    /// in Postgres — and, for an archive table that keeps a key set, replaced by the same op on its
+    /// key set, carrying the key alone. Done here rather than in each store so that every
+    /// <see cref="IHotStore"/>, including one this assembly never saw, holds nothing of an archive
+    /// table but its keys. The AutoInc sequencer and every decoupled applier still see the whole record.
+    /// </summary>
+    private CommitRecord WithoutArchiveOps(CommitRecord record)
+    {
+        if (_archiveTables.Count == 0)
+            return record;
+
+        List<RowOp>? kept = null;
+        for (var i = 0; i < record.WriteSet.Count; i++)
+        {
+            var op = record.WriteSet[i];
+            if (_archiveTables.Contains(op.Table))
+            {
+                if (kept is null)
+                {
+                    kept = new List<RowOp>(record.WriteSet.Count);
+                    for (var j = 0; j < i; j++)
+                        kept.Add(record.WriteSet[j]);
+                }
+
+                if (Schema.KeySetFor(op.Table) is { } keySet)
+                    kept.Add(KeySetOp(keySet, op));
+                continue;
+            }
+
+            kept?.Add(op);
+        }
+
+        return kept is null ? record : new CommitRecord
+        {
+            Lsn = record.Lsn,
+            FormatVersion = record.FormatVersion,
+            Timestamp = record.Timestamp,
+            Caller = record.Caller,
+            ReducerName = record.ReducerName,
+            Arguments = record.Arguments,
+            WriteSet = kept,
+            Events = record.Events,
+            SerializedLength = record.SerializedLength,
+        };
+    }
+
+    private static RowOp KeySetOp(TableSchema keySet, in RowOp op)
+    {
+        if (op.Kind == RowOpKind.Delete)
+            return new RowOp(RowOpKind.Delete, keySet.Id, op.Key);
+        var key = keySet.PrimaryKey;
+        var row = RowSerializer.SerializeValues(keySet, new Dictionary<string, object?> { [key.Name] = SchemaKeyCodec.Decode(key, op.Key) });
+        return new RowOp(op.Kind, keySet.Id, op.Key, row);
+    }
+
     private void CompleteShapeMigration(IHotStore store)
     {
         if (!_shapes.MigrationPending)
@@ -311,6 +373,9 @@ public sealed partial class MelangeEngine : IDisposable
 
     public ICommitLog Log => _log;
 
+    /// <summary>The earlier epochs this log descends from — empty unless it was restored. See <see cref="EpochLineage"/>.</summary>
+    public EpochLineage Lineage { get; }
+
     /// <summary>
     /// The log as the file it is — path, buffer flush, base sidecar — for the online backup's
     /// direct file walk. Internal on purpose: <see cref="Log"/> is the abstraction everything
@@ -359,6 +424,71 @@ public sealed partial class MelangeEngine : IDisposable
     private IDbView? _committedView;
 
     /// <summary>
+    /// Set for the async flow of a producer call. A producer commits nothing, so a reducer started
+    /// from inside one — through an injected host or engine, which the nested-call guard cannot see
+    /// because it tracks reducer bodies on a thread — is refused.
+    /// </summary>
+    internal static readonly AsyncLocal<bool> InProducer = new();
+
+    private static void ThrowIfInProducer(string reducerName)
+    {
+        if (InProducer.Value)
+        {
+            throw new InvalidOperationException(
+                $"A producer cannot invoke a reducer ('{reducerName}'): a producer commits nothing. " +
+                "Do the write in a reducer the client calls, or move the read into the reducer.");
+        }
+    }
+
+    /// <summary>
+    /// Whether the hot store offers pinned reads (<see cref="IReadViewSource"/>), which is what
+    /// <see cref="OpenReadView"/>, snapshot isolation, and producers need. Both shipped stores do.
+    /// </summary>
+    public bool SupportsReadViews => _readViewSource is not null;
+
+    /// <summary>
+    /// Opens a read-only view pinned at the hot store's current applied LSN — the way to read
+    /// committed state off the write lock, across awaits and threads, without seeing a commit land
+    /// halfway. Dispose it promptly: the store retains superseded versions for as long as it is
+    /// held. Throws on a store without <see cref="IReadViewSource"/>; check
+    /// <see cref="SupportsReadViews"/>, or use <see cref="ReadCommitted{T}"/>, which falls back.
+    /// </summary>
+    public PinnedReadView OpenReadView()
+    {
+        var source = _readViewSource ?? throw new NotSupportedException(
+            $"The hot store ({HotStore.GetType().Name}) does not implement IReadViewSource, so it cannot pin a read view. " +
+            "Use a store that does (the in-memory and FASTER stores both do).");
+        return new PinnedReadView(Schema, OpenPinned(source), _tableGuard);
+    }
+
+    /// <summary>
+    /// Runs a synchronous read of committed state from off the write lock — a policy evaluated
+    /// before its transaction opens, a strategy consulted from a gateway. Pins a view for the read
+    /// when the store can; otherwise runs it under the write lock against <see cref="CommittedView"/>,
+    /// which is correct and merely holds up commits for as long as the read takes.
+    /// </summary>
+    public T ReadCommitted<T>(Func<IDbView, T> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        if (_readViewSource is null)
+            return ReadConsistent(_ => read(CommittedView));
+        using var view = OpenReadView();
+        return read(view);
+    }
+
+    /// <summary>
+    /// Opens the store's pinned view under the write lock, as <see cref="IReadViewSource"/>
+    /// requires: no apply can run while the store captures its tables, so the view is one LSN across
+    /// every table rather than one table after a multi-table commit and another before it. Cheap —
+    /// the capture is references, not rows.
+    /// </summary>
+    private IHotStoreReadView OpenPinned(IReadViewSource source)
+    {
+        lock (_writeLock)
+            return source.OpenReadView();
+    }
+
+    /// <summary>
     /// Invokes a reducer body as one transaction. <paramref name="reducerName"/> and
     /// <paramref name="arguments"/> are recorded as log metadata for audit; the write set is the
     /// authoritative payload. Nested invocations are forbidden and throw.
@@ -388,6 +518,8 @@ public sealed partial class MelangeEngine : IDisposable
                 "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
                 "Extract shared logic into a plain method both reducers call.");
         }
+
+        ThrowIfInProducer(reducerName);
 
         try
         {
@@ -440,6 +572,8 @@ public sealed partial class MelangeEngine : IDisposable
                 "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
                 "Extract shared logic into a plain method both reducers call.");
         }
+
+        ThrowIfInProducer(reducerName);
 
         if (isolation == Isolation.Snapshot && ReadViewOrFallback() is { } source)
         {
@@ -1077,6 +1211,20 @@ public sealed partial class MelangeEngine : IDisposable
         floors.Add(new TruncationFloor(TruncationFloorNames.ResumeWindow, resumeFloor));
         floor = Math.Min(floor, resumeFloor);
 
+        // The archive retention window, searched the same way: records committed within it stay,
+        // so a Postgres restored from a dump taken inside it can catch its archive tables up from
+        // the log. Only while archive tables are declared — a mirror rebuilds from the hot store.
+        if (_archiveTables.Count > 0 && _options.Postgres.ArchiveLogRetentionHours > 0)
+        {
+            var archiveFloor = floor;
+            var archiveCutoff = _time.GetUtcNow().AddHours(-_options.Postgres.ArchiveLogRetentionHours);
+            var archiveCutoffMicros = Timestamp.FromDateTimeOffset(archiveCutoff).UnixTimeMicroseconds;
+            if (_log.FirstLsnAtOrAfter(archiveCutoffMicros, _log.BaseLsn + 1, floor) is { } oldestInArchiveWindow)
+                archiveFloor = oldestInArchiveWindow - 1;
+            floors.Add(new TruncationFloor(TruncationFloorNames.ArchiveRetention, archiveFloor));
+            floor = Math.Min(floor, archiveFloor);
+        }
+
         var governing = floors[0];
         foreach (var candidate in floors)
         {
@@ -1464,9 +1612,10 @@ public sealed partial class MelangeEngine : IDisposable
         double? bodyMs = null;
         try
         {
-            // Disposed before the lock is taken: the pin is the body's, and holding it across the
-            // commit would keep versions alive for no reader.
-            using (var view = source.OpenReadView())
+            // Opened under the write lock for an instant, so the pin cannot straddle a multi-table
+            // commit; disposed before the lock is taken for this transaction's own commit: the pin
+            // is the body's, and holding it across the commit would keep versions alive for no reader.
+            using (var view = OpenPinned(source))
             {
                 var context = new ReducerContext(
                     caller,
@@ -1884,6 +2033,17 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void ShapeAdopted(ILogger logger, string directory, ulong headLsn) =>
             ShapeAdoptedMessage(logger, directory, headLsn, null);
+
+        private static readonly Action<ILogger, int, string, Exception?> ShapeTiersRecordedMessage =
+            LoggerMessage.Define<int, string>(
+                LogLevel.Information,
+                new EventId(1009, "ShapeTiersRecorded"),
+                "Recorded the tier of {Count} table(s) in the shape sidecar under '{Directory}', which predates tier " +
+                "recording, taking each from the running code. From here on a changed tier is detected at boot. " +
+                "Correct only if this deploy did not also change a table's tier — the same rule as the sidecar's own adoption.");
+
+        public static void ShapeTiersRecorded(ILogger logger, int count, string directory) =>
+            ShapeTiersRecordedMessage(logger, count, directory, null);
 
         private static readonly Action<ILogger, Guid, ulong, string, DateTimeOffset, DateTimeOffset, Exception?> CloneProvenanceMessage =
             LoggerMessage.Define<Guid, ulong, string, DateTimeOffset, DateTimeOffset>(

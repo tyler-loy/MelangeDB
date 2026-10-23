@@ -6,7 +6,7 @@ using Npgsql;
 namespace MelangeDB.Storage.Postgres;
 
 /// <summary>
-/// Executes validated aggregate queries against the relational tier. The SQL is assembled entirely
+/// Executes validated aggregate queries against the relational backplane. The SQL is assembled entirely
 /// from schema-derived, quoted identifiers and closed keyword sets — <c>DATE_TRUNC</c> units come
 /// from an enum, functions from an enum — with every operand a typed parameter, so client text
 /// never reaches Postgres. Results reflect the tier at the applier's checkpoint; grouped rows come

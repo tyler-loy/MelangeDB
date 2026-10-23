@@ -27,10 +27,10 @@ internal static class ManifestParser
             ?? throw new ManifestException("The manifest root is not a JSON object.");
 
         var format = GetNumber(root, "format");
-        if (format != ManifestEmitter.FormatVersion)
+        if (format is not (ManifestEmitter.FormatWithoutProducers or ManifestEmitter.FormatVersion))
         {
             throw new ManifestException(
-                $"Manifest format {format} is not supported; this generator reads format {ManifestEmitter.FormatVersion}. " +
+                $"Manifest format {format} is not supported; this generator reads formats {ManifestEmitter.FormatWithoutProducers}-{ManifestEmitter.FormatVersion}. " +
                 "Re-export the manifest with a matching MelangeDB.CodeGen.");
         }
 
@@ -96,12 +96,71 @@ internal static class ManifestParser
             reducers.Add(new ClientReducerModel(reducerName, new EquatableArray<ClientParameterModel>([.. parameters])));
         }
 
+        var producers = new List<ClientProducerModel>();
+        var resultTypes = new List<ClientResultTypeModel>();
+        if (format >= ManifestEmitter.FormatVersion)
+        {
+            foreach (var entry in GetArray(root, "types"))
+            {
+                var type = AsObject(entry, "types[]");
+                var fields = new List<ClientFieldModel>();
+                foreach (var fieldEntry in GetArray(type, "fields"))
+                {
+                    var field = AsObject(fieldEntry, "fields[]");
+                    fields.Add(new ClientFieldModel(GetString(field, "name"), GetString(field, "type")));
+                }
+
+                resultTypes.Add(new ClientResultTypeModel(GetString(type, "name"), GetBool(type, "valueType"), new EquatableArray<ClientFieldModel>([.. fields])));
+            }
+
+            var typeNames = new HashSet<string>(resultTypes.Select(static t => t.Name), StringComparer.Ordinal);
+            foreach (var type in resultTypes)
+            {
+                foreach (var field in type.Fields.Items)
+                    CheckTypeReference(field.Type, enumNames, typeNames, $"type '{type.Name}'");
+            }
+
+            foreach (var entry in GetArray(root, "producers"))
+            {
+                var producer = AsObject(entry, "producers[]");
+                var producerName = GetString(producer, "name");
+                var parameters = new List<ClientParameterModel>();
+                foreach (var parameterEntry in GetArray(producer, "params"))
+                {
+                    var parameter = AsObject(parameterEntry, "params[]");
+                    parameters.Add(new ClientParameterModel(
+                        GetString(parameter, "name"),
+                        GetKind(parameter, "kind"),
+                        GetBool(parameter, "isArray"),
+                        GetEnumReference(parameter, enumNames, $"producer '{producerName}'"),
+                        parameter.TryGetValue("default", out var value) ? value as string ?? throw new ManifestException($"A default in producer '{producerName}' is not a string.") : null));
+                }
+
+                var returns = GetString(producer, "returns");
+                CheckTypeReference(returns, enumNames, typeNames, $"producer '{producerName}'");
+                producers.Add(new ClientProducerModel(producerName, new EquatableArray<ClientParameterModel>([.. parameters]), returns));
+            }
+        }
+
         return new ClientSchemaModel(
             GetString(root, "schemaHash"),
             GetString(root, "module"),
             new EquatableArray<ClientEnumModel>([.. enums]),
             new EquatableArray<ClientTableModel>([.. tables]),
-            new EquatableArray<ClientReducerModel>([.. reducers]));
+            new EquatableArray<ClientReducerModel>([.. reducers]),
+            new EquatableArray<ClientProducerModel>([.. producers]),
+            new EquatableArray<ClientResultTypeModel>([.. resultTypes]));
+    }
+
+    /// <summary>
+    /// A result type reference must bottom out in a scalar kind, a declared enum, or a declared
+    /// result type, under any number of <c>?</c> and <c>[]</c> suffixes.
+    /// </summary>
+    private static void CheckTypeReference(string reference, HashSet<string> enumNames, HashSet<string> typeNames, string where)
+    {
+        var name = ResultTypeReference.Base(reference);
+        if (ResultTypeReference.ScalarKind(name) is null && !enumNames.Contains(name) && !typeNames.Contains(name))
+            throw new ManifestException($"{where} references type '{name}', which is not a scalar kind and which the manifest does not declare.");
     }
 
     private static string? GetEnumReference(Dictionary<string, object?> node, HashSet<string> enumNames, string where)

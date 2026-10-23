@@ -45,6 +45,17 @@ public ref struct ReducerArgsReader
             throw new ReducerArgumentException($"Expected {declared} argument(s); the call carries {Count}.");
     }
 
+    /// <summary>
+    /// Rejects the call unless it carries between <paramref name="required"/> and
+    /// <paramref name="declared"/> arguments — for a producer whose trailing parameters have
+    /// defaults, which a caller may leave off.
+    /// </summary>
+    public void ExpectCount(int required, int declared)
+    {
+        if (Count < required || Count > declared)
+            throw new ReducerArgumentException($"Expected {required} to {declared} argument(s); the call carries {Count}.");
+    }
+
     /// <summary>Rejects the call unless every argument byte was consumed.</summary>
     public void End()
     {

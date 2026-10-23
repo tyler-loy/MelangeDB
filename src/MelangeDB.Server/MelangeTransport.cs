@@ -31,11 +31,13 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
         MelangeAuthenticator authenticator,
         MelangeSessions sessions,
         PolicySet policies,
-        CancellationToken stopping = default)
+        CancellationToken stopping = default,
+        MelangeProducerHost? producers = null)
     {
         Stopping = stopping;
         Engine = engine;
         Reducers = reducers;
+        Producers = producers;
         _options = options;
         Time = time ?? TimeProvider.System;
         Logger = loggerFactory.CreateLogger("MelangeDB.Server");
@@ -67,6 +69,9 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
     public MelangeEngine Engine { get; }
 
     public MelangeReducerHost Reducers { get; }
+
+    /// <summary>The producer host, or null on an engine with none — a shard engine before producers route there.</summary>
+    public MelangeProducerHost? Producers { get; }
 
     public TimeProvider Time { get; }
 

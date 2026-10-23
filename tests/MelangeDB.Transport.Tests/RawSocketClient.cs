@@ -25,13 +25,13 @@ internal sealed class RawSocketClient : IAsyncDisposable
     /// shared test token, and null sends Hello with no token at all — the browser-style cases pass
     /// a ticket on the URL or a header instead.
     /// </summary>
-    public async Task<WelcomeFrame> ConnectAsync(Uri uri, CancellationToken ct, string? token = "default")
+    public async Task<WelcomeFrame> ConnectAsync(Uri uri, CancellationToken ct, string? token = "default", int? maxVersion = null)
     {
         await _socket.ConnectAsync(uri, ct);
         await SendAsync(
             new HelloFrame(
-                MessagePackFrameSerializer.ProtocolVersion,
-                MessagePackFrameSerializer.ProtocolVersion,
+                maxVersion ?? MessagePackFrameSerializer.ProtocolVersion,
+                maxVersion ?? MessagePackFrameSerializer.ProtocolVersion,
                 token == "default" ? TestTokens.Default : token),
             ct);
         return Assert.IsType<WelcomeFrame>(await ReceiveAsync(ct));

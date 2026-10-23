@@ -62,7 +62,7 @@ public partial struct Player
     public float Y;
 }
 
-[Table(Tier = StorageTier.Relational)]        // opts into Postgres; private by default
+[Table(Tier = StorageTier.HotWithRelationalBackplane)]   // hot, plus a Postgres copy; private by default
 public partial struct Registration
 {
     [PrimaryKey, AutoInc] public long Id;
@@ -73,8 +73,12 @@ public partial struct Registration
 
 Four orthogonal knobs, and conflating any two of them is a design error:
 
-- **`Tier`** — *where the row is stored.* Hot (default) or Relational. Postgres is opt-in, so a table
-  only lands there if it asks to, and a deployment only needs Postgres if some table asks to.
+- **`Tier`** — *where the row is stored.* Hot (default); HotWithRelationalBackplane — hot, with a
+  Postgres copy the applier projects from the log (called `Relational` until 0.3); or Archive —
+  Postgres only, for unbounded history: reducers append and delete by key and cannot read, and the
+  rows are in no hot store, snapshot, or backup archive. `KeepKeys = true` keeps an archive table's
+  keys alone in the hot store, so a reducer can still ask `Contains(key)`. Postgres is opt-in, so a table only lands
+  there if it asks to, and a deployment only needs Postgres if some table asks to.
 - **`Public`** — *may this table sync to clients at all?* **Private by default.** A private table is
   server-internal and no subscription may name it.
 - **`Residency`** — *must this table stay wholly in memory?* See §8.
@@ -249,6 +253,28 @@ The full design record, including what was deliberately left out (`Isolation.Rea
 concurrency with read-set validation, cross-tier isolation) and what remains open, is in
 [design/snapshot-isolation.md](design/snapshot-isolation.md).
 
+### Producers: the read a client asks for
+
+A **producer** is the other half of the call surface: where a reducer writes and returns nothing, a
+producer writes nothing and returns a typed value — and because nothing it does is replayed or holds the
+write lock, it may be async and await I/O.
+
+```csharp
+public sealed class WalletProducers(IArchiveReader archive)
+{
+    [Producer(Policy = typeof(PlayersOnly))]
+    public async Task<WalletHistory> History(ProducerContext ctx, string? after = null) { /* hot + archive */ }
+}
+```
+
+`ctx.Db` is the hot store **pinned at one LSN for the whole call** (`ctx.Lsn`), not the live store a
+policy used to read: an async body runs off the write lock, where a raw read could see a commit half
+applied. Passing `ctx.Lsn` as an archive query's `AsOfLsn` makes the Postgres read answer for the same
+commit, so a row the sweep moves between the two reads is counted once. The result is encoded while the
+pin is held, and the answer waits for durability through that LSN, as a reducer's acknowledgement does.
+Producers are how archive history reaches clients, which never read archive tables directly. The design
+record, including the transaction scope, is [design/producers.md](design/producers.md).
+
 ## 5. The commit log is the database
 
 This is the load-bearing decision.
@@ -298,6 +324,11 @@ without breaking anything: on restart, each applier resumes from its own checkpo
 - Postgres reads are eventually consistent with the log. A reducer that must read a relational table
   it just wrote needs the overlay, and external SQL readers may see a slightly stale tier.
 - Commit latency is bounded by the log's fsync policy, which is therefore configurable.
+- **Archive tables are the one exception to "the log is the database".** Their rows ride the log
+  like any write, but once the log truncates past them Postgres holds the only copy, because they
+  were never in the hot store. Postgres is therefore not disposable for those tables: it needs its
+  own backups, point-in-time recovery included. See
+  [plan-phase-25.md](road-to-0.3/plan-phase-25.md).
 
 ### Domain events: the bus falls out of the log
 

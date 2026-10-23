@@ -26,6 +26,8 @@ public sealed class MelangeDbOptions
 
     public RateLimitOptions RateLimit { get; set; } = new();
 
+    public ProducersOptions Producers { get; set; } = new();
+
     public SqlOptions Sql { get; set; } = new();
 
     public BulkOptions Bulk { get; set; } = new();
@@ -52,15 +54,15 @@ public sealed class MelangeDbOptions
 }
 
 /// <summary>
-/// Options for the relational tier (<c>MelangeDb:Postgres:*</c>). The tier is opt-in: an absent
-/// connection string means no Postgres at all, and a deployment with no relational tables needs
+/// Options for the relational backplane (<c>MelangeDb:Postgres:*</c>). The tier is opt-in: an absent
+/// connection string means no Postgres at all, and a deployment with no backplane tables needs
 /// none. The implementation lives in the MelangeDB.Storage.Postgres package; these options bind
 /// here so the whole <c>MelangeDb:</c> section stays one configuration surface.
 /// </summary>
 public sealed class PostgresOptions
 {
     /// <summary>
-    /// The Npgsql connection string. Absent means no relational tier — the zero-infra single-file
+    /// The Npgsql connection string. Absent means no relational backplane — the zero-infra single-file
     /// story stays intact. Set by <c>AddPostgres(...)</c> or bound from configuration.
     /// </summary>
     public string? ConnectionString { get; set; }
@@ -80,6 +82,16 @@ public sealed class PostgresOptions
     /// are ever automatic — destructive ones are refused loudly in both settings.
     /// </summary>
     public bool AutoMigrate { get; set; }
+
+    /// <summary>
+    /// How long the commit log keeps records behind the Postgres applier's checkpoint while archive
+    /// tables are declared, in hours; 0 (the default) is off. Archive rows are in no hot store, so
+    /// once the log truncates past one, Postgres holds the only copy — and a Postgres restored from
+    /// a plain dump comes back with an older checkpoint the log can no longer serve. Set this to at
+    /// least the dump interval plus margin so such a restore catches up from the log. Leave it off
+    /// when Postgres has point-in-time recovery. Fractional hours are allowed.
+    /// </summary>
+    public double ArchiveLogRetentionHours { get; set; }
 }
 
 /// <summary>Diagnostics toggles (<c>MelangeDb:Diagnostics:*</c>).</summary>
@@ -422,6 +434,30 @@ public sealed class RateLimitOptions
 
     /// <summary>Per-reducer overrides of <see cref="ReducerCallsPerSecond"/>, keyed by reducer name.</summary>
     public Dictionary<string, int> PerReducer { get; set; } = new(StringComparer.Ordinal);
+}
+
+/// <summary>Producer call limits (<c>MelangeDb:Producers:*</c>); see docs/design/producers.md.</summary>
+public sealed class ProducersOptions
+{
+    /// <summary>
+    /// How long one call may run before its <c>CancellationToken</c> fires and it answers
+    /// <c>timeout</c>. Also bounds how long a call holds its pinned read view, and so how long the
+    /// hot store keeps superseded versions for it.
+    /// </summary>
+    public double TimeoutSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// The largest encoded result a call may return; past it the call answers <c>too_many_bytes</c>.
+    /// Encoding stops at the cap rather than building the whole answer first.
+    /// </summary>
+    public int MaxResponseBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>
+    /// Producer calls one socket connection may have in flight. Each holds a pinned read view for
+    /// as long as it runs, so this bounds the versions one client can make the hot store keep. A
+    /// call past it answers <c>rate_limited</c> without running.
+    /// </summary>
+    public int MaxConcurrentPerConnection { get; set; } = 4;
 }
 
 /// <summary>Whether ad-hoc SQL results pass through row and column policies.</summary>

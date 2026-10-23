@@ -10,7 +10,186 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Breaking
+
+- **`StorageTier.Relational` is renamed `StorageTier.HotWithRelationalBackplane`.** The old name
+  described where people assumed the rows lived, not where they do: a relational table's rows live
+  in the hot store, reducers read them there, and Postgres holds a copy the applier projects from
+  the log. Phase 25's Postgres-only archive tier would have made the old name actively misleading,
+  so it goes first. **The break is source-only.** The value stays `1`, so nothing on disk changes —
+  no hot-store rebuild, no Postgres DDL, no shape-sidecar change, and the applier's checkpoint is
+  untouched. `StorageTier.Relational` remains as an `[Obsolete(error: true)]` alias whose message
+  names the replacement, so an upgrade fails at compile time with the fix in the error. Also renamed:
+  `ServerSubscription.Compile`'s `allowPrivateRelational` parameter (now `allowPrivateBackplane`),
+  and "relational tier" in the docs, XML docs and log and error *messages*. Deliberately **not**
+  renamed: the types named for Postgres (`PostgresRelationalTier`, `IRelationalQueryExecutor`,
+  `RelationalAggregateQuery`), the wire error codes (`not_relational`, `no_relational_tier`,
+  `relational_unavailable`), the `Postgres:*` configuration keys, and EventIds and their names —
+  each is a contract something outside this repo matches on. See
+  [docs/MIGRATION.md](docs/MIGRATION.md#upgrading-to-03-the-relational-backplane-rename) and
+  [plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md).
+
+### Added
+
+- **The shape sidecar records each table's tier.** Where a table's rows live is part of what a data
+  directory holds, and phase 25's Postgres-only archive tier will make some tier changes lose data,
+  so a changed tier is now detected at boot like any other shape change. Between `Hot` and
+  `HotWithRelationalBackplane` the change is additive: a migration boot, EventId 1006 naming it. A
+  recorded tier this build doesn't know (written by a newer one) refuses boot. A 0.2 sidecar has its
+  tiers filled in place on the first boot (EventId 1009), without a migration. Tiers are persisted
+  by explicit name, never by the enum's own formatting, because `Relational` and
+  `HotWithRelationalBackplane` share a value and which aliased name `ToString()` returns is
+  unspecified.
+
+- **The archive tier: `StorageTier.Archive`, tables that live only in Postgres.** For unbounded
+  history, such as a wallet ledger whose recent rows stay in a hot table and whose old ones move to
+  an archive with a reducer (`Insert` into the archive, `Delete` from the hot table, one atomic write
+  set). Writes ride the commit log and the Postgres applier projects them; the engine strips them
+  from every record before the hot store sees it, through commit and recovery alike, so they are in
+  no hot store, snapshot or `.mbak`, and that holds for any `IHotStore`. Reducers can `Insert` and
+  blind-`Delete` by key; nothing that reads is generated, and the reflection path refuses reads with
+  the reason. AutoInc ids stay unique across restarts. MELANGE0024–0026 refuse a Public archive
+  table, `[Unique]` on one, and Scheduled, Replicated or a declared Residency. An archive table
+  without `Postgres:ConnectionString` refuses to start, every tier change into or out of `Archive`
+  refuses boot with the supported path named, shard and node-local engines refuse archive writes
+  (declare them `Placement.Global`), and an applier that would have to rebuild over a truncated log
+  refuses rather than begin an archive with a hole (EventId 1611). Ad-hoc aggregates run over
+  archive tables. Each archive row carries the `_melange_lsn` and `_melange_epoch` it was committed
+  at. An insert whose primary key Postgres already holds is never an overwrite and never a stall: it
+  is dead-lettered into `__melange_archive_dead_letter` in the batch's own transaction (values kept
+  as `row_values` jsonb), logged at Error by key and reducer but never by value (EventId 1612),
+  counted (`melange.archive.dead_lettered`), and reported as a Degraded `melange-applier` until the
+  table is cleared — through the new `IApplierCondition`, which any decoupled applier can implement.
+  Back up Postgres with point-in-time recovery; see [docs/BACKUP.md](docs/BACKUP.md).
+
+- **`KeepKeys`: an archive table's keys kept in the hot store.** Opt-in per archive table
+  (`[Table(Tier = StorageTier.Archive, KeepKeys = true)]`, off by default). The engine maintains a
+  key-only hot table, `__keys_<Table>`, from the archive's ops; the generated accessor gains
+  `Contains(key)`, so a reducer can check an idempotency key that has left the hot window, and an
+  insert refuses an already-archived key before commit instead of it being dead-lettered after.
+  `IDbView.ContainsKey<TRow>` is the untyped form, a default interface method. Must be declared when
+  the table is created; turning it on later refuses boot, turning it off doesn't. MELANGE0027 refuses
+  it on any other tier.
+
+- **A wallet sample, `samples/MelangeDB.Sample.Wallet`: the archive tier's worked example.** A hot
+  balance, a hot recent ledger keyed by the caller's idempotency key, a `KeepKeys` archive, a
+  scheduled sweep that moves entries past the hot window (an index range on `At`, one atomic write set
+  per batch), a credit/debit reducer that stays idempotent across both, and a `History` producer that
+  pages the caller's own history — hot ledger and archive, the archive read as of the producer's
+  pinned LSN so an entry the sweep moves mid-call is listed once — behind a players-only policy.
+  Needs Postgres.
+
+- **`IArchiveReader`: reading archive history outside a reducer.** Registered by `AddPostgres`.
+  Keyset-paginated pages of an archive table, ordered by primary key (ascending or newest first),
+  filtered on the key or one indexed column by value or inclusive range, values in the columns' own
+  CLR types. Each page reads Postgres and the applier's checkpoint in one repeatable-read transaction,
+  then overlays the unapplied log tail for that table, so a row that just left the hot store is never
+  briefly invisible; past 50,000 unapplied records the overlay is skipped and the page says `Stale`.
+
+- **`Postgres:ArchiveLogRetentionHours`, the archive retention floor.** Off by default. While archive
+  tables are declared, the log keeps the records committed within the window — a named truncation
+  floor, `archive-retention`, searched by commit timestamp like the resume window — so a Postgres
+  restored from a plain dump taken inside it catches its archive up from the log. Outside it, the
+  refusal names the lost LSN range and the setting (EventId 1611). For deployments without
+  point-in-time recovery; set it to at least the dump interval.
+
+- **Restores record their lineage, and the Postgres projection is reconciled after one.** A restored
+  directory's `melange.lineage` names the source epoch and the LSN it forked at, plus that epoch's own
+  ancestors (carried in the archive's per-engine identity as an optional field, so the archive format
+  is unchanged and older archives still restore). On first boot, a Postgres checkpoint from an
+  ancestor epoch is reconciled to the restored history instead of refused: archive rows outside it
+  move to `__melange_archive_rewound` (not deleted), backplane tables that ran past the fork are
+  re-copied from the hot store, and the applier resumes from the fork (EventId 1613). A checkpoint
+  from an epoch the lineage doesn't name — another branch — is still refused (1605). A reconcile
+  whose resume point is below the restored log's base refuses for archive tables (1611), and a
+  clone starts its archive without the source's history (1614). **Behavior change:** a restore of
+  a backplane-only deployment used to stop at EventId 1605 until the schema was cleared; it now
+  reconciles on its own. Clearing the schema still works.
+
+- **Producers: `[Producer]` methods, typed read-only calls a client makes for data** (road-to-0.3
+  phase 26, [design/producers.md](docs/design/producers.md)). A producer is
+  `T Name(ProducerContext ctx, ...)`, `Task<T>`, or `ValueTask<T>`: it writes nothing, so it may be
+  async and await I/O, and it returns a typed value — `List<WalletLine> History(int page = 1)`. The
+  generator discovers producers beside reducers (register them with `AddProducersFrom`), decodes
+  their parameters as reducer arguments with trailing defaults a caller may leave off, and emits an
+  encoder for the result: one tagged value in the reducer-argument encoding, a record as an array of
+  its public fields and properties in declaration order. Results may be scalars, strings, `byte[]`,
+  `Identity`, `Timestamp`, enums, nullable values, arrays and lists, and records, classes, or
+  structs of those, recursively. MELANGE0028 refuses a signature the dispatcher cannot call,
+  MELANGE0029 a result it cannot encode — a `[Table]` struct included, so a table's shape reaches a
+  client only through a type its author wrote — naming the member path, and MELANGE0030 a producer
+  sharing its name with a reducer or another producer.
+
+  `MelangeProducerHost.CallAsync` runs a call: arguments validated, a client call rate limited
+  (`RateLimit:*`) and authorized (the producer's `IReducerPolicy`, or `Policies:DefaultReducerPosture`)
+  before anything is pinned; then one read view is pinned for the whole call (`ctx.Db`, `ctx.Lsn`),
+  the body runs under `Producers:TimeoutSeconds`, the result is encoded under
+  `Producers:MaxResponseBytes` while the pin is still held, and the answer waits for the log to be
+  durable through the pinned LSN, as a reducer's acknowledgement does. A producer that invokes a
+  reducer is refused. The unpoliced report lists producers (EventId 1107), and a hot store without
+  pinned reads refuses to start once any producer is registered. Telemetry: the `melange.producer`
+  span and `melange.producer.calls`, `.duration`, and `.pin.duration`.
+
+  On the wire, producers are **protocol version 3**: `CallProducer` (17) and `ProducerResult` (18)
+  on the calls channel, with error codes `unknown_producer` and `timeout` beside the reducer ones.
+  The server negotiates 2–3 and serves a version-2 client exactly as before, refusing it only if it
+  sends a producer frame; `MelangeClient` offers 2–3 and gains `CallProducerAsync`, whose result
+  `ProducerResultReader` decodes. The socket runs calls off the read loop, cancels them when the
+  connection closes, and holds at most `Producers:MaxConcurrentPerConnection` at once (EventId 1206
+  for an unexpected failure). Over HTTP, `POST {path}/producers/{name}` takes a JSON array of
+  arguments and answers `{"ok", "lsn", "result"}`, the result rendered as JSON under the response
+  cap while the read view is still pinned. In a cluster, producers run where the reducer rules put
+  them — the hub for `Global`/`Replicated` reads, the caller's shard otherwise, `[Producer(Site = ...)]`
+  to override — and the gateway, now on version 3, routes and handoff-holds them as it does reducer
+  calls; every shard engine gets its own producer host.
+
+  The schema manifest carries producers — **format 2**, written only by a module that has them, so
+  every other module's manifest and schema hash are unchanged — with each producer's parameters
+  (defaults included) and result as a type reference, and each result type's fields in wire order.
+  The client generator re-declares result types as records and emits `conn.Producers.<Name>Async`,
+  whose defaults are the server method's and whose decoders read the result positionally.
+  MELANGE0031 refuses a result type whose client name another result type, a public table's row
+  type, an enum, or a scalar kind already has.
+
+- **`MelangeEngine.OpenReadView()` — committed state pinned at one LSN, readable off the write
+  lock.** A `PinnedReadView` is a read-only `IDbView` with an `Lsn`, safe to read from several
+  threads (each read and each step of a lazy query runs under its own lock), that throws on a read
+  after disposal rather than reading a released pin. `SupportsReadViews` says whether the store can
+  pin, and `ReadCommitted(db => ...)` runs a synchronous read through a pin or, without one, under
+  the write lock. It is the read scope phase 26's producers run in.
+
+- **`ArchiveQuery.AsOfLsn` — read the archive as of a pinned view's LSN.** Postgres rows committed
+  after it and the overlaid log tail beyond it are left out, so a reader that merges hot and archive
+  rows sees a row the sweep moved in between exactly once, rather than twice (archive read later) or
+  not at all (archive read first). The read waits for the log to be durable through that LSN, since
+  the overlay reads only durable records. Archive deletes carry no LSN, so a delete committed after
+  it and already applied shows early.
+
+### Fixed
+
+- **A table switched from `Hot` to the relational backplane now gets its existing rows in
+  Postgres.** The applier skipped the table's ops while it was hot, so its checkpoint was already
+  past the table's history: the Postgres table was created empty, and only rows written after the
+  change ever reached it. The hot store still held everything, so nothing was lost, but the copy
+  was silently incomplete. The applier now keeps a projected-tables registry
+  (`__melange_projected`) beside its checkpoint and, on start, fills any backplane table missing
+  from it from the hot store at one consistent LSN before resuming (EventId 1609). A table that
+  leaves the backplane leaves the registry (EventId 1610), so moving it back copies it afresh
+  instead of resuming a stale copy. A 0.2 projection seeds the registry from the tables Postgres
+  already holds. See [docs/MIGRATION.md](docs/MIGRATION.md#changing-a-tables-tier).
+
+- **A snapshot-isolated reducer on the in-memory store could read a commit half applied.**
+  `IReadViewSource` requires the pinned view to be opened while no apply runs, and the engine opened
+  it without the write lock. A commit writing to two tables could land between the two captures, so
+  the body saw the first table after the commit and the second before it. The FASTER store takes its
+  own lock and was not affected. The view is now opened under the write lock for the instant the
+  capture takes (references only).
+
+- **Reducer policies, and the cluster gateway's shard strategy, read the live store off the write
+  lock.** `MayCall` runs before its transaction opens, and `IShardStrategy.ShardForSession` runs on
+  the gateway, both against `CommittedView`, which the `IHotStore` contract allows only on paths the
+  engine serializes. Both now read through `MelangeEngine.ReadCommitted`: a pinned view, or the write
+  lock on a store without one.
 
 ## [0.2.3] — 2026-10-19
 

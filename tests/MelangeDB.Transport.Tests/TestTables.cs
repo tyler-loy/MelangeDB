@@ -181,7 +181,7 @@ public partial struct AdminIdentity
 /// Relational-tier and private — the WorldStat shape: written by gameplay, read by admin tooling.
 /// What owner-mode ad-hoc SQL (rows and aggregates) exists for.
 /// </summary>
-[Table(Tier = StorageTier.Relational)]
+[Table(Tier = StorageTier.HotWithRelationalBackplane)]
 public partial struct WorldStat
 {
     [PrimaryKey]

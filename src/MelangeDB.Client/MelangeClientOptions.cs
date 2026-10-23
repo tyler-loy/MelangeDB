@@ -144,3 +144,10 @@ public sealed class MelangeSubscriptionException : Exception
 
     public string Code { get; }
 }
+
+/// <summary>
+/// A producer's answer as it arrived: the encoded result (read it with
+/// <see cref="MelangeDB.Protocol.ProducerResultReader"/>, or let the generated bindings) and the
+/// commit LSN the server's read answered for.
+/// </summary>
+public sealed record ProducerReply(ReadOnlyMemory<byte> Payload, ulong Lsn);

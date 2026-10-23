@@ -30,7 +30,7 @@ head LSN), its snapshot rows, its log tail above the snapshot LSN, and its sidec
 checkpoints ride along; they are part of what has happened). Two properties fall out for free:
 
 - **Small and shaped like the state, not the deployment.** No FASTER files, no Postgres dump. The
-  hot store is scratch that recovery rebuilds; the relational tier re-bootstraps from the restored
+  hot store is scratch that recovery rebuilds; the relational backplane re-bootstraps from the restored
   log (phase 08 machinery).
 - **Store-engine agnostic.** A backup taken from a FASTER deployment restores into an in-memory
   one, and vice versa — the archive predates the projection choice by construction.
@@ -121,7 +121,7 @@ carries the tail record by record, so this collects rather than invents.
   head are free again: the archive carries sequences as of its snapshot, and boot re-observes only
   the records the cut kept. Nothing inside the restored world refers to those ids — that history
   did not happen — and the fresh epoch is what forces every consumer outside it (clients, the
-  relational tier) to rebuild rather than carry a stale reference across the boundary. Reconcile
+  relational backplane) to rebuild rather than carry a stale reference across the boundary. Reconcile
   anything *else* that recorded them; a rewind is a business-level event, not only a technical one.
 
 The window is one archive's: `--at-lsn` reaches back to the archive's snapshot floor, and the
@@ -154,14 +154,38 @@ rather than starting it — starting would open this deployment's own data direc
 under test. `MelangeBackup.CheckRestore(directory, schema)` is the same thing without a host. A CI
 job's whole contract is that the check throws and the alert is the throw.
 
-The Postgres tier is not in the archive and is not silently overwritten: on first boot after a
-restore, the applier's checkpoint belongs to an epoch the restored log has never seen, and the
-tier refuses loudly (EventId 1605) with the remediation printed rather than projecting history
-that no longer happened — the `AutoMigrate` posture: destructive disagreement is never automatic.
-The clean path is an empty schema, which the bootstrap machinery fills from the restored log; the
-refusal's same-epoch cousin — a checkpoint ahead of the log's head, the hand-rolled directory
-swap — is EventId 1608. Both refusals' remediations are tested to recover when followed
-literally.
+The Postgres tier is not in the archive, and it keeps running across a restore — so on first boot
+after one, it holds a future the restored log does not contain. **A restore records where it came
+from:** the restored directory's `melange.lineage` names the source epoch and the LSN it forked at
+(and that epoch's own ancestors, which the archive carries), so the applier can tell a projection of
+this world's past from one of an unrelated world.
+
+- **Its own past: reconciled** (EventId 1613, Warning). Archive rows outside the restored history are
+  *moved* to `__melange_archive_rewound`, not deleted — Postgres may hold their only copy, and
+  destructive is never automatic; drop them once nothing needs them. Backplane tables that ran past
+  the fork are re-copied from the hot store. The checkpoint moves to the restored epoch at the fork,
+  and the applier resumes. Before lineage, this was a refusal (EventId 1605) whose remediation was an
+  empty schema.
+- **Another branch: refused** (EventId 1605). Restoring a backup whose lineage does not include the
+  epoch Postgres follows — the older backup restored after a newer restore, say — cannot be
+  reconciled: rows that world needs may have been moved aside already. For a deployment with no
+  archive tables, an empty schema is still the clean path, which the bootstrap machinery fills from
+  the restored log. Its same-epoch cousin — a checkpoint ahead of the log's head, the hand-rolled
+  directory swap — is EventId 1608. Both refusals' remediations are tested to recover when followed
+  literally.
+
+**Archive tables make Postgres part of the backup.** A table declared `Tier = Archive` lives only in
+Postgres: its rows are not in the archive, and once the log truncates past them Postgres holds the
+only copy. Back Postgres up with point-in-time recovery (WAL archiving), and when Postgres itself is
+lost, restore it to the same moment as the log. Without point-in-time recovery, set
+`Postgres:ArchiveLogRetentionHours` to at least your dump interval: a plain dump restores an older
+checkpoint, and the log then still holds the archive rows committed since, so the applier catches up
+instead of refusing with the lost range named (EventId 1611). **Do not clear the schema** in such a deployment: it
+deletes the archive's rows for good. A reconcile whose resume point sits below the restored log's
+base — Postgres had fallen behind the archive's snapshot — refuses for the same reason (EventId 1611):
+the archive rows in between exist only in a Postgres backup. A **clone** starts its archive without
+the source's history (EventId 1614): it gets only the archive rows still in its log above the
+snapshot, and the rest stays in the source's Postgres.
 
 After restoring, point `CommitLog:Path` at the restored directory (or place it where your
 configuration already points). The hot-store directory is scratch and is rebuilt on boot.
@@ -201,7 +225,7 @@ invite using one where the other was meant.
 **What the archive cannot carry is yours to separate**, and every one of these is how a clone
 stops being one:
 
-- **Its own Postgres schema.** The archive holds no relational tier; point the clone at an empty
+- **Its own Postgres schema.** The archive holds no relational backplane; point the clone at an empty
   schema and the phase 08 bootstrap fills it from the restored log. Pointing it at production's is
   two worlds writing one projection.
 - **Its own data directory and its own fleet.** Never `CommitLog:Path` production's, never a node

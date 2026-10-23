@@ -68,7 +68,7 @@ public sealed record RelationalPredicate
 }
 
 /// <summary>
-/// A validated one-shot aggregate query over a relational-tier table, ready for the relational
+/// A validated one-shot aggregate query over a relational-backplane table, ready for the relational
 /// executor: selections, grouping, and an optional predicate, every identifier already resolved
 /// against the <see cref="TableSchema"/>. Results are ordered by the grouping selections
 /// ascending, so output is deterministic without an ORDER BY in the subset.
@@ -93,9 +93,9 @@ public sealed record RelationalAggregateQuery
 public sealed record RelationalQueryResult(IReadOnlyList<string> Columns, IReadOnlyList<object?[]> Rows);
 
 /// <summary>
-/// The seam between ad-hoc SQL and the relational tier's engine: executes a validated aggregate
+/// The seam between ad-hoc SQL and the relational backplane's engine: executes a validated aggregate
 /// query against the tier. Registered by the storage package (<c>AddPostgres</c>); absent when no
-/// relational tier is configured, which the SQL endpoint reports as an explicit error rather than
+/// relational backplane is configured, which the SQL endpoint reports as an explicit error rather than
 /// an empty result. Results reflect the tier at its applier's checkpoint — the documented,
 /// deliberate lag of the two-backend design.
 /// </summary>

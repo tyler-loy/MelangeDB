@@ -15,12 +15,24 @@ public sealed record ShapeColumn(string Name, ColumnKind Kind);
 /// The persisted shape of one table: its key column's name and its columns in declaration order —
 /// the order row format v1 writes them. Two shapes are byte-compatible iff they are equal; a row
 /// written under one decodes under another only through <see cref="RowShapeMapper"/>.
+/// <para>
+/// Also the table's <see cref="Tier"/>, which the bytes do not depend on but where the rows
+/// <em>live</em> does: a tier change that crosses the hot store's boundary is a data-loss event,
+/// so it has to be detectable at boot like any other change to what the directory holds. It takes
+/// no part in <see cref="SameAs"/>, which stays the byte-compatibility question.
+/// </para>
 /// </summary>
 public sealed class TableShape
 {
     public required string Key { get; init; }
 
     public required IReadOnlyList<ShapeColumn> Columns { get; init; }
+
+    /// <summary>
+    /// The table's tier by its stable name (<see cref="ShapeTiers"/>), or null in a sidecar written
+    /// before tiers were recorded — <see cref="ShapeHistory.RecordMissingTiers"/> fills it in.
+    /// </summary>
+    public string? Tier { get; init; }
 
     public bool SameAs(TableShape other) =>
         Key == other.Key && Columns.SequenceEqual(other.Columns);
@@ -30,6 +42,30 @@ public sealed class TableShape
     {
         Key = table.PrimaryKey.Name,
         Columns = table.Columns.Select(c => new ShapeColumn(c.Name, c.Kind)).ToArray(),
+        Tier = ShapeTiers.NameOf(table.Tier),
+    };
+}
+
+/// <summary>
+/// The sidecar's names for <see cref="StorageTier"/> values. Explicit rather than the enum's own
+/// names on purpose: <c>Relational</c> and <c>HotWithRelationalBackplane</c> share a value, and
+/// which of two aliased names <see cref="Enum.ToString()"/> returns is unspecified — a persisted
+/// name has to be the same on every runtime that will ever read it.
+/// </summary>
+public static class ShapeTiers
+{
+    public const string Hot = "Hot";
+
+    public const string HotWithRelationalBackplane = "HotWithRelationalBackplane";
+
+    public const string Archive = "Archive";
+
+    public static string NameOf(StorageTier tier) => tier switch
+    {
+        StorageTier.Hot => Hot,
+        StorageTier.HotWithRelationalBackplane => HotWithRelationalBackplane,
+        StorageTier.Archive => Archive,
+        _ => throw new ArgumentOutOfRangeException(nameof(tier), tier, "No sidecar name for this tier."),
     };
 }
 
@@ -107,6 +143,32 @@ public sealed class ShapeHistory
         FromLsn = fromLsn,
         Tables = schema.Tables.ToDictionary(t => t.Name, TableShape.Of),
     };
+
+    /// <summary>
+    /// Fills in the tier of every table in the current entry that has none — a sidecar written
+    /// before tiers were recorded — from the booting schema, and returns how many were filled. In
+    /// place rather than as a new reign, because the tier never changes what a record's bytes mean.
+    /// It is the adoption reading again, for one field: correct when this boot did not also change
+    /// a tier, which is the same upgrade rule that governs the sidecar itself.
+    /// </summary>
+    public int RecordMissingTiers(SchemaRegistry schema)
+    {
+        var current = Current;
+        Dictionary<string, TableShape>? tables = null;
+        var filled = 0;
+        foreach (var (name, shape) in current.Tables)
+        {
+            if (shape.Tier is not null || !schema.TryGetByName(name, out var table))
+                continue;
+            tables ??= new Dictionary<string, TableShape>(current.Tables);
+            tables[name] = new TableShape { Key = shape.Key, Columns = shape.Columns, Tier = ShapeTiers.NameOf(table.Tier) };
+            filled++;
+        }
+
+        if (tables is not null)
+            _entries[^1] = new ShapeEntry { FromLsn = current.FromLsn, Tables = tables };
+        return filled;
+    }
 
     /// <summary>Appends a new reign. Its <see cref="ShapeEntry.FromLsn"/> must be past the current one's.</summary>
     public void Append(ShapeEntry entry)

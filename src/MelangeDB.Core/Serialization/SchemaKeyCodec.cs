@@ -47,7 +47,7 @@ public static class SchemaKeyCodec
     /// Boxed decoding: the inverse of <see cref="Encode(ColumnSchema, object)"/>, recovering the
     /// column value from its order-preserving key form. What lets a delete op — which carries only
     /// the encoded primary key, no row — be applied to a projection keyed by natural values, the
-    /// relational tier being the case in point.
+    /// relational backplane being the case in point.
     /// </summary>
     public static object Decode(ColumnSchema column, in RowKey key)
     {

@@ -68,6 +68,12 @@ internal sealed record DiagnosticInfo(string DescriptorId, LocationInfo Location
         "MELANGE0016" => Diagnostics.ScheduleAtColumnMisplaced,
         "MELANGE0018" => Diagnostics.ShardByIsPrimaryKey,
         "MELANGE0022" => Diagnostics.ScheduledTablePlacement,
+        "MELANGE0024" => Diagnostics.ArchiveTablePublic,
+        "MELANGE0025" => Diagnostics.UniqueOnArchiveTable,
+        "MELANGE0026" => Diagnostics.ArchiveTableDeclaration,
+        "MELANGE0027" => Diagnostics.KeepKeysOnNonArchiveTable,
+        "MELANGE0028" => Diagnostics.InvalidProducerSignature,
+        "MELANGE0029" => Diagnostics.UnserializableProducerResult,
         _ => throw new InvalidOperationException($"Unknown diagnostic id {id}."),
     };
 }
@@ -148,7 +154,8 @@ internal sealed record TableModel(
     string? Scheduled,
     EquatableArray<ColumnModel> Columns,
     EquatableArray<DiagnosticInfo> Diagnostics,
-    EquatableArray<EnumModel> Enums = default)
+    EquatableArray<EnumModel> Enums = default,
+    bool KeepKeys = false)
 {
     public bool IsValid => Diagnostics.Items.All(d => d.DescriptorId is "MELANGE0003" or "MELANGE0007");
 }
@@ -164,7 +171,13 @@ internal sealed record ParameterModel(
     string ElementClrFqn,
     bool ElementIsEnum,
     string ElementEnumUnderlyingFqn,
-    bool IsTimerRow = false);
+    bool IsTimerRow = false,
+    string? DefaultLiteral = null,
+    string? DefaultJson = null)
+{
+    /// <summary>Whether the parameter declares a default value, which a caller may then leave off (producers only).</summary>
+    public bool HasDefault => DefaultLiteral is not null;
+}
 
 internal sealed record ReducerModel(
     string ContainingTypeFqn,
@@ -194,15 +207,30 @@ internal sealed record ReducerModel(
     /// <c>ctx</c> or <c>ctx.Db</c> to a helper, or names a table this compilation does not know)
     /// resolves to the shard, where a Global read fails loudly with the fix in the message.
     /// </summary>
-    public string ResolveSite(IReadOnlyDictionary<string, string> placementByTypeName)
+    public string ResolveSite(IReadOnlyDictionary<string, string> placementByTypeName) =>
+        Kind is "ClientConnected" or "ClientDisconnected"
+            ? "Hub"
+            : Sites.Resolve(DeclaredSite, OpaqueBody, TouchedTables, placementByTypeName);
+}
+
+/// <summary>Execution-site resolution shared by reducers and producers.</summary>
+internal static class Sites
+{
+    /// <summary>
+    /// An explicit <c>Site</c> wins; otherwise only Global and Replicated touches means the hub,
+    /// and an opaque body or any other touch means the shard.
+    /// </summary>
+    public static string Resolve(
+        string declaredSite,
+        bool opaqueBody,
+        EquatableArray<string> touchedTables,
+        IReadOnlyDictionary<string, string> placementByTypeName)
     {
-        if (Kind is "ClientConnected" or "ClientDisconnected")
-            return "Hub";
-        if (DeclaredSite is "Hub" or "Shard")
-            return DeclaredSite;
-        if (OpaqueBody)
+        if (declaredSite is "Hub" or "Shard")
+            return declaredSite;
+        if (opaqueBody)
             return "Shard";
-        foreach (var table in TouchedTables.Items)
+        foreach (var table in touchedTables.Items)
         {
             if (!placementByTypeName.TryGetValue(table, out var placement)
                 || placement is not ("Global" or "Replicated"))
@@ -213,4 +241,91 @@ internal sealed record ReducerModel(
 
         return "Hub";
     }
+}
+
+/// <summary>
+/// One member of a producer result type, in declaration order — the order it rides on the wire.
+/// <paramref name="TypeRef"/> is a <see cref="ResultTypeRefs"/> reference.
+/// </summary>
+internal sealed record ResultFieldModel(string Name, string TypeRef);
+
+/// <summary>
+/// A record, class, or struct a producer returns (or that one it returns contains), encoded as an
+/// array of its public fields and properties. <paramref name="Name"/> is the simple name the client
+/// declares it under.
+/// </summary>
+internal sealed record ResultTypeModel(
+    string Name,
+    string Fqn,
+    bool IsValueType,
+    EquatableArray<ResultFieldModel> Fields)
+{
+    /// <summary>The generated encoder method's name: unique per CLR type, not per simple name.</summary>
+    public string EncoderName => "Write_" + ResultTypeRefs.Safe(Fqn);
+}
+
+/// <summary>
+/// The compact, equatable form a producer result's type travels in through the generator:
+/// <c>s:Kind</c> a scalar (a <see cref="WireKind"/> name), <c>e:Kind:Fqn</c> an enum with its
+/// underlying kind, <c>r:Fqn</c> a result type, <c>l:inner</c> a list or array, <c>n:inner</c> a
+/// nullable value type.
+/// </summary>
+internal static class ResultTypeRefs
+{
+    public static string Scalar(WireKind kind) => "s:" + kind;
+
+    public static string Enum(WireKind underlying, string fqn) => $"e:{underlying}:{fqn}";
+
+    public static string Record(string fqn) => "r:" + fqn;
+
+    public static string List(string inner) => "l:" + inner;
+
+    public static string Nullable(string inner) => "n:" + inner;
+
+    public static string Safe(string fqn)
+    {
+        var builder = new System.Text.StringBuilder(fqn.Length);
+        foreach (var c in fqn.Replace("global::", string.Empty))
+            builder.Append(char.IsLetterOrDigit(c) ? c : '_');
+        return builder.ToString();
+    }
+}
+
+internal sealed record ProducerModel(
+    string ContainingTypeFqn,
+    string MethodName,
+    string ProducerName,
+    string? PolicyFqn,
+    LocationInfo Location,
+    EquatableArray<ParameterModel> Parameters,
+    string ResultRef,
+    string ResultFqn,
+    EquatableArray<ResultTypeModel> ResultTypes,
+    EquatableArray<EnumModel> Enums,
+    EquatableArray<DiagnosticInfo> Diagnostics,
+    string DeclaredSite,
+    EquatableArray<string> TouchedTables,
+    bool OpaqueBody)
+{
+    public bool IsValid => Diagnostics.Length == 0;
+
+    /// <summary>How many leading parameters a caller must supply: those before the first default.</summary>
+    public int RequiredParameters
+    {
+        get
+        {
+            var required = 0;
+            foreach (var parameter in Parameters.Items)
+            {
+                if (parameter.HasDefault)
+                    break;
+                required++;
+            }
+
+            return required;
+        }
+    }
+
+    public string ResolveSite(IReadOnlyDictionary<string, string> placementByTypeName) =>
+        Sites.Resolve(DeclaredSite, OpaqueBody, TouchedTables, placementByTypeName);
 }

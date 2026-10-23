@@ -47,6 +47,14 @@ public static class ServiceCollectionExtensions
                 services.TryAddScoped(policy);
         }
 
+        services.TryAddSingleton(new ProducerRegistry(builder.Producers));
+        foreach (var descriptor in builder.Producers)
+        {
+            services.TryAddScoped(descriptor.ProducerClass);
+            if (descriptor.Policy is { } policy)
+                services.TryAddScoped(policy);
+        }
+
         var handlerTypes = builder.EventHandlers;
         services.TryAddSingleton(new EventHandlerRegistry(handlerTypes));
         foreach (var handlerType in handlerTypes)
@@ -73,6 +81,7 @@ public static class ServiceCollectionExtensions
             provider.GetService<IHotStoreProvider>(),
             randomProvider: provider.GetService<IReducerRandomProvider>()));
         services.TryAddSingleton<MelangeReducerHost>();
+        services.TryAddSingleton<MelangeProducerHost>();
         services.TryAddSingleton(provider => new MelangeScheduler(
             provider.GetRequiredService<MelangeEngine>(),
             provider.GetRequiredService<MelangeReducerHost>(),

@@ -92,6 +92,73 @@ internal static class MelangeHttpEndpoints
     }
 
     /// <summary>
+    /// POST {path}/producers/{producer} — a producer call: a JSON array of arguments in (trailing
+    /// defaulted ones may be left off), <c>{"ok":true,"lsn":N,"result":...}</c> out, the result
+    /// rendered as JSON by <see cref="ProducerCalls.RenderJson"/>. Errors carry the socket's codes.
+    /// </summary>
+    public static async Task CallProducerAsync(HttpContext context, MelangeTransport transport)
+    {
+        if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
+            return;
+        var producer = (string)context.Request.RouteValues["producer"]!;
+        if (transport.Producers is not { } producers)
+        {
+            await WriteErrorAsync(context, StatusCodes.Status404NotFound, MelangeErrorCodes.UnknownProducer, $"No producer named '{producer}' is registered.").ConfigureAwait(false);
+            return;
+        }
+
+        object?[] arguments;
+        try
+        {
+            using var body = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted).ConfigureAwait(false);
+            arguments = body.RootElement.ValueKind switch
+            {
+                JsonValueKind.Array => body.RootElement.EnumerateArray().Select(ToArgument).ToArray(),
+                JsonValueKind.Null or JsonValueKind.Undefined => [],
+                _ => throw new JsonException("The request body must be a JSON array of arguments."),
+            };
+        }
+        catch (JsonException exception)
+        {
+            await WriteErrorAsync(context, StatusCodes.Status400BadRequest, MelangeErrorCodes.InvalidArguments, exception.Message).ConfigureAwait(false);
+            return;
+        }
+
+        ProducerResult result;
+        try
+        {
+            result = await producers.CallAsync(
+                producer,
+                session.Identity,
+                ConnectionId.None,
+                ReducerArguments.Encode(arguments),
+                Activity.Current?.Context ?? default,
+                CallSource.Client(session.IsGuest),
+                session.CapturedClaims,
+                context.RequestAborted,
+                ProducerCalls.RenderJson).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            var (code, status, message) = ProducerCalls.Classify(exception, producer, transport.Logger);
+            await WriteErrorAsync(context, status, code, message).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
+        {
+            writer.WriteBoolean("ok", true);
+            writer.WriteNumber("lsn", result.Lsn);
+            writer.WritePropertyName("result");
+            writer.WriteRawValue(result.Payload.Span, skipInputValidation: true);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// POST {path}/bulk — bulk ingestion: <c>{"tables": {"TableName": [{...row}, ...]}}</c>,
     /// appended as one write set, one log record, not one transaction per row. Off until
     /// <c>Bulk:Enabled</c> opts in, and requires the caller's <c>Bulk:OwnerRole</c> claim —
@@ -236,10 +303,10 @@ internal static class MelangeHttpEndpoints
     /// <c>Sql:AdHocEnabled</c> opts in. The row shapes run against the hot store at head,
     /// under the same cost ceilings subscriptions have; aggregate shapes (<c>COUNT</c>/<c>SUM</c>/
     /// <c>AVG</c>/<c>MIN</c>/<c>MAX</c>, <c>GROUP BY</c>, <c>DATE_TRUNC</c> bucketing) run against
-    /// the relational tier and reflect its applier's checkpoint. <c>Sql:AdHocMode</c> is the
+    /// the relational backplane and reflect its applier's checkpoint. <c>Sql:AdHocMode</c> is the
     /// two-mode contract: <c>PolicyEnforced</c> (default) applies the caller's row and column
     /// policies exactly as a subscription would; <c>Owner</c> deliberately bypasses them, requires
-    /// the <c>Sql:OwnerRole</c> claim per caller, and additionally sees private relational-tier
+    /// the <c>Sql:OwnerRole</c> claim per caller, and additionally sees private relational-backplane
     /// tables. Aggregates are owner-mode only — row policies are in-process code that cannot be
     /// pushed into Postgres, and a policy-enforced aggregate is refused loudly rather than
     /// computed unenforced. <c>[ServerOnly]</c> columns are excluded in both modes — "never
@@ -309,7 +376,7 @@ internal static class MelangeHttpEndpoints
                 var compiled = ServerSubscription.Compile(
                     NullSink.Instance, 0, parsed, transport.Engine.Schema, limits,
                     enforced ? transport.Policies : null, callerContext,
-                    allowPrivateRelational: owner);
+                    allowPrivateBackplane: owner);
 
                 // Placement is inert on a single node, so this fires only in a cluster — where
                 // a Partitioned table's rows live in the shard engines and this endpoint reads
@@ -387,8 +454,8 @@ internal static class MelangeHttpEndpoints
     }
 
     /// <summary>
-    /// The aggregate half of <c>{path}/sql</c>: owner mode only, relational tier only, executed by
-    /// the registered <see cref="IRelationalQueryExecutor"/> — absent means no relational tier is
+    /// The aggregate half of <c>{path}/sql</c>: owner mode only, relational backplane only, executed by
+    /// the registered <see cref="IRelationalQueryExecutor"/> — absent means no relational backplane is
     /// configured, which is an explicit error rather than an empty result. Results reflect the
     /// tier at its applier's checkpoint; that lag is the design, not a bug, and the applier's
     /// health check is where it becomes visible.
@@ -408,7 +475,7 @@ internal static class MelangeHttpEndpoints
 
         // Placement and tier are independent axes, so closing the empty-result lie for row shapes
         // (#114) did not close it here: a Partitioned table can also be Relational, and this node's
-        // relational tier holds only what this node's engine wrote. On a hub that is every shard's
+        // relational backplane holds only what this node's engine wrote. On a hub that is every shard's
         // rows except the partitioned ones — the aggregate would answer a confident number over a
         // subset, which is worse than the empty result the row path refuses. Checked after Build
         // for the same reason the row path checks after Compile: Build answers unknown and
@@ -429,7 +496,7 @@ internal static class MelangeHttpEndpoints
         {
             await WriteErrorAsync(
                 context, StatusCodes.Status400BadRequest, MelangeErrorCodes.NoRelationalTier,
-                "No relational tier is configured; aggregates need AddPostgres(...).").ConfigureAwait(false);
+                "No relational backplane is configured; aggregates need AddPostgres(...).").ConfigureAwait(false);
             return;
         }
         Core.RelationalQueryResult result;
@@ -445,7 +512,7 @@ internal static class MelangeHttpEndpoints
         {
             await WriteErrorAsync(
                 context, StatusCodes.Status503ServiceUnavailable, MelangeErrorCodes.RelationalUnavailable,
-                "The relational tier did not answer; see the server logs. Writes and subscriptions are unaffected.").ConfigureAwait(false);
+                "The relational backplane did not answer; see the server logs. Writes and subscriptions are unaffected.").ConfigureAwait(false);
             return;
         }
 

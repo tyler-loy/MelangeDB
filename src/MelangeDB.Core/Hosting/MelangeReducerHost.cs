@@ -176,27 +176,6 @@ public sealed class MelangeReducerHost
         Identity caller,
         CallSource source,
         PoliciesOptions policies,
-        IServiceProvider services)
-    {
-        if (descriptor.Policy is null)
-        {
-            if (policies.DefaultReducerPosture == ReducerPolicyPosture.Deny)
-            {
-                throw new ReducerDeniedException(
-                    $"Reducer '{descriptor.Name}' declares no policy and Policies:DefaultReducerPosture is Deny.");
-            }
-
-            return;
-        }
-
-        if (services.GetRequiredService(descriptor.Policy) is not IReducerPolicy policy)
-        {
-            throw new InvalidOperationException(
-                $"Reducer '{descriptor.Name}': policy type {descriptor.Policy} does not implement IReducerPolicy.");
-        }
-
-        var context = new PolicyContext(caller, source.CallerIsGuest, _engine.CommittedView);
-        if (!policy.MayCall(descriptor.Name, context))
-            throw new ReducerDeniedException($"Reducer '{descriptor.Name}' denied by {descriptor.Policy.Name}.");
-    }
+        IServiceProvider services) =>
+        CallAuthorization.Authorize(_engine, "Reducer", descriptor.Name, descriptor.Policy, caller, source, policies, services);
 }

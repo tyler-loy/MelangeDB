@@ -261,6 +261,13 @@ internal static class RestoreCheck
             found.Add("melange.events.json");
         }
 
+        if (File.Exists(Path.Combine(directory, EpochLineage.FileName)))
+        {
+            // Load throws loudly on a corrupt sidecar; a Postgres archive needs it after a restore.
+            EpochLineage.Load(directory);
+            found.Add(EpochLineage.FileName);
+        }
+
         if (File.Exists(Path.Combine(directory, ShapeHistory.FileName)))
         {
             // Load throws loudly on a corrupt sidecar, which is the behaviour under test.

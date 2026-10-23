@@ -2,9 +2,32 @@
 
 How a deployment with a changed schema boots against an existing world. The one rule, both tiers,
 one sentence: **additive changes are automatic and loud; destructive changes are refused and
-manual.** The relational tier has worked this way since phase 08 (`Postgres:AutoMigrate`,
+manual.** The relational backplane has worked this way since phase 08 (`Postgres:AutoMigrate`,
 [CONFIGURATION.md](CONFIGURATION.md)); the hot tier works this way since phase 16, and this page
 walks the whole deploy.
+
+## Upgrading to 0.3: the relational backplane rename
+
+`StorageTier.Relational` is now `StorageTier.HotWithRelationalBackplane`. It is a rename, not a
+migration:
+
+```csharp
+[Table(Tier = StorageTier.Relational)]                 // 0.2 — now error CS0619
+[Table(Tier = StorageTier.HotWithRelationalBackplane)] // 0.3 — same table, same behaviour
+```
+
+Replace the name everywhere and redeploy. **Nothing on disk changes:** the enum value is still `1`,
+so the shape sidecar, the hot store, the Postgres schema, and the applier's checkpoint are all
+exactly as they were, and the first 0.3 boot is an ordinary restart. If you passed
+`allowPrivateRelational:` by name to `ServerSubscription.Compile`, it is now `allowPrivateBackplane:`.
+Log queries and alerts need no change: EventIds and their names are unchanged (1607 is still
+`RelationalTablesWithoutPostgres`; only its message text names the new tier), as are the wire
+error codes.
+
+The old name was retired rather than reused because a Postgres-only tier is coming
+([phase 25](road-to-0.3/plan-phase-25.md)), and a table that silently changed meaning on upgrade
+would lose its hot rows. That is why `Relational` stays as a compile error rather than coming back
+with a different meaning.
 
 ## Why the hot tier needs machinery at all
 
@@ -41,10 +64,55 @@ stale client fails `ClientRowShape.Verify` at subscription time — structural r
 garbage. Regenerate bindings with the deploy.
 
 What counts as additive: added columns (any position), reordered columns, added tables, added or
-removed indexes (indexes are projections; recovery rebuilds them from the declaration). What is
+removed indexes (indexes are projections; recovery rebuilds them from the declaration), and a tier
+change between `Hot` and `HotWithRelationalBackplane` (see [Changing a table's
+tier](#changing-a-tables-tier)). What is
 refused as destructive: a removed table, a removed column, a changed column kind, a moved
 `[PrimaryKey]`. A **rename is a removal plus an addition** — the column's name is its identity —
 so rename refuses too; rename it back, or treat it as a deliberate manual migration.
+
+## Changing a table's tier
+
+The shape sidecar records each table's tier, because where a table's rows live is part of what the
+data directory holds. Between `Hot` and `HotWithRelationalBackplane` the rows stay in the hot store
+either way, so the change is additive: the boot is a migration boot (EventId 1006 names the tier
+change), and the new tier governs from the marker.
+
+- **`Hot` → `HotWithRelationalBackplane`.** The Postgres applier skipped the table's ops while it was
+  hot, so its checkpoint is already past the table's whole history and replay cannot produce it.
+  On its next start the applier finds the table missing from its projected-tables registry
+  (`__melange_projected`) and fills its Postgres table from the hot store at one consistent LSN,
+  replacing anything it held, before resuming (EventId 1609, with the row count). Before 0.3 this
+  copy did not happen: the Postgres table was created empty and only rows written after the change
+  ever reached it.
+- **`HotWithRelationalBackplane` → `Hot`.** The rows were in the hot store all along, so nothing moves.
+  The Postgres table is left as is and stops being maintained (EventId 1610); drop it when you no
+  longer want it. Moving the table back onto the backplane later copies it afresh rather than
+  resuming the stale copy.
+
+A change into or out of `Archive` is refused at boot, because it moves rows across the hot store's
+boundary. `Hot` or backplane → `Archive` would drop the table's rows from the hot store with no
+guarantee Postgres holds all of them; `Archive` → anything would boot an empty hot table whose rows
+live only in Postgres. The supported path is the one the tier is designed around: declare a new
+`Archive` table and move rows into it with a reducer — `Insert` into the archive and `Delete` from the
+hot table in the same transaction, in batches, which makes each move atomic.
+
+`KeepKeys` on an archive table follows the same logic. Turning it on for an archive table that already
+exists is refused, because the keys archived so far live only in Postgres and the new key set would
+start without them — `Contains` would answer false for exactly the keys an idempotency check exists to
+catch. Declare it on a new archive table and move to it. Turning it off is allowed: the key set is derived
+from the archive's ops, so dropping it loses nothing but the ability to ask.
+
+A recorded tier this build does not recognize — one written by a newer MelangeDB — is refused like any
+destructive change: booting it under a tier whose rows live elsewhere would present an empty table as
+the whole truth.
+
+A sidecar written before tiers were recorded (any 0.2 data directory) has each table's tier filled in
+from the running code on the first 0.3 boot, in place and without a migration (EventId 1009). That is
+the adoption reading again, for one field, so the upgrade rule below covers it: don't change a table's
+tier in the same deploy as the upgrade. The Postgres half needs no such care. A 0.2 projection has no
+registry, so the first 0.3 start seeds it from the backplane tables Postgres already holds, and copies
+any it does not.
 
 ## The refusal
 

@@ -18,11 +18,11 @@ Conflating any two of these is a design error. A table declares all three.
 
 | | Question it answers | Values |
 | --- | --- | --- |
-| **Tier** | *Which storage engine holds it?* | `Hot` (default) or `Relational` (Postgres) |
+| **Tier** | *Which storage engine holds it?* | `Hot` (default), `HotWithRelationalBackplane` (hot, plus a Postgres copy), or `Archive` (Postgres only) |
 | **Placement** | *Which node in a cluster holds it?* | `Partitioned`, `Replicated`, `Global`, `Local` |
 | **Residency** | *Must it stay wholly in memory?* | `Resident`, `Paged` (default), `Auto` |
 
-A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `Relational` + `Global` + `Paged` (accounts), or
+A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `HotWithRelationalBackplane` + `Global` + `Paged` (accounts), or
 `Hot` + `Replicated` + `Resident` (item definitions). They don't imply each other.
 
 ### Exposure — three levels, not two
@@ -39,7 +39,7 @@ A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `Relational` + `Glo
 | --- | --- | --- |
 | **Row policy** | Which *rows* a caller sees | **Union** — any policy admitting a row is enough |
 | **Column policy** | Which *columns* a caller sees | **Intersection** — every rule must admit the column |
-| **Reducer policy** | Whether a caller may *call* a reducer | Single decision |
+| **Reducer policy** | Whether a caller may *call* a reducer — or a producer, which uses the same `IReducerPolicy` | Single decision |
 
 Rows union, columns intersect. Getting this backwards produces either a leak or an unusable system.
 
@@ -350,7 +350,9 @@ its ordered (name, kind) column list. Row format v1 is positional, so the bytes 
 what they mean; the shape sidecar beside the log says it — as a *history*, each entry fenced by
 the LSN it governs from, because log records outlive deployments. The booting engine compares
 the newest entry against the code's schema: identical is the fast path, additive is a migration
-boot, destructive refuses (`SchemaShapeException`). See [MIGRATION.md](MIGRATION.md).
+boot, destructive refuses (`SchemaShapeException`). Each table's entry also records its **tier**,
+which the bytes do not depend on but where the rows live does, so a tier change is detected at boot
+like any other. See [MIGRATION.md](MIGRATION.md).
 
 **Migration boot** — A boot whose schema differs additively from the directory's shape: recovery
 re-encodes every old-shape row to the new shape *by column name*, an empty marker record opens
@@ -417,7 +419,7 @@ endpoint, one protocol, and never learns the topology.
 its row codec attached, and every `[Reducer]` descriptor. `AddTablesFrom`/`AddReducersFrom` discover it
 through an assembly attribute, which is why a new table or reducer needs no manual registration anywhere.
 
-**Global** — Placement: the table lives on the hub only. In practice the relational tier.
+**Global** — Placement: the table lives on the hub only. In practice the relational backplane.
 
 **Guest identity** — An ordinary identity whose token the IdP issued with a guest role claim. MelangeDB mints
 nothing — **the IdP is the gate** for guests as for everyone — so "converting" a guest is IdP-side account
@@ -439,7 +441,7 @@ mechanism-versus-meaning line as the shard strategy itself.
 **Hot store / hot tier** — The in-process log-structured store holding world state. "Hot" describes *access
 pattern*, not volatility: it is durable, and it is not a cache.
 
-**Hub** — The node holding `Global` and `Replicated` tables, identity, the relational tier, and shard
+**Hub** — The node holding `Global` and `Replicated` tables, identity, the relational backplane, and shard
 assignment. Every client holds a permanent hub attachment. Originally "master node."
 
 **Identity** — The stable identifier for who is acting: a hash of a token's **issuer and subject**. Issuer
@@ -583,18 +585,75 @@ runs in owner mode. The per-caller half of the two-mode contract, per the guest-
 gate, owner capability is a claim it issues, and a caller without it is refused — never silently downgraded to
 policy-enforced.
 
-**Postgres applier** — The relational tier's applier: consumes the commit log on its own dispatch loop, off
-the commit path, projecting relational-tier rows into Postgres in batches whose checkpoint commits *inside*
+**Archive tier** — `Tier = Archive`: a table that lives only in Postgres, for unbounded history such as a
+wallet ledger whose recent rows stay in a hot table. Writes ride the commit log and the Postgres applier
+projects them, but the engine strips them from every record before the hot store sees it, so they are in no
+hot store, snapshot, or `.mbak`. Reducers can `Insert` and blind-`Delete` by key, and nothing that reads is
+generated. Each row carries the `_melange_lsn` and `_melange_epoch` it was committed at, and an insert whose
+key Postgres already holds is dead-lettered into `__melange_archive_dead_letter` rather than overwriting or
+stalling (EventId 1612). The one place the log is not the whole truth: once it truncates past an archived row,
+Postgres holds the only copy. Requires `AddPostgres(...)`; refused at compile time when Public, `[Unique]`, Scheduled,
+Replicated, or declaring a Residency (MELANGE0024–0026). See
+[plan-phase-25.md](road-to-0.3/plan-phase-25.md).
+
+**Archive reader (`IArchiveReader`)** — How code outside a reducer reads an archive table: keyset-paginated pages
+ordered by primary key, filtered on the key or one indexed column. A page is Postgres at the applier's checkpoint
+with the unapplied log tail overlaid, so a just-archived row is never briefly invisible; when that tail is too long
+to overlay, the page is Postgres alone and says `Stale`. `AsOfLsn` reads it as of a pinned view's LSN instead of
+now, so hot and archive reads answer for one commit. Registered by `AddPostgres`.
+
+**Pinned read view (`PinnedReadView`)** — Committed hot-store state held at one LSN, readable off the write lock,
+across awaits and from several threads: `MelangeEngine.OpenReadView()`. What a producer's `ctx.Db` is, and what
+policies now read. Holding one keeps superseded row versions alive, so it is held only as long as a call runs.
+
+**Producer** — A `[Producer]` method: a typed, read-only server call a client makes for data,
+`T Name(ProducerContext ctx, ...)` or its `Task`/`ValueTask` form. Where a reducer writes and returns nothing, a
+producer writes nothing and returns a value, so it may be async and do I/O; it is not in the log and never
+replays. `ctx.Db` is the hot store pinned at `ctx.Lsn` for the whole call. Clients reach archive history only
+this way. Calls ride protocol version 3 (`CallProducer`/`ProducerResult`) or `POST {path}/producers/{name}`,
+are authorized by an `IReducerPolicy`, and are bounded by `Producers:*`. See
+[design/producers.md](design/producers.md).
+
+**ProducerContext (`ctx`)** — What a producer is given: `Caller`, `ConnectionId`, `Claims`, `Timestamp`, `Lsn`,
+`Db` (the pinned view), and a `CancellationToken` that fires on disconnect or timeout. No `Random` and no
+`Publish`: a producer commits nothing.
+
+**Key set (`__keys_<Table>`)** — The key-only hot table behind an archive table declared `KeepKeys = true`: one
+key per archived row and no payload, maintained by the engine from the archive's ops, so a reducer can ask
+`Contains(key)` — an idempotency check across the hot window — and a duplicate archive insert is refused before
+commit rather than dead-lettered after. An ordinary hot table, so snapshots, paging, recovery and backups carry
+it. Must be declared when the archive table is created; turning it on later is refused at boot, turning it off
+drops a derived set and is not. The prefix is reserved.
+
+**Lineage (`melange.lineage`)** — Which earlier epochs a log descends from, and the LSN it forked from each: a
+restore writes its source epoch and restored head, extending the lineage the archive carried. LSNs run on along a
+lineage, so an (epoch, LSN) pair is this log's history when the epoch is the current one or an ancestor and the
+LSN is at or below its fork point. It is how the Postgres applier tells a projection of this world's past —
+reconciled after a restore (EventId 1613), with rewound archive rows moved to `__melange_archive_rewound` — from
+one of an unrelated world (refused, 1605).
+
+**Projected-tables registry (`__melange_projected`)** — The Postgres applier's record of which backplane tables
+it holds a complete copy of, beside its checkpoint. A declared backplane table missing from it is new to the
+projection — its history is behind the checkpoint, skipped while the table was hot — and is copied from the
+hot store before the applier resumes (EventId 1609). A table that leaves the backplane leaves the registry,
+so declaring it again copies it afresh.
+
+**Postgres applier** — The relational backplane's applier: consumes the commit log on its own dispatch loop, off
+the commit path, projecting relational-backplane rows into Postgres in batches whose checkpoint commits *inside*
 the same Postgres transaction — which is what makes resume after any failure gap-free and duplicate-free with
 no 2PC. Registered as a decoupled applier: tracked for lag and truncation floors, never driven by the commit
 path, so Postgres down is not server down.
 
-**Relational tier** — Opt-in Postgres storage for tables declaring `Tier = Relational`. The "servicey" half:
-accounts, registration, statistics. Eventually consistent with the log by design. Settled in phase 08: a
-relational table's rows **also** project into the hot store like any table's — tier is *additionally
+**Relational backplane** — Opt-in Postgres copy for tables declaring `Tier = HotWithRelationalBackplane`. The
+"servicey" half: accounts, registration, statistics. Eventually consistent with the log by design. Settled in
+phase 08: a backplane table's rows live in the hot store like any table's — the tier is *additionally
 Postgres*, not *instead of the hot store* — so reducer reads, the overlay, uniqueness, and (for public
 tables) subscriptions work unchanged, and memory stays bounded by phase 07's paging. Postgres is the extra
-projection that serves SQL tooling and aggregates.
+projection that serves SQL tooling and aggregates, and can always be rebuilt from the log. Called the
+*relational tier*, with the enum value `StorageTier.Relational`, until 0.3 renamed both for what they are
+(see [MIGRATION.md](MIGRATION.md#upgrading-to-03-the-relational-backplane-rename)).
+
+**Relational tier** — The 0.2 name for the *relational backplane*, above.
 
 **WaitForApplied** — `PostgresRelationalTier.WaitForAppliedAsync(lsn)`: completes when the tier's checkpoint
 reaches the LSN — the narrow primitive for the rare flow that genuinely needs cross-tier read-after-write.
@@ -728,12 +787,12 @@ the old row and an insert of the new one.
 registration order and survives restarts. Write-set ops and log records are keyed by table id, never by CLR
 type. Collisions are detected at schema registration.
 
-**Tier** — Which storage engine holds a table: `Hot` or `Relational`.
+**Tier** — Which storage engine holds a table: `Hot`, `HotWithRelationalBackplane`, or `Archive`.
 
 **Truncation floor** — A named holder of the commit log: a mechanism that still needs old records, providing
 the highest LSN compaction may remove from its perspective. Log truncation takes the minimum across all of
 them and never passes it. The built-in set is `snapshot` (the ceiling — truncation never passes the snapshot
-it was decided behind), `resume-window`, `event-bus`, `backup-pin`, `shard-freeze`, `shard-import`,
+it was decided behind), `resume-window`, `archive-retention`, `event-bus`, `backup-pin`, `shard-freeze`, `shard-import`,
 `shard-sidecar`, `cluster-events`, and one per applier name, plus `unnamed` for a floor registered through
 `AddTruncationFloor(Func<ulong?>)`. The one whose LSN is lowest is the **governing floor**: the answer to "why
 is the log not truncating", named in every truncation's log line, in `melange.log.truncation_floor`'s tag, and

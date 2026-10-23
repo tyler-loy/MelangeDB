@@ -7,7 +7,7 @@ public enum AccountKind : short
 }
 
 /// <summary>The WorldStat shape: written by gameplay, read by admin aggregates.</summary>
-[Table(Tier = StorageTier.Relational)]
+[Table(Tier = StorageTier.HotWithRelationalBackplane)]
 public partial struct Stat
 {
     [PrimaryKey]
@@ -23,7 +23,7 @@ public partial struct Stat
 }
 
 /// <summary>One column of every mappable kind, so the type map is exercised end to end.</summary>
-[Table(Tier = StorageTier.Relational, Placement = Placement.Global)]
+[Table(Tier = StorageTier.HotWithRelationalBackplane, Placement = Placement.Global)]
 public partial struct Account
 {
     [PrimaryKey]

@@ -227,7 +227,10 @@ checkpoint onward, so the mirror silently lacks every row written before the cha
 lost, since the hot store still holds them, but the mirror is quietly incomplete. Recording tier
 fixes this case too, by making the change visible at boot.)
 
-**An archive retention floor.** A new, optional named truncation floor that holds the log back by
+**An archive retention floor.** (As built: the floor lives in the engine's truncation decision
+beside the resume window and is searched the same way, by commit timestamp; the "sharper refusal"
+reuses EventId 1611, whose situation names the lost range and the setting, rather than a new id.)
+A new, optional named truncation floor that holds the log back by
 `Postgres:ArchiveLogRetentionHours` behind the applier's checkpoint, so a Postgres restored from a
 backup taken inside that window can catch up from the log instead of losing the rows in between.
 Off by default (unset or `0`), since it is for deployments without Postgres point-in-time recovery;
@@ -293,7 +296,9 @@ later; starting there would hide the one write that matters.
 per Postgres schema, and in a cluster Postgres lives on the hub. A per-player ledger is
 naturally `Partitioned`, which means every shard would need its own applier and checkpoint key into
 a shared archive. That is real and it is a follow-up; this phase refuses a `Partitioned` archive
-table when cluster mode is on, and allows `Global` ones.
+table when cluster mode is on, and allows `Global` ones. (As built: refused at write time rather
+than at boot. Shard and node-local engines refuse archive writes through the placement guards,
+which is where every other placement rule is already enforced.)
 
 **Archive rows in `.mbak`.** See the backup decision; the leaning is that the archive tier is
 backed up by Postgres's own tools.
@@ -368,7 +373,10 @@ every other table while it waits for a human.
   `melange_archive_dead_letter` when the first inserted nothing — so the quarantine commits in the
   same transaction as the batch and its checkpoint. The dead-letter table records the table, the
   key, the LSN, the epoch, the reducer name from the record, the time, and the full row bytes, so
-  the row can be inspected and re-applied by hand.
+  the row can be inspected and re-applied by hand. (As built: the table is
+  `__melange_archive_dead_letter`, matching the applier's other plumbing tables, and the row is
+  kept as `row_values` jsonb built from the statement's own parameters rather than as bytes —
+  readable, and re-appliable with a plain `INSERT ... SELECT`.)
 - **Logged at Error, once per row,** under a new EventId with the table, key, LSN, and reducer
   name. Never the row's values: an archive is where audit and wallet data lives, and log sinks are
   not where it belongs. The dead-letter table holds the payload.
@@ -384,6 +392,14 @@ OBSERVABILITY.md gets the EventId, the counter, and the remediation: find the co
 source, fix the key allocation, and re-apply or discard each dead-lettered row deliberately.
 
 ### Existence checks: idempotency keys that outlive the hot window
+
+**As built:** the key set is a synthesized hot table, `__keys_<Table>`, registered beside the archive
+table and maintained by the engine from the archive's ops in the same place it strips them from the
+hot store. Being an ordinary hot table is what lets snapshots, paging, recovery and backups carry it
+with no machinery of its own. `IDbView.ContainsKey<TRow>` is the untyped form. One rule the decision
+below did not foresee: `KeepKeys` must be declared when the archive table is created, because turning
+it on later starts the set without the keys already in Postgres — boot refuses that; turning it off is
+fine.
 
 The first real consumer of this shape already needs one reducer-side read of archived rows. Its
 `WalletEntry.Id` is the idempotency key for credits, refunds, and redelivered saga legs. The hot
@@ -488,6 +504,15 @@ that has to be wired into somebody's backup job.
 With tier in the recorded shape, every change is detectable at boot. The question is which ones
 proceed.
 
+**As built, so far: every change into or out of `Archive` is refused**, including the
+backplane → `Archive` path the leaning below allows. Implementing that path safely needs one thing
+the leaning missed: a mirror made by a 0.2 `Hot` → `Relational` switch never received the rows
+written before the switch (the gap the projected-tables registry closes from 0.3 on), and the
+registry seeds such a mirror as complete. Dropping hot rows on the strength of that mirror would
+lose them. The path needs the applier to re-verify or re-copy the table from the hot store before
+the engine drops it, which crosses the engine/applier boundary at boot. Until then the refusal names
+the reducer move (Insert into a new archive table, Delete from the old one) as the supported path.
+
 **Leaning:**
 
 - **`HotWithRelationalBackplane` → `Archive`** is allowed, because it is the natural path for a
@@ -512,6 +537,14 @@ kind of thing the `AutoMigrate` posture exists to make deliberate.
 
 ### Trimming across more than one restore
 
+**As built:** the lineage sidecar exists (`melange.lineage`, carried in the archive's per-engine
+identity as an optional field rather than as a sidecar frame, so the archive format version does not
+move), and the trim is a *move*: rows outside the restored history go to `__melange_archive_rewound`
+rather than being deleted, so the reconcile can run automatically without being destructive. A
+restore whose lineage does not name Postgres's epoch is still refused (1605). The open question
+below resolved itself: an archive taken before lineage still names its own source epoch, so a
+restore of it gets a one-generation lineage and reconciles normally.
+
 LSNs count within one epoch, and a restore mints a new epoch that continues numbering from the
 restored head. Restore once at LSN 100 and run to 500 under epoch B; then restore an older backup of
 epoch A at LSN 300. Archive rows from B at LSNs 101–300 are not part of A's history, yet an
@@ -532,6 +565,13 @@ printed. Refusal is the `AutoMigrate` posture and probably right.
 
 ### The visibility gap
 
+**As built (`IArchiveReader`, the first half of the read side):** one filter column — the key or an
+indexed column, by value or inclusive range — and primary-key order either way, keyset-paginated. The
+checkpoint and the page are read in one repeatable-read transaction so they describe the same moment.
+The overlay cap is a constant, 50,000 records, past which the page is marked `Stale` rather than the
+read scanning the log; it becomes a setting if anyone needs to tune it. The client-facing endpoint is
+the second half.
+
 After a move commits, the row is gone from the hot store immediately and arrives in Postgres when the
 applier gets to it. A reader that queries both sees nothing in between.
 
@@ -544,6 +584,15 @@ which is the opposite of the tier's posture. **Open:** a cap on the overlay when
 (Postgres down for an hour), after which the reader answers from Postgres and says it is stale.
 
 ### Where the client-facing read lives
+
+**Settled differently: clients never read archive tables directly.** No generic endpoint, and no
+visibility knob on a tier that is private by construction. History reaches a client through server
+code that shapes and authorizes it — a new kind of server-side action, the **producer**: a typed,
+read-only, async call with typed inputs and outputs (`List<WalletLine> History(int page)`), which may
+inject `IArchiveReader`. It is a protocol change with its own design record,
+[design/producers.md](../design/producers.md), and is [phase 26](plan-phase-26.md), not part of this phase. Server-side code that
+is not a client keeps using `IArchiveReader` directly. The original
+leaning is kept below as the record of what was considered.
 
 A paginated history read is neither a subscription nor a reducer.
 

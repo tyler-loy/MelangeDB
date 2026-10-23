@@ -13,6 +13,9 @@ public interface IMelangeModel
 
     /// <summary>Builds the assembly's reducer descriptors.</summary>
     IReadOnlyList<ReducerDescriptor> Reducers();
+
+    /// <summary>Builds the assembly's producer descriptors. Models generated before producers existed have none.</summary>
+    IReadOnlyList<ProducerDescriptor> Producers() => [];
 }
 
 /// <summary>

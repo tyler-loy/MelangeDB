@@ -281,7 +281,7 @@ public class ClusterAcceptanceTests
         using var socket = new ClientWebSocket();
         await socket.ConnectAsync(_cluster.GatewayUri, TestContext.Current.CancellationToken);
         var hello = serializer.Serialize(new HelloFrame(
-            MessagePackFrameSerializer.ProtocolVersion, MessagePackFrameSerializer.ProtocolVersion, assertion));
+            MessagePackFrameSerializer.MinProtocolVersion, MessagePackFrameSerializer.ProtocolVersion, assertion));
         await socket.SendAsync(hello, WebSocketMessageType.Binary, true, TestContext.Current.CancellationToken);
 
         var buffer = new byte[64 * 1024];

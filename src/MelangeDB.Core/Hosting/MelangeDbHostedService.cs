@@ -50,6 +50,10 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         // Resolving the engine is startup: its constructor runs log recovery and projection rebuild.
         var engine = (MelangeEngine)_provider.GetService(typeof(MelangeEngine))!;
         _engine = engine;
+
+        // Before anything can commit: an archive write with nowhere to go is lost at the first truncation.
+        RequirePostgresForArchive(engine.Schema, _monitor.CurrentValue.Postgres);
+        RequireReadViewsForProducers(engine, (MelangeProducerHost?)_provider.GetService(typeof(MelangeProducerHost)));
         _reloadBridge = _monitor.OnChange(next =>
         {
             CopyLiveKeys(next, engine);
@@ -84,19 +88,54 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         _scheduler = (MelangeScheduler?)_provider.GetService(typeof(MelangeScheduler));
         _scheduler?.Start();
 
-        // A relational table with no relational tier is a projection that will never exist. The
-        // rows still live in the hot store, so nothing is lost — but the declared intent isn't
+        // A backplane table with no Postgres is a projection that will never exist. The rows
+        // still live in the hot store, so nothing is lost — but the declared intent isn't
         // being served, and silence here would look exactly like a working deployment.
         if (string.IsNullOrEmpty(_monitor.CurrentValue.Postgres.ConnectionString))
         {
-            var relational = engine.Schema.Tables.Where(t => t.Tier == StorageTier.Relational).Select(t => t.Name).ToList();
-            if (relational.Count > 0)
-                LogRelationalWithoutPostgres(_logger, relational.Count, string.Join(", ", relational));
+
+            var backplane = engine.Schema.Tables.Where(t => t.Tier == StorageTier.HotWithRelationalBackplane).Select(t => t.Name).ToList();
+            if (backplane.Count > 0)
+                LogBackplaneWithoutPostgres(_logger, backplane.Count, string.Join(", ", backplane));
         }
 
         _state.Started = true;
         LogStarted(_logger, engine.Log.HeadLsn, engine.Schema.Tables.Count);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Producers need a store that can pin a read view: a producer is async, so unlike a
+    /// snapshot-isolated reducer it has no serialized fallback — it cannot hold the write lock across
+    /// an await. Refused at startup, naming the capability, rather than at the first call.
+    /// </summary>
+    internal static void RequireReadViewsForProducers(MelangeEngine engine, MelangeProducerHost? producers)
+    {
+        if (producers is null || producers.Producers.Count == 0 || engine.SupportsReadViews)
+            return;
+        throw new InvalidOperationException(
+            $"{producers.Producers.Count} producer(s) are registered, but the hot store ({engine.HotStore.GetType().Name}) does not " +
+            "implement IReadViewSource. A producer reads one pinned view for its whole call; use a store that can pin one " +
+            "(the in-memory and FASTER stores both can).");
+    }
+
+    /// <summary>
+    /// An archive table without Postgres refuses to start. Unlike a backplane table, whose rows stay
+    /// in the hot store when no Postgres is configured, an archive table's rows are in no hot store
+    /// and no snapshot, so the first log truncation would lose them.
+    /// </summary>
+    internal static void RequirePostgresForArchive(SchemaRegistry schema, PostgresOptions postgres)
+    {
+        if (!string.IsNullOrEmpty(postgres.ConnectionString))
+            return;
+        var archive = schema.Tables.Where(static t => t.Tier == StorageTier.Archive).Select(static t => t.Name).ToList();
+        if (archive.Count == 0)
+            return;
+        throw new InvalidOperationException(
+            $"{archive.Count} table(s) declare Tier = Archive but no Postgres:ConnectionString is configured: " +
+            $"{string.Join(", ", archive)}. An archive table's rows live only in Postgres — they are in no hot store " +
+            "and no snapshot — so without AddPostgres(...) they would be lost the first time the log truncated. " +
+            "Configure Postgres, or declare the tables Hot.");
     }
 
     /// <summary>
@@ -109,19 +148,24 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         var mode = _monitor.CurrentValue.Policies.UnpolicedReducerReport;
         if (mode == UnpolicedReducerReport.Off)
             return;
-        var host = (MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost));
-        if (host is null || host.UnpolicedReducers is not { Count: > 0 } unpoliced)
+        var reducers = ((MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)))?.UnpolicedReducers ?? [];
+        var producers = ((MelangeProducerHost?)_provider.GetService(typeof(MelangeProducerHost)))?.UnpolicedProducers ?? [];
+        if (reducers.Count == 0 && producers.Count == 0)
             return;
 
-        var list = string.Join(", ", unpoliced);
         if (mode == UnpolicedReducerReport.Fail)
         {
+            var named = string.Join(", ", reducers.Concat(producers));
             throw new InvalidOperationException(
-                $"Policies:UnpolicedReducerReport is Fail and {unpoliced.Count} client-callable reducer(s) declare no " +
-                $"authorization policy: {list}. Attach [Reducer(Policy = typeof(...))] to each, or lower the report to Warn.");
+                $"Policies:UnpolicedReducerReport is Fail and {reducers.Count + producers.Count} client-callable reducer(s) or producer(s) " +
+                $"declare no authorization policy: {named}. Attach [Reducer(Policy = typeof(...))] or [Producer(Policy = typeof(...))] " +
+                "to each, or lower the report to Warn.");
         }
 
-        LogUnpolicedReducers(_logger, unpoliced.Count, list);
+        if (reducers.Count > 0)
+            LogUnpolicedReducers(_logger, reducers.Count, string.Join(", ", reducers));
+        if (producers.Count > 0)
+            LogUnpolicedProducers(_logger, producers.Count, string.Join(", ", producers));
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -135,6 +179,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         if (_engine is { } engine)
         {
             ((MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)))?.SignalStopping();
+            ((MelangeProducerHost?)_provider.GetService(typeof(MelangeProducerHost)))?.SignalStopping();
             engine.Drain();
             engine.Checkpoint();
             LogStopped(_logger, engine.Log.HeadLsn);
@@ -168,6 +213,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Transport.HeartbeatTimeoutMs = next.Transport.HeartbeatTimeoutMs;
         live.Transport.MaxInitialSetChunkBytes = next.Transport.MaxInitialSetChunkBytes;
         live.Resume.RetentionWindowSeconds = next.Resume.RetentionWindowSeconds;
+        live.Postgres.ArchiveLogRetentionHours = next.Postgres.ArchiveLogRetentionHours;
         live.Subscriptions.MaxPerConnection = next.Subscriptions.MaxPerConnection;
         live.Subscriptions.BackpressurePolicy = next.Subscriptions.BackpressurePolicy;
         live.Subscriptions.MaxBufferedBytes = next.Subscriptions.MaxBufferedBytes;
@@ -216,9 +262,9 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     private static partial void LogResidencyChangeFailed(ILogger logger, string table, Residency residency, Exception exception);
 
     [LoggerMessage(EventId = 1607, EventName = "RelationalTablesWithoutPostgres", Level = LogLevel.Warning,
-        Message = "{Count} table(s) declare Tier = Relational but no Postgres:ConnectionString is configured: {Tables}. " +
-            "Rows stay in the hot store; the relational projection (and ad-hoc SQL aggregates) will not exist until AddPostgres(...) is configured.")]
-    private static partial void LogRelationalWithoutPostgres(ILogger logger, int count, string tables);
+        Message = "{Count} table(s) declare Tier = HotWithRelationalBackplane but no Postgres:ConnectionString is configured: {Tables}. " +
+            "Rows stay in the hot store; the relational backplane (and ad-hoc SQL aggregates) will not exist until AddPostgres(...) is configured.")]
+    private static partial void LogBackplaneWithoutPostgres(ILogger logger, int count, string tables);
 
     [LoggerMessage(EventId = 1101, EventName = "MelangeStarted", Level = LogLevel.Information,
         Message = "MelangeDB started: recovered to LSN {HeadLsn} with {TableCount} table(s).")]
@@ -232,4 +278,9 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         Message = "{Count} client-callable reducer(s) declare no authorization policy: {Reducers}. " +
             "Each is callable by any authenticated client (Policies:DefaultReducerPosture).")]
     private static partial void LogUnpolicedReducers(ILogger logger, int count, string reducers);
+
+    [LoggerMessage(EventId = 1107, EventName = "UnpolicedProducers", Level = LogLevel.Warning,
+        Message = "{Count} producer(s) declare no authorization policy: {Producers}. " +
+            "Each is an open read of whatever it returns, callable by any authenticated client (Policies:DefaultReducerPosture).")]
+    private static partial void LogUnpolicedProducers(ILogger logger, int count, string producers);
 }

@@ -127,6 +127,37 @@ public class HealthCheckTests : IDisposable
         Assert.Contains("not configured", entry.Description);
     }
 
+    [Fact]
+    public async Task Applier_check_reports_degraded_while_an_applier_reports_a_condition_lag_cannot_show()
+    {
+        using var host = TestApp.Build(_root);
+        await host.StartAsync(TestContext.Current.CancellationToken);
+        var health = host.Services.GetRequiredService<HealthCheckService>();
+
+        // Caught up, so lag says healthy; what it set aside is the condition only it can report.
+        var applier = new ConditionApplier { AppliedLsn = host.Engine().Log.HeadLsn, Degraded = "2 archive row(s) are dead-lettered." };
+        host.Engine().Appliers.RegisterDecoupled(applier);
+
+        var degraded = (await health.CheckHealthAsync(TestContext.Current.CancellationToken)).Entries["melange-applier"];
+        Assert.Equal(HealthStatus.Degraded, degraded.Status);
+        Assert.Contains("dead-lettered", degraded.Description);
+
+        applier.Degraded = null;
+        var cleared = (await health.CheckHealthAsync(TestContext.Current.CancellationToken)).Entries["melange-applier"];
+        Assert.Equal(HealthStatus.Healthy, cleared.Status);
+    }
+
+    private sealed class ConditionApplier : ILogApplier, IApplierCondition
+    {
+        public string Name => "condition-test";
+
+        public ulong AppliedLsn { get; set; }
+
+        public string? Degraded { get; set; }
+
+        public void Apply(CommitRecord record) => throw new NotSupportedException();
+    }
+
     private sealed class StalledApplier : ILogApplier
     {
         public string Name => "stalled-test";

@@ -75,6 +75,13 @@ public static class TruncationFloorNames
     public const string ClusterEvents = "cluster-events";
 
     /// <summary>
+    /// <c>Postgres:ArchiveLogRetentionHours</c>: records kept so a Postgres restored from a dump can
+    /// catch its archive tables up from the log. The one floor whose holder is an operator's backup
+    /// schedule rather than a process.
+    /// </summary>
+    public const string ArchiveRetention = "archive-retention";
+
+    /// <summary>
     /// A floor registered through the unnamed overload — a third-party holder that never named
     /// itself. Diagnostic in its own right: it says the log is pinned by something outside
     /// MelangeDB.

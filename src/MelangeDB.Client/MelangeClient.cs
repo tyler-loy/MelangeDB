@@ -23,6 +23,7 @@ public sealed class MelangeClient : IAsyncDisposable
     private readonly MelangeClientOptions _options;
     private readonly IMelangeSerializer _serializer = new MessagePackFrameSerializer();
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<ReducerResultFrame>> _pendingCalls = new();
+    private readonly ConcurrentDictionary<uint, TaskCompletionSource<ProducerResultFrame>> _pendingProducerCalls = new();
     private readonly ConcurrentDictionary<uint, TaskCompletionSource> _pendingUnsubscribes = new();
     private readonly ConcurrentDictionary<uint, MelangeSubscription> _subscriptions = new();
     private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -150,6 +151,45 @@ public sealed class MelangeClient : IAsyncDisposable
         finally
         {
             _pendingCalls.TryRemove(requestId, out _);
+        }
+    }
+
+    /// <summary>
+    /// Calls a producer and awaits its encoded result: one tagged value in the reducer-argument
+    /// encoding, which the generated bindings decode against the producer's return type (see
+    /// <see cref="ProducerResultReader"/>). Failures throw <see cref="MelangeCallException"/> with
+    /// the server's error code. Needs protocol version 3; a server or gateway that settled on 2 has
+    /// no producers to call.
+    /// </summary>
+    public async Task<ProducerReply> CallProducerAsync(string producer, object?[]? arguments = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(producer);
+        if (ProtocolVersion < 3)
+        {
+            throw new MelangeCallException(
+                MelangeErrorCodes.UnsupportedVersion,
+                $"This connection negotiated protocol version {ProtocolVersion}, which has no producer calls.");
+        }
+
+        var requestId = Interlocked.Increment(ref _nextRequestId);
+        var pending = new TaskCompletionSource<ProducerResultFrame>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingProducerCalls[requestId] = pending;
+        try
+        {
+            await SendAsync(new CallProducerFrame(
+                requestId,
+                producer,
+                ReducerArgs.Encode(arguments ?? []),
+                Activity.Current?.Id)
+            { Channel = MelangeChannels.Calls }, cancellationToken).ConfigureAwait(false);
+            var result = await pending.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (!result.Ok)
+                throw new MelangeCallException(result.ErrorCode ?? MelangeErrorCodes.Internal, result.Message ?? "The call failed.");
+            return new ProducerReply(result.Payload, result.Lsn);
+        }
+        finally
+        {
+            _pendingProducerCalls.TryRemove(requestId, out _);
         }
     }
 
@@ -328,7 +368,7 @@ public sealed class MelangeClient : IAsyncDisposable
         var era = Interlocked.Increment(ref _era);
         _receiveLoop = Task.Run(() => ReceiveLoopAsync(socket, era), CancellationToken.None);
         await SendAsync(new HelloFrame(
-            MessagePackFrameSerializer.ProtocolVersion,
+            MessagePackFrameSerializer.MinProtocolVersion,
             MessagePackFrameSerializer.ProtocolVersion,
             helloToken), cancellationToken).ConfigureAwait(false);
         var welcome = await welcomePending.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -543,6 +583,10 @@ public sealed class MelangeClient : IAsyncDisposable
                 if (_pendingCalls.TryRemove(result.RequestId, out var call))
                     call.TrySetResult(result);
                 break;
+            case ProducerResultFrame produced:
+                if (_pendingProducerCalls.TryRemove(produced.RequestId, out var producerCall))
+                    producerCall.TrySetResult(produced);
+                break;
 
             // The frame-tick seam. These two cases are the data channel — everything that
             // mutates a cache or raises a row event flows through them — so Manual dispatch
@@ -587,6 +631,12 @@ public sealed class MelangeClient : IAsyncDisposable
         if (error.RequestId != 0 && _pendingCalls.TryRemove(error.RequestId, out var call))
         {
             call.TrySetException(new MelangeCallException(error.Code, error.Message));
+            return;
+        }
+
+        if (error.RequestId != 0 && _pendingProducerCalls.TryRemove(error.RequestId, out var producerCall))
+        {
+            producerCall.TrySetException(new MelangeCallException(error.Code, error.Message));
             return;
         }
 
@@ -794,6 +844,12 @@ public sealed class MelangeClient : IAsyncDisposable
         foreach (var (id, pending) in _pendingCalls)
         {
             if (_pendingCalls.TryRemove(id, out _))
+                pending.TrySetException(new MelangeCallException(MelangeErrorCodes.Internal, "The connection dropped before the result arrived."));
+        }
+
+        foreach (var (id, pending) in _pendingProducerCalls)
+        {
+            if (_pendingProducerCalls.TryRemove(id, out _))
                 pending.TrySetException(new MelangeCallException(MelangeErrorCodes.Internal, "The connection dropped before the result arrived."));
         }
 

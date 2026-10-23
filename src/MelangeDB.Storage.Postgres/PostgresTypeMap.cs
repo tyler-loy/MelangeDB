@@ -116,6 +116,35 @@ internal static class PostgresTypeMap
         return value;
     }
 
+    /// <summary>
+    /// The inverse of <see cref="ToParameter"/>: a value read back from Postgres as the column's own
+    /// CLR value, narrowing what was widened on the way in — what reading a whole row needs.
+    /// </summary>
+    public static object? ToRowValue(object value, ColumnSchema column)
+    {
+        if (value is DBNull)
+            return null;
+        object narrowed = column.Kind switch
+        {
+            ColumnKind.Int8 => (sbyte)Convert.ToInt16(value),
+            ColumnKind.UInt8 => (byte)Convert.ToInt16(value),
+            ColumnKind.UInt16 => (ushort)Convert.ToInt32(value),
+            ColumnKind.UInt32 => (uint)Convert.ToInt64(value),
+            ColumnKind.UInt64 => (ulong)Convert.ToDecimal(value),
+            ColumnKind.Identity => new Identity((byte[])value),
+            ColumnKind.Timestamp => Timestamp.FromDateTimeOffset(new DateTimeOffset(DateTime.SpecifyKind((DateTime)value, DateTimeKind.Utc))),
+            ColumnKind.ScheduleAt => ParseScheduleAt((string)value),
+            _ => value,
+        };
+        return column.IsEnum ? Enum.ToObject(column.ClrType, narrowed) : narrowed;
+    }
+
+    private static ScheduleAt ParseScheduleAt(string text)
+    {
+        var colon = text.IndexOf(':', StringComparison.Ordinal);
+        return ScheduleAt.FromMicroseconds(text[..colon] == "interval", long.Parse(text[(colon + 1)..], System.Globalization.CultureInfo.InvariantCulture));
+    }
+
     private static string Format(ScheduleAt schedule) =>
         schedule.IsInterval ? $"interval:{schedule.Microseconds}" : $"at:{schedule.Microseconds}";
 }

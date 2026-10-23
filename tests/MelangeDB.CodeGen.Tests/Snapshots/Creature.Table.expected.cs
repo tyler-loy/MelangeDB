@@ -120,7 +120,8 @@ namespace MelangeDB.Generated
                 placement: global::MelangeDB.Placement.Partitioned,
                 shardBy: "ChunkId",
                 scheduled: null,
-                codec: Instance);
+                codec: Instance,
+                keepKeys: false);
 
         public override byte[] Serialize(in global::Snapshot.Creature row)
         {

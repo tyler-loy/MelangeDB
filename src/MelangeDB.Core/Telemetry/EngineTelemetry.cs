@@ -28,6 +28,9 @@ internal sealed class EngineTelemetry : IDisposable
     private readonly Counter<long> _schedulerOverruns;
     private readonly Histogram<double> _schedulerTickDuration;
     private readonly Counter<long> _deadLettered;
+    private readonly Counter<long> _producerCalls;
+    private readonly Histogram<double> _producerDuration;
+    private readonly Histogram<double> _producerPin;
     private Func<long>? _eventQueueDepth;
     private Func<HotStoreStatistics>? _storeStatistics;
 
@@ -49,6 +52,9 @@ internal sealed class EngineTelemetry : IDisposable
         _schedulerOverruns = _meter.CreateCounter<long>("melange.scheduler.overruns", "{tick}", "Ticks that ran past their timer's interval — the death-spiral early warning.");
         _schedulerTickDuration = _meter.CreateHistogram<double>("melange.scheduler.tick.duration", "ms", "Scheduled fire duration, dispatch and transaction included.");
         _deadLettered = _meter.CreateCounter<long>("melange.events.deadlettered", "{event}", "Events whose delivery exhausted its retries and was recorded to the dead-letter path.");
+        _producerCalls = _meter.CreateCounter<long>("melange.producer.calls", "{call}", "Producer calls, by producer and outcome.");
+        _producerDuration = _meter.CreateHistogram<double>("melange.producer.duration", "ms", "Producer call duration: validation, policy, body, and encoding.");
+        _producerPin = _meter.CreateHistogram<double>("melange.producer.pin.duration", "ms", "How long a producer call held its pinned read view — what the hot store kept superseded versions for.");
         _meter.CreateObservableGauge("melange.events.queue_depth", () => _eventQueueDepth?.Invoke() ?? 0L, "{event}", "Events held in the bus's in-memory delivery window.");
         _meter.CreateObservableGauge("melange.log.head_lsn", () => (long)headLsn(), "{lsn}", "LSN of the newest log record.");
 
@@ -183,6 +189,33 @@ internal sealed class EngineTelemetry : IDisposable
         _reducerDuration.Record(durationMs, reducerTag);
         _writeSetRows.Record(writeSetRows, reducerTag);
     }
+
+    /// <summary>
+    /// Starts a <c>melange.producer</c> span, parented to a transport-propagated trace context
+    /// when the client sent one.
+    /// </summary>
+    public Activity? StartProducer(string producerName, Identity caller, ActivityContext parentContext = default)
+    {
+        var activity = parentContext == default
+            ? Source.StartActivity("melange.producer")
+            : Source.StartActivity("melange.producer", ActivityKind.Server, parentContext);
+        if (activity is null)
+            return null;
+        activity.SetTag("melange.producer.name", producerName);
+        if (_options.IncludeCallerIdentity)
+            activity.SetTag("melange.caller", caller.ToString());
+        return activity;
+    }
+
+    public void RecordProducer(string producerName, string outcome, double durationMs)
+    {
+        var producerTag = new KeyValuePair<string, object?>("producer", producerName);
+        _producerCalls.Add(1, producerTag, new KeyValuePair<string, object?>("outcome", outcome));
+        _producerDuration.Record(durationMs, producerTag);
+    }
+
+    public void RecordProducerPin(string producerName, double durationMs) =>
+        _producerPin.Record(durationMs, new KeyValuePair<string, object?>("producer", producerName));
 
     public void RecordRateLimited(string reducerName) =>
         _rateLimited.Add(1, new KeyValuePair<string, object?>("reducer", reducerName));

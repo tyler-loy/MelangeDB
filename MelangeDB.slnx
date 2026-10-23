@@ -30,6 +30,7 @@
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/MelangeDB.Sample.Client/MelangeDB.Sample.Client.csproj" />
+    <Project Path="samples/MelangeDB.Sample.Wallet/MelangeDB.Sample.Wallet.csproj" />
     <Project Path="samples/MelangeDB.Sample.Worker/MelangeDB.Sample.Worker.csproj" />
   </Folder>
 </Solution>

@@ -4,11 +4,13 @@ using Xunit;
 namespace MelangeDB.Storage.Postgres.Tests;
 
 /// <summary>
-/// The relational tier across a restore (road-to-0.2 phase 15): the Postgres projection is not in
-/// the archive and is never silently overwritten. A restore mints a fresh epoch, so a leftover
-/// checkpoint is refused as an epoch mismatch (EventId 1605) with the remediation printed — and
-/// the remediation, followed literally, recovers. The same-epoch cousin — a checkpoint ahead of
-/// the log's head, the hand-rolled directory swap — is refused just as loudly (EventId 1608).
+/// The relational backplane across a restore (road-to-0.2 phase 15, revised in road-to-0.3 phase
+/// 25): the Postgres projection is not in the archive. A restore mints a fresh epoch and records
+/// the source in its lineage, so a leftover checkpoint from that source is reconciled to the
+/// restored history (EventId 1613) rather than refused; one from an unrelated epoch is still
+/// refused (1605, covered with archives in ArchiveRestoreTests). Clearing the schema still
+/// rebuilds the projection. The same-epoch cousin — a checkpoint ahead of the log's head, the
+/// hand-rolled directory swap — is refused loudly (EventId 1608).
 /// </summary>
 [Collection(PostgresCollection.Name)]
 public class BackupRestorePostgresTests
@@ -18,7 +20,7 @@ public class BackupRestorePostgresTests
     public BackupRestorePostgresTests(PostgresContainerFixture postgres) => _postgres = postgres;
 
     [Fact]
-    public async Task After_a_restore_the_stale_projection_is_refused_and_the_printed_remediation_recovers()
+    public async Task After_a_restore_the_projection_is_reconciled_and_clearing_the_schema_still_rebuilds_it()
     {
         _postgres.SkipUnlessAvailable();
         var schema = PostgresContainerFixture.NewSchema();
@@ -51,17 +53,18 @@ public class BackupRestorePostgresTests
             var restoredRoot = Path.Combine(scratch, "restored");
             MelangeBackup.Restore(archive, Path.Combine(restoredRoot, "log"));
 
-            // First boot against the restored directory: the applier checkpoint belongs to an
-            // epoch the restored log has never seen, and the tier refuses loudly rather than
-            // projecting history that no longer happened.
+            // First boot against the restored directory: the applier checkpoint belongs to the
+            // epoch the restored log names as its ancestor, so the projection is reconciled to the
+            // restored history and the applier carries on.
             await using var rebooted = new TierHarness(_postgres.ConnectionString, schema, root: restoredRoot);
             await rebooted.StartTierAsync();
-            await TierHarness.WaitUntilAsync(
-                () => rebooted.Tier.IsStalled && rebooted.Logs.Has(1605),
-                "the epoch-mismatch refusal (EventId 1605)");
+            await rebooted.WaitAppliedAsync(rebooted.Engine.Log.HeadLsn);
+            Assert.True(rebooted.Logs.Has(1613));
+            Assert.False(rebooted.Tier.IsStalled);
+            Assert.Equal(5L, await rebooted.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\""));
 
-            // The printed remediation, followed literally: the clean path is an empty schema,
-            // which the bootstrap machinery fills from the restored log.
+            // The pre-lineage remediation still works for a deployment without archive tables:
+            // an empty schema, which the bootstrap machinery fills from the restored log.
             await rebooted.ExecuteAsync($"DROP SCHEMA \"{schema}\" CASCADE");
             await rebooted.RestartAsync();
             await rebooted.WaitAppliedAsync(rebooted.Engine.Log.HeadLsn);

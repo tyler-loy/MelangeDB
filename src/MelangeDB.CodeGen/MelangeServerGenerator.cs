@@ -31,6 +31,14 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
             .Where(static reducer => reducer is not null)
             .Select(static (reducer, _) => reducer!);
 
+        var producers = context.SyntaxProvider
+            .ForAttributeWithMetadataName(
+                "MelangeDB.ProducerAttribute",
+                static (node, _) => node is MethodDeclarationSyntax,
+                static (ctx, _) => ModelExtractor.ExtractProducer(ctx))
+            .Where(static producer => producer is not null)
+            .Select(static (producer, _) => producer!);
+
         context.RegisterSourceOutput(tables, static (production, table) =>
         {
             foreach (var diagnostic in table.Diagnostics.Items)
@@ -42,19 +50,26 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         var moduleName = context.CompilationProvider.Select(static (compilation, _) => compilation.AssemblyName ?? "module");
 
         context.RegisterSourceOutput(
-            tables.Collect().Combine(reducers.Collect()).Combine(moduleName),
-            static (production, source) => EmitModel(production, source.Left.Left, source.Left.Right, source.Right));
+            tables.Collect().Combine(reducers.Collect()).Combine(producers.Collect()).Combine(moduleName),
+            static (production, source) => EmitModel(production, source.Left.Left.Left, source.Left.Left.Right, source.Left.Right, source.Right));
     }
 
     private static void EmitModel(
         SourceProductionContext production,
         ImmutableArray<TableModel> tables,
         ImmutableArray<ReducerModel> reducers,
+        ImmutableArray<ProducerModel> producers,
         string moduleName)
     {
         foreach (var reducer in reducers)
         {
             foreach (var diagnostic in reducer.Diagnostics.Items)
+                production.ReportDiagnostic(diagnostic.ToDiagnostic());
+        }
+
+        foreach (var producer in producers)
+        {
+            foreach (var diagnostic in producer.Diagnostics.Items)
                 production.ReportDiagnostic(diagnostic.ToDiagnostic());
         }
 
@@ -69,10 +84,15 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
             .ThenBy(static r => r.ContainingTypeFqn, StringComparer.Ordinal)
             .ToArray();
         validReducers = ValidateScheduling(production, reducers, validTables, validReducers);
-        if (validTables.Length == 0 && validReducers.Length == 0)
+        var validProducers = ReportCallableCollisions(production, reducers, producers
+            .Where(static p => p.IsValid)
+            .OrderBy(static p => p.ProducerName, StringComparer.Ordinal)
+            .ThenBy(static p => p.ContainingTypeFqn, StringComparer.Ordinal)
+            .ToArray());
+        if (validTables.Length == 0 && validReducers.Length == 0 && validProducers.Length == 0)
             return;
-        production.AddSource("MelangeModel.g.cs", Emitter.EmitModel(validTables, validReducers));
-        EmitManifest(production, validTables, validReducers, moduleName);
+        production.AddSource("MelangeModel.g.cs", Emitter.EmitModel(validTables, validReducers, validProducers));
+        EmitManifest(production, validTables, validReducers, validProducers, moduleName);
     }
 
     /// <summary>
@@ -85,12 +105,13 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         SourceProductionContext production,
         TableModel[] validTables,
         ReducerModel[] validReducers,
+        ProducerModel[] validProducers,
         string moduleName)
     {
-        if (!ManifestEmitter.HasClientSurface(validTables, validReducers))
+        if (!ManifestEmitter.HasClientSurface(validTables, validReducers, validProducers))
             return;
 
-        var collisions = ManifestEmitter.EnumNameCollisions(validTables, validReducers);
+        var collisions = ManifestEmitter.EnumNameCollisions(validTables, validReducers, validProducers);
         if (collisions.Length > 0)
         {
             foreach (var collision in collisions)
@@ -98,7 +119,15 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
             return;
         }
 
-        var (json, hash) = ManifestEmitter.Build(moduleName, validTables, validReducers);
+        var typeCollisions = ManifestEmitter.ResultTypeNameCollisions(validTables, validReducers, validProducers);
+        if (typeCollisions.Length > 0)
+        {
+            foreach (var collision in typeCollisions)
+                production.ReportDiagnostic(Diagnostic.Create(Diagnostics.AmbiguousResultTypeName, Location.None, collision));
+            return;
+        }
+
+        var (json, hash) = ManifestEmitter.Build(moduleName, validTables, validReducers, validProducers);
         production.AddSource("MelangeSchemaManifest.g.cs", ManifestEmitter.EmitHolder(json, hash));
     }
 
@@ -167,6 +196,42 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         }
 
         return invalid.Count == 0 ? validReducers : validReducers.Where(r => !invalid.Contains(r)).ToArray();
+    }
+
+    /// <summary>
+    /// Reports MELANGE0030 for a producer whose name another producer or any reducer already has, and
+    /// drops it: a client names what it calls, so one name must mean one callable.
+    /// </summary>
+    private static ProducerModel[] ReportCallableCollisions(
+        SourceProductionContext production,
+        ImmutableArray<ReducerModel> reducers,
+        ProducerModel[] producers)
+    {
+        var reducerNames = new HashSet<string>(reducers.Select(static r => r.ReducerName), StringComparer.Ordinal);
+        var colliding = new HashSet<ProducerModel>();
+        foreach (var producer in producers)
+        {
+            if (reducerNames.Contains(producer.ProducerName))
+            {
+                production.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.DuplicateCallableName, producer.Location.ToLocation(), producer.ProducerName, "a reducer"));
+                colliding.Add(producer);
+            }
+        }
+
+        foreach (var group in producers.GroupBy(static p => p.ProducerName, StringComparer.Ordinal))
+        {
+            if (group.Count() < 2)
+                continue;
+            foreach (var producer in group)
+            {
+                production.ReportDiagnostic(Diagnostic.Create(
+                    Diagnostics.DuplicateCallableName, producer.Location.ToLocation(), producer.ProducerName, "another producer"));
+                colliding.Add(producer);
+            }
+        }
+
+        return colliding.Count == 0 ? producers : producers.Where(p => !colliding.Contains(p)).ToArray();
     }
 
     /// <summary>

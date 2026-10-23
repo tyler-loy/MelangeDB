@@ -37,8 +37,19 @@ internal sealed class TransactionDb : IDbView
     {
         var schema = _registry.Get(typeof(TRow));
         _guard?.Invoke(schema, access);
+        if (access == TableAccess.Read && schema.Tier == StorageTier.Archive)
+            throw ArchiveRead(schema);
         return schema;
     }
+
+    private static InvalidOperationException ArchiveRead(TableSchema schema) => new(
+        $"Table '{schema.Name}' is an archive table: its rows live only in Postgres, and a reducer cannot read them " +
+        "— a reducer body does no I/O. Keep what reducers need (a balance, a key set) in a hot table, and read the " +
+        "archive's history outside a reducer.");
+
+    private static InvalidOperationException ArchiveUpdate(TableSchema schema) => new(
+        $"Table '{schema.Name}' is an archive table, which reducers append to and never update: an update needs the " +
+        "current row, and the current row is not readable. Insert a new row instead.");
 
     public TRow Insert<TRow>(TRow row)
         where TRow : struct
@@ -48,6 +59,14 @@ internal sealed class TransactionDb : IDbView
         {
             codec.AssignAutoInc(ref row, _autoInc, schema.Id);
             var key = codec.EncodePrimaryKey(in row);
+            if (schema.Tier == StorageTier.Archive)
+            {
+                // The row goes to Postgres through the log. Only a key set gives anything to check against.
+                RefuseArchivedKey(schema, key);
+                _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, key, codec.Serialize(in row)));
+                return row;
+            }
+
             if (Exists(schema.Id, key))
                 throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {key} already exists.");
             CheckUniqueConstraints(schema, codec, key, in row);
@@ -72,6 +91,13 @@ internal sealed class TransactionDb : IDbView
         }
 
         var boxedKey = SchemaKeyCodec.Encode(schema.PrimaryKey, schema.PrimaryKey.GetValue(boxed));
+        if (schema.Tier == StorageTier.Archive)
+        {
+            RefuseArchivedKey(schema, boxedKey);
+            _writeSet.Stage(new RowOp(RowOpKind.Insert, schema.Id, boxedKey, RowSerializer.Serialize(schema, boxed)));
+            return (TRow)boxed;
+        }
+
         if (Exists(schema.Id, boxedKey))
             throw new InvalidOperationException($"Table '{schema.Name}': a row with primary key {boxedKey} already exists.");
         CheckUniqueConstraints(schema, boxedKey, boxed);
@@ -84,6 +110,8 @@ internal sealed class TransactionDb : IDbView
         where TRow : struct
     {
         var schema = Resolve<TRow>(TableAccess.Write);
+        if (schema.Tier == StorageTier.Archive)
+            throw ArchiveUpdate(schema);
         if (schema.Codec is RowCodec<TRow> codec)
         {
             var key = codec.EncodePrimaryKey(in row);
@@ -110,6 +138,15 @@ internal sealed class TransactionDb : IDbView
         ArgumentNullException.ThrowIfNull(primaryKey);
         var schema = Resolve<TRow>(TableAccess.Write);
         var key = SchemaKeyCodec.Encode(schema.PrimaryKey, primaryKey);
+        if (schema.Tier == StorageTier.Archive)
+        {
+            // Blind: whether Postgres holds the row is unknowable here, and deleting a row it does
+            // not hold is a no-op there. A second delete of one key in one transaction adds nothing.
+            if (!_writeSet.TryGetPending(schema.Id, key, out var pending) || pending.Kind != RowOpKind.Delete)
+                _writeSet.Stage(new RowOp(RowOpKind.Delete, schema.Id, key));
+            return true;
+        }
+
         if (!Exists(schema.Id, key))
             return false;
         _writeSet.Stage(new RowOp(RowOpKind.Delete, schema.Id, key));
@@ -299,6 +336,41 @@ internal sealed class TransactionDb : IDbView
         if (_writeSet.TryGetPending(schema.Id, key, out var pending))
             return pending.Kind == RowOpKind.Delete ? null : Materialize<TRow>(schema, pending.Row);
         return _store.TryGetRow(schema.Id, key, out var stored) ? Materialize<TRow>(schema, stored) : null;
+    }
+
+    public bool ContainsKey<TRow>(object primaryKey)
+        where TRow : struct
+    {
+        ArgumentNullException.ThrowIfNull(primaryKey);
+        var schema = _registry.Get(typeof(TRow));
+        _guard?.Invoke(schema, TableAccess.Read);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, primaryKey);
+        if (schema.Tier != StorageTier.Archive)
+            return Exists(schema.Id, key);
+        if (_registry.KeySetFor(schema.Id) is null)
+        {
+            throw new InvalidOperationException(
+                $"Table '{schema.Name}' is an archive table without a key set, so a reducer cannot ask whether a key exists: " +
+                "its rows live only in Postgres. Declare it [Table(Tier = StorageTier.Archive, KeepKeys = true)] when the " +
+                "table is created to keep its keys in the hot store.");
+        }
+
+        return ArchivedKeyExists(schema, key);
+    }
+
+    /// <summary>An archive key's existence: the transaction's own pending op first, then the key set.</summary>
+    private bool ArchivedKeyExists(TableSchema archive, RowKey key)
+    {
+        if (_writeSet.TryGetPending(archive.Id, key, out var pending))
+            return pending.Kind != RowOpKind.Delete;
+        return _store.ContainsKey(_registry.KeySetFor(archive.Id)!.Id, key);
+    }
+
+    /// <summary>With a key set, a duplicate archive key is refused here, before commit — the hot table's contract.</summary>
+    private void RefuseArchivedKey(TableSchema archive, RowKey key)
+    {
+        if (_registry.KeySetFor(archive.Id) is not null && ArchivedKeyExists(archive, key))
+            throw new InvalidOperationException($"Table '{archive.Name}': a row with primary key {key} has already been archived.");
     }
 
     private bool Exists(TableId table, RowKey key)

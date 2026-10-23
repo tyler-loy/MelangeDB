@@ -10,7 +10,9 @@ internal sealed record ClientSchemaModel(
     string Module,
     EquatableArray<ClientEnumModel> Enums,
     EquatableArray<ClientTableModel> Tables,
-    EquatableArray<ClientReducerModel> Reducers);
+    EquatableArray<ClientReducerModel> Reducers,
+    EquatableArray<ClientProducerModel> Producers = default,
+    EquatableArray<ClientResultTypeModel> ResultTypes = default);
 
 internal sealed record ClientEnumModel(
     string Name,
@@ -46,4 +48,22 @@ internal sealed record ClientParameterModel(
     string Name,
     WireKind Kind,
     bool IsArray,
-    string? EnumName);
+    string? EnumName,
+    string? Default = null);
+
+/// <summary>
+/// One producer: its parameters, and its result as a manifest type reference — a scalar kind, an
+/// enum, or a result type's name, suffixed <c>?</c> (nullable value) and <c>[]</c> (list).
+/// </summary>
+internal sealed record ClientProducerModel(
+    string Name,
+    EquatableArray<ClientParameterModel> Parameters,
+    string Returns);
+
+/// <summary>A record a producer returns, with its fields in wire order.</summary>
+internal sealed record ClientResultTypeModel(
+    string Name,
+    bool IsValueType,
+    EquatableArray<ClientFieldModel> Fields);
+
+internal sealed record ClientFieldModel(string Name, string Type);

@@ -206,7 +206,7 @@ public sealed class FileCommitLog : ICommitLog
     /// <see cref="HeadLsn"/>, because those policies promise nothing beyond the OS's own writeback
     /// and gating a reader on a promise never made would only add the timer's latency. This is the
     /// ceiling anything that leaves the process — a subscription delta, a replica stream, a
-    /// relational-tier apply — must stay under: an LSN served beyond it could be untold by a crash.
+    /// relational-backplane apply — must stay under: an LSN served beyond it could be untold by a crash.
     /// </summary>
     public ulong DurableLsn => _options.FsyncPolicy == FsyncPolicy.OnCommit ? FsyncedLsn : HeadLsn;
 

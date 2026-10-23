@@ -107,6 +107,13 @@ internal sealed class ArchiveEngineIdentity
     /// from the log tail during recovery — the same machinery every restart uses.
     /// </summary>
     public required IReadOnlyList<ArchiveSequence> Sequences { get; init; }
+
+    /// <summary>
+    /// The source log's own ancestors (<see cref="EpochLineage"/>), so a restore extends the
+    /// lineage rather than starting it over. Optional, so archives written before it existed still
+    /// read, and readers that predate it ignore it: absent means no ancestors.
+    /// </summary>
+    public IReadOnlyList<EpochAncestor>? Lineage { get; init; }
 }
 
 internal sealed class ArchiveSequence
