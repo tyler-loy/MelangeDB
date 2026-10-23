@@ -31,6 +31,7 @@ arguable.
 | [22](plan-phase-22.md) | `MelangeDB.Testing` — the reducer test kit | Planned |
 | [23](plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate` | Planned |
 | 24 | Scheduler lane — player reducers ahead of simulation work | [Design record](../design/scheduler-lanes.md) written; may not become a phase |
+| [25](plan-phase-25.md) | The archive tier — relational-only tables for unbounded history; **breaking:** `Relational` renamed to hot with a relational backplane | Planned |
 
 **Phase 20 comes first and gates two things**, and it is now the decision-gating half only — the head-to-head comparison against SpacetimeDB is split out and undecided, because its frozen baseline has diverged from the live workload in capability rather than merely in size. It is not a feature; it is the measurement half
 [phase 11](../road-to-0.1/plan-phase-11.md) called its deliverable and did not record. Everything
@@ -45,6 +46,10 @@ cost of the fourteen scheduled reducers that sizes phase 24.
 at all it falls out of the designs: 21 wants a manifest to render argument and row bytes, which is
 the same manifest 23 generates from, and 22's harness is the obvious place to assert against what 21
 displays.
+
+**Phase 25 is independent of all of them** but touches two contracts other phases care about: it
+adds an epoch-lineage sidecar that phase 21's inspector should read when it crosses a restore, and
+its client-facing history read is HTTP-only unless it lands before phase 23 pins the protocol.
 
 **Phase 24 gets a `design/` document before it gets a plan**, the way
 [elastic-rebalancing.md](../design/elastic-rebalancing.md) preceded 13–14. That record —
