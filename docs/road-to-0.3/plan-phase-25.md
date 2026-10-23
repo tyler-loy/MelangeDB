@@ -190,8 +190,9 @@ tables alike, with three changes:
 
 - Archive tables get hidden `_melange_lsn bigint` and `_melange_epoch uuid` columns, written from the
   record on every insert, and an index on them. This is what lets restore trim (below).
-- Archive inserts are `ON CONFLICT (pk) DO NOTHING` with a per-command row count check, not the
-  mirror's upsert — see the decision on constraints.
+- Archive inserts never overwrite: a primary-key collision dead-letters the incoming row into
+  `melange_archive_dead_letter`, in the same Postgres transaction as the batch and its checkpoint,
+  instead of the mirror's upsert. See the decision on constraints.
 - `BootstrapFromStoreAsync` neither scans nor `DELETE`s archive tables. Bootstrapping a mirror is
   still safe; bootstrapping an archive from a store that never held it would empty it.
 - A fresh anchor against a truncated log, with archive tables present and empty in Postgres, refuses
@@ -226,10 +227,12 @@ checkpoint onward, so the mirror silently lacks every row written before the cha
 lost, since the hot store still holds them, but the mirror is quietly incomplete. Recording tier
 fixes this case too, by making the change visible at boot.)
 
-**An archive retention floor.** A new, optional named truncation floor that holds the log back by a
-configured window behind the applier's checkpoint, so a Postgres restored from a backup taken inside
-that window can catch up from the log instead of losing the rows in between. Off by default, since
-it is for deployments without Postgres point-in-time recovery; see the backup decision. It ships
+**An archive retention floor.** A new, optional named truncation floor that holds the log back by
+`Postgres:ArchiveLogRetentionHours` behind the applier's checkpoint, so a Postgres restored from a
+backup taken inside that window can catch up from the log instead of losing the rows in between.
+Off by default (unset or `0`), since it is for deployments without Postgres point-in-time recovery;
+see the backup decision. The floor resolves hours to an LSN using commit timestamps — the oldest
+record within the window — so it is configured in the operator's units and enforced in the log's. It ships
 with a sharper refusal for the case it exists to prevent. When the applier's checkpoint is below the
 log's base after a Postgres restore, a new EventId names the lost LSN range and the archive tables
 it affects, instead of the generic "truncated past checkpoint" message.
@@ -271,7 +274,9 @@ not collide; the reader sees a just-moved row before the applier does; an archiv
 Postgres refuses boot; a Postgres outage during a sweep grows the log, holds the floor, and
 catches up with nothing lost; every refused tier change refuses boot with the table named and no
 rows dropped; and a Postgres restored from a backup inside the retention window catches up from the
-log, while one restored from outside it refuses under the new EventId with the lost range named.
+log, while one restored from outside it refuses under the new EventId with the lost range named;
+and a primary-key collision dead-letters exactly that row, in the batch's transaction, while the
+applier's checkpoint keeps advancing and every other row in the batch lands.
 
 ## Out of scope
 
@@ -300,11 +305,11 @@ engine path for it.
 
 ### What the renamed tier is called, and whether `Relational` comes back
 
-The rename is settled; the identifier is not. Candidates: `HotWithRelationalBackplane` (says
+Candidates were `HotWithRelationalBackplane` (says
 exactly what happens), `Backplane` (short, but drops *hot*, which is the whole point), `Mirrored`
 (accurate, but says nothing about Postgres).
 
-**Leaning:** `HotWithRelationalBackplane`. A tier is written once per table declaration, so length
+**Settled:** `HotWithRelationalBackplane`. A tier is written once per table declaration, so length
 costs nothing, and the name answers the two questions a reader actually has — can reducers read it
 (yes, it's hot) and is it in Postgres (yes, as a backplane) — without a trip to the docs.
 
@@ -352,13 +357,31 @@ Replays are not a concern either way: the checkpoint commits in the same Postgre
 batch, so the applier never re-applies a record. **Any conflict on an archive insert is a real
 collision.**
 
-**Leaning:** make collisions impossible rather than detected, and loud when they happen anyway.
-Primary keys come from AutoInc, `Guid`, or a hot table's AutoInc key carried across the move;
-`[Unique]` is refused; no foreign keys. Archive inserts use `ON CONFLICT (pk) DO NOTHING` and check
-each command's `RecordsAffected`; a zero is a collision, logged under a new EventId with the table
-and key. **Open:** whether that collision then stalls the applier or dead-letters the row. Stalling
-is the current posture for every applier error and the honest one; dead-lettering keeps the game
-running and drops an audit row. Probably stall.
+**Settled:** make collisions impossible rather than detected, and quarantine them when they happen
+anyway. Primary keys come from AutoInc, `Guid`, or a hot table's AutoInc key carried across the
+move; `[Unique]` is refused; no foreign keys. A primary-key collision **dead-letters the row** rather
+than stalling the applier: one bad row should not hold the truncation floor and grow the log for
+every other table while it waits for a human.
+
+- **Nothing is dropped.** Each archive insert is a single statement — the `INSERT ... ON CONFLICT
+  (pk) DO NOTHING` in a CTE, followed by an insert of the same row into
+  `melange_archive_dead_letter` when the first inserted nothing — so the quarantine commits in the
+  same transaction as the batch and its checkpoint. The dead-letter table records the table, the
+  key, the LSN, the epoch, the reducer name from the record, the time, and the full row bytes, so
+  the row can be inspected and re-applied by hand.
+- **Logged at Error, once per row,** under a new EventId with the table, key, LSN, and reducer
+  name. Never the row's values: an archive is where audit and wallet data lives, and log sinks are
+  not where it belongs. The dead-letter table holds the payload.
+- **Counted.** A `melange.archive.dead_lettered` counter tagged by table, for alerting, and the
+  `melange-applier` health check reports *Degraded* while the dead-letter table holds rows nobody
+  has cleared. A collision is a bug in the application's keys, so it must be impossible to miss
+  rather than merely recorded.
+- **Not for everything.** Only primary-key collisions dead-letter. A connection failure, a type
+  error, or anything else still stalls and retries as today, because those are not a property of one
+  row and skipping them would skip data.
+
+OBSERVABILITY.md gets the EventId, the counter, and the remediation: find the colliding key's
+source, fix the key allocation, and re-apply or discard each dead-lettered row deliberately.
 
 ### Existence checks: idempotency keys that outlive the hot window
 
@@ -382,15 +405,31 @@ The reducer does not need the row, only whether the key exists. Three ways to an
   store, with no payload: one key per row, `Paged`, in snapshots and `.mbak`. The generated
   accessor gains `Contains(key)`, still with no `Find`.
 
-**Leaning:** the third, opt-in per table (`[Table(Tier = Archive, KeepKeys = true)]`, name open).
+**Settled:** the third, opt-in per table and **off by default** (`[Table(Tier = Archive, KeepKeys = true)]`).
 It is the seen-keys pattern built once, and it pays for itself twice. It answers idempotency with no
 Postgres I/O under the write lock. It also lets `Insert` check the primary key in the reducer again,
 so the silent-overwrite case in the constraints decision above becomes an ordinary duplicate-key exception before
 commit. The cost is honest and bounded: the key set still grows with history, at the size of a key
 rather than a row. It stays in the backup, so the archive's keys survive a lost Postgres even though
-its payloads do not. **Open:** whether to keep keys by default rather than opt-in, given that it
-closes the collision hole for every archive table; and whether an expiring key window
-(`KeepKeysFor = "90d"`) belongs in the engine or stays the app's second option above.
+its payloads do not.
+
+Off by default because the cost grows with history for every archive table, and most of them —
+combat logs, chat history, telemetry — never ask whether an old key exists. The behaviour without it
+is documented where a team will read it (the `Archive` XML docs, DESIGN.md §2, and the sample):
+
+- **No `Contains`.** The generated accessor has none, so a reducer cannot ask whether an archived
+  key exists. A key that has left the hot table is invisible to reducers.
+- **Idempotency stops at the hot window.** A team using archived ids as idempotency keys must turn
+  `KeepKeys` on, or keep its own seen-keys table, or bound its replay window — otherwise a key
+  replayed after it was archived is processed again. The docs say this in those words, because it is
+  the mistake the default makes possible.
+- **Collisions are caught after commit.** With no hot key set, `Insert` cannot check the primary
+  key, so a collision reaches Postgres and is dead-lettered (see the constraints decision). With
+  `KeepKeys`, it is an ordinary duplicate-key exception inside the reducer and the transaction never
+  commits.
+
+**Open:** whether an expiring key window (`KeepKeysFor = "90d"`) belongs in the engine or stays the
+app's second option above.
 
 ### Deletes
 
@@ -432,8 +471,14 @@ the log. The archive is the first projection whose backup and the log's truncati
   is log disk proportional to the window. This is also the one floor whose holder is an operator's
   backup schedule rather than a process, so `melange-retention` names it as such.
 
-**Open:** whether the floor should be measured in time or in records (the retention health check
-counts records, but backup schedules are written in hours). Also open: whether an operator command
+**Settled: measured in hours,** as `Postgres:ArchiveLogRetentionHours`, off by default. Backup
+schedules are written in hours, and an operator sizing the window from a nightly dump should write
+`26`, not compute a record count from commit rate. The floor converts hours to an LSN internally
+from commit timestamps, and `melange-retention` keeps reporting the pinned distance in records, as
+every other floor does. Leave it off when Postgres has point-in-time recovery; set it to at least the
+dump interval plus margin when it does not.
+
+**Open:** whether an operator command
 that records "a Postgres backup completed at LSN X" should replace the fixed window, so the floor
 tracks real backups rather than an estimate of them. That is more precise, and it is one more thing
 that has to be wired into somebody's backup job.
