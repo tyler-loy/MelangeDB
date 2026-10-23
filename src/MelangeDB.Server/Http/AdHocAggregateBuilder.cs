@@ -20,7 +20,7 @@ internal static class AdHocAggregateBuilder
                 MelangeErrorCodes.UnknownTable, $"No table named '{parsed.Table}' is registered.");
         }
 
-        if (schema.Tier != StorageTier.HotWithRelationalBackplane)
+        if (schema.Tier is not (StorageTier.HotWithRelationalBackplane or StorageTier.Archive))
         {
             throw new SubscriptionRejectedException(
                 MelangeErrorCodes.NotRelationalTier,

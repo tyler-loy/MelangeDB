@@ -18,6 +18,16 @@ public enum StorageTier
     [Obsolete("Renamed to StorageTier.HotWithRelationalBackplane in 0.3: rows live in the hot store and Postgres " +
         "holds a copy. Nothing on disk changes. See docs/MIGRATION.md.", error: true)]
     Relational = 1,
+
+    /// <summary>
+    /// Postgres only. Rows ride the commit log like any write and the Postgres applier projects
+    /// them, but they never occupy the hot store, a snapshot, or a backup archive — once the log
+    /// truncates past a row, Postgres holds the only copy. Reducers can append (<c>Insert</c>) and
+    /// delete by key, and cannot read: a reducer body does no I/O. For unbounded history — a wallet
+    /// ledger, a trade log — whose recent rows stay in a hot table. Requires <c>AddPostgres(...)</c>.
+    /// See docs/road-to-0.3/plan-phase-25.md.
+    /// </summary>
+    Archive = 2,
 }
 
 /// <summary>Whether a table must stay wholly in memory.</summary>

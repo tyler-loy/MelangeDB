@@ -28,3 +28,6 @@ MELANGE0020 | MelangeDB | Error | Schema manifest is invalid
 MELANGE0021 | MelangeDB | Error | One project generates from one schema manifest
 MELANGE0022 | MelangeDB | Error | Scheduled tables are always Placement.Local
 MELANGE0023 | MelangeDB | Warning | Read-modify-write inside a snapshot-isolated reducer
+MELANGE0024 | MelangeDB | Error | Archive tables cannot be Public
+MELANGE0025 | MelangeDB | Error | [Unique] on an archive table cannot be checked
+MELANGE0026 | MelangeDB | Error | Archive table declares something only a hot table can honour

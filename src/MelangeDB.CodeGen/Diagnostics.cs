@@ -4,7 +4,7 @@ namespace MelangeDB.CodeGen;
 
 /// <summary>
 /// Every diagnostic MelangeDB reports at compile time. Ids are stable public API: MELANGE0001
-/// through MELANGE0023, never renumbered, each with a fires-test and a compiles-clean test.
+/// through MELANGE0026, never renumbered, each with a fires-test and a compiles-clean test.
 /// </summary>
 public static class Diagnostics
 {
@@ -201,6 +201,34 @@ public static class Diagnostics
         "op value. Recompute the row from the reducer's own inputs, or leave the reducer Serialized.",
         Category,
         DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ArchiveTablePublic = new(
+        "MELANGE0024",
+        "Archive tables cannot be Public",
+        "Table '{0}' is Tier = Archive and Public. An archive table's rows live only in Postgres, so no subscription " +
+        "can serve them: subscriptions read the hot store. Drop Public, and read the table's history outside a reducer " +
+        "(see docs/road-to-0.3/plan-phase-25.md).",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor UniqueOnArchiveTable = new(
+        "MELANGE0025",
+        "[Unique] on an archive table cannot be checked",
+        "Table '{0}': [Unique] column '{1}' on an archive table. A reducer cannot read an archive table, so a duplicate " +
+        "would first be seen by Postgres, after the transaction committed, and would stall the applier. Drop [Unique]; " +
+        "keep the values that must be unique in a hot table, where the reducer can check them.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ArchiveTableDeclaration = new(
+        "MELANGE0026",
+        "Archive table declares something only a hot table can honour",
+        "Table '{0}' is Tier = Archive and declares {1}, which it cannot honour: {2}. Drop the declaration.",
+        Category,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(

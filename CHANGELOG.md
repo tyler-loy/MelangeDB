@@ -41,6 +41,23 @@ All packages ship together at one version; there is no per-package versioning. S
   `HotWithRelationalBackplane` share a value and which aliased name `ToString()` returns is
   unspecified.
 
+- **The archive tier: `StorageTier.Archive`, tables that live only in Postgres.** For unbounded
+  history, such as a wallet ledger whose recent rows stay in a hot table and whose old ones move to
+  an archive with a reducer (`Insert` into the archive, `Delete` from the hot table, one atomic write
+  set). Writes ride the commit log and the Postgres applier projects them; the engine strips them
+  from every record before the hot store sees it, through commit and recovery alike, so they are in
+  no hot store, snapshot or `.mbak`, and that holds for any `IHotStore`. Reducers can `Insert` and
+  blind-`Delete` by key; nothing that reads is generated, and the reflection path refuses reads with
+  the reason. AutoInc ids stay unique across restarts. MELANGE0024–0026 refuse a Public archive
+  table, `[Unique]` on one, and Scheduled, Replicated or a declared Residency. An archive table
+  without `Postgres:ConnectionString` refuses to start, every tier change into or out of `Archive`
+  refuses boot with the supported path named, shard and node-local engines refuse archive writes
+  (declare them `Placement.Global`), and an applier that would have to rebuild over a truncated log
+  refuses rather than begin an archive with a hole (EventId 1611). Ad-hoc aggregates run over
+  archive tables. **Not yet in this release:** duplicate-key dead-lettering, restore trimming, and
+  the archive retention floor ([plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md)); until then,
+  back up Postgres with point-in-time recovery and see [docs/BACKUP.md](docs/BACKUP.md).
+
 ### Fixed
 
 - **A table switched from `Hot` to the relational backplane now gets its existing rows in

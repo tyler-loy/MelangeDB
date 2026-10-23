@@ -68,6 +68,9 @@ internal sealed record DiagnosticInfo(string DescriptorId, LocationInfo Location
         "MELANGE0016" => Diagnostics.ScheduleAtColumnMisplaced,
         "MELANGE0018" => Diagnostics.ShardByIsPrimaryKey,
         "MELANGE0022" => Diagnostics.ScheduledTablePlacement,
+        "MELANGE0024" => Diagnostics.ArchiveTablePublic,
+        "MELANGE0025" => Diagnostics.UniqueOnArchiveTable,
+        "MELANGE0026" => Diagnostics.ArchiveTableDeclaration,
         _ => throw new InvalidOperationException($"Unknown diagnostic id {id}."),
     };
 }

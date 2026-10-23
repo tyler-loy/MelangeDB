@@ -50,6 +50,9 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         // Resolving the engine is startup: its constructor runs log recovery and projection rebuild.
         var engine = (MelangeEngine)_provider.GetService(typeof(MelangeEngine))!;
         _engine = engine;
+
+        // Before anything can commit: an archive write with nowhere to go is lost at the first truncation.
+        RequirePostgresForArchive(engine.Schema, _monitor.CurrentValue.Postgres);
         _reloadBridge = _monitor.OnChange(next =>
         {
             CopyLiveKeys(next, engine);
@@ -89,6 +92,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         // being served, and silence here would look exactly like a working deployment.
         if (string.IsNullOrEmpty(_monitor.CurrentValue.Postgres.ConnectionString))
         {
+
             var backplane = engine.Schema.Tables.Where(t => t.Tier == StorageTier.HotWithRelationalBackplane).Select(t => t.Name).ToList();
             if (backplane.Count > 0)
                 LogBackplaneWithoutPostgres(_logger, backplane.Count, string.Join(", ", backplane));
@@ -97,6 +101,25 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         _state.Started = true;
         LogStarted(_logger, engine.Log.HeadLsn, engine.Schema.Tables.Count);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// An archive table without Postgres refuses to start. Unlike a backplane table, whose rows stay
+    /// in the hot store when no Postgres is configured, an archive table's rows are in no hot store
+    /// and no snapshot, so the first log truncation would lose them.
+    /// </summary>
+    internal static void RequirePostgresForArchive(SchemaRegistry schema, PostgresOptions postgres)
+    {
+        if (!string.IsNullOrEmpty(postgres.ConnectionString))
+            return;
+        var archive = schema.Tables.Where(static t => t.Tier == StorageTier.Archive).Select(static t => t.Name).ToList();
+        if (archive.Count == 0)
+            return;
+        throw new InvalidOperationException(
+            $"{archive.Count} table(s) declare Tier = Archive but no Postgres:ConnectionString is configured: " +
+            $"{string.Join(", ", archive)}. An archive table's rows live only in Postgres — they are in no hot store " +
+            "and no snapshot — so without AddPostgres(...) they would be lost the first time the log truncated. " +
+            "Configure Postgres, or declare the tables Hot.");
     }
 
     /// <summary>

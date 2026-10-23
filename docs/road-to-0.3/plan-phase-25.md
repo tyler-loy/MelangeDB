@@ -293,7 +293,9 @@ later; starting there would hide the one write that matters.
 per Postgres schema, and in a cluster Postgres lives on the hub. A per-player ledger is
 naturally `Partitioned`, which means every shard would need its own applier and checkpoint key into
 a shared archive. That is real and it is a follow-up; this phase refuses a `Partitioned` archive
-table when cluster mode is on, and allows `Global` ones.
+table when cluster mode is on, and allows `Global` ones. (As built: refused at write time rather
+than at boot. Shard and node-local engines refuse archive writes through the placement guards,
+which is where every other placement rule is already enforced.)
 
 **Archive rows in `.mbak`.** See the backup decision; the leaning is that the archive tier is
 backed up by Postgres's own tools.
@@ -487,6 +489,15 @@ that has to be wired into somebody's backup job.
 
 With tier in the recorded shape, every change is detectable at boot. The question is which ones
 proceed.
+
+**As built, so far: every change into or out of `Archive` is refused**, including the
+backplane → `Archive` path the leaning below allows. Implementing that path safely needs one thing
+the leaning missed: a mirror made by a 0.2 `Hot` → `Relational` switch never received the rows
+written before the switch (the gap the projected-tables registry closes from 0.3 on), and the
+registry seeds such a mirror as complete. Dropping hot rows on the strength of that mirror would
+lose them. The path needs the applier to re-verify or re-copy the table from the hot store before
+the engine drops it, which crosses the engine/applier boundary at boot. Until then the refusal names
+the reducer move (Insert into a new archive table, Delete from the old one) as the supported path.
 
 **Leaning:**
 

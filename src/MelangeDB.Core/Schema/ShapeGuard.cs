@@ -105,9 +105,11 @@ public static class ShapeCompatibility
     /// <summary>
     /// A tier change is classified by whether the rows stay in the hot store across it. Between
     /// <c>Hot</c> and <c>HotWithRelationalBackplane</c> they do — only the Postgres copy appears or
-    /// stops being maintained — so the change is additive and recorded as a new reign. Any other
-    /// pair is refused: a recorded tier this build does not know was written by a newer one.
-    /// A recorded tier of null predates tier recording and compares as unchanged.
+    /// stops being maintained — so the change is additive and recorded as a new reign. A change
+    /// into or out of <c>Archive</c> moves rows across the hot store's boundary and is refused,
+    /// with the supported path named; a recorded tier this build does not know was written by a
+    /// newer one and is refused too. A recorded tier of null predates tier recording and compares
+    /// as unchanged.
     /// </summary>
     private static void CompareTier(string name, string? recorded, string current, List<string> destructive, List<string> additive)
     {
@@ -119,6 +121,24 @@ public static class ShapeCompatibility
             additive.Add(current == ShapeTiers.HotWithRelationalBackplane
                 ? $"table '{name}': tier {recorded} -> {current} (Postgres copies its existing rows on its next start)"
                 : $"table '{name}': tier {recorded} -> {current} (its Postgres table is no longer maintained and is left as is)");
+            return;
+        }
+
+        if (current == ShapeTiers.Archive && IsHotResident(recorded))
+        {
+            destructive.Add(
+                $"table '{name}': tier {recorded} -> Archive would drop its rows from the hot store, and Postgres is not " +
+                "guaranteed to hold all of them. Declare a new Archive table instead and move rows into it with a reducer " +
+                "(Insert into the archive, Delete from this table, in batches) — the move is one write set, so it is atomic");
+            return;
+        }
+
+        if (recorded == ShapeTiers.Archive && IsHotResident(current))
+        {
+            destructive.Add(
+                $"table '{name}': tier Archive -> {current} would present an empty hot table as the whole truth: an archive " +
+                "table's rows live only in Postgres. Keep it Archive; to bring rows back, read them outside a reducer and " +
+                "insert them into a hot table through a reducer");
             return;
         }
 

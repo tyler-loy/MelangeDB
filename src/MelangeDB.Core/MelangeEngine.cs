@@ -20,6 +20,9 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly FileCommitLog _log;
     private readonly AutoIncSequencer _sequencer;
     private readonly ShapeResolution _shapes;
+
+    /// <summary>Tables whose rows live only in Postgres; see <see cref="WithoutArchiveOps"/>.</summary>
+    private readonly HashSet<TableId> _archiveTables;
     private readonly EngineTelemetry? _telemetry;
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
@@ -76,6 +79,7 @@ public sealed partial class MelangeEngine : IDisposable
         ArgumentNullException.ThrowIfNull(schema);
         _options = options;
         Schema = schema;
+        _archiveTables = schema.Tables.Where(static t => t.Tier == StorageTier.Archive).Select(static t => t.Id).ToHashSet();
         _time = timeProvider ?? TimeProvider.System;
         _randomProvider = randomProvider ?? SeededReducerRandomProvider.Instance;
         var loggers = loggerFactory ?? NullLoggerFactory.Instance;
@@ -131,7 +135,7 @@ public sealed partial class MelangeEngine : IDisposable
             foreach (var record in _log.ReadFrom(replayFrom))
             {
                 var replay = _shapes.TransformRecord(record);
-                store.Apply(replay);
+                store.Apply(WithoutArchiveOps(replay));
                 _sequencer.Observe(replay, schema);
                 RecoveredTailTimestamp = replay.Timestamp;
             }
@@ -142,7 +146,7 @@ public sealed partial class MelangeEngine : IDisposable
             HotStore = store;
             _readViewSource = store as IReadViewSource;
             Appliers = new ApplierPipeline(_log, _telemetry, _shapes.TransformRecord, _log.ReadUncapped);
-            Appliers.Register(new HotStoreApplier(store));
+            Appliers.Register(new HotStoreApplier(store, WithoutArchiveOps));
             _telemetry?.SetHotStoreStatisticsProvider(store.Statistics);
             _truncationFloors.Add((TruncationFloorNames.BackupPin, PinnedTruncationFloor));
             ReportCloneProvenance(options.CommitLog.Path);
@@ -202,6 +206,50 @@ public sealed partial class MelangeEngine : IDisposable
     /// unambiguously the one governing its own LSN — without the marker, a snapshot taken at
     /// exactly the pre-migration head could be either shape and recovery could not tell.
     /// </summary>
+    /// <summary>
+    /// The record as the hot store sees it: archive-tier ops removed, because those rows live only
+    /// in Postgres. Done here rather than in each store so that every <see cref="IHotStore"/>,
+    /// including one this assembly never saw, holds nothing of an archive table. The AutoInc
+    /// sequencer and every decoupled applier still see the whole record.
+    /// </summary>
+    private CommitRecord WithoutArchiveOps(CommitRecord record)
+    {
+        if (_archiveTables.Count == 0)
+            return record;
+
+        List<RowOp>? kept = null;
+        for (var i = 0; i < record.WriteSet.Count; i++)
+        {
+            var op = record.WriteSet[i];
+            if (_archiveTables.Contains(op.Table))
+            {
+                if (kept is null)
+                {
+                    kept = new List<RowOp>(record.WriteSet.Count);
+                    for (var j = 0; j < i; j++)
+                        kept.Add(record.WriteSet[j]);
+                }
+
+                continue;
+            }
+
+            kept?.Add(op);
+        }
+
+        return kept is null ? record : new CommitRecord
+        {
+            Lsn = record.Lsn,
+            FormatVersion = record.FormatVersion,
+            Timestamp = record.Timestamp,
+            Caller = record.Caller,
+            ReducerName = record.ReducerName,
+            Arguments = record.Arguments,
+            WriteSet = kept,
+            Events = record.Events,
+            SerializedLength = record.SerializedLength,
+        };
+    }
+
     private void CompleteShapeMigration(IHotStore store)
     {
         if (!_shapes.MigrationPending)

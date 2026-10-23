@@ -196,6 +196,12 @@ internal static class Emitter
 
     private static void EmitAccessors(StringBuilder builder, TableModel table)
     {
+        if (table.Tier == "Archive")
+        {
+            EmitArchiveAccessors(builder, table);
+            return;
+        }
+
         var row = table.TypeFqn;
         var handle = $"{table.TypeName}Handle";
         builder.AppendLine($"    /// <summary>Typed access to table '{table.TableName}' through the transactional view.</summary>");
@@ -269,6 +275,53 @@ internal static class Emitter
                 builder.AppendLine($"            _db.FilterRange<{row}>({Literal(column.Name)}, low, high);");
             }
 
+            builder.AppendLine("    }");
+        }
+    }
+
+    /// <summary>
+    /// An archive table's accessor: append and delete-by-key, nothing that reads. The absent
+    /// members are the documentation — a reducer cannot read rows that live only in Postgres.
+    /// </summary>
+    private static void EmitArchiveAccessors(StringBuilder builder, TableModel table)
+    {
+        var row = table.TypeFqn;
+        var handle = $"{table.TypeName}Handle";
+        builder.AppendLine($"    /// <summary>Append-only access to archive table '{table.TableName}': its rows live only in Postgres, so a reducer can add and delete them but never read them.</summary>");
+        builder.AppendLine($"    internal readonly struct {handle}");
+        builder.AppendLine("    {");
+        builder.AppendLine("        private readonly global::MelangeDB.IDbView _db;");
+        builder.AppendLine();
+        builder.AppendLine($"        public {handle}(global::MelangeDB.IDbView db) => _db = db;");
+        builder.AppendLine();
+        builder.AppendLine("        /// <summary>Appends a row. It reaches Postgres through the log; nothing in a reducer can read it back.</summary>");
+        builder.AppendLine($"        public {row} Insert({row} row) => _db.Insert(row);");
+        foreach (var column in table.Columns.Items)
+        {
+            if (column.IsPrimaryKey && column.IsKeyEncodable)
+            {
+                builder.AppendLine();
+                builder.AppendLine($"        public {table.TypeName}{column.Name}Accessor {column.Name} => new {table.TypeName}{column.Name}Accessor(_db);");
+            }
+        }
+
+        builder.AppendLine("    }");
+
+        foreach (var column in table.Columns.Items)
+        {
+            if (!column.IsPrimaryKey || !column.IsKeyEncodable)
+                continue;
+            var accessor = $"{table.TypeName}{column.Name}Accessor";
+            builder.AppendLine();
+            builder.AppendLine($"    /// <summary>Delete-by-key on archive table '{table.TableName}'.</summary>");
+            builder.AppendLine($"    internal readonly struct {accessor}");
+            builder.AppendLine("    {");
+            builder.AppendLine("        private readonly global::MelangeDB.IDbView _db;");
+            builder.AppendLine();
+            builder.AppendLine($"        public {accessor}(global::MelangeDB.IDbView db) => _db = db;");
+            builder.AppendLine();
+            builder.AppendLine("        /// <summary>Deletes the row with this key if Postgres holds one. Blind: a reducer cannot see whether it exists.</summary>");
+            builder.AppendLine($"        public void Delete({column.ClrFqn} key) => _db.Delete<{row}>(key);");
             builder.AppendLine("    }");
         }
     }

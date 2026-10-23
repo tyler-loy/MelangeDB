@@ -73,9 +73,11 @@ public partial struct Registration
 
 Four orthogonal knobs, and conflating any two of them is a design error:
 
-- **`Tier`** — *where the row is stored.* Hot (default) or HotWithRelationalBackplane — hot, with a
-  Postgres copy the applier projects from the log (called `Relational` until 0.3). Postgres is opt-in,
-  so a table only lands there if it asks to, and a deployment only needs Postgres if some table asks to.
+- **`Tier`** — *where the row is stored.* Hot (default); HotWithRelationalBackplane — hot, with a
+  Postgres copy the applier projects from the log (called `Relational` until 0.3); or Archive —
+  Postgres only, for unbounded history: reducers append and delete by key and cannot read, and the
+  rows are in no hot store, snapshot, or backup archive. Postgres is opt-in, so a table only lands
+  there if it asks to, and a deployment only needs Postgres if some table asks to.
 - **`Public`** — *may this table sync to clients at all?* **Private by default.** A private table is
   server-internal and no subscription may name it.
 - **`Residency`** — *must this table stay wholly in memory?* See §8.
@@ -299,6 +301,11 @@ without breaking anything: on restart, each applier resumes from its own checkpo
 - Postgres reads are eventually consistent with the log. A reducer that must read a relational table
   it just wrote needs the overlay, and external SQL readers may see a slightly stale tier.
 - Commit latency is bounded by the log's fsync policy, which is therefore configurable.
+- **Archive tables are the one exception to "the log is the database".** Their rows ride the log
+  like any write, but once the log truncates past them Postgres holds the only copy, because they
+  were never in the hot store. Postgres is therefore not disposable for those tables: it needs its
+  own backups, point-in-time recovery included. See
+  [plan-phase-25.md](road-to-0.3/plan-phase-25.md).
 
 ### Domain events: the bus falls out of the log
 

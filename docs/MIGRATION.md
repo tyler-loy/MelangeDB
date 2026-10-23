@@ -90,6 +90,13 @@ change), and the new tier governs from the marker.
   longer want it. Moving the table back onto the backplane later copies it afresh rather than
   resuming the stale copy.
 
+A change into or out of `Archive` is refused at boot, because it moves rows across the hot store's
+boundary. `Hot` or backplane → `Archive` would drop the table's rows from the hot store with no
+guarantee Postgres holds all of them; `Archive` → anything would boot an empty hot table whose rows
+live only in Postgres. The supported path is the one the tier is designed around: declare a new
+`Archive` table and move rows into it with a reducer — `Insert` into the archive and `Delete` from the
+hot table in the same transaction, in batches, which makes each move atomic.
+
 A recorded tier this build does not recognize — one written by a newer MelangeDB — is refused like any
 destructive change: booting it under a tier whose rows live elsewhere would present an empty table as
 the whole truth.

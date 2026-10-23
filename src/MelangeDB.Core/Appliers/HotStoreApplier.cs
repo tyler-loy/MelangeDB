@@ -7,16 +7,23 @@ namespace MelangeDB.Core;
 public sealed class HotStoreApplier : ILogApplier
 {
     private readonly IHotStore _store;
+    private readonly Func<CommitRecord, CommitRecord>? _filter;
 
-    public HotStoreApplier(IHotStore store)
+    /// <param name="store">The projection to advance.</param>
+    /// <param name="filter">
+    /// Narrows each record to what the hot store holds — the engine passes one that removes
+    /// archive-tier ops, whose rows live only in Postgres.
+    /// </param>
+    public HotStoreApplier(IHotStore store, Func<CommitRecord, CommitRecord>? filter = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         _store = store;
+        _filter = filter;
     }
 
     public string Name => "hot-store";
 
     public ulong AppliedLsn => _store.AppliedLsn;
 
-    public void Apply(CommitRecord record) => _store.Apply(record);
+    public void Apply(CommitRecord record) => _store.Apply(_filter is null ? record : _filter(record));
 }

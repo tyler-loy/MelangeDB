@@ -43,6 +43,12 @@ One declaration, three problems solved — replicate it everywhere, pin it in RA
 `Global` converges with the Postgres tier: **the hub's `Global` tables are the relational backplane.** The
 "servicey" split you'd already built by hand is the same split the cluster needs.
 
+**Archive tables are written on the hub.** An archive table's rows reach Postgres only through the
+applier on the engine that wrote them, and shard nodes run none, so shard and node-local engines refuse
+archive writes. Declare archive tables `Placement.Global`. Partitioned archive tables — a per-player
+ledger written where the player lives — are a recorded follow-up in
+[plan-phase-25.md](road-to-0.3/plan-phase-25.md).
+
 ### Partitioned tables are readable beyond their owner
 
 "Some tables will be alive *in part* on all nodes" — yes, and this is a distinct thing from `Replicated`.

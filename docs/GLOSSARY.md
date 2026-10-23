@@ -18,7 +18,7 @@ Conflating any two of these is a design error. A table declares all three.
 
 | | Question it answers | Values |
 | --- | --- | --- |
-| **Tier** | *Which storage engine holds it?* | `Hot` (default) or `HotWithRelationalBackplane` (hot, plus a Postgres copy) |
+| **Tier** | *Which storage engine holds it?* | `Hot` (default), `HotWithRelationalBackplane` (hot, plus a Postgres copy), or `Archive` (Postgres only) |
 | **Placement** | *Which node in a cluster holds it?* | `Partitioned`, `Replicated`, `Global`, `Local` |
 | **Residency** | *Must it stay wholly in memory?* | `Resident`, `Paged` (default), `Auto` |
 
@@ -585,6 +585,15 @@ runs in owner mode. The per-caller half of the two-mode contract, per the guest-
 gate, owner capability is a claim it issues, and a caller without it is refused — never silently downgraded to
 policy-enforced.
 
+**Archive tier** — `Tier = Archive`: a table that lives only in Postgres, for unbounded history such as a
+wallet ledger whose recent rows stay in a hot table. Writes ride the commit log and the Postgres applier
+projects them, but the engine strips them from every record before the hot store sees it, so they are in no
+hot store, snapshot, or `.mbak`. Reducers can `Insert` and blind-`Delete` by key, and nothing that reads is
+generated. The one place the log is not the whole truth: once it truncates past an archived row, Postgres
+holds the only copy. Requires `AddPostgres(...)`; refused at compile time when Public, `[Unique]`, Scheduled,
+Replicated, or declaring a Residency (MELANGE0024–0026). See
+[plan-phase-25.md](road-to-0.3/plan-phase-25.md).
+
 **Projected-tables registry (`__melange_projected`)** — The Postgres applier's record of which backplane tables
 it holds a complete copy of, beside its checkpoint. A declared backplane table missing from it is new to the
 projection — its history is behind the checkpoint, skipped while the table was hot — and is copied from the
@@ -740,7 +749,7 @@ the old row and an insert of the new one.
 registration order and survives restarts. Write-set ops and log records are keyed by table id, never by CLR
 type. Collisions are detected at schema registration.
 
-**Tier** — Which storage engine holds a table: `Hot` or `HotWithRelationalBackplane`.
+**Tier** — Which storage engine holds a table: `Hot`, `HotWithRelationalBackplane`, or `Archive`.
 
 **Truncation floor** — A named holder of the commit log: a mechanism that still needs old records, providing
 the highest LSN compaction may remove from its perspective. Log truncation takes the minimum across all of

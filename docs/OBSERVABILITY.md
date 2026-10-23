@@ -413,7 +413,10 @@ and are told what they are missing (08); `1609 PostgresTableCopied` — a table 
 backplane (switched from `Hot`, or a table Postgres never held) was filled from the hot store at one
 consistent LSN before the applier resumed, with its row count; Warning, because a whole table was replaced
 automatically — and `1610 PostgresTableUnprojected` — a table left the backplane, and its Postgres table is
-left as is and no longer maintained (road-to-0.3 phase 25); `1700 ClusterHubStarted` (naming the node-link listener's bound
+left as is and no longer maintained — and `1611 PostgresArchiveUnrecoverable` — the applier has no
+checkpoint and the log is truncated while archive tables are declared, so it stalls rather than start an
+archive with a hole: their rows below the truncation base exist only in a Postgres backup (road-to-0.3
+phase 25); `1700 ClusterHubStarted` (naming the node-link listener's bound
 port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
 loud: how long the silence was and how many shards moved under bumped fencing tokens —
 `1703 ClusterLinkAuthFailed` (a link that could not prove the cluster secret; a rogue dialer or a

@@ -58,10 +58,13 @@ public static class ShapeTiers
 
     public const string HotWithRelationalBackplane = "HotWithRelationalBackplane";
 
+    public const string Archive = "Archive";
+
     public static string NameOf(StorageTier tier) => tier switch
     {
         StorageTier.Hot => Hot,
         StorageTier.HotWithRelationalBackplane => HotWithRelationalBackplane,
+        StorageTier.Archive => Archive,
         _ => throw new ArgumentOutOfRangeException(nameof(tier), tier, "No sidecar name for this tier."),
     };
 }

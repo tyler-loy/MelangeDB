@@ -163,6 +163,15 @@ refusal's same-epoch cousin — a checkpoint ahead of the log's head, the hand-r
 swap — is EventId 1608. Both refusals' remediations are tested to recover when followed
 literally.
 
+**Archive tables change this.** A table declared `Tier = Archive` lives only in Postgres: its rows
+are not in the archive, and once the log truncates past them Postgres holds the only copy. So for a
+deployment with archive tables, Postgres is part of the backup, not a projection beside it — back it
+up with point-in-time recovery (WAL archiving), and restore it to the same moment as the log. **Do
+not follow the empty-schema remediation above** in such a deployment: it deletes the archive's rows
+for good, and with the log truncated the applier then refuses to start (EventId 1611) rather than
+begin an archive with a hole. Trimming an archive back to a restored log's history is planned
+([plan-phase-25.md](road-to-0.3/plan-phase-25.md)).
+
 After restoring, point `CommitLog:Path` at the restored directory (or place it where your
 configuration already points). The hot-store directory is scratch and is rebuilt on boot.
 

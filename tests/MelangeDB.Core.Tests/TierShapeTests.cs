@@ -188,12 +188,13 @@ public class TierShapeTests : IDisposable
         using (var first = Boot(options, StorageTier.Hot))
             Seed(first, 1);
 
-        // What a newer build's Archive table looks like to this one: rows that are not in its hot
-        // store. Booting it as Hot would present an empty table as the whole truth.
-        RewriteTiers(options, tier: "Archive");
+        // What a newer build's tier looks like to this one: a name it cannot place, so it cannot
+        // know whether the rows are in its hot store. Booting it as Hot could present an empty
+        // table as the whole truth.
+        RewriteTiers(options, tier: "Columnar");
 
         var refused = Assert.Throws<SchemaShapeException>(() => Boot(options, StorageTier.Hot));
         var reason = Assert.Single(refused.Reasons);
-        Assert.Contains("tier Archive -> Hot is not a supported change", reason, StringComparison.Ordinal);
+        Assert.Contains("tier Columnar -> Hot is not a supported change", reason, StringComparison.Ordinal);
     }
 }
