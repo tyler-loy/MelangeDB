@@ -118,6 +118,16 @@ All packages ship together at one version; there is no per-package versioning. S
   client only through a type its author wrote — naming the member path, and MELANGE0030 a producer
   sharing its name with a reducer or another producer.
 
+  `MelangeProducerHost.CallAsync` runs a call: arguments validated, a client call rate limited
+  (`RateLimit:*`) and authorized (the producer's `IReducerPolicy`, or `Policies:DefaultReducerPosture`)
+  before anything is pinned; then one read view is pinned for the whole call (`ctx.Db`, `ctx.Lsn`),
+  the body runs under `Producers:TimeoutSeconds`, the result is encoded under
+  `Producers:MaxResponseBytes` while the pin is still held, and the answer waits for the log to be
+  durable through the pinned LSN, as a reducer's acknowledgement does. A producer that invokes a
+  reducer is refused. The unpoliced report lists producers (EventId 1107), and a hot store without
+  pinned reads refuses to start once any producer is registered. Telemetry: the `melange.producer`
+  span and `melange.producer.calls`, `.duration`, and `.pin.duration`.
+
 - **`MelangeEngine.OpenReadView()` — committed state pinned at one LSN, readable off the write
   lock.** A `PinnedReadView` is a read-only `IDbView` with an `Lsn`, safe to read from several
   threads (each read and each step of a lazy query runs under its own lock), that throws on a read

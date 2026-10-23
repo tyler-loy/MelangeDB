@@ -104,6 +104,7 @@ Source name: `MelangeDB`.
 | `melange.subscription.delta` | 03 | `melange.table`, `melange.subscribers` | Sampled — this is the highest-frequency operation in the system and must not be traced per row op at full rate. |
 | `melange.event.handle` | 06 | `melange.event.type`, `melange.handler` | **Linked, not parented** — see below. |
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
+| `melange.producer` | 26 | `melange.producer.name`, `melange.producer.outcome` (`ok`/`invalid_args`/`rate_limited`/`denied`/`rejected`/`timeout`/`too_many_bytes`/`error`); `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off | Parented to the client's `traceparent` when one was sent, as `melange.reducer` is. Producers write nothing, so no `melange.commit` span ever sits under one. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
 A `melange.reducer` span that exceeds `Telemetry:SlowReducerMs` additionally carries a
@@ -272,6 +273,9 @@ Meter name: `MelangeDB`.
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |
 | `melange.connections.active` | gauge | `{conn}` | — | 03 |
 | `melange.ratelimit.rejected` | counter | `{call}` | `reducer` | 04 |
+| `melange.producer.calls` | counter | `{call}` | `producer`, `outcome` | 26 |
+| `melange.producer.duration` | histogram | `ms` | `producer` | 26 |
+| `melange.producer.pin.duration` | histogram | `ms` | `producer` | 26 |
 | `melange.policy.rows_filtered` | counter | `{row}` | `table` | 04 |
 | `melange.scheduler.overruns` | counter | `{tick}` | `reducer` | 05 |
 | `melange.scheduler.tick.duration` | histogram | `ms` | `reducer` | 05 |
@@ -470,6 +474,10 @@ tick) — and `1723 ShardHasNoTimerRows`, a shard that opened holding no rows in
 last one is worth an alert in a world whose shards are created by players arriving: the state it names is
 otherwise completely silent, because a shard with no timers serves reads and writes perfectly and simply
 never ticks.
+
+Since phase 26: `1107 UnpolicedProducers`, the unpoliced report's producer half — producers with no
+`[Producer(Policy = ...)]`, each an open read of whatever it returns. It is logged beside `1104` under the same
+`Policies:UnpolicedReducerReport` setting, and `Fail` refuses to start naming reducers and producers together.
 
 Reaping a shard (issue #112) is the one cluster operation that destroys durable state, so both of its
 receipts are warnings and the refusal is not: `1747 ShardReaped` (node-side — the shard held nothing of

@@ -81,6 +81,7 @@ public static class ServiceCollectionExtensions
             provider.GetService<IHotStoreProvider>(),
             randomProvider: provider.GetService<IReducerRandomProvider>()));
         services.TryAddSingleton<MelangeReducerHost>();
+        services.TryAddSingleton<MelangeProducerHost>();
         services.TryAddSingleton(provider => new MelangeScheduler(
             provider.GetRequiredService<MelangeEngine>(),
             provider.GetRequiredService<MelangeReducerHost>(),

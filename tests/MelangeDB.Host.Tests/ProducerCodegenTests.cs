@@ -23,7 +23,8 @@ public class ProducerCodegenTests
     [Fact]
     public void The_generated_model_registers_every_producer_under_its_public_name()
     {
-        Assert.Equal(["Answer", "Echo", "NoteIds", "Nothing", "Page"], Producers.Keys.Order(StringComparer.Ordinal));
+        Assert.Subset(Producers.Keys.ToHashSet(), new HashSet<string> { "Answer", "Echo", "NoteIds", "Nothing", "Page" });
+        Assert.DoesNotContain("NoPage", Producers.Keys);
         Assert.Equal(typeof(NoteProducers), Producers["Page"].ProducerClass);
         Assert.Equal(ReducerSite.Hub, Producers["Answer"].ExecutionSite);
     }

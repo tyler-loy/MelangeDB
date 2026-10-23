@@ -26,6 +26,8 @@ public sealed class MelangeDbOptions
 
     public RateLimitOptions RateLimit { get; set; } = new();
 
+    public ProducersOptions Producers { get; set; } = new();
+
     public SqlOptions Sql { get; set; } = new();
 
     public BulkOptions Bulk { get; set; } = new();
@@ -432,6 +434,23 @@ public sealed class RateLimitOptions
 
     /// <summary>Per-reducer overrides of <see cref="ReducerCallsPerSecond"/>, keyed by reducer name.</summary>
     public Dictionary<string, int> PerReducer { get; set; } = new(StringComparer.Ordinal);
+}
+
+/// <summary>Producer call limits (<c>MelangeDb:Producers:*</c>); see docs/design/producers.md.</summary>
+public sealed class ProducersOptions
+{
+    /// <summary>
+    /// How long one call may run before its <c>CancellationToken</c> fires and it answers
+    /// <c>timeout</c>. Also bounds how long a call holds its pinned read view, and so how long the
+    /// hot store keeps superseded versions for it.
+    /// </summary>
+    public double TimeoutSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// The largest encoded result a call may return; past it the call answers <c>too_many_bytes</c>.
+    /// Encoding stops at the cap rather than building the whole answer first.
+    /// </summary>
+    public int MaxResponseBytes { get; set; } = 1024 * 1024;
 }
 
 /// <summary>Whether ad-hoc SQL results pass through row and column policies.</summary>

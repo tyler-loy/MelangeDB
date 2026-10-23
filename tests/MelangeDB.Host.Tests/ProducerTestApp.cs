@@ -1,3 +1,5 @@
+using MelangeDB.Core;
+
 namespace MelangeDB.Host.Tests;
 
 public enum Mood : byte
@@ -64,4 +66,70 @@ public sealed class NoteProducers
     /// <summary>A lazy query over the pinned view, returned unmaterialized: the encoder reads it while the pin is held.</summary>
     [Producer]
     public IEnumerable<ulong> NoteIds(ProducerContext ctx) => ctx.Db.Note.Iter().Select(static note => note.Id);
+}
+
+/// <summary>Lets a test hold a producer mid-call while it commits underneath it.</summary>
+public sealed class ProducerGate
+{
+    public TaskCompletionSource Entered { get; private set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource Release { get; private set; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void Reset()
+    {
+        Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+}
+
+/// <summary>Allows a caller only once they have written a note — a policy that reads committed state.</summary>
+public sealed class AuthorsOnly : IReducerPolicy
+{
+    public bool MayCall(string reducerName, PolicyContext context) =>
+        context.Db.Note.Author.Filter(context.Caller).Any();
+}
+
+/// <summary>Producers that exercise the host: the pin, the timeout, the policy, the no-write rule.</summary>
+public sealed class HostedProducers(ProducerGate gate, MelangeReducerHost reducers)
+{
+    /// <summary>Counts notes, waits for the test to commit more, and counts again: both counts are the pin's.</summary>
+    [Producer]
+    public async Task<long[]> CountAcrossACommit(ProducerContext ctx)
+    {
+        var before = ctx.Db.Note.Count;
+        gate.Entered.TrySetResult();
+        await gate.Release.Task.WaitAsync(ctx.CancellationToken);
+        return [before, ctx.Db.Note.Count];
+    }
+
+    [Producer]
+    public async Task<int> WaitForCancellation(ProducerContext ctx)
+    {
+        await Task.Delay(Timeout.Infinite, ctx.CancellationToken);
+        return 0;
+    }
+
+    /// <summary>Ignores its token: the host abandons it at the timeout anyway.</summary>
+    [Producer]
+    public async Task<int> IgnoreCancellation(ProducerContext ctx)
+    {
+        await gate.Release.Task;
+        return 0;
+    }
+
+    [Producer]
+    public string Big(ProducerContext ctx, int length) => new('x', length);
+
+    [Producer]
+    public int TryToWrite(ProducerContext ctx)
+    {
+        reducers.Call("AddNote", ctx.Caller, "from a producer", 1.0);
+        return 0;
+    }
+
+    [Producer]
+    public int Refuse(ProducerContext ctx) => throw new RejectedException("No.");
+
+    [Producer(Policy = typeof(AuthorsOnly))]
+    public long MyNoteCount(ProducerContext ctx) => ctx.Db.Note.Author.Filter(ctx.Caller).LongCount();
 }

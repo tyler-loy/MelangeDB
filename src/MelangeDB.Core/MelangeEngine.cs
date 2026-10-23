@@ -424,6 +424,23 @@ public sealed partial class MelangeEngine : IDisposable
     private IDbView? _committedView;
 
     /// <summary>
+    /// Set for the async flow of a producer call. A producer commits nothing, so a reducer started
+    /// from inside one — through an injected host or engine, which the nested-call guard cannot see
+    /// because it tracks reducer bodies on a thread — is refused.
+    /// </summary>
+    internal static readonly AsyncLocal<bool> InProducer = new();
+
+    private static void ThrowIfInProducer(string reducerName)
+    {
+        if (InProducer.Value)
+        {
+            throw new InvalidOperationException(
+                $"A producer cannot invoke a reducer ('{reducerName}'): a producer commits nothing. " +
+                "Do the write in a reducer the client calls, or move the read into the reducer.");
+        }
+    }
+
+    /// <summary>
     /// Whether the hot store offers pinned reads (<see cref="IReadViewSource"/>), which is what
     /// <see cref="OpenReadView"/>, snapshot isolation, and producers need. Both shipped stores do.
     /// </summary>
@@ -502,6 +519,8 @@ public sealed partial class MelangeEngine : IDisposable
                 "Extract shared logic into a plain method both reducers call.");
         }
 
+        ThrowIfInProducer(reducerName);
+
         try
         {
             _inReducer.Value = true;
@@ -553,6 +572,8 @@ public sealed partial class MelangeEngine : IDisposable
                 "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
                 "Extract shared logic into a plain method both reducers call.");
         }
+
+        ThrowIfInProducer(reducerName);
 
         if (isolation == Isolation.Snapshot && ReadViewOrFallback() is { } source)
         {

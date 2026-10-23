@@ -53,6 +53,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
 
         // Before anything can commit: an archive write with nowhere to go is lost at the first truncation.
         RequirePostgresForArchive(engine.Schema, _monitor.CurrentValue.Postgres);
+        RequireReadViewsForProducers(engine, (MelangeProducerHost?)_provider.GetService(typeof(MelangeProducerHost)));
         _reloadBridge = _monitor.OnChange(next =>
         {
             CopyLiveKeys(next, engine);
@@ -104,6 +105,21 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     }
 
     /// <summary>
+    /// Producers need a store that can pin a read view: a producer is async, so unlike a
+    /// snapshot-isolated reducer it has no serialized fallback — it cannot hold the write lock across
+    /// an await. Refused at startup, naming the capability, rather than at the first call.
+    /// </summary>
+    internal static void RequireReadViewsForProducers(MelangeEngine engine, MelangeProducerHost? producers)
+    {
+        if (producers is null || producers.Producers.Count == 0 || engine.SupportsReadViews)
+            return;
+        throw new InvalidOperationException(
+            $"{producers.Producers.Count} producer(s) are registered, but the hot store ({engine.HotStore.GetType().Name}) does not " +
+            "implement IReadViewSource. A producer reads one pinned view for its whole call; use a store that can pin one " +
+            "(the in-memory and FASTER stores both can).");
+    }
+
+    /// <summary>
     /// An archive table without Postgres refuses to start. Unlike a backplane table, whose rows stay
     /// in the hot store when no Postgres is configured, an archive table's rows are in no hot store
     /// and no snapshot, so the first log truncation would lose them.
@@ -132,19 +148,24 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         var mode = _monitor.CurrentValue.Policies.UnpolicedReducerReport;
         if (mode == UnpolicedReducerReport.Off)
             return;
-        var host = (MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost));
-        if (host is null || host.UnpolicedReducers is not { Count: > 0 } unpoliced)
+        var reducers = ((MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)))?.UnpolicedReducers ?? [];
+        var producers = ((MelangeProducerHost?)_provider.GetService(typeof(MelangeProducerHost)))?.UnpolicedProducers ?? [];
+        if (reducers.Count == 0 && producers.Count == 0)
             return;
 
-        var list = string.Join(", ", unpoliced);
         if (mode == UnpolicedReducerReport.Fail)
         {
+            var named = string.Join(", ", reducers.Concat(producers));
             throw new InvalidOperationException(
-                $"Policies:UnpolicedReducerReport is Fail and {unpoliced.Count} client-callable reducer(s) declare no " +
-                $"authorization policy: {list}. Attach [Reducer(Policy = typeof(...))] to each, or lower the report to Warn.");
+                $"Policies:UnpolicedReducerReport is Fail and {reducers.Count + producers.Count} client-callable reducer(s) or producer(s) " +
+                $"declare no authorization policy: {named}. Attach [Reducer(Policy = typeof(...))] or [Producer(Policy = typeof(...))] " +
+                "to each, or lower the report to Warn.");
         }
 
-        LogUnpolicedReducers(_logger, unpoliced.Count, list);
+        if (reducers.Count > 0)
+            LogUnpolicedReducers(_logger, reducers.Count, string.Join(", ", reducers));
+        if (producers.Count > 0)
+            LogUnpolicedProducers(_logger, producers.Count, string.Join(", ", producers));
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
@@ -158,6 +179,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         if (_engine is { } engine)
         {
             ((MelangeReducerHost?)_provider.GetService(typeof(MelangeReducerHost)))?.SignalStopping();
+            ((MelangeProducerHost?)_provider.GetService(typeof(MelangeProducerHost)))?.SignalStopping();
             engine.Drain();
             engine.Checkpoint();
             LogStopped(_logger, engine.Log.HeadLsn);
@@ -256,4 +278,9 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         Message = "{Count} client-callable reducer(s) declare no authorization policy: {Reducers}. " +
             "Each is callable by any authenticated client (Policies:DefaultReducerPosture).")]
     private static partial void LogUnpolicedReducers(ILogger logger, int count, string reducers);
+
+    [LoggerMessage(EventId = 1107, EventName = "UnpolicedProducers", Level = LogLevel.Warning,
+        Message = "{Count} producer(s) declare no authorization policy: {Producers}. " +
+            "Each is an open read of whatever it returns, callable by any authenticated client (Policies:DefaultReducerPosture).")]
+    private static partial void LogUnpolicedProducers(ILogger logger, int count, string producers);
 }

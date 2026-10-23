@@ -299,12 +299,14 @@ internal static class TestApp
         builder.Services.AddSingleton<SingletonProbe>();
         builder.Services.AddSingleton<SchedulerProbe>();
         builder.Services.AddSingleton<EventProbe>();
+        builder.Services.AddSingleton<ProducerGate>();
 
         builder.Services.AddMelangeDb(melange =>
         {
             melange
                 .AddTablesFrom(typeof(Note).Assembly)
-                .AddReducersFrom(typeof(NoteReducers).Assembly);
+                .AddReducersFrom(typeof(NoteReducers).Assembly)
+                .AddProducersFrom(typeof(NoteProducers).Assembly);
             if (events is null)
                 melange.AddEventHandlersFrom(typeof(Note).Assembly);
             else
@@ -329,6 +331,8 @@ internal static class TestApp
     public static MelangeEngine Engine(this IHost host) => host.Services.GetRequiredService<MelangeEngine>();
 
     public static MelangeReducerHost Reducers(this IHost host) => host.Services.GetRequiredService<MelangeReducerHost>();
+
+    public static MelangeProducerHost Producers(this IHost host) => host.Services.GetRequiredService<MelangeProducerHost>();
 
     public static MelangeEventBus Bus(this IHost host) => host.Services.GetRequiredService<MelangeEventBus>();
 }

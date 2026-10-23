@@ -340,7 +340,9 @@ change that adds them. Added by the frame-tick pump, issue #26.
 | `RateLimit:Enabled` | bool | `true` | live | 04 | |
 | `RateLimit:ReducerCallsPerSecond` | int | `20` | live | 04 | Default sustained rate; the bucket is per identity **per reducer**, so one spammed reducer cannot starve the rest of a player's actions. Rejected before a transaction opens, so it costs no log volume. Client-originated calls only. |
 | `RateLimit:BurstCapacity` | int | `60` | live | 04 | Bursts pass at human click speed; sustained rates are what actually stop macros. Buckets that have refilled to this are evicted, which changes no decision: a bucket is created full, so a refilled one is indistinguishable from one that never existed. A caller mid-burst is never evicted, so the sweep can never be a way through the limit. |
-| `RateLimit:PerReducer:<ReducerName>` | int | — | live | 04 | Per-reducer override of the global rate. |
+| `RateLimit:PerReducer:<ReducerName>` | int | — | live | 04 | Per-reducer override of the global rate. Producers share these buckets' settings, keyed by the producer's name (one namespace with reducers), each with a bucket of its own. |
+| `Producers:TimeoutSeconds` | double | `10` | live | 26 | How long one producer call may run. At the deadline its `CancellationToken` fires and the call answers `timeout`, whether or not the body honours the token — a body that ignores it is abandoned, and its pinned read view released. This is also the bound on how long one call makes the hot store keep superseded row versions. |
+| `Producers:MaxResponseBytes` | int | `1048576` | live | 26 | The largest encoded producer result. Encoding stops at the cap rather than building the whole answer, and the call answers `too_many_bytes`. Page a large history through the producer's own arguments. |
 
 ## Scheduling
 
