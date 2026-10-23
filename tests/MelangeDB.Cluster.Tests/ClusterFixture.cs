@@ -313,6 +313,7 @@ internal sealed class ClusterFixture : IAsyncDisposable
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Mob).Assembly)
             .AddReducersFrom(typeof(ClusterReducers).Assembly)
+            .AddProducersFrom(typeof(ClusterProducers).Assembly)
             .AddEventHandler<MobDiedHandler>()
             .AddEventHandler<GiftSagaHandler>());
         if (_spatial)

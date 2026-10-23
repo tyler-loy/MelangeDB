@@ -136,8 +136,10 @@ All packages ship together at one version; there is no per-package versioning. S
   connection closes, and holds at most `Producers:MaxConcurrentPerConnection` at once (EventId 1206
   for an unexpected failure). Over HTTP, `POST {path}/producers/{name}` takes a JSON array of
   arguments and answers `{"ok", "lsn", "result"}`, the result rendered as JSON under the response
-  cap while the read view is still pinned. The cluster gateway still settles on version 2 until it
-  routes producer calls.
+  cap while the read view is still pinned. In a cluster, producers run where the reducer rules put
+  them — the hub for `Global`/`Replicated` reads, the caller's shard otherwise, `[Producer(Site = ...)]`
+  to override — and the gateway, now on version 3, routes and handoff-holds them as it does reducer
+  calls; every shard engine gets its own producer host.
 
   The schema manifest carries producers — **format 2**, written only by a module that has them, so
   every other module's manifest and schema hash are unchanged — with each producer's parameters

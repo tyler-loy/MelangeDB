@@ -30,6 +30,7 @@ internal sealed class GatewayRuntime
         Options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
         Serializer = new MessagePackFrameSerializer();
         Reducers = services.GetRequiredService<ReducerRegistry>();
+        Producers = services.GetService<ProducerRegistry>() ?? new ProducerRegistry([]);
         Schema = services.GetRequiredService<SchemaRegistry>();
         Strategy = services.GetService<IShardStrategy>();
         Logger = (services.GetService<ILoggerFactory>() ?? Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance)
@@ -51,6 +52,9 @@ internal sealed class GatewayRuntime
     public IMelangeSerializer Serializer { get; }
 
     public ReducerRegistry Reducers { get; }
+
+    /// <summary>The producers, for routing: each call goes where its execution site says.</summary>
+    public ProducerRegistry Producers { get; }
 
     public SchemaRegistry Schema { get; }
 

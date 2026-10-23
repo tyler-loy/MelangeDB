@@ -124,6 +124,11 @@ is still in flight, and the overlay reads only durable records.
 - The gateway routes `CallProducer` frames as it routes reducer calls, and speaks version 3 on both
   sides.
 
+**As built:** PR 4 shipped the gateway settling on version 2, so clients through it never sent a
+producer frame it could not route; this PR lifts it to 3. Shard-bound producer calls join the
+handoff hold queue with reducer calls, and a held call that cannot be delivered is refused in the
+frame its kind answers with.
+
 ### 7. The wallet sample and the docs
 
 - The wallet's anonymous `/wallet/{owner}/archive` endpoint becomes a `History` producer, scoped to

@@ -152,10 +152,16 @@ internal sealed partial class ShardRuntime : IDisposable
 
         ReducerHost = new MelangeReducerHost(
             Engine, reducers, services.GetRequiredService<IServiceScopeFactory>(), options, time);
+        ProducerHost = new MelangeProducerHost(
+            Engine,
+            services.GetService<ProducerRegistry>() ?? new ProducerRegistry([]),
+            services.GetRequiredService<IServiceScopeFactory>(),
+            options,
+            time);
         Scheduler = new MelangeScheduler(Engine, ReducerHost, options, loggerFactory, time);
         Transport = new MelangeTransport(
             Engine, ReducerHost, options, time, loggerFactory, authenticator, sessions,
-            new PolicySet(services, schema));
+            new PolicySet(services, schema), producers: ProducerHost);
 
         // A shard is created the first time a session resolves to it, and this engine opened
         // empty: its scheduled tables are Local, so their timer rows live here and nowhere else,
@@ -179,6 +185,12 @@ internal sealed partial class ShardRuntime : IDisposable
     public MelangeEngine Engine { get; }
 
     public MelangeReducerHost ReducerHost { get; }
+
+    /// <summary>
+    /// This shard's producer host: shard-site producers run here, reading this shard's engine — the
+    /// player's partitioned rows — through a view pinned on it.
+    /// </summary>
+    public MelangeProducerHost ProducerHost { get; }
 
     public MelangeScheduler Scheduler { get; }
 

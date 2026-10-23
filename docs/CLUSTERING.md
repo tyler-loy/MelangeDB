@@ -134,7 +134,7 @@ developer needs to get placement right.
 
 ### The HTTP surface is node-local
 
-`MapMelangeSocket` maps `/call/{reducer}`, `/bulk`, `/sql`, and `/ticket` against the engine
+`MapMelangeSocket` maps `/call/{reducer}`, `/producers/{producer}`, `/bulk`, `/sql`, and `/ticket` against the engine
 registered in DI — **this node's engine, not a shard's.** A shard node's `ShardRuntime` builds its
 own engine per owned shard, so the HTTP endpoints on a shard node reach none of them; the shard
 engines are reachable only over the internal `/{path}/shard/{shardKey}` sockets, which are
@@ -580,6 +580,14 @@ from its key on the first transfer. The shard id is its own column.
   `Hub` when every touch is `Global`/`Replicated`, `Shard` otherwise, including bodies the analysis cannot
   see through (which fail loudly on the shard if they were really hub-shaped, with
   `[Reducer(Site = ReducerSite.Hub)]` as the stated fix). The gateway routes calls by it.
+- **Producers follow the same rules** (phase 26). A producer reading only `Global` and `Replicated`
+  tables runs on the hub, against a view pinned on the hub's engine; one reading `Partitioned` rows runs
+  on the caller's shard, against that shard's engine; `[Producer(Site = ...)]` overrides, and an opaque body
+  goes to the shard. The gateway speaks protocol version 3 and routes `CallProducer` frames exactly as it
+  routes reducer calls — shard-bound ones are held through a handoff and replayed on whichever side ends up
+  authoritative, because a view pinned on a shard mid-transfer would read a world about to be released.
+  An archive table is `Global`, so a producer that merges hot rows with archive history through
+  `IArchiveReader` is hub-site whenever its hot rows are `Global` too, as the wallet's are.
 - **A shard may itself be replicated** (Raft across nodes) for HA later, independently of this design.
 
 ## Two axes of scale, not one

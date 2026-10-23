@@ -37,7 +37,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     private readonly Dictionary<uint, bool> _subscriptionOnShard = [];
     private readonly Dictionary<uint, byte[]> _shardSubscribeFrames = [];
     private readonly Dictionary<ulong, Task<UpstreamSession>> _preopened = [];
-    private readonly List<(byte[] Bytes, uint RequestId)> _heldCalls = [];
+    private readonly List<(byte[] Bytes, uint RequestId, bool IsProducer)> _heldCalls = [];
     private readonly CancellationTokenSource _closed = new();
     private AuthResult? _session;
     private UpstreamSession? _hub;
@@ -130,7 +130,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         switch (frame)
         {
             case CallReducerFrame call:
-                await RouteCallAsync(call, bytes, ct).ConfigureAwait(false);
+                await RouteCallAsync(call.RequestId, IsShardReducer(call.Reducer), isProducer: false, bytes, ct).ConfigureAwait(false);
+                break;
+            case CallProducerFrame call:
+                if (_protocolVersion < 3)
+                    throw new InvalidOperationException($"CallProducer requires protocol version 3; this connection negotiated {_protocolVersion}.");
+                await RouteCallAsync(call.RequestId, IsShardProducer(call.Producer), isProducer: true, bytes, ct).ConfigureAwait(false);
                 break;
             case SubscribeFrame subscribe:
                 await RouteSubscribeAsync(subscribe, bytes, ct).ConfigureAwait(false);
@@ -159,11 +164,10 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     }
 
     /// <summary>
-    /// The newest version the gateway offers clients. It does not route producer calls yet, so it
-    /// settles on version 2 — where a client knows not to send them — rather than accept a frame it
-    /// would have to refuse.
+    /// The newest version the gateway offers clients: all of them, now that it routes producer
+    /// calls. A version-2 client is relayed exactly as before.
     /// </summary>
-    private const int MaxGatewayVersion = 2;
+    private const int MaxGatewayVersion = MessagePackFrameSerializer.ProtocolVersion;
 
     private int _protocolVersion;
 
@@ -261,19 +265,40 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         }
     }
 
-    private async Task RouteCallAsync(CallReducerFrame call, byte[] bytes, CancellationToken ct)
+    private bool IsShardReducer(string reducer)
     {
-        var toShard = false;
         try
         {
-            var descriptor = _gateway.Reducers.Get(call.Reducer);
-            toShard = descriptor.ExecutionSite == ReducerSite.Shard;
+            return _gateway.Reducers.Get(reducer).ExecutionSite == ReducerSite.Shard;
         }
         catch (UnknownReducerException)
         {
             // Unknown reducer: let the hub answer, so the error shape is the server's own.
+            return false;
         }
+    }
 
+    /// <summary>
+    /// A producer runs where the reducer rules put it: on the hub when it reads only Global and
+    /// Replicated tables, on the caller's shard otherwise. An unknown name goes to the hub, which
+    /// answers <c>unknown_producer</c> in the server's own words.
+    /// </summary>
+    private bool IsShardProducer(string producer) =>
+        _gateway.Producers.TryGet(producer, out var descriptor) && descriptor.ExecutionSite == ReducerSite.Shard;
+
+    /// <summary>The refusal a call gets when the gateway cannot deliver it, in the frame its kind answers with.</summary>
+    private static Frame CallFailure(uint requestId, bool isProducer, string message) =>
+        isProducer
+            ? new ProducerResultFrame(requestId, false, 0, ReadOnlyMemory<byte>.Empty, MelangeErrorCodes.Internal, message) { Channel = MelangeChannels.Calls }
+            : new ReducerResultFrame(requestId, false, 0, MelangeErrorCodes.Internal, message) { Channel = MelangeChannels.Calls };
+
+    /// <summary>
+    /// Sends a reducer or producer call to its execution site. Shard-bound calls are held during a
+    /// handoff and replayed on whichever side ends up authoritative, exactly as reducer calls always
+    /// were: a producer pinned on a shard mid-transfer would read a world about to be released.
+    /// </summary>
+    private async Task RouteCallAsync(uint requestId, bool toShard, bool isProducer, byte[] bytes, CancellationToken ct)
+    {
         if (toShard)
         {
             lock (_stateLock)
@@ -286,15 +311,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                     // latency on these calls. The cap bounds a wedged transfer's memory.
                     if (_heldCalls.Count < MaxHeldCalls)
                     {
-                        _heldCalls.Add((bytes, call.RequestId));
+                        _heldCalls.Add((bytes, requestId, isProducer));
                         return;
                     }
 
                     LogHandoffQueueOverflow(_gateway.Logger, MaxHeldCalls);
-                    _ = SendToClientAsync(new ReducerResultFrame(
-                        call.RequestId, false, 0, MelangeErrorCodes.Internal,
-                        "The transfer in progress has queued too many calls; retry.")
-                    { Channel = MelangeChannels.Calls }, ct);
+                    _ = SendToClientAsync(CallFailure(requestId, isProducer, "The transfer in progress has queued too many calls; retry."), ct);
                     return;
                 }
             }
@@ -309,9 +331,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            await SendToClientAsync(new ReducerResultFrame(
-                call.RequestId, false, 0, MelangeErrorCodes.Internal, exception.Message)
-            { Channel = MelangeChannels.Calls }, ct).ConfigureAwait(false);
+            await SendToClientAsync(CallFailure(requestId, isProducer, exception.Message), ct).ConfigureAwait(false);
         }
     }
 
@@ -490,7 +510,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     {
         _ = Task.Run(async () =>
         {
-            List<(byte[] Bytes, uint RequestId)> held;
+            List<(byte[] Bytes, uint RequestId, bool IsProducer)> held;
             lock (_stateLock)
             {
                 _muted = null;
@@ -500,7 +520,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 _heldCalls.Clear();
             }
 
-            foreach (var (bytes, requestId) in held)
+            foreach (var (bytes, requestId, isProducer) in held)
             {
                 try
                 {
@@ -509,9 +529,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
-                    await SendToClientAsync(new ReducerResultFrame(
-                        requestId, false, 0, MelangeErrorCodes.Internal, exception.Message)
-                    { Channel = MelangeChannels.Calls }, _closed.Token).ConfigureAwait(false);
+                    await SendToClientAsync(CallFailure(requestId, isProducer, exception.Message), _closed.Token).ConfigureAwait(false);
                 }
             }
         });
@@ -622,7 +640,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 : await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
 
             byte[][] subscribes;
-            List<(byte[] Bytes, uint RequestId)> held;
+            List<(byte[] Bytes, uint RequestId, bool IsProducer)> held;
             lock (_stateLock)
             {
                 retired = _shard;
@@ -640,7 +658,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             // terrain, no disconnect.
             foreach (var frame in subscribes)
                 await session.SendRawAsync(frame, _closed.Token).ConfigureAwait(false);
-            foreach (var (bytes, _) in held)
+            foreach (var (bytes, _, _) in held)
                 await session.SendRawAsync(bytes, _closed.Token).ConfigureAwait(false);
             LogSwapCompleted(_gateway.Logger, to.Value, subscribes.Length, held.Count);
         }
