@@ -54,8 +54,13 @@ All packages ship together at one version; there is no per-package versioning. S
   refuses boot with the supported path named, shard and node-local engines refuse archive writes
   (declare them `Placement.Global`), and an applier that would have to rebuild over a truncated log
   refuses rather than begin an archive with a hole (EventId 1611). Ad-hoc aggregates run over
-  archive tables. **Not yet in this release:** duplicate-key dead-lettering, restore trimming, and
-  the archive retention floor ([plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md)); until then,
+  archive tables. Each archive row carries the `_melange_lsn` and `_melange_epoch` it was committed
+  at. An insert whose primary key Postgres already holds is never an overwrite and never a stall: it
+  is dead-lettered into `__melange_archive_dead_letter` in the batch's own transaction (values kept
+  as `row_values` jsonb), logged at Error by key and reducer but never by value (EventId 1612),
+  counted (`melange.archive.dead_lettered`), and reported as a Degraded `melange-applier` until the
+  table is cleared — through the new `IApplierCondition`, which any decoupled applier can implement.
+  **Not yet in this release:** restore trimming and the archive retention floor ([plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md)); until then,
   back up Postgres with point-in-time recovery and see [docs/BACKUP.md](docs/BACKUP.md).
 
 ### Fixed

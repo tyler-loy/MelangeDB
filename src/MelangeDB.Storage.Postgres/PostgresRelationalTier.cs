@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using MelangeDB.Core;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -24,7 +25,7 @@ namespace MelangeDB.Storage.Postgres;
 /// truncation can never pass its checkpoint.
 /// </para>
 /// </summary>
-public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHostedService, IAsyncDisposable
+public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHostedService, IAsyncDisposable, IApplierCondition
 {
     private const string ApplierName = "postgres";
     private static readonly ActivitySource Source = new("MelangeDB");
@@ -48,6 +49,11 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
     private bool _stalled;
     private long _lastStallLogTicks;
     private volatile bool _stopped;
+    private readonly Meter _meter = new("MelangeDB");
+    private readonly Counter<long> _deadLetteredCounter;
+
+    /// <summary>Rows in the dead-letter table as last counted — refreshed while nonzero, since only an operator can lower it.</summary>
+    private long _deadLettered;
 
     public PostgresRelationalTier(
         MelangeEngine engine,
@@ -64,6 +70,24 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         _options = options;
         _time = timeProvider ?? TimeProvider.System;
         _logger = (loggerFactory ?? NullLoggerFactory.Instance).CreateLogger<PostgresRelationalTier>();
+        _deadLetteredCounter = _meter.CreateCounter<long>(
+            "melange.archive.dead_lettered",
+            "{row}",
+            "Archive inserts set aside because Postgres already held a row with the same primary key.");
+    }
+
+    /// <inheritdoc />
+    public string? Degraded
+    {
+        get
+        {
+            var count = Interlocked.Read(ref _deadLettered);
+            return count == 0
+                ? null
+                : $"{count} archive row(s) are dead-lettered in {_options.CurrentValue.Postgres.Schema}.{PostgresSchemaManager.DeadLetterTable}: " +
+                  "each collided with a primary key Postgres already held (EventId 1612). Fix the key allocation, then " +
+                  "re-apply or delete each row deliberately; the check clears once the table is empty.";
+        }
     }
 
     /// <inheritdoc />
@@ -174,6 +198,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         await StopAsync(CancellationToken.None).ConfigureAwait(false);
         _cts.Dispose();
         _signal.Dispose();
+        _meter.Dispose();
     }
 
     private async Task RunAsync(CancellationToken ct)
@@ -190,6 +215,8 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 }
 
                 await ApplyAvailableAsync(ct).ConfigureAwait(false);
+                if (Interlocked.Read(ref _deadLettered) > 0)
+                    await RefreshDeadLetteredAsync(ct).ConfigureAwait(false);
                 if (_stalled)
                 {
                     Volatile.Write(ref _stalled, false);
@@ -238,6 +265,8 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         var registryExisted = (await _schemaManager!.ExistingTablesAsync(connection, [PostgresSchemaManager.ProjectedTable], ct).ConfigureAwait(false)).Count > 0;
         var presentBefore = await _schemaManager.ExistingTablesAsync(connection, _relationalTables.Select(t => t.Name), ct).ConfigureAwait(false);
         var appliedDdl = await _schemaManager.EnsureAsync(connection, _relationalTables, options.AutoMigrate, ct).ConfigureAwait(false);
+        if (_relationalTables.Any(static t => t.Tier == StorageTier.Archive))
+            Interlocked.Exchange(ref _deadLettered, await CountDeadLetteredAsync(connection, ct).ConfigureAwait(false));
         if (appliedDdl.Length > 0)
             LogMessages.SchemaMigrated(_logger, appliedDdl);
 
@@ -382,6 +411,21 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             LogMessages.TableCopied(_logger, table.Name, rows[table.Id].Count, anchor);
     }
 
+    private string DeadLetterTableName =>
+        PostgresIdentifier.Qualify(_options.CurrentValue.Postgres.Schema, PostgresSchemaManager.DeadLetterTable);
+
+    private async Task<long> CountDeadLetteredAsync(NpgsqlConnection connection, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand($"SELECT count(*) FROM {DeadLetterTableName}", connection);
+        return (long)(await command.ExecuteScalarAsync(ct).ConfigureAwait(false))!;
+    }
+
+    private async Task RefreshDeadLetteredAsync(CancellationToken ct)
+    {
+        await using var connection = await _connections.DataSource.OpenConnectionAsync(ct).ConfigureAwait(false);
+        Interlocked.Exchange(ref _deadLettered, await CountDeadLetteredAsync(connection, ct).ConfigureAwait(false));
+    }
+
     private string ProjectedTableName =>
         PostgresIdentifier.Qualify(_options.CurrentValue.Postgres.Schema, PostgresSchemaManager.ProjectedTable);
 
@@ -507,6 +551,9 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             activity?.SetTag("melange.applier", ApplierName);
 
             var last = batch[^1].Lsn;
+            var epoch = _engine.Log.EpochId;
+            List<(NpgsqlBatchCommand Command, TableSchema Table, RowOp Op, CommitRecord Record)> archiveInserts = [];
+            List<(TableSchema Table, RowOp Op, CommitRecord Record)> deadLettered = [];
             await using (var connection = await _connections.DataSource.OpenConnectionAsync(ct).ConfigureAwait(false))
             {
                 await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
@@ -515,15 +562,37 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 {
                     foreach (var op in record.WriteSet)
                     {
-                        if (_tableSql.TryGetValue(op.Table, out var sql))
-                            commands.BatchCommands.Add(sql.Command(op));
+                        if (!_tableSql.TryGetValue(op.Table, out var sql))
+                            continue;
+                        var command = sql.Command(op, record, epoch);
+                        commands.BatchCommands.Add(command);
+                        if (sql.IsArchive && op.Kind == RowOpKind.Insert)
+                            archiveInserts.Add((command, sql.Table, op, record));
                     }
                 }
 
                 if (commands.BatchCommands.Count > 0)
                     await commands.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
-                await WriteCheckpointAsync(connection, transaction, last, _engine.Log.EpochId, ct).ConfigureAwait(false);
+
+                // An archive insert's statement inserts into the dead-letter table only when the
+                // archive already held its key, so one affected row there means it was set aside.
+                foreach (var (command, table, op, record) in archiveInserts)
+                {
+                    if (command.RecordsAffected > 0)
+                        deadLettered.Add((table, op, record));
+                }
+
+                await WriteCheckpointAsync(connection, transaction, last, epoch, ct).ConfigureAwait(false);
                 await transaction.CommitAsync(ct).ConfigureAwait(false);
+            }
+
+            // Reported after the commit, so a log line never names a row a retried batch then
+            // applied differently: until this point the batch could still roll back.
+            foreach (var (table, op, record) in deadLettered)
+            {
+                LogMessages.ArchiveRowDeadLettered(_logger, table.Name, op.Key.ToString(), record.Lsn, record.ReducerName ?? string.Empty);
+                _deadLetteredCounter.Add(1, new KeyValuePair<string, object?>("table", table.Name));
+                Interlocked.Increment(ref _deadLettered);
             }
 
             Volatile.Write(ref _appliedLsn, last);
@@ -668,15 +737,59 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         private readonly TableSchema _table;
         private readonly string _upsertSql;
         private readonly string _deleteSql;
+        private readonly string? _archiveInsertSql;
 
-        private TableSql(TableSchema table, string upsertSql, string deleteSql)
+        private TableSql(TableSchema table, string upsertSql, string deleteSql, string? archiveInsertSql = null)
         {
             _table = table;
             _upsertSql = upsertSql;
             _deleteSql = deleteSql;
+            _archiveInsertSql = archiveInsertSql;
         }
 
-        public static TableSql For(TableSchema table, string schema)
+        public TableSchema Table => _table;
+
+        public bool IsArchive => _archiveInsertSql is not null;
+
+        public static TableSql For(TableSchema table, string schema) =>
+            table.Tier == StorageTier.Archive ? ForArchive(table, schema) : ForMirror(table, schema);
+
+        /// <summary>
+        /// An archive never overwrites. An insert whose key Postgres already holds lands in the
+        /// dead-letter table instead — one statement, so it is part of the batch's transaction, and
+        /// the statement's affected-row count says which happened. A whole-row update, which only a
+        /// delete-then-insert of one key inside one transaction produces, upserts: that is the
+        /// reducer replacing its own row, not a collision. Every row carries its LSN and epoch.
+        /// </summary>
+        private static TableSql ForArchive(TableSchema table, string schema)
+        {
+            var qualified = PostgresIdentifier.Qualify(schema, table.Name);
+            var n = table.Columns.Count;
+            var lsn = PostgresIdentifier.Quote(PostgresSchemaManager.LsnColumn);
+            var epoch = PostgresIdentifier.Quote(PostgresSchemaManager.EpochColumn);
+            var columns = string.Join(", ", table.Columns.Select(c => PostgresIdentifier.Quote(c.Name))) + $", {lsn}, {epoch}";
+            var values = string.Join(", ", table.Columns.Select((_, i) => $"${i + 1}")) + $", ${n + 1}, ${n + 2}";
+            var key = PostgresIdentifier.Quote(table.PrimaryKey.Name);
+            var rowValues = "jsonb_build_object(" +
+                string.Join(", ", table.Columns.Select((c, i) => $"'{c.Name.Replace("'", "''", StringComparison.Ordinal)}', ${i + 1}")) + ")";
+            var insert =
+                $"WITH inserted AS (INSERT INTO {qualified} ({columns}) VALUES ({values}) ON CONFLICT ({key}) DO NOTHING RETURNING 1) " +
+                $"INSERT INTO {PostgresIdentifier.Qualify(schema, PostgresSchemaManager.DeadLetterTable)} " +
+                "(\"table_name\", \"row_key\", \"lsn\", \"log_epoch\", \"reducer\", \"row_values\", \"dead_lettered_at\") " +
+                $"SELECT ${n + 3}, ${n + 4}, ${n + 1}, ${n + 2}, ${n + 5}, {rowValues}, now() WHERE NOT EXISTS (SELECT 1 FROM inserted)";
+            var updates = table.Columns
+                .Where(c => !c.IsPrimaryKey)
+                .Select(c => $"{PostgresIdentifier.Quote(c.Name)} = EXCLUDED.{PostgresIdentifier.Quote(c.Name)}")
+                .Append($"{lsn} = EXCLUDED.{lsn}")
+                .Append($"{epoch} = EXCLUDED.{epoch}");
+            var upsert =
+                $"INSERT INTO {qualified} ({columns}) VALUES ({values}) " +
+                $"ON CONFLICT ({key}) DO UPDATE SET {string.Join(", ", updates)}";
+            var delete = $"DELETE FROM {qualified} WHERE {key} = $1";
+            return new TableSql(table, upsert, delete, insert);
+        }
+
+        private static TableSql ForMirror(TableSchema table, string schema)
         {
             var qualified = PostgresIdentifier.Qualify(schema, table.Name);
             var columns = string.Join(", ", table.Columns.Select(c => PostgresIdentifier.Quote(c.Name)));
@@ -695,16 +808,39 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             return new TableSql(table, upsert, delete);
         }
 
-        public NpgsqlBatchCommand Command(in RowOp op) =>
-            op.Kind == RowOpKind.Delete ? Delete(op.Key) : Upsert(op.Row);
+        public NpgsqlBatchCommand Command(in RowOp op, CommitRecord record, Guid epoch)
+        {
+            if (op.Kind == RowOpKind.Delete)
+                return Delete(op.Key);
+            if (!IsArchive)
+                return Upsert(op.Row);
+
+            var command = new NpgsqlBatchCommand(op.Kind == RowOpKind.Insert ? _archiveInsertSql! : _upsertSql);
+            AddRowParameters(command, op.Row);
+            command.Parameters.Add(new NpgsqlParameter<long> { TypedValue = (long)record.Lsn });
+            command.Parameters.Add(new NpgsqlParameter<Guid> { TypedValue = epoch });
+            if (op.Kind == RowOpKind.Insert)
+            {
+                command.Parameters.Add(new NpgsqlParameter<string> { TypedValue = _table.Name });
+                command.Parameters.Add(new NpgsqlParameter<string> { TypedValue = op.Key.ToString() });
+                command.Parameters.Add(new NpgsqlParameter { Value = (object?)record.ReducerName ?? DBNull.Value, NpgsqlDbType = NpgsqlTypes.NpgsqlDbType.Text });
+            }
+
+            return command;
+        }
 
         public NpgsqlBatchCommand Upsert(ReadOnlyMemory<byte> row)
         {
             var command = new NpgsqlBatchCommand(_upsertSql);
+            AddRowParameters(command, row);
+            return command;
+        }
+
+        private void AddRowParameters(NpgsqlBatchCommand command, ReadOnlyMemory<byte> row)
+        {
             var boxed = RowSerializer.Deserialize(_table, row);
             foreach (var column in _table.Columns)
                 command.Parameters.Add(PostgresTypeMap.Parameter(column, column.GetValue(boxed)));
-            return command;
         }
 
         private NpgsqlBatchCommand Delete(in RowKey key)
@@ -831,6 +967,20 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         public static void ArchiveUnrecoverable(ILogger logger, string tables, ulong baseLsn) =>
             ArchiveUnrecoverableMessage(logger, tables, baseLsn, null);
+
+        // The key and the reducer, never the row's values: an archive is where wallet and audit
+        // data lives, and log sinks are not where it belongs. The dead-letter table holds the row.
+        private static readonly Action<ILogger, string, string, ulong, string, Exception?> ArchiveRowDeadLetteredMessage =
+            LoggerMessage.Define<string, string, ulong, string>(
+                LogLevel.Error,
+                new EventId(1612, "PostgresArchiveRowDeadLettered"),
+                "Archive row dead-lettered: table {Table}, key {Key}, LSN {Lsn}, reducer '{Reducer}'. Postgres already held a " +
+                "row with this primary key, so the incoming row was set aside in __melange_archive_dead_letter rather than " +
+                "overwrite the archived one or stall the applier; the applier carried on. A collision is a bug in how the " +
+                "keys are allocated: find where this one came from and fix that, then re-apply or delete the row deliberately.");
+
+        public static void ArchiveRowDeadLettered(ILogger logger, string table, string key, ulong lsn, string reducer) =>
+            ArchiveRowDeadLetteredMessage(logger, table, key, lsn, reducer, null);
     }
 }
 

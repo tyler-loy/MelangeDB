@@ -370,7 +370,10 @@ every other table while it waits for a human.
   `melange_archive_dead_letter` when the first inserted nothing — so the quarantine commits in the
   same transaction as the batch and its checkpoint. The dead-letter table records the table, the
   key, the LSN, the epoch, the reducer name from the record, the time, and the full row bytes, so
-  the row can be inspected and re-applied by hand.
+  the row can be inspected and re-applied by hand. (As built: the table is
+  `__melange_archive_dead_letter`, matching the applier's other plumbing tables, and the row is
+  kept as `row_values` jsonb built from the statement's own parameters rather than as bytes —
+  readable, and re-appliable with a plain `INSERT ... SELECT`.)
 - **Logged at Error, once per row,** under a new EventId with the table, key, LSN, and reducer
   name. Never the row's values: an archive is where audit and wallet data lives, and log sinks are
   not where it belongs. The dead-letter table holds the payload.

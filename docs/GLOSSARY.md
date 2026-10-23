@@ -589,8 +589,10 @@ policy-enforced.
 wallet ledger whose recent rows stay in a hot table. Writes ride the commit log and the Postgres applier
 projects them, but the engine strips them from every record before the hot store sees it, so they are in no
 hot store, snapshot, or `.mbak`. Reducers can `Insert` and blind-`Delete` by key, and nothing that reads is
-generated. The one place the log is not the whole truth: once it truncates past an archived row, Postgres
-holds the only copy. Requires `AddPostgres(...)`; refused at compile time when Public, `[Unique]`, Scheduled,
+generated. Each row carries the `_melange_lsn` and `_melange_epoch` it was committed at, and an insert whose
+key Postgres already holds is dead-lettered into `__melange_archive_dead_letter` rather than overwriting or
+stalling (EventId 1612). The one place the log is not the whole truth: once it truncates past an archived row,
+Postgres holds the only copy. Requires `AddPostgres(...)`; refused at compile time when Public, `[Unique]`, Scheduled,
 Replicated, or declaring a Residency (MELANGE0024–0026). See
 [plan-phase-25.md](road-to-0.3/plan-phase-25.md).
 

@@ -42,6 +42,18 @@ internal sealed class PostgresSchemaManager
     /// </summary>
     public const string ProjectedTable = "__melange_projected";
 
+    /// <summary>
+    /// Where an archive insert whose primary key Postgres already holds is set aside, in the same
+    /// transaction as the batch and its checkpoint — so nothing is dropped and nothing overwritten.
+    /// </summary>
+    public const string DeadLetterTable = "__melange_archive_dead_letter";
+
+    /// <summary>The log position an archive row was committed at, so a restore can trim the archive back to its history.</summary>
+    public const string LsnColumn = "_melange_lsn";
+
+    /// <summary>The log epoch an archive row was committed under; LSNs mean nothing across epochs.</summary>
+    public const string EpochColumn = "_melange_epoch";
+
     private readonly string _schema;
 
     public PostgresSchemaManager(string schema) => _schema = schema;
@@ -77,6 +89,24 @@ internal sealed class PostgresSchemaManager
             )
             """,
             ct).ConfigureAwait(false);
+        if (tables.Any(static t => t.Tier == StorageTier.Archive))
+        {
+            await ExecuteAsync(
+                connection,
+                $"""
+                CREATE TABLE IF NOT EXISTS {PostgresIdentifier.Qualify(_schema, DeadLetterTable)} (
+                    "id" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    "table_name" text NOT NULL,
+                    "row_key" text NOT NULL,
+                    "lsn" bigint NOT NULL,
+                    "log_epoch" uuid NOT NULL,
+                    "reducer" text,
+                    "row_values" jsonb NOT NULL,
+                    "dead_lettered_at" timestamp with time zone NOT NULL
+                )
+                """,
+                ct).ConfigureAwait(false);
+        }
 
         var pendingDdl = new StringBuilder();
         var appliedDdl = new StringBuilder();
@@ -122,6 +152,9 @@ internal sealed class PostgresSchemaManager
                 await ApplyOrCollectAsync(AddColumnDdl(table, column)).ConfigureAwait(false);
             }
 
+            if (table.Tier == StorageTier.Archive && !existing.ContainsKey(LsnColumn))
+                await ApplyOrCollectAsync(ArchiveColumnsDdl(table)).ConfigureAwait(false);
+
             if (autoMigrate)
                 await ExecuteScriptAsync(connection, IndexDdl(table), ct).ConfigureAwait(false);
         }
@@ -163,6 +196,12 @@ internal sealed class PostgresSchemaManager
                 builder.Append(" PRIMARY KEY");
         }
 
+        if (table.Tier == StorageTier.Archive)
+        {
+            builder.Append($",\n    {PostgresIdentifier.Quote(LsnColumn)} bigint NOT NULL");
+            builder.Append($",\n    {PostgresIdentifier.Quote(EpochColumn)} uuid NOT NULL");
+        }
+
         builder.Append("\n);");
         var indexes = IndexDdl(table);
         if (indexes.Length > 0)
@@ -181,9 +220,22 @@ internal sealed class PostgresSchemaManager
         return builder.ToString();
     }
 
+    /// <summary>The archive's hidden columns, for an archive table created before they existed.</summary>
+    private string ArchiveColumnsDdl(TableSchema table) =>
+        $"ALTER TABLE {PostgresIdentifier.Qualify(_schema, table.Name)} " +
+        $"ADD COLUMN IF NOT EXISTS {PostgresIdentifier.Quote(LsnColumn)} bigint NOT NULL DEFAULT 0, " +
+        $"ADD COLUMN IF NOT EXISTS {PostgresIdentifier.Quote(EpochColumn)} uuid NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000';";
+
     private string IndexDdl(TableSchema table)
     {
         var builder = new StringBuilder();
+        if (table.Tier == StorageTier.Archive)
+        {
+            builder.Append(
+                $"CREATE INDEX IF NOT EXISTS {PostgresIdentifier.Quote($"ix_{table.Name}_{LsnColumn}")} " +
+                $"ON {PostgresIdentifier.Qualify(_schema, table.Name)} ({PostgresIdentifier.Quote(EpochColumn)}, {PostgresIdentifier.Quote(LsnColumn)});\n");
+        }
+
         foreach (var index in table.Indexes)
         {
             var name = $"{(index.Unique ? "ux" : "ix")}_{table.Name}_{index.Column}";

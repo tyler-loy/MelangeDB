@@ -277,6 +277,7 @@ Meter name: `MelangeDB`.
 | `melange.scheduler.tick.duration` | histogram | `ms` | `reducer` | 05 |
 | `melange.events.queue_depth` | gauge | `{event}` | — | 06 |
 | `melange.events.deadlettered` | counter | `{event}` | `event_type` | 06 |
+| `melange.archive.dead_lettered` | counter | `{row}` | `table` | 25 |
 | `melange.handoff.duration` | histogram | `ms` | — | 09 |
 | `melange.handoff.failed` | counter | `{handoff}` | `reason` | 09 |
 | `melange.shard.owned` | gauge | `{shard}` | — | 09 |
@@ -415,8 +416,14 @@ consistent LSN before the applier resumed, with its row count; Warning, because 
 automatically — and `1610 PostgresTableUnprojected` — a table left the backplane, and its Postgres table is
 left as is and no longer maintained — and `1611 PostgresArchiveUnrecoverable` — the applier has no
 checkpoint and the log is truncated while archive tables are declared, so it stalls rather than start an
-archive with a hole: their rows below the truncation base exist only in a Postgres backup (road-to-0.3
-phase 25); `1700 ClusterHubStarted` (naming the node-link listener's bound
+archive with a hole: their rows below the truncation base exist only in a Postgres backup — and
+`1612 PostgresArchiveRowDeadLettered` — an archive insert whose primary key Postgres already held was set
+aside in `__melange_archive_dead_letter`, in the batch's own transaction, rather than overwrite the archived
+row or stall the applier. Error, once per row, naming the table, key, LSN and reducer and never the row's
+values; the dead-letter table holds those (as `row_values` jsonb), and `melange.archive.dead_lettered` counts
+them. A collision is a bug in key allocation: find the source, fix it, then re-apply or delete each row
+deliberately — the `melange-applier` check stays Degraded until the table is empty (road-to-0.3 phase 25);
+`1700 ClusterHubStarted` (naming the node-link listener's bound
 port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
 loud: how long the silence was and how many shards moved under bumped fencing tokens —
 `1703 ClusterLinkAuthFailed` (a link that could not prove the cluster secret; a rogue dialer or a
@@ -557,7 +564,7 @@ host to register into, so the first one landed with phase 02's host integration 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
 | `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**) | 02 |
-| `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form | 08 |
+| `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form. **Degraded** while an applier reports a condition lag cannot show (`IApplierCondition`): the Postgres applier does so while `__melange_archive_dead_letter` holds rows, because a dead-lettered row leaves the checkpoint advancing and the lag at zero (road-to-0.3 phase 25) | 08 |
 | `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
 | `melange-capacity` | Two provision attempts failed or expired and the loop has stopped asking (**shipped, 14**) — EventId 1738 in health-endpoint form, cleared when a ticket-named node joins. Degraded while a ticket is outstanding; healthy off the hub or with no provisioner registered. | 14 |
 | `melange-retention` | More records are pinned above the log's truncation floor than `HealthChecks:RetentionPinnedThreshold` allows (**shipped, 18**) — the disk-filling alarm, with the governing floor's name and LSN in the description. `melange.log.pinned_records` is its metric form. Healthy trivially when snapshots or truncation are not configured, and while no truncation has been decided yet. The applier check overlaps by one holder deliberately: an applier is one of seven, and it fires far earlier at its own threshold. | 18 |

@@ -5,7 +5,9 @@ namespace MelangeDB.Core;
 
 /// <summary>
 /// The <c>melange-applier</c> health check: unhealthy when any applier's checkpoint lags the log
-/// head by more than <c>HealthChecks:ApplierLagThreshold</c> transactions. The whole two-tier
+/// head by more than <c>HealthChecks:ApplierLagThreshold</c> transactions, and degraded when an
+/// applier reports a condition lag cannot show (<see cref="IApplierCondition"/>) — archive rows
+/// dead-lettered while the checkpoint kept advancing. The whole two-tier
 /// design rests on appliers being <em>allowed</em> to lag — so the dangerous failure is a silent
 /// stall, writes succeeding while a projection falls hours behind. This check is that alarm's
 /// health-endpoint form; <c>melange.applier.lag</c> is its metric form.
@@ -34,9 +36,19 @@ internal sealed class MelangeApplierHealthCheck : IHealthCheck
             .Where(l => l.Lag > threshold)
             .Select(l => $"{l.Applier} is {l.Lag} transaction(s) behind")
             .ToList();
-        return Task.FromResult(lagging.Count > 0
-            ? HealthCheckResult.Unhealthy(
-                $"Applier lag exceeds HealthChecks:ApplierLagThreshold ({threshold}): {string.Join("; ", lagging)}.")
+        if (lagging.Count > 0)
+        {
+            return Task.FromResult(HealthCheckResult.Unhealthy(
+                $"Applier lag exceeds HealthChecks:ApplierLagThreshold ({threshold}): {string.Join("; ", lagging)}."));
+        }
+
+        var degraded = engine.Appliers.Appliers
+            .OfType<IApplierCondition>()
+            .Select(static applier => applier.Degraded)
+            .OfType<string>()
+            .ToList();
+        return Task.FromResult(degraded.Count > 0
+            ? HealthCheckResult.Degraded(string.Join(" ", degraded))
             : HealthCheckResult.Healthy("Every applier is within its lag threshold."));
     }
 }
