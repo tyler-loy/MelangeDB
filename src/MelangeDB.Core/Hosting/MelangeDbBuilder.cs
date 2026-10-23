@@ -12,9 +12,11 @@ public sealed class MelangeDbBuilder
 {
     private readonly HashSet<Assembly> _tableAssemblies = [];
     private readonly HashSet<Assembly> _reducerAssemblies = [];
+    private readonly HashSet<Assembly> _producerAssemblies = [];
     private readonly HashSet<Assembly> _handlerAssemblies = [];
     private readonly List<TableSchema> _tables = [];
     private readonly List<ReducerDescriptor> _reducers = [];
+    private readonly List<ProducerDescriptor> _producers = [];
     private readonly List<Type> _eventHandlers = [];
     private readonly SchemaManifests _manifests = new();
 
@@ -26,6 +28,8 @@ public sealed class MelangeDbBuilder
     internal IReadOnlyList<TableSchema> Tables => _tables;
 
     internal IReadOnlyList<ReducerDescriptor> Reducers => _reducers;
+
+    internal IReadOnlyList<ProducerDescriptor> Producers => _producers;
 
     internal IReadOnlyList<Type> EventHandlers => _eventHandlers;
 
@@ -73,6 +77,22 @@ public sealed class MelangeDbBuilder
         if (_reducerAssemblies.Add(assembly))
         {
             _reducers.AddRange(ModelOf(assembly).Reducers());
+            _manifests.AddFrom(assembly);
+        }
+
+        return this;
+    }
+
+    /// <summary>
+    /// Registers every <c>[Producer]</c> method in <paramref name="assembly"/> through its generated
+    /// model, and its declaring classes as scoped services if not already registered.
+    /// </summary>
+    public MelangeDbBuilder AddProducersFrom(Assembly assembly)
+    {
+        ArgumentNullException.ThrowIfNull(assembly);
+        if (_producerAssemblies.Add(assembly))
+        {
+            _producers.AddRange(ModelOf(assembly).Producers());
             _manifests.AddFrom(assembly);
         }
 

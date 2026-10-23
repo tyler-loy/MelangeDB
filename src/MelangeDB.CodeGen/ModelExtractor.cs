@@ -4,7 +4,7 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 namespace MelangeDB.CodeGen;
 
 /// <summary>Turns attributed symbols into equatable models, collecting structural diagnostics.</summary>
-internal static class ModelExtractor
+internal static partial class ModelExtractor
 {
     public static TableModel? ExtractTable(GeneratorAttributeSyntaxContext context)
     {

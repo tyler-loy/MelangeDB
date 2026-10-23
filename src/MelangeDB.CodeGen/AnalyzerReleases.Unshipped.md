@@ -32,3 +32,6 @@ MELANGE0024 | MelangeDB | Error | Archive tables cannot be Public
 MELANGE0025 | MelangeDB | Error | [Unique] on an archive table cannot be checked
 MELANGE0026 | MelangeDB | Error | Archive table declares something only a hot table can honour
 MELANGE0027 | MelangeDB | Error | KeepKeys applies only to archive tables
+MELANGE0028 | MelangeDB | Error | Producer signature is invalid
+MELANGE0029 | MelangeDB | Error | Producer result type is not serializable
+MELANGE0030 | MelangeDB | Error | Producer names must be unique across producers and reducers

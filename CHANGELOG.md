@@ -104,6 +104,20 @@ All packages ship together at one version; there is no per-package versioning. S
   a backplane-only deployment used to stop at EventId 1605 until the schema was cleared; it now
   reconciles on its own. Clearing the schema still works.
 
+- **Producers: `[Producer]` methods, typed read-only calls a client makes for data** (road-to-0.3
+  phase 26, [design/producers.md](docs/design/producers.md)). A producer is
+  `T Name(ProducerContext ctx, ...)`, `Task<T>`, or `ValueTask<T>`: it writes nothing, so it may be
+  async and await I/O, and it returns a typed value — `List<WalletLine> History(int page = 1)`. The
+  generator discovers producers beside reducers (register them with `AddProducersFrom`), decodes
+  their parameters as reducer arguments with trailing defaults a caller may leave off, and emits an
+  encoder for the result: one tagged value in the reducer-argument encoding, a record as an array of
+  its public fields and properties in declaration order. Results may be scalars, strings, `byte[]`,
+  `Identity`, `Timestamp`, enums, nullable values, arrays and lists, and records, classes, or
+  structs of those, recursively. MELANGE0028 refuses a signature the dispatcher cannot call,
+  MELANGE0029 a result it cannot encode — a `[Table]` struct included, so a table's shape reaches a
+  client only through a type its author wrote — naming the member path, and MELANGE0030 a producer
+  sharing its name with a reducer or another producer.
+
 - **`MelangeEngine.OpenReadView()` — committed state pinned at one LSN, readable off the write
   lock.** A `PinnedReadView` is a read-only `IDbView` with an `Lsn`, safe to read from several
   threads (each read and each step of a lazy query runs under its own lock), that throws on a read

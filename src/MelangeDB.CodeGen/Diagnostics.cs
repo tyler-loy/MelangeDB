@@ -241,6 +241,33 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor InvalidProducerSignature = new(
+        "MELANGE0028",
+        "Producer signature is invalid",
+        "Producer '{0}' {1}. A producer is declared T Name(ProducerContext ctx, ...), Task<T>, or ValueTask<T>, as an " +
+        "instance method on a non-generic, public-or-internal class.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor UnserializableProducerResult = new(
+        "MELANGE0029",
+        "Producer result type is not serializable",
+        "Producer '{0}': {1} is {2}, which {3}. A result is built from bool, integers, floats, string, byte[], Identity, " +
+        "Timestamp, enums, lists and arrays, and records, classes, or structs of those.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor DuplicateCallableName = new(
+        "MELANGE0030",
+        "Producer names must be unique across producers and reducers",
+        "Producer '{0}' shares its name with {1}. A client calls a producer or a reducer by name, so one name means one " +
+        "callable; rename one with [Producer(Name = ...)] or [Reducer(Name = ...)].",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor UnindexedScanOnPagedTable = new(
         "MELANGE0017",
         "Full scan over a table that is not Resident",
