@@ -74,8 +74,10 @@ All packages ship together at one version; there is no per-package versioning. S
 - **A wallet sample, `samples/MelangeDB.Sample.Wallet`: the archive tier's worked example.** A hot
   balance, a hot recent ledger keyed by the caller's idempotency key, a `KeepKeys` archive, a
   scheduled sweep that moves entries past the hot window (an index range on `At`, one atomic write set
-  per batch), a credit/debit reducer that stays idempotent across both, and an HTTP endpoint that
-  pages archived history through `IArchiveReader`. Needs Postgres.
+  per batch), a credit/debit reducer that stays idempotent across both, and a `History` producer that
+  pages the caller's own history — hot ledger and archive, the archive read as of the producer's
+  pinned LSN so an entry the sweep moves mid-call is listed once — behind a players-only policy.
+  Needs Postgres.
 
 - **`IArchiveReader`: reading archive history outside a reducer.** Registered by `AddPostgres`.
   Keyset-paginated pages of an archive table, ordered by primary key (ascending or newest first),

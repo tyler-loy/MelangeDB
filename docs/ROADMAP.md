@@ -111,7 +111,7 @@ the measurement debt below, and three separate decisions are waiting on it.
 | [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Planned |
 | 24 | Scheduler lane: simulation work yields to client-initiated work when they contend | [Design record](design/scheduler-lanes.md) written; conditional on a phase 20 measurement, and may close as a refusal |
 | [25](road-to-0.3/plan-phase-25.md) | The archive tier: tables that live in Postgres only — reducers append, everything else reads — so unbounded history leaves the hot store, snapshots, and backups. **Breaking:** `StorageTier.Relational` is renamed to say what it is — hot with a relational backplane | Planned |
-| [26](road-to-0.3/plan-phase-26.md) | Producers: typed, read-only calls a client makes for data — `List<WalletLine> History(int page)` — which is how archived history reaches a client. Protocol version 3 | Planned |
+| [26](road-to-0.3/plan-phase-26.md) | Producers: typed, read-only calls a client makes for data — `List<WalletLine> History(int page)` — which is how archived history reaches a client. Protocol version 3 | Built |
 
 Phases 21–23 are mutually independent and land in any order. Phase 24 is gated on 20 for its sizing
 and gets a design record before a plan, the way

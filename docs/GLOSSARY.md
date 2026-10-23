@@ -39,7 +39,7 @@ A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `HotWithRelationalB
 | --- | --- | --- |
 | **Row policy** | Which *rows* a caller sees | **Union** — any policy admitting a row is enough |
 | **Column policy** | Which *columns* a caller sees | **Intersection** — every rule must admit the column |
-| **Reducer policy** | Whether a caller may *call* a reducer | Single decision |
+| **Reducer policy** | Whether a caller may *call* a reducer — or a producer, which uses the same `IReducerPolicy` | Single decision |
 
 Rows union, columns intersect. Getting this backwards produces either a leak or an unusable system.
 
@@ -599,7 +599,24 @@ Replicated, or declaring a Residency (MELANGE0024–0026). See
 **Archive reader (`IArchiveReader`)** — How code outside a reducer reads an archive table: keyset-paginated pages
 ordered by primary key, filtered on the key or one indexed column. A page is Postgres at the applier's checkpoint
 with the unapplied log tail overlaid, so a just-archived row is never briefly invisible; when that tail is too long
-to overlay, the page is Postgres alone and says `Stale`. Registered by `AddPostgres`.
+to overlay, the page is Postgres alone and says `Stale`. `AsOfLsn` reads it as of a pinned view's LSN instead of
+now, so hot and archive reads answer for one commit. Registered by `AddPostgres`.
+
+**Pinned read view (`PinnedReadView`)** — Committed hot-store state held at one LSN, readable off the write lock,
+across awaits and from several threads: `MelangeEngine.OpenReadView()`. What a producer's `ctx.Db` is, and what
+policies now read. Holding one keeps superseded row versions alive, so it is held only as long as a call runs.
+
+**Producer** — A `[Producer]` method: a typed, read-only server call a client makes for data,
+`T Name(ProducerContext ctx, ...)` or its `Task`/`ValueTask` form. Where a reducer writes and returns nothing, a
+producer writes nothing and returns a value, so it may be async and do I/O; it is not in the log and never
+replays. `ctx.Db` is the hot store pinned at `ctx.Lsn` for the whole call. Clients reach archive history only
+this way. Calls ride protocol version 3 (`CallProducer`/`ProducerResult`) or `POST {path}/producers/{name}`,
+are authorized by an `IReducerPolicy`, and are bounded by `Producers:*`. See
+[design/producers.md](design/producers.md).
+
+**ProducerContext (`ctx`)** — What a producer is given: `Caller`, `ConnectionId`, `Claims`, `Timestamp`, `Lsn`,
+`Db` (the pinned view), and a `CancellationToken` that fires on disconnect or timeout. No `Random` and no
+`Publish`: a producer commits nothing.
 
 **Key set (`__keys_<Table>`)** — The key-only hot table behind an archive table declared `KeepKeys = true`: one
 key per archived row and no payload, maintained by the engine from the archive's ops, so a reducer can ask

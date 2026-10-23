@@ -253,6 +253,28 @@ The full design record, including what was deliberately left out (`Isolation.Rea
 concurrency with read-set validation, cross-tier isolation) and what remains open, is in
 [design/snapshot-isolation.md](design/snapshot-isolation.md).
 
+### Producers: the read a client asks for
+
+A **producer** is the other half of the call surface: where a reducer writes and returns nothing, a
+producer writes nothing and returns a typed value — and because nothing it does is replayed or holds the
+write lock, it may be async and await I/O.
+
+```csharp
+public sealed class WalletProducers(IArchiveReader archive)
+{
+    [Producer(Policy = typeof(PlayersOnly))]
+    public async Task<WalletHistory> History(ProducerContext ctx, string? after = null) { /* hot + archive */ }
+}
+```
+
+`ctx.Db` is the hot store **pinned at one LSN for the whole call** (`ctx.Lsn`), not the live store a
+policy used to read: an async body runs off the write lock, where a raw read could see a commit half
+applied. Passing `ctx.Lsn` as an archive query's `AsOfLsn` makes the Postgres read answer for the same
+commit, so a row the sweep moves between the two reads is counted once. The result is encoded while the
+pin is held, and the answer waits for durability through that LSN, as a reducer's acknowledgement does.
+Producers are how archive history reaches clients, which never read archive tables directly. The design
+record, including the transaction scope, is [design/producers.md](design/producers.md).
+
 ## 5. The commit log is the database
 
 This is the load-bearing decision.

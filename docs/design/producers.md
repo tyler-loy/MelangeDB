@@ -6,7 +6,7 @@ is archive history: [phase 25](../road-to-0.3/plan-phase-25.md) settled that **c
 archive tables directly**, so the history a player is entitled to see has to be shaped and authorized
 by server code. A producer is that code.
 
-**Status:** **scheduled as [phase 26](../road-to-0.3/plan-phase-26.md)**, in the same release as
+**Status:** **built as [phase 26](../road-to-0.3/plan-phase-26.md)**, in the same release as
 phase 25 and ahead of [phase 23](../road-to-0.3/plan-phase-23.md). Written when phase 25's
 client-facing read was replaced by this idea; the decisions below are settled unless marked as
 leanings.
@@ -180,4 +180,5 @@ Phase 25's plan leaned toward a generic, policy-checked HTTP read of archive tab
 withdrawn: a generic read exposes a table's shape and needs a visibility knob on a tier that is
 private by construction, while a producer exposes exactly the answer its author wrote and nothing
 else. Server-side code that is not a client — an admin tool, a report — keeps using `IArchiveReader`
-directly, as the wallet sample's endpoint does.
+directly; the wallet sample, which once served history from an open HTTP endpoint, now serves it
+through a `History` producer.

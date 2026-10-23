@@ -1,6 +1,6 @@
 # Phase 26 — Producers: typed, read-only calls a client makes for data
 
-**Status: Planned.** Ships in the same release as [phase 25](plan-phase-25.md), whose breaking
+**Status: Built.** Ships in the same release as [phase 25](plan-phase-25.md), whose breaking
 changes already make that release a version boundary, and ahead of [phase 23](plan-phase-23.md),
 which pins the wire contract for a second client runtime.
 

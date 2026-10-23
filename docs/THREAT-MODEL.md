@@ -165,6 +165,18 @@ reducer carry an annotation. **Decided and shipped in phase 04**: allow-by-defau
 test so it cannot silently regress. Policies apply to client-originated calls only; in-process dispatch is
 the host's own code. Denial happens before any transaction opens — no log record exists for a refused call.
 
+**Producers (phase 26) sit on the same ladder.** `[Producer(Policy = ...)]` takes an `IReducerPolicy`, the
+default posture and the unpoliced report cover producers too (EventId 1107), and an unpoliced producer is
+worse than an unpoliced reducer in one respect: it is an **open read of whatever it returns**, including
+private and archive tables the producer reads on the caller's behalf. Row and column policies do not apply
+to a producer's result — the producer's code decides what the caller sees, which is the point, and is why
+the archive decision chose producers over a generic archive endpoint: a generic read publishes a table's
+shape, while a producer publishes exactly the answer its author wrote. Two structural limits back that up:
+a `[Table]` struct cannot be a result type (MELANGE0029), so a row's full shape never leaks by returning it,
+and a producer cannot write — the call path refuses a reducer invoked from inside one. Resource limits are
+`Producers:TimeoutSeconds`, `Producers:MaxResponseBytes`, `Producers:MaxConcurrentPerConnection` (each call
+pins a read view), and the shared `RateLimit:*` buckets.
+
 ### The bulk ingestion boundary
 
 Everything above rests on one premise: **the reducer is the authorization boundary** — reducer policies,

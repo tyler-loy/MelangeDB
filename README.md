@@ -131,6 +131,8 @@ A runnable version of all of this lives in [`samples/`](samples).
 | Group commit: coalesced fsyncs at unchanged durability | Shipped (17) |
 | Named truncation floors and the retention health check | Shipped (18) |
 | Validation against a live game | Shipped (11) — its measurement pass is outstanding |
+| Archive tier: Postgres-only tables for unbounded history | Unreleased (25) |
+| Producers: typed, read-only calls a client makes for data | Unreleased (26) |
 
 Deliberately out of scope: joins in subscriptions, an unreliable/UDP transport, a sandbox for
 reducer code, and a stock admin console. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) or

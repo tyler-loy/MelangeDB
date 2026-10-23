@@ -591,7 +591,7 @@ code that shapes and authorizes it — a new kind of server-side action, the **p
 read-only, async call with typed inputs and outputs (`List<WalletLine> History(int page)`), which may
 inject `IArchiveReader`. It is a protocol change with its own design record,
 [design/producers.md](../design/producers.md), and is [phase 26](plan-phase-26.md), not part of this phase. Server-side code that
-is not a client keeps using `IArchiveReader` directly, as the wallet sample does. The original
+is not a client keeps using `IArchiveReader` directly. The original
 leaning is kept below as the record of what was considered.
 
 A paginated history read is neither a subscription nor a reducer.
