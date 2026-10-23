@@ -107,6 +107,7 @@ public sealed partial class MelangeEngine : IDisposable
                 _telemetry,
                 SnapshotFile.DurableFloor(options.CommitLog.Path));
             _sequencer = new AutoIncSequencer(originator);
+            Lineage = EpochLineage.Load(options.CommitLog.Path);
 
             // Shape governance before any row byte is interpreted: load (or adopt) the shape
             // sidecar, refuse a destructive schema change, and hold the additive transform that
@@ -359,6 +360,9 @@ public sealed partial class MelangeEngine : IDisposable
     public SchemaRegistry Schema { get; }
 
     public ICommitLog Log => _log;
+
+    /// <summary>The earlier epochs this log descends from — empty unless it was restored. See <see cref="EpochLineage"/>.</summary>
+    public EpochLineage Lineage { get; }
 
     /// <summary>
     /// The log as the file it is — path, buffer flush, base sidecar — for the online backup's

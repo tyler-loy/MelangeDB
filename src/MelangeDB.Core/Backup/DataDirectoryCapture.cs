@@ -130,6 +130,7 @@ internal static class DataDirectoryCapture
             Sequences = snapshot is null
                 ? []
                 : [.. snapshot.Header.Sequences.Select(pair => new ArchiveSequence { Table = pair.Key.Value, Next = pair.Value })],
+            Lineage = EpochLineage.Load(Path.GetDirectoryName(logPath)!).Ancestors is { Count: > 0 } ancestors ? ancestors : null,
         };
         writer.WriteFrame(ArchiveFrameType.EngineBegin, JsonSerializer.SerializeToUtf8Bytes(identity));
 

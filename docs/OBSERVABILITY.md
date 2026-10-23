@@ -406,7 +406,9 @@ is already compacted from one that has stopped compacting, and the second is the
 risk register demands: first failure always, then every 30 seconds under `Diagnostics:ReportApplierLag` with
 the growing lag — `1602 PostgresApplierRecovered`, `1603 PostgresSchemaMigrated` (the DDL AutoMigrate
 applied — automatic must not mean silent), `1604 PostgresMigrationRefused` (carrying the exact pending DDL,
-so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (LSNs are meaningless across log
+so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (since road-to-0.3 phase 25, only for
+an epoch the restored log's lineage does not name — a restore of the projection's own world reconciles under
+1613 instead; LSNs are meaningless across log
 epochs; the applier stalls rather than guesses), `1606 PostgresTierBootstrapped` (a tier attached after log
 truncation is rebuilt from the hot store at one consistent LSN), and `1607 RelationalTablesWithoutPostgres` —
 tables declared `Tier = HotWithRelationalBackplane` in a deployment that configured no Postgres run fine in the hot store,
@@ -422,7 +424,12 @@ aside in `__melange_archive_dead_letter`, in the batch's own transaction, rather
 row or stall the applier. Error, once per row, naming the table, key, LSN and reducer and never the row's
 values; the dead-letter table holds those (as `row_values` jsonb), and `melange.archive.dead_lettered` counts
 them. A collision is a bug in key allocation: find the source, fix it, then re-apply or delete each row
-deliberately — the `melange-applier` check stays Degraded until the table is empty (road-to-0.3 phase 25);
+deliberately — the `melange-applier` check stays Degraded until the table is empty — and
+`1613 PostgresRestoreReconciled` — after a restore, the projection's epoch was an ancestor in the
+restored log's lineage, so the applier reconciled it: archive rows outside the restored history moved to
+`__melange_archive_rewound` (not deleted), backplane tables that ran past the fork re-copied, the resume
+LSN named; Warning, because rows moved automatically — and `1614 PostgresCloneArchiveEmpty` — a clone's
+archive starts without the source's history (road-to-0.3 phase 25);
 `1700 ClusterHubStarted` (naming the node-link listener's bound
 port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
 loud: how long the silence was and how many shards moved under bumped fencing tokens —

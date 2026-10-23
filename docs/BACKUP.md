@@ -154,23 +154,35 @@ rather than starting it — starting would open this deployment's own data direc
 under test. `MelangeBackup.CheckRestore(directory, schema)` is the same thing without a host. A CI
 job's whole contract is that the check throws and the alert is the throw.
 
-The Postgres tier is not in the archive and is not silently overwritten: on first boot after a
-restore, the applier's checkpoint belongs to an epoch the restored log has never seen, and the
-tier refuses loudly (EventId 1605) with the remediation printed rather than projecting history
-that no longer happened — the `AutoMigrate` posture: destructive disagreement is never automatic.
-The clean path is an empty schema, which the bootstrap machinery fills from the restored log; the
-refusal's same-epoch cousin — a checkpoint ahead of the log's head, the hand-rolled directory
-swap — is EventId 1608. Both refusals' remediations are tested to recover when followed
-literally.
+The Postgres tier is not in the archive, and it keeps running across a restore — so on first boot
+after one, it holds a future the restored log does not contain. **A restore records where it came
+from:** the restored directory's `melange.lineage` names the source epoch and the LSN it forked at
+(and that epoch's own ancestors, which the archive carries), so the applier can tell a projection of
+this world's past from one of an unrelated world.
 
-**Archive tables change this.** A table declared `Tier = Archive` lives only in Postgres: its rows
-are not in the archive, and once the log truncates past them Postgres holds the only copy. So for a
-deployment with archive tables, Postgres is part of the backup, not a projection beside it — back it
-up with point-in-time recovery (WAL archiving), and restore it to the same moment as the log. **Do
-not follow the empty-schema remediation above** in such a deployment: it deletes the archive's rows
-for good, and with the log truncated the applier then refuses to start (EventId 1611) rather than
-begin an archive with a hole. Trimming an archive back to a restored log's history is planned
-([plan-phase-25.md](road-to-0.3/plan-phase-25.md)).
+- **Its own past: reconciled** (EventId 1613, Warning). Archive rows outside the restored history are
+  *moved* to `__melange_archive_rewound`, not deleted — Postgres may hold their only copy, and
+  destructive is never automatic; drop them once nothing needs them. Backplane tables that ran past
+  the fork are re-copied from the hot store. The checkpoint moves to the restored epoch at the fork,
+  and the applier resumes. Before lineage, this was a refusal (EventId 1605) whose remediation was an
+  empty schema.
+- **Another branch: refused** (EventId 1605). Restoring a backup whose lineage does not include the
+  epoch Postgres follows — the older backup restored after a newer restore, say — cannot be
+  reconciled: rows that world needs may have been moved aside already. For a deployment with no
+  archive tables, an empty schema is still the clean path, which the bootstrap machinery fills from
+  the restored log. Its same-epoch cousin — a checkpoint ahead of the log's head, the hand-rolled
+  directory swap — is EventId 1608. Both refusals' remediations are tested to recover when followed
+  literally.
+
+**Archive tables make Postgres part of the backup.** A table declared `Tier = Archive` lives only in
+Postgres: its rows are not in the archive, and once the log truncates past them Postgres holds the
+only copy. Back Postgres up with point-in-time recovery (WAL archiving), and when Postgres itself is
+lost, restore it to the same moment as the log. **Do not clear the schema** in such a deployment: it
+deletes the archive's rows for good. A reconcile whose resume point sits below the restored log's
+base — Postgres had fallen behind the archive's snapshot — refuses for the same reason (EventId 1611):
+the archive rows in between exist only in a Postgres backup. A **clone** starts its archive without
+the source's history (EventId 1614): it gets only the archive rows still in its log above the
+snapshot, and the rest stays in the source's Postgres.
 
 After restoring, point `CommitLog:Path` at the restored directory (or place it where your
 configuration already points). The hot-store directory is scratch and is rebuilt on boot.

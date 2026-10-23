@@ -596,6 +596,13 @@ Postgres holds the only copy. Requires `AddPostgres(...)`; refused at compile ti
 Replicated, or declaring a Residency (MELANGE0024–0026). See
 [plan-phase-25.md](road-to-0.3/plan-phase-25.md).
 
+**Lineage (`melange.lineage`)** — Which earlier epochs a log descends from, and the LSN it forked from each: a
+restore writes its source epoch and restored head, extending the lineage the archive carried. LSNs run on along a
+lineage, so an (epoch, LSN) pair is this log's history when the epoch is the current one or an ancestor and the
+LSN is at or below its fork point. It is how the Postgres applier tells a projection of this world's past —
+reconciled after a restore (EventId 1613), with rewound archive rows moved to `__melange_archive_rewound` — from
+one of an unrelated world (refused, 1605).
+
 **Projected-tables registry (`__melange_projected`)** — The Postgres applier's record of which backplane tables
 it holds a complete copy of, beside its checkpoint. A declared backplane table missing from it is new to the
 projection — its history is behind the checkpoint, skipped while the table was hot — and is copied from the

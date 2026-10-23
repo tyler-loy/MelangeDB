@@ -526,6 +526,14 @@ kind of thing the `AutoMigrate` posture exists to make deliberate.
 
 ### Trimming across more than one restore
 
+**As built:** the lineage sidecar exists (`melange.lineage`, carried in the archive's per-engine
+identity as an optional field rather than as a sidecar frame, so the archive format version does not
+move), and the trim is a *move*: rows outside the restored history go to `__melange_archive_rewound`
+rather than being deleted, so the reconcile can run automatically without being destructive. A
+restore whose lineage does not name Postgres's epoch is still refused (1605). The open question
+below resolved itself: an archive taken before lineage still names its own source epoch, so a
+restore of it gets a one-generation lineage and reconciles normally.
+
 LSNs count within one epoch, and a restore mints a new epoch that continues numbering from the
 restored head. Restore once at LSN 100 and run to 500 under epoch B; then restore an older backup of
 epoch A at LSN 300. Archive rows from B at LSNs 101–300 are not part of A's history, yet an

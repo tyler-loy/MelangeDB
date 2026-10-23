@@ -48,6 +48,12 @@ internal sealed class PostgresSchemaManager
     /// </summary>
     public const string DeadLetterTable = "__melange_archive_dead_letter";
 
+    /// <summary>
+    /// Where archive rows from a future a restore rewound are moved — not deleted — when the
+    /// projection is reconciled to the restored log's history. Postgres may hold their only copy.
+    /// </summary>
+    public const string RewoundTable = "__melange_archive_rewound";
+
     /// <summary>The log position an archive row was committed at, so a restore can trim the archive back to its history.</summary>
     public const string LsnColumn = "_melange_lsn";
 
@@ -103,6 +109,21 @@ internal sealed class PostgresSchemaManager
                     "reducer" text,
                     "row_values" jsonb NOT NULL,
                     "dead_lettered_at" timestamp with time zone NOT NULL
+                )
+                """,
+                ct).ConfigureAwait(false);
+            await ExecuteAsync(
+                connection,
+                $"""
+                CREATE TABLE IF NOT EXISTS {PostgresIdentifier.Qualify(_schema, RewoundTable)} (
+                    "id" bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    "table_name" text NOT NULL,
+                    "row_key" text NOT NULL,
+                    "lsn" bigint NOT NULL,
+                    "log_epoch" uuid NOT NULL,
+                    "row_values" jsonb NOT NULL,
+                    "restored_epoch" uuid NOT NULL,
+                    "rewound_at" timestamp with time zone NOT NULL
                 )
                 """,
                 ct).ConfigureAwait(false);

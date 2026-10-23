@@ -284,7 +284,15 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         }
 
         if (checkpointEpoch != epoch)
-            throw new PostgresEpochMismatchException(checkpointEpoch.Value, epoch, checkpointLsn);
+        {
+            // A projection from an ancestor of this log — the restore case — is reconciled to the
+            // restored history; one from an unrelated world is refused, as before lineage existed.
+            if (_engine.Lineage.UpToFor(checkpointEpoch.Value) is not { } forkedAt)
+                throw new PostgresEpochMismatchException(checkpointEpoch.Value, epoch, checkpointLsn);
+            if (await ReconcileRestoredAsync(connection, checkpointEpoch.Value, checkpointLsn, forkedAt, epoch, ct).ConfigureAwait(false) is not { } resumeFrom)
+                return;
+            checkpointLsn = resumeFrom;
+        }
 
         // Same epoch, checkpoint past the head: the relational backplane holds a future the log no
         // longer contains. A restore cannot produce this (it always mints a new epoch, which is
@@ -363,6 +371,127 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         var newMirrors = missing.Where(static t => t.Tier != StorageTier.Archive).ToList();
         if (newMirrors.Count > 0)
             await CopyTablesFromStoreAsync(connection, newMirrors, epoch, ct).ConfigureAwait(false);
+    }
+
+    private List<string> ArchiveTableNames =>
+        _relationalTables.Where(static t => t.Tier == StorageTier.Archive).Select(static t => t.Name).ToList();
+
+    /// <summary>
+    /// Reconciles a projection whose checkpoint belongs to <paramref name="checkpointEpoch"/>, an
+    /// ancestor this log forked from at <paramref name="forkedAt"/> — what Postgres looks like after
+    /// a restore. The projection may hold history past the fork, the future the restore rewound:
+    /// <list type="bullet">
+    /// <item>Archive rows outside this log's lineage are <em>moved</em> to the rewound table, not
+    /// deleted: Postgres may hold their only copy, and destructive is never automatic.</item>
+    /// <item>Backplane tables are re-copied from the hot store only when the checkpoint ran past
+    /// the fork; below it they already describe this log's history.</item>
+    /// <item>The checkpoint moves to this epoch at the earlier of itself and the fork, and the
+    /// applier resumes from there; re-applying the mirrors' ops from there to the copy's capture
+    /// LSN converges, as for any copy.</item>
+    /// </list>
+    /// All in one Postgres transaction. Returns the LSN to resume from, or null when the projection
+    /// was instead rebuilt from scratch (no archive tables, and the log truncated past the resume
+    /// point).
+    /// </summary>
+    private async Task<ulong?> ReconcileRestoredAsync(
+        NpgsqlConnection connection,
+        Guid checkpointEpoch,
+        ulong checkpointLsn,
+        ulong forkedAt,
+        Guid epoch,
+        CancellationToken ct)
+    {
+        var resumeFrom = Math.Min(checkpointLsn, forkedAt);
+        if (resumeFrom < _engine.Log.BaseLsn)
+        {
+            // The records between the resume point and the restored log's base are gone. Mirrors
+            // rebuild from the hot store; archive rows in that range exist nowhere this process
+            // can reach — only in a Postgres backup taken at the same moment as the log's.
+            var archives = ArchiveTableNames;
+            if (archives.Count > 0)
+            {
+                throw new PostgresArchiveUnrecoverableException(
+                    archives,
+                    _engine.Log.BaseLsn,
+                    $"its checkpoint (LSN {resumeFrom} of the ancestor epoch {checkpointEpoch}) is below the restored log's base");
+            }
+
+            await BootstrapFromStoreAsync(connection, epoch, ct).ConfigureAwait(false);
+            return null;
+        }
+
+        var schema = _options.CurrentValue.Postgres.Schema;
+        var lineage = _engine.Lineage.Ancestors;
+        var recopy = checkpointLsn > forkedAt ? MirroredTables.ToList() : [];
+        Dictionary<TableId, List<byte[]>> rows = recopy.ToDictionary(t => t.Id, _ => new List<byte[]>());
+        if (recopy.Count > 0)
+        {
+            _engine.ReadConsistent(head =>
+            {
+                foreach (var table in recopy)
+                {
+                    foreach (var pair in _engine.HotStore.Scan(table.Id))
+                        rows[table.Id].Add(pair.Value.ToArray());
+                }
+            });
+        }
+
+        long moved = 0;
+        await using (var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false))
+        {
+            foreach (var table in _relationalTables.Where(static t => t.Tier == StorageTier.Archive))
+            {
+                var qualified = PostgresIdentifier.Qualify(schema, table.Name);
+                var lsnColumn = PostgresIdentifier.Quote(PostgresSchemaManager.LsnColumn);
+                var epochColumn = PostgresIdentifier.Quote(PostgresSchemaManager.EpochColumn);
+                await using var move = new NpgsqlCommand(
+                    $"""
+                    WITH moved AS (
+                        DELETE FROM {qualified} AS r
+                        WHERE r.{epochColumn} <> $1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM unnest($2::uuid[], $3::bigint[]) AS a(epoch, upto)
+                              WHERE a.epoch = r.{epochColumn} AND r.{lsnColumn} <= a.upto)
+                        RETURNING r.*)
+                    INSERT INTO {PostgresIdentifier.Qualify(schema, PostgresSchemaManager.RewoundTable)}
+                        ("table_name", "row_key", "lsn", "log_epoch", "row_values", "restored_epoch", "rewound_at")
+                    SELECT $4, moved.{PostgresIdentifier.Quote(table.PrimaryKey.Name)}::text, moved.{lsnColumn}, moved.{epochColumn},
+                        to_jsonb(moved) - '{PostgresSchemaManager.LsnColumn}' - '{PostgresSchemaManager.EpochColumn}', $1, now()
+                    FROM moved
+                    """,
+                    connection,
+                    transaction);
+                command(move, epoch, lineage, table.Name);
+                moved += await move.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            foreach (var table in recopy)
+            {
+                await using var delete = new NpgsqlCommand($"DELETE FROM {PostgresIdentifier.Qualify(schema, table.Name)}", connection, transaction);
+                await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                if (rows[table.Id].Count > 0)
+                {
+                    await using var commands = new NpgsqlBatch(connection, transaction);
+                    foreach (var row in rows[table.Id])
+                        commands.BatchCommands.Add(_tableSql[table.Id].Upsert(row));
+                    await commands.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+                }
+            }
+
+            await WriteCheckpointAsync(connection, transaction, resumeFrom, epoch, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+        }
+
+        LogMessages.RestoreReconciled(_logger, checkpointEpoch, forkedAt, moved, recopy.Count, resumeFrom);
+        return resumeFrom;
+
+        static void command(NpgsqlCommand move, Guid epoch, IReadOnlyList<EpochAncestor> lineage, string table)
+        {
+            move.Parameters.Add(new NpgsqlParameter<Guid> { TypedValue = epoch });
+            move.Parameters.Add(new NpgsqlParameter<Guid[]> { TypedValue = [.. lineage.Select(static a => a.Epoch)] });
+            move.Parameters.Add(new NpgsqlParameter<long[]> { TypedValue = [.. lineage.Select(static a => (long)a.UpToLsn)] });
+            move.Parameters.Add(new NpgsqlParameter<string> { TypedValue = table });
+        }
     }
 
     /// <summary>The backplane tables: hot, with a Postgres copy that can always be rebuilt from the hot store.</summary>
@@ -485,10 +614,21 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             // A mirror rebuilds from the hot store; an archive cannot, because its rows below the
             // truncation base were never in the hot store and are no longer in the log. Whatever
             // Postgres held of them went with the checkpoint, so anchoring would quietly begin an
-            // archive with a hole at its start.
-            var archives = _relationalTables.Where(static t => t.Tier == StorageTier.Archive).Select(static t => t.Name).ToList();
+            // archive with a hole at its start. The one exception is a clone: a new world whose
+            // archive is meant to start empty, with history left in the source's Postgres.
+            var archives = ArchiveTableNames;
             if (archives.Count > 0)
-                throw new PostgresArchiveUnrecoverableException(archives, _engine.Log.BaseLsn);
+            {
+                if (MelangeBackup.ReadProvenance(_options.CurrentValue.CommitLog.Path) is null)
+                {
+                    throw new PostgresArchiveUnrecoverableException(
+                        archives,
+                        _engine.Log.BaseLsn,
+                        "the applier has no checkpoint to resume from");
+                }
+
+                LogMessages.CloneArchiveEmpty(_logger, string.Join(", ", archives));
+            }
 
             await BootstrapFromStoreAsync(connection, epoch, ct).ConfigureAwait(false);
         }
@@ -635,14 +775,19 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             await commands.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
         }
 
-        await WriteCheckpointAsync(connection, transaction, anchor, epoch, ct).ConfigureAwait(false);
-        await ReplaceProjectedAsync(connection, transaction, anchor, epoch, ct).ConfigureAwait(false);
+        // The copy covers the mirrors only. Archive rows are in no hot store, so with archive
+        // tables declared (a clone) the checkpoint goes to the log's base rather than the capture
+        // LSN: every archive op still in the log is applied, and re-applying the mirrors' ops from
+        // the base to the capture LSN over the copy converges, as for any copy.
+        var checkpoint = _relationalTables.Any(static t => t.Tier == StorageTier.Archive) ? _engine.Log.BaseLsn : anchor;
+        await WriteCheckpointAsync(connection, transaction, checkpoint, epoch, ct).ConfigureAwait(false);
+        await ReplaceProjectedAsync(connection, transaction, checkpoint, epoch, ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         // Log before publishing the checkpoint: anyone woken by WaitForAppliedAsync must be able
         // to observe that the anchor came from a bootstrap, not replay.
         LogMessages.Bootstrapped(_logger, rows.Count, anchor);
-        Volatile.Write(ref _appliedLsn, anchor);
-        SignalWaiters(anchor);
+        Volatile.Write(ref _appliedLsn, checkpoint);
+        SignalWaiters(checkpoint);
     }
 
     private async Task<(ulong Lsn, Guid? Epoch)> ReadCheckpointAsync(NpgsqlConnection connection, CancellationToken ct)
@@ -723,7 +868,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 LogMessages.CheckpointAhead(_logger, ahead.CheckpointLsn, ahead.HeadLsn);
                 break;
             case PostgresArchiveUnrecoverableException unrecoverable:
-                LogMessages.ArchiveUnrecoverable(_logger, string.Join(", ", unrecoverable.Tables), unrecoverable.BaseLsn);
+                LogMessages.ArchiveUnrecoverable(_logger, unrecoverable.Situation, string.Join(", ", unrecoverable.Tables), unrecoverable.BaseLsn);
                 break;
             default:
                 LogMessages.Stalled(_logger, lag, AppliedLsn, failures, exception);
@@ -898,14 +1043,13 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 LogLevel.Error,
                 new EventId(1605, "PostgresEpochMismatch"),
                 "The Postgres checkpoint belongs to log epoch {CheckpointEpoch} at LSN {CheckpointLsn}, but the current " +
-                "log's epoch is {LogEpoch}; LSNs are meaningless across epochs, so the applier is stalled {Lag} " +
-                "transaction(s) behind rather than guessing. Clear the Postgres schema to re-bootstrap from current " +
-                "state, or restore the log this projection belongs to. After `melange restore` this is the expected " +
-                "refusal when the old projection is still present — a restore is a rewind, the relational backplane holds " +
-                "a future the restored log does not contain, and the clean path is an empty schema, which bootstrap " +
-                "refills from the restored log. EXCEPT when this deployment declares archive tables: their rows exist only " +
-                "in this Postgres schema, so clearing it deletes them for good. Restore the Postgres schema from the backup " +
-                "taken with the log instead (point-in-time recovery to the same moment).")
+                "log's epoch is {LogEpoch}, which does not descend from it; LSNs are meaningless across epochs, so the " +
+                "applier is stalled {Lag} transaction(s) behind rather than guessing. A restore of this projection's own " +
+                "world is reconciled automatically (EventId 1613) because the restored log's lineage names it; this one " +
+                "is another branch, or a restore from before lineage was recorded. Restore the log this projection belongs " +
+                "to, or clear the Postgres schema to re-bootstrap from current state. EXCEPT when this deployment declares " +
+                "archive tables: their rows exist only in this Postgres schema, so clearing it deletes them for good. " +
+                "Restore the Postgres schema from a backup taken with the log instead (point-in-time recovery to the same moment).")
             ;
 
         public static void EpochMismatch(ILogger logger, Guid checkpointEpoch, Guid logEpoch, ulong checkpointLsn, long lag) =>
@@ -955,18 +1099,42 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         public static void TableUnprojected(ILogger logger, string table) =>
             TableUnprojectedMessage(logger, table, null);
 
-        private static readonly Action<ILogger, string, ulong, Exception?> ArchiveUnrecoverableMessage =
-            LoggerMessage.Define<string, ulong>(
+        private static readonly Action<ILogger, string, string, ulong, Exception?> ArchiveUnrecoverableMessage =
+            LoggerMessage.Define<string, string, ulong>(
                 LogLevel.Error,
                 new EventId(1611, "PostgresArchiveUnrecoverable"),
-                "The Postgres applier has no checkpoint to resume from, and the log was truncated up to LSN {BaseLsn}, so " +
-                "the archive table(s) {Tables} cannot be rebuilt: their rows below that LSN were never in the hot store " +
-                "and are no longer in the log. The applier is stalled rather than starting an archive with a hole at its " +
-                "start. Restore this Postgres schema from its backup (point-in-time recovery reaches the checkpoint it lost), " +
-                "or restore the log this projection belongs to.");
+                "The Postgres applier cannot continue: {Situation}, and the log was truncated up to LSN {BaseLsn}, so the " +
+                "archive table(s) {Tables} cannot be rebuilt: their rows below that LSN were never in the hot store and are " +
+                "no longer in the log. The applier is stalled rather than leave a hole in the archive. Restore this Postgres " +
+                "schema from a backup at the same moment as the log (point-in-time recovery), or restore the log this " +
+                "projection belongs to.");
 
-        public static void ArchiveUnrecoverable(ILogger logger, string tables, ulong baseLsn) =>
-            ArchiveUnrecoverableMessage(logger, tables, baseLsn, null);
+        public static void ArchiveUnrecoverable(ILogger logger, string situation, string tables, ulong baseLsn) =>
+            ArchiveUnrecoverableMessage(logger, situation, tables, baseLsn, null);
+
+        private static readonly Action<ILogger, Guid, ulong, long, int, ulong, Exception?> RestoreReconciledMessage =
+            LoggerMessage.Define<Guid, ulong, long, int, ulong>(
+                LogLevel.Warning,
+                new EventId(1613, "PostgresRestoreReconciled"),
+                "The Postgres projection belonged to epoch {CheckpointEpoch}, an ancestor this restored log forked from at " +
+                "LSN {ForkedAt}, and was reconciled to the restored history: {Moved} archive row(s) from the future the " +
+                "restore rewound were moved to __melange_archive_rewound (not deleted — Postgres may hold their only copy), " +
+                "{Recopied} backplane table(s) were re-copied from the hot store, and the applier resumes from LSN {ResumeFrom}. " +
+                "Drop the rewound rows once nothing needs them.");
+
+        public static void RestoreReconciled(ILogger logger, Guid checkpointEpoch, ulong forkedAt, long moved, int recopied, ulong resumeFrom) =>
+            RestoreReconciledMessage(logger, checkpointEpoch, forkedAt, moved, recopied, resumeFrom, null);
+
+        private static readonly Action<ILogger, string, Exception?> CloneArchiveEmptyMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Warning,
+                new EventId(1614, "PostgresCloneArchiveEmpty"),
+                "This world is a clone, and its archive table(s) {Tables} start without the source's history: archive rows " +
+                "live in the source's Postgres, and a clone carries only the ones still in its log above the archive's " +
+                "snapshot. Copy the rest from the source's Postgres yourself if this clone needs that history.");
+
+        public static void CloneArchiveEmpty(ILogger logger, string tables) =>
+            CloneArchiveEmptyMessage(logger, tables, null);
 
         // The key and the reducer, never the row's values: an archive is where wallet and audit
         // data lives, and log sinks are not where it belongs. The dead-letter table holds the row.
@@ -989,14 +1157,17 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 /// mirror can be rebuilt from the hot store, but an archive's rows below the truncation base exist
 /// nowhere this process can reach. Refused loudly (EventId 1611) rather than anchored with a hole.
 /// </summary>
-public sealed class PostgresArchiveUnrecoverableException(IReadOnlyList<string> tables, ulong baseLsn)
+public sealed class PostgresArchiveUnrecoverableException(IReadOnlyList<string> tables, ulong baseLsn, string situation)
     : Exception(
-        $"The archive table(s) {string.Join(", ", tables)} cannot be rebuilt: the applier has no checkpoint and the log " +
-        $"was truncated up to LSN {baseLsn}, below which their rows exist only in a Postgres backup.")
+        $"The archive table(s) {string.Join(", ", tables)} cannot be rebuilt: {situation}, and the log was truncated up " +
+        $"to LSN {baseLsn}, below which their rows exist only in a Postgres backup.")
 {
     public IReadOnlyList<string> Tables { get; } = tables;
 
     public ulong BaseLsn { get; } = baseLsn;
+
+    /// <summary>Why the applier cannot simply resume, as the 1611 line names it.</summary>
+    public string Situation { get; } = situation;
 }
 
 /// <summary>Thrown when the Postgres checkpoint names a different log epoch than the current log.</summary>

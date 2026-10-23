@@ -267,6 +267,9 @@ internal static class ArchiveRestore
                 newEpoch).Write(engineDirectory);
         }
 
+        // The new epoch descends from the source at the restored head. Written before the epoch
+        // sidecar, which stays last: a directory with an epoch always has its lineage.
+        new EpochLineage(identity.Lineage ?? []).Extend(identity.SourceEpoch, restoredHead).Save(engineDirectory);
         File.WriteAllBytes(Path.Combine(engineDirectory, "melange.epoch"), newEpoch.ToByteArray());
 
         return new RestoredEngineSummary(

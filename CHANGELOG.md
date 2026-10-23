@@ -60,8 +60,21 @@ All packages ship together at one version; there is no per-package versioning. S
   as `row_values` jsonb), logged at Error by key and reducer but never by value (EventId 1612),
   counted (`melange.archive.dead_lettered`), and reported as a Degraded `melange-applier` until the
   table is cleared — through the new `IApplierCondition`, which any decoupled applier can implement.
-  **Not yet in this release:** restore trimming and the archive retention floor ([plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md)); until then,
+  **Not yet in this release:** the archive retention floor ([plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md)); until then,
   back up Postgres with point-in-time recovery and see [docs/BACKUP.md](docs/BACKUP.md).
+
+- **Restores record their lineage, and the Postgres projection is reconciled after one.** A restored
+  directory's `melange.lineage` names the source epoch and the LSN it forked at, plus that epoch's own
+  ancestors (carried in the archive's per-engine identity as an optional field, so the archive format
+  is unchanged and older archives still restore). On first boot, a Postgres checkpoint from an
+  ancestor epoch is reconciled to the restored history instead of refused: archive rows outside it
+  move to `__melange_archive_rewound` (not deleted), backplane tables that ran past the fork are
+  re-copied from the hot store, and the applier resumes from the fork (EventId 1613). A checkpoint
+  from an epoch the lineage doesn't name — another branch — is still refused (1605). A reconcile
+  whose resume point is below the restored log's base refuses for archive tables (1611), and a
+  clone starts its archive without the source's history (1614). **Behavior change:** a restore of
+  a backplane-only deployment used to stop at EventId 1605 until the schema was cleared; it now
+  reconciles on its own. Clearing the schema still works.
 
 ### Fixed
 
