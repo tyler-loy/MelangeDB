@@ -596,6 +596,11 @@ Postgres holds the only copy. Requires `AddPostgres(...)`; refused at compile ti
 Replicated, or declaring a Residency (MELANGE0024–0026). See
 [plan-phase-25.md](road-to-0.3/plan-phase-25.md).
 
+**Archive reader (`IArchiveReader`)** — How code outside a reducer reads an archive table: keyset-paginated pages
+ordered by primary key, filtered on the key or one indexed column. A page is Postgres at the applier's checkpoint
+with the unapplied log tail overlaid, so a just-archived row is never briefly invisible; when that tail is too long
+to overlay, the page is Postgres alone and says `Stale`. Registered by `AddPostgres`.
+
 **Key set (`__keys_<Table>`)** — The key-only hot table behind an archive table declared `KeepKeys = true`: one
 key per archived row and no payload, maintained by the engine from the archive's ops, so a reducer can ask
 `Contains(key)` — an idempotency check across the hot window — and a duplicate archive insert is refused before

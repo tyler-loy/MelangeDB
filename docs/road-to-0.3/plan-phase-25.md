@@ -565,6 +565,13 @@ printed. Refusal is the `AutoMigrate` posture and probably right.
 
 ### The visibility gap
 
+**As built (`IArchiveReader`, the first half of the read side):** one filter column — the key or an
+indexed column, by value or inclusive range — and primary-key order either way, keyset-paginated. The
+checkpoint and the page are read in one repeatable-read transaction so they describe the same moment.
+The overlay cap is a constant, 50,000 records, past which the page is marked `Stale` rather than the
+read scanning the log; it becomes a setting if anyone needs to tune it. The client-facing endpoint is
+the second half.
+
 After a move commits, the row is gone from the hot store immediately and arrives in Postgres when the
 applier gets to it. A reader that queries both sees nothing in between.
 

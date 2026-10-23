@@ -71,6 +71,13 @@ All packages ship together at one version; there is no per-package versioning. S
   the table is created; turning it on later refuses boot, turning it off doesn't. MELANGE0027 refuses
   it on any other tier.
 
+- **`IArchiveReader`: reading archive history outside a reducer.** Registered by `AddPostgres`.
+  Keyset-paginated pages of an archive table, ordered by primary key (ascending or newest first),
+  filtered on the key or one indexed column by value or inclusive range, values in the columns' own
+  CLR types. Each page reads Postgres and the applier's checkpoint in one repeatable-read transaction,
+  then overlays the unapplied log tail for that table, so a row that just left the hot store is never
+  briefly invisible; past 50,000 unapplied records the overlay is skipped and the page says `Stale`.
+
 - **`Postgres:ArchiveLogRetentionHours`, the archive retention floor.** Off by default. While archive
   tables are declared, the log keeps the records committed within the window — a named truncation
   floor, `archive-retention`, searched by commit timestamp like the resume window — so a Postgres

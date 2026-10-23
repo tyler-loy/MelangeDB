@@ -43,6 +43,7 @@ public static class PostgresMelangeDbBuilderExtensions
             provider.GetService<ILoggerFactory>(),
             provider.GetService<TimeProvider>()));
         builder.Services.TryAddSingleton<IRelationalQueryExecutor, PostgresQueryExecutor>();
+        builder.Services.TryAddSingleton<IArchiveReader, PostgresArchiveReader>();
         builder.Services.AddSingleton<IHostedService>(provider => provider.GetRequiredService<PostgresRelationalTier>());
         return builder;
     }
