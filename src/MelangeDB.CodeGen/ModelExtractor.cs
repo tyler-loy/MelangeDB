@@ -31,7 +31,7 @@ internal static class ModelExtractor
                     isPublic = named.Value.Value is true;
                     break;
                 case "Tier":
-                    tier = named.Value.Value is int t && t == 1 ? "Relational" : "Hot";
+                    tier = named.Value.Value is int t ? t switch { 1 => "HotWithRelationalBackplane", _ => "Hot" } : "Hot";
                     break;
                 case "Residency":
                     residency = named.Value.Value is int r ? r switch { 1 => "Resident", 2 => "Auto", _ => "Paged" } : "Paged";

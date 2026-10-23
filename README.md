@@ -36,7 +36,7 @@ dotnet add package MelangeDB.CodeGen          # the source generator
 
 All packages ship together at one version. `MelangeDB.CodeGen` is the generator — referencing it is
 all it takes. Add `MelangeDB.Client` to a client project, `MelangeDB.Cluster` to run more than one
-node, and `MelangeDB.Storage.Postgres` for the optional relational tier. The `melange` CLI is a
+node, and `MelangeDB.Storage.Postgres` for the optional relational backplane. The `melange` CLI is a
 dotnet tool: `dotnet tool install -g MelangeDB.Cli`. See
 [docs/RELEASING.md](docs/RELEASING.md#consuming-the-packages) for the full set and for consuming
 per-commit prereleases.
@@ -76,7 +76,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddMelangeDb(melange => melange
     .UseHotStore(o => o.Path = "./data/hot")            // world state machine
-    .AddPostgres(builder.Configuration                  // optional relational tier
+    .AddPostgres(builder.Configuration                  // optional relational backplane
         .GetConnectionString("Melange"))
     .AddTablesFrom(typeof(Player).Assembly)
     .AddReducersFrom(typeof(Program).Assembly));
@@ -121,7 +121,7 @@ A runnable version of all of this lives in [`samples/`](samples).
 | Scheduled reducers (timers as rows), lifecycle reducers | Shipped (05) |
 | Transactional event bus over the log as an outbox | Shipped (06) |
 | Paged hot store on FASTER, residency tiers, snapshots, compaction | Shipped (07) |
-| Postgres relational tier, ad-hoc SQL with aggregates | Shipped (08) |
+| Postgres relational backplane, ad-hoc SQL with aggregates | Shipped (08) |
 | Clustering: placement, hub/shard roles, instancing | Shipped (09) |
 | Clustering: spatial sharding, seamless handoff | Shipped (10) |
 | Typed client bindings, schema manifest, `melange` CLI | Shipped (12) |

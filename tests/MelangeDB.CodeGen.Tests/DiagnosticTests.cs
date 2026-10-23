@@ -641,7 +641,7 @@ public class DiagnosticTests
                 [ServerOnly] public ulong LastSeenTick;
             }
 
-            [Table(Placement = Placement.Global, Tier = StorageTier.Relational)]
+            [Table(Placement = Placement.Global, Tier = StorageTier.HotWithRelationalBackplane)]
             public partial struct Registration
             {
                 [PrimaryKey][AutoInc] public long Id;

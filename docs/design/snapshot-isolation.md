@@ -137,7 +137,7 @@ deliberately does **no read-set validation**: the module author declares the rea
 declaration is the contract.
 
 **Cross-tier isolation.** There is nothing to extend it across. A reducer never touches Postgres:
-writing a `Tier = StorageTier.Relational` table stages ops into the same write set as any other
+writing a `Tier = StorageTier.HotWithRelationalBackplane` table stages ops into the same write set as any other
 table, and `PostgresRelationalTier` is an `ILogApplier` with its own checkpoint that consumes the log
 on its own thread, outside the write lock, explicitly permitted to lag (`1601
 PostgresApplierStalled`: *"Writes and subscriptions are unaffected"*). Relational tables also live in

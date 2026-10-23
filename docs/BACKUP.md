@@ -30,7 +30,7 @@ head LSN), its snapshot rows, its log tail above the snapshot LSN, and its sidec
 checkpoints ride along; they are part of what has happened). Two properties fall out for free:
 
 - **Small and shaped like the state, not the deployment.** No FASTER files, no Postgres dump. The
-  hot store is scratch that recovery rebuilds; the relational tier re-bootstraps from the restored
+  hot store is scratch that recovery rebuilds; the relational backplane re-bootstraps from the restored
   log (phase 08 machinery).
 - **Store-engine agnostic.** A backup taken from a FASTER deployment restores into an in-memory
   one, and vice versa — the archive predates the projection choice by construction.
@@ -121,7 +121,7 @@ carries the tail record by record, so this collects rather than invents.
   head are free again: the archive carries sequences as of its snapshot, and boot re-observes only
   the records the cut kept. Nothing inside the restored world refers to those ids — that history
   did not happen — and the fresh epoch is what forces every consumer outside it (clients, the
-  relational tier) to rebuild rather than carry a stale reference across the boundary. Reconcile
+  relational backplane) to rebuild rather than carry a stale reference across the boundary. Reconcile
   anything *else* that recorded them; a rewind is a business-level event, not only a technical one.
 
 The window is one archive's: `--at-lsn` reaches back to the archive's snapshot floor, and the
@@ -201,7 +201,7 @@ invite using one where the other was meant.
 **What the archive cannot carry is yours to separate**, and every one of these is how a clone
 stops being one:
 
-- **Its own Postgres schema.** The archive holds no relational tier; point the clone at an empty
+- **Its own Postgres schema.** The archive holds no relational backplane; point the clone at an empty
   schema and the phase 08 bootstrap fills it from the restored log. Pointing it at production's is
   two worlds writing one projection.
 - **Its own data directory and its own fleet.** Never `CommitLog:Path` production's, never a node

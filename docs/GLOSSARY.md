@@ -18,11 +18,11 @@ Conflating any two of these is a design error. A table declares all three.
 
 | | Question it answers | Values |
 | --- | --- | --- |
-| **Tier** | *Which storage engine holds it?* | `Hot` (default) or `Relational` (Postgres) |
+| **Tier** | *Which storage engine holds it?* | `Hot` (default) or `HotWithRelationalBackplane` (hot, plus a Postgres copy) |
 | **Placement** | *Which node in a cluster holds it?* | `Partitioned`, `Replicated`, `Global`, `Local` |
 | **Residency** | *Must it stay wholly in memory?* | `Resident`, `Paged` (default), `Auto` |
 
-A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `Relational` + `Global` + `Paged` (accounts), or
+A table can be `Hot` + `Partitioned` + `Paged` (terrain), or `HotWithRelationalBackplane` + `Global` + `Paged` (accounts), or
 `Hot` + `Replicated` + `Resident` (item definitions). They don't imply each other.
 
 ### Exposure — three levels, not two
@@ -417,7 +417,7 @@ endpoint, one protocol, and never learns the topology.
 its row codec attached, and every `[Reducer]` descriptor. `AddTablesFrom`/`AddReducersFrom` discover it
 through an assembly attribute, which is why a new table or reducer needs no manual registration anywhere.
 
-**Global** — Placement: the table lives on the hub only. In practice the relational tier.
+**Global** — Placement: the table lives on the hub only. In practice the relational backplane.
 
 **Guest identity** — An ordinary identity whose token the IdP issued with a guest role claim. MelangeDB mints
 nothing — **the IdP is the gate** for guests as for everyone — so "converting" a guest is IdP-side account
@@ -439,7 +439,7 @@ mechanism-versus-meaning line as the shard strategy itself.
 **Hot store / hot tier** — The in-process log-structured store holding world state. "Hot" describes *access
 pattern*, not volatility: it is durable, and it is not a cache.
 
-**Hub** — The node holding `Global` and `Replicated` tables, identity, the relational tier, and shard
+**Hub** — The node holding `Global` and `Replicated` tables, identity, the relational backplane, and shard
 assignment. Every client holds a permanent hub attachment. Originally "master node."
 
 **Identity** — The stable identifier for who is acting: a hash of a token's **issuer and subject**. Issuer
@@ -583,18 +583,22 @@ runs in owner mode. The per-caller half of the two-mode contract, per the guest-
 gate, owner capability is a claim it issues, and a caller without it is refused — never silently downgraded to
 policy-enforced.
 
-**Postgres applier** — The relational tier's applier: consumes the commit log on its own dispatch loop, off
-the commit path, projecting relational-tier rows into Postgres in batches whose checkpoint commits *inside*
+**Postgres applier** — The relational backplane's applier: consumes the commit log on its own dispatch loop, off
+the commit path, projecting relational-backplane rows into Postgres in batches whose checkpoint commits *inside*
 the same Postgres transaction — which is what makes resume after any failure gap-free and duplicate-free with
 no 2PC. Registered as a decoupled applier: tracked for lag and truncation floors, never driven by the commit
 path, so Postgres down is not server down.
 
-**Relational tier** — Opt-in Postgres storage for tables declaring `Tier = Relational`. The "servicey" half:
-accounts, registration, statistics. Eventually consistent with the log by design. Settled in phase 08: a
-relational table's rows **also** project into the hot store like any table's — tier is *additionally
+**Relational backplane** — Opt-in Postgres copy for tables declaring `Tier = HotWithRelationalBackplane`. The
+"servicey" half: accounts, registration, statistics. Eventually consistent with the log by design. Settled in
+phase 08: a backplane table's rows live in the hot store like any table's — the tier is *additionally
 Postgres*, not *instead of the hot store* — so reducer reads, the overlay, uniqueness, and (for public
 tables) subscriptions work unchanged, and memory stays bounded by phase 07's paging. Postgres is the extra
-projection that serves SQL tooling and aggregates.
+projection that serves SQL tooling and aggregates, and can always be rebuilt from the log. Called the
+*relational tier*, with the enum value `StorageTier.Relational`, until 0.3 renamed both for what they are
+(see [MIGRATION.md](MIGRATION.md#upgrading-to-03-the-relational-backplane-rename)).
+
+**Relational tier** — The 0.2 name for the *relational backplane*, above.
 
 **WaitForApplied** — `PostgresRelationalTier.WaitForAppliedAsync(lsn)`: completes when the tier's checkpoint
 reaches the LSN — the narrow primitive for the rare flow that genuinely needs cross-tier read-after-write.
@@ -728,7 +732,7 @@ the old row and an insert of the new one.
 registration order and survives restarts. Write-set ops and log records are keyed by table id, never by CLR
 type. Collisions are detected at schema registration.
 
-**Tier** — Which storage engine holds a table: `Hot` or `Relational`.
+**Tier** — Which storage engine holds a table: `Hot` or `HotWithRelationalBackplane`.
 
 **Truncation floor** — A named holder of the commit log: a mechanism that still needs old records, providing
 the highest LSN compaction may remove from its perspective. Log truncation takes the minimum across all of

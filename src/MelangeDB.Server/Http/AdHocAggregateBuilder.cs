@@ -7,7 +7,7 @@ namespace MelangeDB.Server;
 /// Validates a parsed aggregate query against the schema and builds the executor's form. All
 /// identifier resolution happens here, against <see cref="TableSchema"/> — the executor quotes
 /// what this produced and parameterizes every operand, so no client text ever reaches Postgres.
-/// Aggregates are relational-tier only and owner-mode only; the endpoint enforces the mode, this
+/// Aggregates are relational-backplane only and owner-mode only; the endpoint enforces the mode, this
 /// class enforces the tier and the columns.
 /// </summary>
 internal static class AdHocAggregateBuilder
@@ -20,11 +20,11 @@ internal static class AdHocAggregateBuilder
                 MelangeErrorCodes.UnknownTable, $"No table named '{parsed.Table}' is registered.");
         }
 
-        if (schema.Tier != StorageTier.Relational)
+        if (schema.Tier != StorageTier.HotWithRelationalBackplane)
         {
             throw new SubscriptionRejectedException(
                 MelangeErrorCodes.NotRelationalTier,
-                $"Table '{schema.Name}' is hot-tier; aggregates run against the relational tier only. " +
+                $"Table '{schema.Name}' is hot-tier; aggregates run against the relational backplane only. " +
                 "The row shapes remain available for hot tables.");
         }
 
@@ -133,7 +133,7 @@ internal static class AdHocAggregateBuilder
                 MelangeErrorCodes.InvalidAggregate, $"Column '{column.Name}' of kind ScheduleAt cannot carry a predicate.");
         }
 
-        // '<>' is a hot-tier index shape (issue #122); an aggregate runs on the relational tier,
+        // '<>' is a hot-tier index shape (issue #122); an aggregate runs on the relational backplane,
         // where the predicate is a RelationalPredicate discriminated by which operands it carries.
         // Refused by name rather than left to fall into the range branch, which would report a
         // null operand and tell the caller nothing about why.
@@ -142,7 +142,7 @@ internal static class AdHocAggregateBuilder
             throw new SubscriptionRejectedException(
                 MelangeErrorCodes.UnsupportedPredicate,
                 $"'<>' on column '{column.Name}' is a row-query and subscription shape; an aggregate over the "
-                + "relational tier does not serve it. Filter with '=' or BETWEEN, or select the rows and count them.");
+                + "relational backplane does not serve it. Filter with '=' or BETWEEN, or select the rows and count them.");
         }
 
         try

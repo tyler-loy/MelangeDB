@@ -68,7 +68,7 @@ plus a `ScrapeWorker` samples `WorldStat`/`CreatureCensus` rows out of Spacetime
 so the admin console can run time-series aggregates (`date_trunc('hour', at)`, `COUNT(*)`) that
 SpacetimeDB can't. You independently arrived at "hot world state + relational servicey tier" and
 paid for it with a bespoke scrape worker. In MelangeDB that worker is deleted and `WorldStat` becomes
-`[Table(Tier = StorageTier.Relational)]`.
+`[Table(Tier = StorageTier.HotWithRelationalBackplane)]`.
 
 **The library model retires an entire toolchain.** The module currently compiles to WASM via
 NativeAOT-LLVM (latest commit: "Move server module to net10.0 via NativeAOT-LLVM"), and every schema

@@ -6,8 +6,18 @@ public enum StorageTier
     /// <summary>The in-process log-structured store holding world state. The default.</summary>
     Hot,
 
-    /// <summary>Opt-in Postgres storage. Eventually consistent with the log by design.</summary>
-    Relational,
+    /// <summary>
+    /// A hot table with a relational backplane: rows live in the hot store, where reducers read and
+    /// write them, and the Postgres applier projects a copy for SQL access. The copy is eventually
+    /// consistent with the log by design and can always be rebuilt from it. Requires
+    /// <c>AddPostgres(...)</c> for the copy to exist; without it the table is an ordinary hot table.
+    /// </summary>
+    HotWithRelationalBackplane = 1,
+
+    /// <summary>The 0.2 name for <see cref="HotWithRelationalBackplane"/>; same value, same behaviour.</summary>
+    [Obsolete("Renamed to StorageTier.HotWithRelationalBackplane in 0.3: rows live in the hot store and Postgres " +
+        "holds a copy. Nothing on disk changes. See docs/MIGRATION.md.", error: true)]
+    Relational = 1,
 }
 
 /// <summary>Whether a table must stay wholly in memory.</summary>

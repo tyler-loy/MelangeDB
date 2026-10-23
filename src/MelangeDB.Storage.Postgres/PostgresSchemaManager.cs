@@ -21,7 +21,7 @@ public sealed class PostgresMigrationRefusedException : Exception
 }
 
 /// <summary>
-/// Schema generation and migration for relational-tier tables, driven by the same
+/// Schema generation and migration for relational-backplane tables, driven by the same
 /// <see cref="TableSchema"/> the hot store uses — one definition serves both tiers. The contract
 /// (DESIGN.md §10, settled in phase 08): creating missing tables and <em>adding</em> missing
 /// columns is automatic under <c>Postgres:AutoMigrate</c>; anything destructive — a changed column

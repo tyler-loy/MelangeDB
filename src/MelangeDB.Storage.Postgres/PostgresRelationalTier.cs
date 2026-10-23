@@ -9,7 +9,7 @@ using Npgsql;
 namespace MelangeDB.Storage.Postgres;
 
 /// <summary>
-/// The relational tier's applier: consumes the commit log and projects relational-tier rows into
+/// The relational backplane's applier: consumes the commit log and projects relational-backplane rows into
 /// Postgres, batched per <c>Postgres:ApplyBatchSize</c> with its <b>own durable LSN checkpoint
 /// stored in Postgres itself</b> — the checkpoint row commits in the same transaction as the
 /// batch, so a resume after any failure is gap-free and duplicate-free by construction. That
@@ -127,7 +127,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
     /// <inheritdoc />
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        _relationalTables = _engine.Schema.Tables.Where(t => t.Tier == StorageTier.Relational).ToList();
+        _relationalTables = _engine.Schema.Tables.Where(t => t.Tier == StorageTier.HotWithRelationalBackplane).ToList();
         _schemaManager = new PostgresSchemaManager(_options.CurrentValue.Postgres.Schema);
         foreach (var table in _relationalTables)
             _tableSql[table.Id] = TableSql.For(table, _options.CurrentValue.Postgres.Schema);
@@ -250,7 +250,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         if (checkpointEpoch != epoch)
             throw new PostgresEpochMismatchException(checkpointEpoch.Value, epoch, checkpointLsn);
 
-        // Same epoch, checkpoint past the head: the relational tier holds a future the log no
+        // Same epoch, checkpoint past the head: the relational backplane holds a future the log no
         // longer contains. A restore cannot produce this (it always mints a new epoch, which is
         // the mismatch above); this is the manual version — a data directory swapped for an older
         // copy with its epoch kept — and it is refused just as loudly.
@@ -296,7 +296,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         while (!ct.IsCancellationRequested)
         {
             // Durable, not head: ReadFrom serves nothing beyond the durability watermark — and a
-            // relational tier must not hold an LSN a crash on the engine could untell.
+            // relational backplane must not hold an LSN a crash on the engine could untell.
             var head = _engine.Log.DurableLsn;
             var applied = AppliedLsn;
             if (applied >= head)
@@ -589,7 +589,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 "log's epoch is {LogEpoch}; LSNs are meaningless across epochs, so the applier is stalled {Lag} " +
                 "transaction(s) behind rather than guessing. Clear the Postgres schema to re-bootstrap from current " +
                 "state, or restore the log this projection belongs to. After `melange restore` this is the expected " +
-                "refusal when the old projection is still present — a restore is a rewind, the relational tier holds " +
+                "refusal when the old projection is still present — a restore is a rewind, the relational backplane holds " +
                 "a future the restored log does not contain, and the clean path is an empty schema, which bootstrap " +
                 "refills from the restored log.")
             ;
@@ -602,7 +602,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 LogLevel.Error,
                 new EventId(1608, "PostgresCheckpointAhead"),
                 "The Postgres applier checkpoint (LSN {CheckpointLsn}) is ahead of the log's head ({HeadLsn}): the " +
-                "relational tier holds a future this log does not contain. This happens when a data directory is " +
+                "relational backplane holds a future this log does not contain. This happens when a data directory is " +
                 "replaced by an older copy that kept its epoch. Clear the Postgres schema to re-bootstrap from this " +
                 "log, or restore the newer log this projection belongs to.");
 
@@ -613,7 +613,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
             LoggerMessage.Define<int, ulong>(
                 LogLevel.Information,
                 new EventId(1606, "PostgresTierBootstrapped"),
-                "The relational tier was bootstrapped from the hot store: {Rows} row(s) captured consistent at LSN {Lsn}. " +
+                "The relational backplane was bootstrapped from the hot store: {Rows} row(s) captured consistent at LSN {Lsn}. " +
                 "The log had been truncated before this applier first ran, so replay alone could not rebuild the projection.");
 
         public static void Bootstrapped(ILogger logger, int rows, ulong lsn) =>

@@ -2,9 +2,32 @@
 
 How a deployment with a changed schema boots against an existing world. The one rule, both tiers,
 one sentence: **additive changes are automatic and loud; destructive changes are refused and
-manual.** The relational tier has worked this way since phase 08 (`Postgres:AutoMigrate`,
+manual.** The relational backplane has worked this way since phase 08 (`Postgres:AutoMigrate`,
 [CONFIGURATION.md](CONFIGURATION.md)); the hot tier works this way since phase 16, and this page
 walks the whole deploy.
+
+## Upgrading to 0.3: the relational backplane rename
+
+`StorageTier.Relational` is now `StorageTier.HotWithRelationalBackplane`. It is a rename, not a
+migration:
+
+```csharp
+[Table(Tier = StorageTier.Relational)]                 // 0.2 — now error CS0619
+[Table(Tier = StorageTier.HotWithRelationalBackplane)] // 0.3 — same table, same behaviour
+```
+
+Replace the name everywhere and redeploy. **Nothing on disk changes:** the enum value is still `1`,
+so the shape sidecar, the hot store, the Postgres schema, and the applier's checkpoint are all
+exactly as they were, and the first 0.3 boot is an ordinary restart. If you passed
+`allowPrivateRelational:` by name to `ServerSubscription.Compile`, it is now `allowPrivateBackplane:`.
+Log queries and alerts need no change: EventIds and their names are unchanged (1607 is still
+`RelationalTablesWithoutPostgres`; only its message text names the new tier), as are the wire
+error codes.
+
+The old name was retired rather than reused because a Postgres-only tier is coming
+([phase 25](road-to-0.3/plan-phase-25.md)), and a table that silently changed meaning on upgrade
+would lose its hot rows. That is why `Relational` stays as a compile error rather than coming back
+with a different meaning.
 
 ## Why the hot tier needs machinery at all
 

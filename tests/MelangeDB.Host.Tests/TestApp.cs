@@ -37,7 +37,7 @@ public partial struct Audit
 /// Relational-tier with no Postgres configured anywhere in this suite: the zero-Postgres
 /// deployment must run — rows live in the hot store — and be warned once (EventId 1607).
 /// </summary>
-[Table(Tier = StorageTier.Relational)]
+[Table(Tier = StorageTier.HotWithRelationalBackplane)]
 public partial struct AuditArchive
 {
     [PrimaryKey]

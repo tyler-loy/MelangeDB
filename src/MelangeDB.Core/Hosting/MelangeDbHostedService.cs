@@ -84,14 +84,14 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         _scheduler = (MelangeScheduler?)_provider.GetService(typeof(MelangeScheduler));
         _scheduler?.Start();
 
-        // A relational table with no relational tier is a projection that will never exist. The
-        // rows still live in the hot store, so nothing is lost — but the declared intent isn't
+        // A backplane table with no Postgres is a projection that will never exist. The rows
+        // still live in the hot store, so nothing is lost — but the declared intent isn't
         // being served, and silence here would look exactly like a working deployment.
         if (string.IsNullOrEmpty(_monitor.CurrentValue.Postgres.ConnectionString))
         {
-            var relational = engine.Schema.Tables.Where(t => t.Tier == StorageTier.Relational).Select(t => t.Name).ToList();
-            if (relational.Count > 0)
-                LogRelationalWithoutPostgres(_logger, relational.Count, string.Join(", ", relational));
+            var backplane = engine.Schema.Tables.Where(t => t.Tier == StorageTier.HotWithRelationalBackplane).Select(t => t.Name).ToList();
+            if (backplane.Count > 0)
+                LogBackplaneWithoutPostgres(_logger, backplane.Count, string.Join(", ", backplane));
         }
 
         _state.Started = true;
@@ -216,9 +216,9 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     private static partial void LogResidencyChangeFailed(ILogger logger, string table, Residency residency, Exception exception);
 
     [LoggerMessage(EventId = 1607, EventName = "RelationalTablesWithoutPostgres", Level = LogLevel.Warning,
-        Message = "{Count} table(s) declare Tier = Relational but no Postgres:ConnectionString is configured: {Tables}. " +
-            "Rows stay in the hot store; the relational projection (and ad-hoc SQL aggregates) will not exist until AddPostgres(...) is configured.")]
-    private static partial void LogRelationalWithoutPostgres(ILogger logger, int count, string tables);
+        Message = "{Count} table(s) declare Tier = HotWithRelationalBackplane but no Postgres:ConnectionString is configured: {Tables}. " +
+            "Rows stay in the hot store; the relational backplane (and ad-hoc SQL aggregates) will not exist until AddPostgres(...) is configured.")]
+    private static partial void LogBackplaneWithoutPostgres(ILogger logger, int count, string tables);
 
     [LoggerMessage(EventId = 1101, EventName = "MelangeStarted", Level = LogLevel.Information,
         Message = "MelangeDB started: recovered to LSN {HeadLsn} with {TableCount} table(s).")]

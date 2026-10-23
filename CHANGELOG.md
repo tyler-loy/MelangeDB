@@ -10,7 +10,24 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Breaking
+
+- **`StorageTier.Relational` is renamed `StorageTier.HotWithRelationalBackplane`.** The old name
+  described where people assumed the rows lived, not where they do: a relational table's rows live
+  in the hot store, reducers read them there, and Postgres holds a copy the applier projects from
+  the log. Phase 25's Postgres-only archive tier would have made the old name actively misleading,
+  so it goes first. **The break is source-only.** The value stays `1`, so nothing on disk changes —
+  no hot-store rebuild, no Postgres DDL, no shape-sidecar change, and the applier's checkpoint is
+  untouched. `StorageTier.Relational` remains as an `[Obsolete(error: true)]` alias whose message
+  names the replacement, so an upgrade fails at compile time with the fix in the error. Also renamed:
+  `ServerSubscription.Compile`'s `allowPrivateRelational` parameter (now `allowPrivateBackplane`),
+  and "relational tier" in the docs, XML docs and log and error *messages*. Deliberately **not**
+  renamed: the types named for Postgres (`PostgresRelationalTier`, `IRelationalQueryExecutor`,
+  `RelationalAggregateQuery`), the wire error codes (`not_relational`, `no_relational_tier`,
+  `relational_unavailable`), the `Postgres:*` configuration keys, and EventIds and their names —
+  each is a contract something outside this repo matches on. See
+  [docs/MIGRATION.md](docs/MIGRATION.md#upgrading-to-03-the-relational-backplane-rename) and
+  [plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md).
 
 ## [0.2.3] — 2026-10-19
 

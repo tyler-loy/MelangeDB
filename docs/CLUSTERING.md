@@ -32,7 +32,7 @@ public partial struct Creature { public ushort ChunkId; /* ... */ }
 [Table(Public = true, Placement = Placement.Replicated)]      // pinned resident everywhere
 public partial struct ItemDefinition { /* ... */ }
 
-[Table(Placement = Placement.Global, Tier = StorageTier.Relational)]
+[Table(Placement = Placement.Global, Tier = StorageTier.HotWithRelationalBackplane)]
 public partial struct Registration { /* ... */ }
 ```
 
@@ -40,7 +40,7 @@ public partial struct Registration { /* ... */ }
 `Residency.Resident` (DESIGN.md §8) and exactly what the audited game's 52 `.Iter()` scans run over.
 One declaration, three problems solved — replicate it everywhere, pin it in RAM, scan it freely.
 
-`Global` converges with the Postgres tier: **the hub's `Global` tables are the relational tier.** The
+`Global` converges with the Postgres tier: **the hub's `Global` tables are the relational backplane.** The
 "servicey" split you'd already built by hand is the same split the cluster needs.
 
 ### Partitioned tables are readable beyond their owner

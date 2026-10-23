@@ -252,16 +252,16 @@ Per-table residency, overriding the `[Table(Residency = ...)]` attribute in code
 world and a 20km production world want different answers — and an operator hitting a slow scan should be able
 to fix it without a code change and a redeploy.
 
-## Relational tier
+## Relational backplane
 
 | Key | Type | Default | Reload | Phase | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `Postgres:ConnectionString` | string | — | restart | 08 | Absent means no relational tier. A deployment with no relational tables needs no Postgres at all; one that declares relational tables without configuring this runs anyway (rows stay in the hot store) and is told so loudly at startup (EventId 1607). |
+| `Postgres:ConnectionString` | string | — | restart | 08 | Absent means no relational backplane. A deployment with no backplane tables needs no Postgres at all; one that declares backplane tables without configuring this runs anyway (rows stay in the hot store) and is told so loudly at startup (EventId 1607). |
 | `Postgres:Schema` | string | `melange` | restart | 08 | The Postgres schema (namespace) relational tables and the applier checkpoint live in. The schema and the checkpoint table are always created — they are the tier's own plumbing; `AutoMigrate` governs user tables only. |
 | `Postgres:ApplyBatchSize` | int | `100` | live | 08 | Log records per Postgres transaction. The applier checkpoint advances only with the batch — batch and checkpoint commit atomically — so batching stays correct. |
 | `Postgres:AutoMigrate` | bool | `false` | restart | 08 | Off by default: schema changes against a production database should be deliberate. Governs only **additive** DDL (create table, add column); destructive disagreement is refused loudly (EventId 1604) in both settings. Off, the applier validates and stalls with the exact pending DDL in the log; running it manually recovers without a restart. |
 | `Sql:AdHocEnabled` | bool | `false` | live | 08 | Gates the whole `/melange/sql` endpoint; off answers `403 sql_disabled`. Ad-hoc SQL is a tooling surface, and a deployment that never opted in should not be exposing one. |
-| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Since 08, `Owner` additionally requires the caller's `Sql:OwnerRole` claim, may name private *relational-tier* tables, and is the only mode that runs aggregates. |
+| `Sql:AdHocMode` | enum | `PolicyEnforced` | live | 04 | `PolicyEnforced` \| `Owner`. There is no third mode and no default-to-owner — ambiguity here is a security hole. Shipped with 04 because `/melange/sql` already returns rows; `PolicyEnforced` applies row and column policies exactly as a subscription would, `Owner` deliberately bypasses them, and `[ServerOnly]` columns are excluded in **both** modes. Since 08, `Owner` additionally requires the caller's `Sql:OwnerRole` claim, may name private *relational-backplane* tables, and is the only mode that runs aggregates. |
 | `Sql:OwnerRole` | string | `melange-owner` | live | 08 | The role claim that authorizes a caller when `AdHocMode` is `Owner` — the per-caller half of the two-mode contract, per the `Auth:GuestRole` precedent (the IdP is the gate). A caller without it is refused (`403 owner_required`), never silently downgraded to policy-enforced. Empty makes owner mode unusable by everyone. |
 
 ## Bulk ingestion

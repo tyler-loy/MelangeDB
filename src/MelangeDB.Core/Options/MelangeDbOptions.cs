@@ -52,15 +52,15 @@ public sealed class MelangeDbOptions
 }
 
 /// <summary>
-/// Options for the relational tier (<c>MelangeDb:Postgres:*</c>). The tier is opt-in: an absent
-/// connection string means no Postgres at all, and a deployment with no relational tables needs
+/// Options for the relational backplane (<c>MelangeDb:Postgres:*</c>). The tier is opt-in: an absent
+/// connection string means no Postgres at all, and a deployment with no backplane tables needs
 /// none. The implementation lives in the MelangeDB.Storage.Postgres package; these options bind
 /// here so the whole <c>MelangeDb:</c> section stays one configuration surface.
 /// </summary>
 public sealed class PostgresOptions
 {
     /// <summary>
-    /// The Npgsql connection string. Absent means no relational tier — the zero-infra single-file
+    /// The Npgsql connection string. Absent means no relational backplane — the zero-infra single-file
     /// story stays intact. Set by <c>AddPostgres(...)</c> or bound from configuration.
     /// </summary>
     public string? ConnectionString { get; set; }

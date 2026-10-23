@@ -336,7 +336,7 @@ Most of the table is routine. These four are the ones this architecture specific
 corresponds to a documented silent failure mode:
 
 - **`melange.applier.lag`** — the whole two-tier design rests on appliers being allowed to lag. The dangerous
-  failure is a *silently stalled* Postgres applier: writes keep succeeding while the relational tier falls hours
+  failure is a *silently stalled* Postgres applier: writes keep succeeding while the relational backplane falls hours
   behind and nobody notices until an admin query returns stale data. This metric is that alarm.
 - **`melange.store.resident_bytes`** — turns the residency budget from a startup log line into something
   continuously observable. "Does a 20km world fit in 8GB" becomes a dashboard rather than an argument.
@@ -406,7 +406,7 @@ applied — automatic must not mean silent), `1604 PostgresMigrationRefused` (ca
 so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (LSNs are meaningless across log
 epochs; the applier stalls rather than guesses), `1606 PostgresTierBootstrapped` (a tier attached after log
 truncation is rebuilt from the hot store at one consistent LSN), and `1607 RelationalTablesWithoutPostgres` —
-tables declared `Tier = Relational` in a deployment that configured no Postgres run fine in the hot store,
+tables declared `Tier = HotWithRelationalBackplane` in a deployment that configured no Postgres run fine in the hot store,
 and are told what they are missing (08); `1700 ClusterHubStarted` (naming the node-link listener's bound
 port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
 loud: how long the silence was and how many shards moved under bumped fencing tokens —

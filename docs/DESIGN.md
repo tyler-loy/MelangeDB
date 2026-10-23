@@ -62,7 +62,7 @@ public partial struct Player
     public float Y;
 }
 
-[Table(Tier = StorageTier.Relational)]        // opts into Postgres; private by default
+[Table(Tier = StorageTier.HotWithRelationalBackplane)]   // hot, plus a Postgres copy; private by default
 public partial struct Registration
 {
     [PrimaryKey, AutoInc] public long Id;
@@ -73,8 +73,9 @@ public partial struct Registration
 
 Four orthogonal knobs, and conflating any two of them is a design error:
 
-- **`Tier`** — *where the row is stored.* Hot (default) or Relational. Postgres is opt-in, so a table
-  only lands there if it asks to, and a deployment only needs Postgres if some table asks to.
+- **`Tier`** — *where the row is stored.* Hot (default) or HotWithRelationalBackplane — hot, with a
+  Postgres copy the applier projects from the log (called `Relational` until 0.3). Postgres is opt-in,
+  so a table only lands there if it asks to, and a deployment only needs Postgres if some table asks to.
 - **`Public`** — *may this table sync to clients at all?* **Private by default.** A private table is
   server-internal and no subscription may name it.
 - **`Residency`** — *must this table stay wholly in memory?* See §8.
