@@ -31,8 +31,8 @@ arguable.
 | [22](plan-phase-22.md) | `MelangeDB.Testing` — the reducer test kit | Planned |
 | [23](plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate` | Planned |
 | 24 | Scheduler lane — player reducers ahead of simulation work | [Design record](../design/scheduler-lanes.md) written; may not become a phase |
-| — | Producers: typed, read-only calls a client makes for data — how archive history reaches clients | [Design record](../design/producers.md) written; not scheduled, sequenced against 23 |
 | [25](plan-phase-25.md) | The archive tier — relational-only tables for unbounded history; **breaking:** `Relational` renamed to hot with a relational backplane | Planned |
+| [26](plan-phase-26.md) | Producers — typed, read-only calls a client makes for data; how archive history reaches clients ([design record](../design/producers.md)) | Planned |
 
 **Phase 20 comes first and gates two things**, and it is now the decision-gating half only — the head-to-head comparison against SpacetimeDB is split out and undecided, because its frozen baseline has diverged from the live workload in capability rather than merely in size. It is not a feature; it is the measurement half
 [phase 11](../road-to-0.1/plan-phase-11.md) called its deliverable and did not record. Everything
@@ -50,7 +50,11 @@ displays.
 
 **Phase 25 is independent of all of them** but touches two contracts other phases care about: it
 adds an epoch-lineage sidecar that phase 21's inspector should read when it crosses a restore, and
-its client-facing history read is HTTP-only unless it lands before phase 23 pins the protocol.
+its client-facing history read is phase 26.
+
+**Phase 26 follows 25 and lands before 23.** It adds two frames and protocol version 3, and phase 23
+exists to pin that contract for a second client runtime; landing producers first means the
+TypeScript client implements them from the start rather than reopening the contract a release later.
 
 **Phase 24 gets a `design/` document before it gets a plan**, the way
 [elastic-rebalancing.md](../design/elastic-rebalancing.md) preceded 13–14. That record —

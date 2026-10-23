@@ -6,10 +6,10 @@ is archive history: [phase 25](../road-to-0.3/plan-phase-25.md) settled that **c
 archive tables directly**, so the history a player is entitled to see has to be shaped and authorized
 by server code. A producer is that code.
 
-**Status:** **design record, not scheduled.** Written when phase 25's client-facing read was
-replaced by this idea. It is a protocol change, so its sequencing against
-[phase 23](../road-to-0.3/plan-phase-23.md) — which pins the wire contract for a second client
-runtime — is the first decision below.
+**Status:** **scheduled as [phase 26](../road-to-0.3/plan-phase-26.md)**, in the same release as
+phase 25 and ahead of [phase 23](../road-to-0.3/plan-phase-23.md). Written when phase 25's
+client-facing read was replaced by this idea; the decisions below are settled unless marked as
+leanings.
 
 ## The shape
 
@@ -56,10 +56,10 @@ commit path, replay, or determinism.
   discovered by the source generator. Async (`Task<T>`/`ValueTask<T>`) or sync. Parameters use the
   reducer argument encoding (`ReducerArgs`, self-describing tagged values), defaults allowed.
 - **`ProducerContext`**: `Caller`, `Claims`, `Timestamp`, a `CancellationToken` that fires when the
-  client disconnects or the call times out, and `Db` — a **read-only committed view** of hot tables
-  (`CommittedReadView` already exists for policies). Archive tables stay unreadable through it, as
-  in a reducer; the producer injects `IArchiveReader` explicitly, which makes the Postgres read a
-  visible choice.
+  client disconnects or the call times out, `Lsn`, and `Db` — a **read-only view of hot tables
+  pinned at `Lsn` for the whole call** (see [transaction scope](#transaction-scope)). Archive tables
+  stay unreadable through it, as in a reducer; the producer injects `IArchiveReader` explicitly,
+  which makes the Postgres read a visible choice.
 - **Return-type serialization.** The one genuinely new piece. Reducers return nothing and tables
   ship as schema-ordered row bytes; a producer returns arbitrary DTOs (`List<WalletLine>`). The
   generator emits a codec for each return type it reaches, from the same kinds the row format
@@ -68,7 +68,9 @@ commit path, replay, or determinism.
   matching types. Anything outside that set is a compile error, as an unserializable reducer
   parameter is today (MELANGE0004's sibling).
 - **Wire frames**: a call (`id`, producer name, args) and a result (`id`, payload) or error, on the
-  existing socket, plus an HTTP form (`POST {path}/producers/{name}`) for clients without one.
+  existing socket's calls channel, plus an HTTP form (`POST {path}/producers/{name}`) for clients
+  without one. The frames arrive with protocol version 3; the server still accepts version 2, which
+  is version 3 without producers.
 - **Authorization** on the existing ladder: the reducer policy shape (`MayCall`) applies unchanged,
   and the unpoliced-reducer startup report covers producers too — an unpoliced producer is an open
   read of whatever it returns. Row policies do not apply: the producer's own code decides what the
@@ -76,18 +78,85 @@ commit path, replay, or determinism.
 - **Limits**: the reducer rate limiter, a per-call timeout, and a response size cap, each a
   documented setting.
 
+## Transaction scope
+
+A producer has a read scope and no write scope. Both halves need saying, because a producer is
+async and runs off the write lock, which is the one thing every other `IDbView` consumer avoids.
+
+### Hot reads: one pinned view for the whole call
+
+`CommittedReadView` — the view policies use — is **not** what a producer gets. It reads the hot
+store with no lock, which the `IHotStore` contract allows only on paths the engine serializes
+against `Apply`; an async body is not one of them, and a raw read racing an apply is undefined
+("collection was modified", a half-applied batch, or a plausible stale answer).
+
+The three ways to scope it, and why the first wins:
+
+| | Consistency | Cost |
+| --- | --- | --- |
+| **One read view pinned for the call** (`IReadViewSource.OpenReadView`) | Every read sees one committed state, named by its LSN | The store retains superseded versions while the pin is held, including across awaits |
+| `ReadConsistent` around each read | Each read is clean; two reads can disagree | Every read takes the write lock — producers become write latency |
+| The write lock for the whole call | Same as a pin | Impossible across an await |
+
+So a call opens one pinned view before the body runs and exposes it as `ctx.Db`, with its LSN as
+`ctx.Lsn`. A producer is the read-only half of a snapshot-isolated reducer, which already works
+this way. The rules that follow:
+
+- **The pin outlives the body until the result is serialized.** A return value may hold a lazy
+  `ctx.Db` enumeration; disposing the pin first would read it after release. Return types are
+  lists, arrays, and records (below), so the codec materializes everything before the pin goes.
+- **The per-call timeout bounds the pin.** A producer stuck on Postgres holds old versions only as
+  long as the timeout allows; pin age is a metric.
+- **One reader at a time.** A pinned view is not thread-safe for concurrent use, and a producer
+  can `Task.WhenAll` two `ctx.Db` reads. The view handed to the body serializes access with its own
+  lock, so that is safe rather than undefined.
+- **A store without pinned reads cannot host producers.** Snapshot-isolated reducers fall back to
+  running serialized; a producer cannot, because it cannot hold the write lock across an await. Both
+  shipped stores pin, so a third-party store without `IReadViewSource` is refused at startup when
+  any producer is registered, naming the capability.
+
+### Hot and archive read the same moment
+
+A producer that merges hot and archive rows — the wallet's whole point — reads two stores at two
+moments unless told otherwise. The archive sweep moves rows from hot to archive in between:
+
+- archive read **after** the pin: an entry moved in between appears in both — a duplicate;
+- archive read **before** the pin: an entry moved in between appears in neither — silently missing.
+
+So `ArchiveQuery` gains `AsOfLsn`. Given `ctx.Lsn`, the reader excludes Postgres rows whose
+`_melange_lsn` is greater, and overlays only the unapplied tail up to that LSN. Both tiers then
+answer for the same commit, and which is read first stops mattering. The `_melange_lsn` column
+phase 25 already writes is what makes this possible.
+
+**The known gap:** archive deletes carry no LSN, so a blind delete committed after `ctx.Lsn` and
+already applied is visible early — the row is simply absent. Deletes from an archive are rare and
+the effect is a row missing that was deleted anyway; documented, not engineered around.
+
+### No write scope
+
+- **A producer commits nothing.** It cannot invoke a reducer: the nested-call guard covers only
+  reducer bodies, so the producer host refuses a reducer invocation from inside a producer call
+  explicitly. Code that needs to write is a reducer.
+- **Nothing spans calls.** A client reading a balance through a producer and then debiting it
+  through a reducer runs two transactions; the reducer re-checks. This is the same contract a
+  subscription already has.
+- **Read-your-writes on one node.** A reducer call is acknowledged only after its write set is in
+  the hot store, so a producer the same client starts afterwards pins a view that includes it, and
+  the archive overlay covers anything Postgres has not applied. In a cluster this holds when the
+  producer runs where the reducer did — see the execution site below.
+
 ## Decisions to settle
 
 ### Before or after phase 23 pins the protocol
 
-**Leaning:** before, or folded into it. Phase 23 exists to pin the wire contract while there is still
-only one client runtime; adding two frames after it means reopening that contract and implementing
-them twice. If 23 is already underway, producers ship HTTP-only first, and the socket frames wait for
-the next deliberate protocol revision.
+**Settled:** before. Phase 23 exists to pin the wire contract while there is still only one client
+runtime; adding two frames after it means reopening that contract and implementing them twice.
+Producers ship in the same release as phase 25, whose breaking changes already make it a version
+boundary, with both the socket frames and the HTTP form.
 
 ### Whether producers may read archive tables through `ctx.Db`
 
-**Leaning:** no. Keeping `ctx.Db` the same read-only hot view in reducers, policies, and producers
+**Settled:** no. Keeping `ctx.Db` the same read-only hot view in reducers, policies, and producers
 means one rule — "`Db` is the hot store" — and an archive read is always an injected, awaited, visible
 call. The cost is one constructor parameter.
 
