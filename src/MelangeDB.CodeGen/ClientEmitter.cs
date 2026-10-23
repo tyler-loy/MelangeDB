@@ -101,6 +101,9 @@ internal static class ClientEmitter
         builder.AppendLine("    }");
         builder.AppendLine();
 
+        if (schema.Producers.Length > 0)
+            ClientProducerEmitter.Emit(builder, schema);
+
         builder.AppendLine("    /// <summary>");
         builder.AppendLine("    /// The typed connection: Db for cached rows and events, Reducers for calls, Client for");
         builder.AppendLine("    /// everything the raw API still owns (connect, reconnect, untyped subscriptions).");
@@ -113,6 +116,8 @@ internal static class ClientEmitter
         builder.AppendLine("            Caches = new global::MelangeDB.Client.ClientCacheRegistry(client);");
         builder.AppendLine("            Db = new MelangeDbView(Caches);");
         builder.AppendLine("            Reducers = new MelangeReducers(client);");
+        if (schema.Producers.Length > 0)
+            builder.AppendLine("            Producers = new MelangeProducers(client);");
         builder.AppendLine("        }");
         builder.AppendLine();
         builder.AppendLine("        public global::MelangeDB.Client.MelangeClient Client { get; }");
@@ -123,6 +128,13 @@ internal static class ClientEmitter
         builder.AppendLine();
         builder.AppendLine("        public MelangeReducers Reducers { get; }");
         builder.AppendLine();
+        if (schema.Producers.Length > 0)
+        {
+            builder.AppendLine("        /// <summary>One typed stub per producer: a read-only server call answered with a value.</summary>");
+            builder.AppendLine("        public MelangeProducers Producers { get; }");
+            builder.AppendLine();
+        }
+
         builder.AppendLine("        /// <summary>The identity this connection authenticated as — what tells my rows apart from everyone else's. Known once connected.</summary>");
         builder.AppendLine("        public global::MelangeDB.Identity Identity => Client.Identity;");
         builder.AppendLine();
@@ -354,7 +366,7 @@ internal static class ClientEmitter
     private static string KeyEncode(ClientColumnModel column, string access) =>
         $"global::MelangeDB.KeyCodec.Encode{column.Kind}({(column.EnumName is null ? access : $"({ClrType(column.Kind, enumName: null)}){access}")})";
 
-    private static string ClrType(WireKind kind, string? enumName)
+    internal static string ClrType(WireKind kind, string? enumName)
     {
         if (enumName is not null)
             return enumName;
@@ -379,21 +391,21 @@ internal static class ClientEmitter
         };
     }
 
-    private static string ParameterClrType(ClientParameterModel parameter)
+    internal static string ParameterClrType(ClientParameterModel parameter)
     {
         var element = ClrType(parameter.Kind, parameter.EnumName);
         return parameter.IsArray ? element + "[]" : element;
     }
 
     /// <summary>Parameter names come from the manifest; a C# keyword gets the verbatim prefix.</summary>
-    private static string ParameterName(string name) =>
+    internal static string ParameterName(string name) =>
         SyntaxFacts.GetKeywordKind(name) == SyntaxKind.None && SyntaxFacts.GetContextualKeywordKind(name) == SyntaxKind.None
             ? name
             : "@" + name;
 
     private static string EscapeCref(string type) => type.Replace('<', '{').Replace('>', '}');
 
-    private static string Literal(string value)
+    internal static string Literal(string value)
     {
         var builder = new StringBuilder("\"");
         foreach (var c in value)

@@ -92,7 +92,7 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         if (validTables.Length == 0 && validReducers.Length == 0 && validProducers.Length == 0)
             return;
         production.AddSource("MelangeModel.g.cs", Emitter.EmitModel(validTables, validReducers, validProducers));
-        EmitManifest(production, validTables, validReducers, moduleName);
+        EmitManifest(production, validTables, validReducers, validProducers, moduleName);
     }
 
     /// <summary>
@@ -105,12 +105,13 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
         SourceProductionContext production,
         TableModel[] validTables,
         ReducerModel[] validReducers,
+        ProducerModel[] validProducers,
         string moduleName)
     {
-        if (!ManifestEmitter.HasClientSurface(validTables, validReducers))
+        if (!ManifestEmitter.HasClientSurface(validTables, validReducers, validProducers))
             return;
 
-        var collisions = ManifestEmitter.EnumNameCollisions(validTables, validReducers);
+        var collisions = ManifestEmitter.EnumNameCollisions(validTables, validReducers, validProducers);
         if (collisions.Length > 0)
         {
             foreach (var collision in collisions)
@@ -118,7 +119,15 @@ public sealed class MelangeServerGenerator : IIncrementalGenerator
             return;
         }
 
-        var (json, hash) = ManifestEmitter.Build(moduleName, validTables, validReducers);
+        var typeCollisions = ManifestEmitter.ResultTypeNameCollisions(validTables, validReducers, validProducers);
+        if (typeCollisions.Length > 0)
+        {
+            foreach (var collision in typeCollisions)
+                production.ReportDiagnostic(Diagnostic.Create(Diagnostics.AmbiguousResultTypeName, Location.None, collision));
+            return;
+        }
+
+        var (json, hash) = ManifestEmitter.Build(moduleName, validTables, validReducers, validProducers);
         production.AddSource("MelangeSchemaManifest.g.cs", ManifestEmitter.EmitHolder(json, hash));
     }
 

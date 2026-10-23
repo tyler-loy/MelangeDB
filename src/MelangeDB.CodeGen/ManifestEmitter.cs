@@ -12,8 +12,15 @@ namespace MelangeDB.CodeGen;
 /// </summary>
 internal static class ManifestEmitter
 {
-    /// <summary>The manifest format this generator writes; readers reject what they don't know.</summary>
-    public const int FormatVersion = 1;
+    /// <summary>
+    /// The newest manifest format this generator writes; readers reject what they don't know. Format
+    /// 2 adds producers and their result types, and is written only by a module that has producers —
+    /// any other module writes format 1 byte for byte as before, so its schema hash does not move.
+    /// </summary>
+    public const int FormatVersion = 2;
+
+    /// <summary>The format a module without producers writes.</summary>
+    public const int FormatWithoutProducers = 1;
 
     /// <summary>The well-known generated holder type the exporter and the dev endpoint read.</summary>
     public const string HolderTypeName = "MelangeDB.Generated.MelangeSchemaManifest";
@@ -22,8 +29,8 @@ internal static class ManifestEmitter
     /// Whether the module has a client-visible surface at all. A module of private tables and
     /// lifecycle reducers exports nothing — there is nothing a client could bind to.
     /// </summary>
-    public static bool HasClientSurface(TableModel[] tables, ReducerModel[] reducers) =>
-        tables.Any(static t => t.IsPublic) || reducers.Any(IsClientCallable);
+    public static bool HasClientSurface(TableModel[] tables, ReducerModel[] reducers, ProducerModel[]? producers = null) =>
+        tables.Any(static t => t.IsPublic) || reducers.Any(IsClientCallable) || producers is { Length: > 0 };
 
     /// <summary>
     /// Standard reducers only: lifecycle reducers are fired by the transport, never by a client
@@ -34,17 +41,18 @@ internal static class ManifestEmitter
         reducer.Kind == "Standard" && !reducer.HasTimerRowParameter;
 
     /// <summary>Builds the manifest JSON and its schema hash for an already-ordered model.</summary>
-    public static (string Json, string Hash) Build(string module, TableModel[] tables, ReducerModel[] reducers)
+    public static (string Json, string Hash) Build(string module, TableModel[] tables, ReducerModel[] reducers, ProducerModel[]? producers = null)
     {
+        producers ??= [];
         // Two fields are blanked before hashing, for different reasons. `schemaHash` because a hash
         // cannot cover itself. `generator` because the hash identifies the *schema*, not the build
         // that emitted it: leave the version in and every MelangeDB release rotates every schema
         // hash, so `conn.SchemaHash` — whose only job is detecting drift — reports drift against a
         // schema nobody touched. The emitted JSON still carries the real version; it just isn't
         // part of the identity.
-        var hashable = Render(module, tables, reducers, schemaHash: string.Empty, generator: string.Empty);
+        var hashable = Render(module, tables, reducers, producers, schemaHash: string.Empty, generator: string.Empty);
         var hash = Sha256Hex(hashable);
-        return (Render(module, tables, reducers, hash, GeneratorVersion()), hash);
+        return (Render(module, tables, reducers, producers, hash, GeneratorVersion()), hash);
     }
 
     /// <summary>Emits the generated source embedding the manifest verbatim.</summary>
@@ -79,16 +87,17 @@ internal static class ManifestEmitter
         string module,
         TableModel[] tables,
         ReducerModel[] reducers,
+        ProducerModel[] producers,
         string schemaHash,
         string generator)
     {
         var publicTables = tables.Where(static t => t.IsPublic).ToArray();
         var clientReducers = reducers.Where(IsClientCallable).ToArray();
-        var enums = CollectReferencedEnums(publicTables, clientReducers);
+        var enums = CollectReferencedEnums(publicTables, clientReducers, producers);
 
         var json = new JsonBuilder();
         json.BeginObject();
-        json.Number("format", FormatVersion);
+        json.Number("format", producers.Length > 0 ? FormatVersion : FormatWithoutProducers);
         json.String("generator", generator);
         json.String("schemaHash", schemaHash);
         json.String("module", module);
@@ -167,16 +176,135 @@ internal static class ManifestEmitter
         }
 
         json.EndArray();
+        if (producers.Length > 0)
+            RenderProducers(json, producers, enums);
         json.EndObject();
         return json.ToString();
+    }
+
+    /// <summary>
+    /// The format-2 arrays. A producer's parameters are written as a reducer's, plus a
+    /// <c>default</c> — the value's literal text — when the caller may leave one off; its result is a
+    /// type reference. A reference is a scalar kind name (<c>Int32</c>), an enum's name, or a
+    /// result type's name, suffixed <c>?</c> for a nullable value type and <c>[]</c> for a list,
+    /// innermost first: <c>Int32?[]</c> is a list of nullable ints. Result types list their fields
+    /// in wire order.
+    /// </summary>
+    private static void RenderProducers(JsonBuilder json, ProducerModel[] producers, EnumModel[] enums)
+    {
+        json.BeginArray("producers");
+        foreach (var producer in producers)
+        {
+            json.BeginObject();
+            json.String("name", producer.ProducerName);
+            json.BeginArray("params");
+            foreach (var parameter in producer.Parameters.Items)
+            {
+                json.BeginObject();
+                json.String("name", parameter.Name);
+                json.String("kind", (parameter.IsArray ? parameter.ElementKind : parameter.Kind).ToString());
+                json.Bool("isArray", parameter.IsArray);
+                if (parameter.IsEnum)
+                    json.String("enum", EnumNameOf(enums, parameter.ClrFqn));
+                else if (parameter.ElementIsEnum)
+                    json.String("enum", EnumNameOf(enums, parameter.ElementClrFqn));
+                if (parameter.DefaultJson is { } value)
+                    json.String("default", value);
+                json.EndObject();
+            }
+
+            json.EndArray();
+            json.String("returns", ManifestTypeRef(producer.ResultRef, enums));
+            json.EndObject();
+        }
+
+        json.EndArray();
+
+        json.BeginArray("types");
+        foreach (var type in ResultTypes(producers))
+        {
+            json.BeginObject();
+            json.String("name", type.Name);
+            json.Bool("valueType", type.IsValueType);
+            json.BeginArray("fields");
+            foreach (var field in type.Fields.Items)
+            {
+                json.BeginObject();
+                json.String("name", field.Name);
+                json.String("type", ManifestTypeRef(field.TypeRef, enums));
+                json.EndObject();
+            }
+
+            json.EndArray();
+            json.EndObject();
+        }
+
+        json.EndArray();
+    }
+
+    /// <summary>Every result type the producers reach, once each, by name.</summary>
+    public static ResultTypeModel[] ResultTypes(ProducerModel[] producers) =>
+        [.. producers
+            .SelectMany(static p => p.ResultTypes.Items)
+            .GroupBy(static t => t.Fqn, StringComparer.Ordinal)
+            .Select(static g => g.First())
+            .OrderBy(static t => t.Name, StringComparer.Ordinal)];
+
+    /// <summary>The generator's internal reference (CLR names) as the manifest writes it (client names).</summary>
+    private static string ManifestTypeRef(string typeRef, EnumModel[] enums) => typeRef[0] switch
+    {
+        's' => typeRef.Substring(2),
+        'e' => EnumNameOf(enums, typeRef.Substring(typeRef.IndexOf(':', 2) + 1)),
+        'r' => SimpleName(typeRef.Substring(2)),
+        'l' => ManifestTypeRef(typeRef.Substring(2), enums) + "[]",
+        'n' => ManifestTypeRef(typeRef.Substring(2), enums) + "?",
+        _ => throw new InvalidOperationException($"Unknown result type reference '{typeRef}'."),
+    };
+
+    private static string SimpleName(string fqn)
+    {
+        var dot = fqn.LastIndexOf('.');
+        var colon = fqn.LastIndexOf(':');
+        return fqn.Substring(Math.Max(dot, colon) + 1);
+    }
+
+    /// <summary>
+    /// Client names a producer's result types would collide on — with each other, with a public
+    /// table's row type, with an enum, or with a scalar kind's name. Each would make the manifest
+    /// ambiguous, so the generator refuses it (MELANGE0031) instead of shipping it.
+    /// </summary>
+    public static string[] ResultTypeNameCollisions(TableModel[] tables, ReducerModel[] reducers, ProducerModel[] producers)
+    {
+        if (producers.Length == 0)
+            return [];
+        var publicTables = tables.Where(static t => t.IsPublic).ToArray();
+        var taken = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (WireKind kind in Enum.GetValues(typeof(WireKind)))
+            taken[kind.ToString()] = "a scalar kind";
+        foreach (var table in publicTables)
+            taken[table.TypeName] = $"public table row type {table.TypeFqn}";
+        foreach (var declaration in CollectReferencedEnums(publicTables, reducers.Where(IsClientCallable).ToArray(), producers))
+            taken[declaration.Name] = $"enum {declaration.Fqn}";
+
+        var collisions = new List<string>();
+        foreach (var group in ResultTypes(producers).GroupBy(static t => t.Name, StringComparer.Ordinal))
+        {
+            if (group.Count() > 1)
+                collisions.Add($"'{group.Key}' ({string.Join(", ", group.Select(static t => t.Fqn))})");
+            else if (taken.TryGetValue(group.Key, out var other))
+                collisions.Add($"'{group.Key}' ({group.First().Fqn} and {other})");
+        }
+
+        return [.. collisions];
     }
 
     /// <summary>
     /// The enums the client-visible surface actually references, by name — an enum used only by a
     /// private table or a <c>[ServerOnly]</c> column never leaves the server, so it never ships.
     /// </summary>
-    private static EnumModel[] CollectReferencedEnums(TableModel[] publicTables, ReducerModel[] clientReducers)
+    private static EnumModel[] CollectReferencedEnums(TableModel[] publicTables, ReducerModel[] clientReducers, ProducerModel[]? producers = null)
     {
+        producers ??= [];
         var referenced = new HashSet<string>(StringComparer.Ordinal);
         foreach (var table in publicTables)
         {
@@ -198,9 +326,18 @@ internal static class ManifestEmitter
             }
         }
 
+        // A producer's enums are all client-visible: its extraction registers only those its
+        // parameters and result reach.
+        foreach (var producer in producers)
+        {
+            foreach (var declaration in producer.Enums.Items)
+                referenced.Add(declaration.Fqn);
+        }
+
         var byFqn = new Dictionary<string, EnumModel>(StringComparer.Ordinal);
         foreach (var declaration in publicTables.SelectMany(static t => t.Enums.Items)
-            .Concat(clientReducers.SelectMany(static r => r.Enums.Items)))
+            .Concat(clientReducers.SelectMany(static r => r.Enums.Items))
+            .Concat(producers.SelectMany(static p => p.Enums.Items)))
         {
             if (referenced.Contains(declaration.Fqn) && !byFqn.ContainsKey(declaration.Fqn))
                 byFqn[declaration.Fqn] = declaration;
@@ -214,11 +351,11 @@ internal static class ManifestEmitter
     /// simple name because that is the name the client bindings declare. Returns the collisions
     /// so the generator can refuse loudly instead of shipping an ambiguous contract.
     /// </summary>
-    public static string[] EnumNameCollisions(TableModel[] tables, ReducerModel[] reducers)
+    public static string[] EnumNameCollisions(TableModel[] tables, ReducerModel[] reducers, ProducerModel[]? producers = null)
     {
         var publicTables = tables.Where(static t => t.IsPublic).ToArray();
         var clientReducers = reducers.Where(IsClientCallable).ToArray();
-        return CollectReferencedEnums(publicTables, clientReducers)
+        return CollectReferencedEnums(publicTables, clientReducers, producers)
             .GroupBy(static e => e.Name, StringComparer.Ordinal)
             .Where(static g => g.Count() > 1)
             .Select(static g => $"{g.Key} ({string.Join(", ", g.Select(static e => e.Fqn))})")

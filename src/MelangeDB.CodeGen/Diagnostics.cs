@@ -259,6 +259,15 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor AmbiguousResultTypeName = new(
+        "MELANGE0031",
+        "Producer result types must have unique client names",
+        "Result type name {0} would be declared twice in the client bindings. The schema manifest carries result types by " +
+        "simple name, alongside public table row types, enums, and the scalar kind names, so each must be unique. Rename one.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor DuplicateCallableName = new(
         "MELANGE0030",
         "Producer names must be unique across producers and reducers",

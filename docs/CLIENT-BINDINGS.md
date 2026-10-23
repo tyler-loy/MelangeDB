@@ -68,8 +68,12 @@ tool, and a CLI each generate their own tree from the one file, nothing to confi
 
 ## The manifest format
 
-`melange-schema.json` is public API, format `1`. It is deliberately language-neutral: a non-C#
-client generator becomes possible by reading this file, not by linking anything.
+`melange-schema.json` is public API, format `1` or `2`. It is deliberately language-neutral: a
+non-C# client generator becomes possible by reading this file, not by linking anything. Format `2`
+adds `producers` and `types`, and is written **only** by a module that has producers: every other
+module writes format `1` byte for byte as before, so adding the format moved no existing schema
+hash. A generator that reads only format `1` rejects a producer manifest loudly rather than binding
+it without its producers.
 
 | Field | Meaning |
 | --- | --- |
@@ -80,6 +84,20 @@ client generator becomes possible by reading this file, not by linking anything.
 | `enums` | Every enum the client-visible surface references: `name`, `underlying` (a `ColumnKind` integer name), and `members` (`name` + `value`, the value as invariant decimal text so `ulong`-backed enums survive JSON). Ordered by name. |
 | `tables` | Public tables only, ordered by name: wire `name`, CLR `type` name, and `columns` in declaration order — which is wire order. `[ServerOnly]` columns are absent, exactly mirroring what the server ever puts in a frame. Each column: `name`, `kind`, optional `enum` (a name in `enums`), and `primaryKey` / `autoInc` / `unique` / `indexed` flags. |
 | `reducers` | Client-callable reducers, ordered by name: `Standard` kind only — lifecycle reducers are fired by the transport, and a scheduled reducer's timer-row argument is server codec bytes no client can legitimately construct. Each `params` entry: `name`, `kind`, `isArray` (arrays carry the element kind), optional `enum`. |
+| `producers` | *Format 2.* Every producer, ordered by name: `name`, `params` as a reducer's plus an optional `default` — the value's literal text (`"1"`, `"true"`, `"\"abc\""`, `"null"`; an enum's as its underlying number) — for trailing parameters a caller may leave off, and `returns`, a type reference. |
+| `types` | *Format 2.* Every record a producer returns or contains, ordered by name: `name`, `valueType` (a struct on the server, so a `record struct` on the client), and `fields` (`name`, `type`) in declaration order — which is wire order. |
+
+A **type reference** is a scalar kind name (`Int32`, `String`, `Identity`, …), an enum's name, or a
+`types` name, suffixed `?` for a nullable value type and `[]` for a list, innermost suffix first:
+`Int32?[]` is a list of nullable ints, `Item[][]` a list of lists of `Item`. Strings, byte arrays,
+lists, and class records are always nullable, so they carry no `?`. A result type's simple name must
+not collide with another result type, a public table's row type, an enum, or a scalar kind name
+(`MELANGE0031`).
+
+A producer's result travels as **one tagged value** in the reducer-argument encoding: integers as
+Int64/UInt64, floats as Float64, an enum as its underlying integer, a list as an array of its
+elements, and a record as an array of its fields in `types` order. Decoding is positional against
+the type reference; `ProducerResultReader` in `MelangeDB.Protocol` is the reference reader.
 
 Excluding `generator` from the hash is what makes the hash mean anything: it identifies the
 **schema**, not the build that emitted it. Upgrading MelangeDB does not change `schemaHash`, so
@@ -119,11 +137,17 @@ await conn.Db.Creature.ChunkId.RescopeRangeAsync(sub, 5, 15);      // the terrai
 await sub.UnsubscribeAsync();                                      // removes only rows nothing else covers
 
 var lsn = await conn.Reducers.SpawnAsync(chunkId, "wolf", stats);  // typed stub per reducer
+List<WalletLine> lines = await conn.Producers.HistoryAsync();      // typed stub per producer; defaults filled in
 conn.Identity;                                                     // who this connection authenticated as
 conn.SchemaHash;                                                   // the drift detector
 ```
 
 Rows are `partial struct`s with the server's field names; enums are re-declared from the manifest.
+A producer's result types are re-declared as `record`s (`record struct` for a server struct) with
+`init` properties, so a decoded result compares by value; `conn.Producers` exists only when the
+module has producers, and a stub's defaults are the server method's own. A producer needs protocol
+version 3 — a connection that negotiated 2 (an older server, or a gateway that does not route
+producers yet) throws `unsupported_version` rather than sending a frame the other side would refuse.
 The caches are **merged per table and refcounted per key** across every subscription — a row
 matching two subscriptions is one cached row and one event, and the server deliberately sends it
 once per subscription (the engine deduplicates nothing across subscriptions on a connection; the

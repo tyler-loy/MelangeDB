@@ -1,7 +1,7 @@
 {
-  "format": 1,
+  "format": 2,
   "generator": "0.2.4.0",
-  "schemaHash": "d797c31e15382e5c4447215dabb016215a5c73cf6a37ac5753af96a56be19c0c",
+  "schemaHash": "e0a1b6f4cf4eda8d4d2d2dd9ac2e73600140aa7e73451857bd69ce87a36372a6",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -705,6 +705,45 @@
           "name": "anything",
           "kind": "UInt32",
           "isArray": false
+        }
+      ]
+    }
+  ],
+  "producers": [
+    {
+      "name": "Chunks",
+      "params": [
+        {
+          "name": "minX",
+          "kind": "Int64",
+          "isArray": false,
+          "default": "0"
+        }
+      ],
+      "returns": "ChunkView[]"
+    },
+    {
+      "name": "Hang",
+      "params": [],
+      "returns": "Int32"
+    }
+  ],
+  "types": [
+    {
+      "name": "ChunkView",
+      "valueType": false,
+      "fields": [
+        {
+          "name": "Id",
+          "type": "Int64"
+        },
+        {
+          "name": "X",
+          "type": "Int64"
+        },
+        {
+          "name": "AskedBy",
+          "type": "Identity"
         }
       ]
     }

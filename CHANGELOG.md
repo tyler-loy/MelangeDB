@@ -139,6 +139,14 @@ All packages ship together at one version; there is no per-package versioning. S
   cap while the read view is still pinned. The cluster gateway still settles on version 2 until it
   routes producer calls.
 
+  The schema manifest carries producers — **format 2**, written only by a module that has them, so
+  every other module's manifest and schema hash are unchanged — with each producer's parameters
+  (defaults included) and result as a type reference, and each result type's fields in wire order.
+  The client generator re-declares result types as records and emits `conn.Producers.<Name>Async`,
+  whose defaults are the server method's and whose decoders read the result positionally.
+  MELANGE0031 refuses a result type whose client name another result type, a public table's row
+  type, an enum, or a scalar kind already has.
+
 - **`MelangeEngine.OpenReadView()` — committed state pinned at one LSN, readable off the write
   lock.** A `PinnedReadView` is a read-only `IDbView` with an `Lsn`, safe to read from several
   threads (each read and each step of a lazy query runs under its own lock), that throws on a read
