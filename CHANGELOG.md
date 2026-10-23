@@ -10,6 +10,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] — 2026-10-23
+
 ### Breaking
 
 - **`StorageTier.Relational` is renamed `StorageTier.HotWithRelationalBackplane`.** The old name
