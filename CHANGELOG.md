@@ -29,6 +29,31 @@ All packages ship together at one version; there is no per-package versioning. S
   [docs/MIGRATION.md](docs/MIGRATION.md#upgrading-to-03-the-relational-backplane-rename) and
   [plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md).
 
+### Added
+
+- **The shape sidecar records each table's tier.** Where a table's rows live is part of what a data
+  directory holds, and phase 25's Postgres-only archive tier will make some tier changes lose data,
+  so a changed tier is now detected at boot like any other shape change. Between `Hot` and
+  `HotWithRelationalBackplane` the change is additive: a migration boot, EventId 1006 naming it. A
+  recorded tier this build doesn't know (written by a newer one) refuses boot. A 0.2 sidecar has its
+  tiers filled in place on the first boot (EventId 1009), without a migration. Tiers are persisted
+  by explicit name, never by the enum's own formatting, because `Relational` and
+  `HotWithRelationalBackplane` share a value and which aliased name `ToString()` returns is
+  unspecified.
+
+### Fixed
+
+- **A table switched from `Hot` to the relational backplane now gets its existing rows in
+  Postgres.** The applier skipped the table's ops while it was hot, so its checkpoint was already
+  past the table's history: the Postgres table was created empty, and only rows written after the
+  change ever reached it. The hot store still held everything, so nothing was lost, but the copy
+  was silently incomplete. The applier now keeps a projected-tables registry
+  (`__melange_projected`) beside its checkpoint and, on start, fills any backplane table missing
+  from it from the hot store at one consistent LSN before resuming (EventId 1609). A table that
+  leaves the backplane leaves the registry (EventId 1610), so moving it back copies it afresh
+  instead of resuming a stale copy. A 0.2 projection seeds the registry from the tables Postgres
+  already holds. See [docs/MIGRATION.md](docs/MIGRATION.md#changing-a-tables-tier).
+
 ## [0.2.3] — 2026-10-19
 
 ### Added

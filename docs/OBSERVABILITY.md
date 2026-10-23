@@ -376,7 +376,9 @@ also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flus
 `1101 MelangeStarted`, `1102 MelangeStopped` (02); `1005 CommitObserverFailed`,
 `1006 ShapeMigrated` — an additive schema migration at boot: the changes, the rebuild, and the
 marker LSN the new shape governs from; Warning-level because automatic must never mean silent
-(road-to-0.2 phase 16, [MIGRATION.md](MIGRATION.md)) — `1008 ShapeAdopted` — a boot that *adopted*
+(road-to-0.2 phase 16, [MIGRATION.md](MIGRATION.md)) — `1009 ShapeTiersRecorded` — a boot that filled in each table's tier in a shape sidecar written before
+tiers were recorded, taking it from the running code; Information, and once per data directory
+(road-to-0.3 phase 25) — `1008 ShapeAdopted` — a boot that *adopted*
 the running code's schema as the meaning of records already on disk, because no shape sidecar
 existed: the only possible reading of those bytes, correct only if the upgrade rule was followed,
 and until it had an id the one step in this area that happened in silence. Warning, and only ever
@@ -407,7 +409,11 @@ so the manual migration is a copy-paste), `1605 PostgresEpochMismatch` (LSNs are
 epochs; the applier stalls rather than guesses), `1606 PostgresTierBootstrapped` (a tier attached after log
 truncation is rebuilt from the hot store at one consistent LSN), and `1607 RelationalTablesWithoutPostgres` —
 tables declared `Tier = HotWithRelationalBackplane` in a deployment that configured no Postgres run fine in the hot store,
-and are told what they are missing (08); `1700 ClusterHubStarted` (naming the node-link listener's bound
+and are told what they are missing (08); `1609 PostgresTableCopied` — a table new to the relational
+backplane (switched from `Hot`, or a table Postgres never held) was filled from the hot store at one
+consistent LSN before the applier resumed, with its row count; Warning, because a whole table was replaced
+automatically — and `1610 PostgresTableUnprojected` — a table left the backplane, and its Postgres table is
+left as is and no longer maintained (road-to-0.3 phase 25); `1700 ClusterHubStarted` (naming the node-link listener's bound
 port), `1701 ClusterNodeRegistered`, `1702 ClusterNodeSuspectedDead` — the failure-detection decision made
 loud: how long the silence was and how many shards moved under bumped fencing tokens —
 `1703 ClusterLinkAuthFailed` (a link that could not prove the cluster secret; a rogue dialer or a

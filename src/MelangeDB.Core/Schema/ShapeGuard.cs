@@ -84,6 +84,8 @@ public static class ShapeCompatibility
                     ? $"table '{name}': added column(s) {string.Join(", ", added.Select(c => $"'{c.Name}' ({c.Kind})"))}"
                     : $"table '{name}': columns reordered");
             }
+
+            CompareTier(name, shape.Tier, current.Tier!, destructive, additive);
         }
 
         foreach (var table in schema.Tables)
@@ -99,6 +101,34 @@ public static class ShapeCompatibility
             AdditiveChanges = additive,
         };
     }
+
+    /// <summary>
+    /// A tier change is classified by whether the rows stay in the hot store across it. Between
+    /// <c>Hot</c> and <c>HotWithRelationalBackplane</c> they do — only the Postgres copy appears or
+    /// stops being maintained — so the change is additive and recorded as a new reign. Any other
+    /// pair is refused: a recorded tier this build does not know was written by a newer one.
+    /// A recorded tier of null predates tier recording and compares as unchanged.
+    /// </summary>
+    private static void CompareTier(string name, string? recorded, string current, List<string> destructive, List<string> additive)
+    {
+        if (recorded is null || recorded == current)
+            return;
+
+        if (IsHotResident(recorded) && IsHotResident(current))
+        {
+            additive.Add(current == ShapeTiers.HotWithRelationalBackplane
+                ? $"table '{name}': tier {recorded} -> {current} (Postgres copies its existing rows on its next start)"
+                : $"table '{name}': tier {recorded} -> {current} (its Postgres table is no longer maintained and is left as is)");
+            return;
+        }
+
+        destructive.Add(
+            $"table '{name}': tier {recorded} -> {current} is not a supported change; the recorded tier " +
+            "decides where this table's rows live, and moving them across the hot store's boundary would lose them");
+    }
+
+    private static bool IsHotResident(string tier) =>
+        tier is ShapeTiers.Hot or ShapeTiers.HotWithRelationalBackplane;
 }
 
 /// <summary>
@@ -265,7 +295,8 @@ internal static class ShapeGuard
         ulong baseLsn,
         ulong headLsn = 0,
         bool allowAdoption = true,
-        Action<ulong>? onAdoptedOverExistingRecords = null)
+        Action<ulong>? onAdoptedOverExistingRecords = null,
+        Action<int>? onTiersRecorded = null)
     {
         var path = Path.Combine(logDirectory, ShapeHistory.FileName);
         var history = ShapeHistory.Load(path);
@@ -306,8 +337,12 @@ internal static class ShapeGuard
             return new ShapeResolution(history, schema, path);
         }
 
-        if (history.Compact(baseLsn))
+        var compacted = history.Compact(baseLsn);
+        var tiersRecorded = history.RecordMissingTiers(schema);
+        if (compacted || tiersRecorded > 0)
             history.Save(path);
+        if (tiersRecorded > 0)
+            onTiersRecorded?.Invoke(tiersRecorded);
 
         var diff = ShapeCompatibility.Compare(history.Current, schema);
         if (diff.IsDestructive)

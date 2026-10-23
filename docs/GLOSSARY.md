@@ -350,7 +350,9 @@ its ordered (name, kind) column list. Row format v1 is positional, so the bytes 
 what they mean; the shape sidecar beside the log says it — as a *history*, each entry fenced by
 the LSN it governs from, because log records outlive deployments. The booting engine compares
 the newest entry against the code's schema: identical is the fast path, additive is a migration
-boot, destructive refuses (`SchemaShapeException`). See [MIGRATION.md](MIGRATION.md).
+boot, destructive refuses (`SchemaShapeException`). Each table's entry also records its **tier**,
+which the bytes do not depend on but where the rows live does, so a tier change is detected at boot
+like any other. See [MIGRATION.md](MIGRATION.md).
 
 **Migration boot** — A boot whose schema differs additively from the directory's shape: recovery
 re-encodes every old-shape row to the new shape *by column name*, an empty marker record opens
@@ -582,6 +584,12 @@ scope per call, and invokes the body as one transaction. The transport phases ca
 runs in owner mode. The per-caller half of the two-mode contract, per the guest-role precedent: the IdP is the
 gate, owner capability is a claim it issues, and a caller without it is refused — never silently downgraded to
 policy-enforced.
+
+**Projected-tables registry (`__melange_projected`)** — The Postgres applier's record of which backplane tables
+it holds a complete copy of, beside its checkpoint. A declared backplane table missing from it is new to the
+projection — its history is behind the checkpoint, skipped while the table was hot — and is copied from the
+hot store before the applier resumes (EventId 1609). A table that leaves the backplane leaves the registry,
+so declaring it again copies it afresh.
 
 **Postgres applier** — The relational backplane's applier: consumes the commit log on its own dispatch loop, off
 the commit path, projecting relational-backplane rows into Postgres in batches whose checkpoint commits *inside*

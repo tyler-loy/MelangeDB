@@ -61,8 +61,15 @@ internal sealed class TierHarness : IAsyncDisposable
     private readonly bool _autoMigrate;
     private bool _tierStarted;
 
-    public TierHarness(string connectionString, string schema, string? root = null, int batchSize = 100, bool autoMigrate = true)
+    public TierHarness(
+        string connectionString,
+        string schema,
+        string? root = null,
+        int batchSize = 100,
+        bool autoMigrate = true,
+        Func<SchemaRegistry>? registry = null)
     {
+        RegistryFactory = registry ?? Registry;
         _connectionString = connectionString;
         _batchSize = batchSize;
         _autoMigrate = autoMigrate;
@@ -70,10 +77,13 @@ internal sealed class TierHarness : IAsyncDisposable
         Root = root ?? Directory.CreateTempSubdirectory("melange-pg-").FullName;
         Logs = new CapturingLoggerFactory();
         Options = BuildOptions();
-        Engine = new MelangeEngine(Options, Registry(), Logs);
+        Engine = new MelangeEngine(Options, RegistryFactory(), Logs);
         Connections = new PostgresConnectionSource(new StaticOptionsMonitor(Options));
         Tier = new PostgresRelationalTier(Engine, Connections, new StaticOptionsMonitor(Options), Logs);
     }
+
+    /// <summary>The schema every (re)start boots; swap it before <see cref="RestartAsync"/> to stage a deploy that changed it.</summary>
+    public Func<SchemaRegistry> RegistryFactory { get; set; }
 
     public string Root { get; }
 
@@ -139,7 +149,7 @@ internal sealed class TierHarness : IAsyncDisposable
 
         Logs = new CapturingLoggerFactory();
         Options = BuildOptions();
-        Engine = new MelangeEngine(Options, Registry(), Logs);
+        Engine = new MelangeEngine(Options, RegistryFactory(), Logs);
         Connections = new PostgresConnectionSource(new StaticOptionsMonitor(Options));
         Tier = new PostgresRelationalTier(Engine, Connections, new StaticOptionsMonitor(Options), Logs);
         if (startTier)
@@ -195,5 +205,11 @@ internal sealed class TierHarness : IAsyncDisposable
         },
     };
 
-    private static SchemaRegistry Registry() => new(new MelangeDB.Generated.MelangeModel().Tables());
+    public static SchemaRegistry Registry() => new(new MelangeDB.Generated.MelangeModel().Tables());
+
+    /// <summary>The generated schema with one table declared on another tier — the same table as a later deploy declares it.</summary>
+    public static SchemaRegistry RegistryWithTier(string table, StorageTier tier) =>
+        new(new MelangeDB.Generated.MelangeModel().Tables().Select(t => t.Name != table
+            ? t
+            : new TableSchema(t.RowType, t.Name, t.Columns, t.IsPublic, tier, t.Residency, t.Placement, t.ShardBy, t.Scheduled, t.Codec)));
 }

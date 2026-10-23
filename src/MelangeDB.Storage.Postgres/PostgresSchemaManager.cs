@@ -35,6 +35,13 @@ internal sealed class PostgresSchemaManager
     /// <summary>The applier checkpoint's table name, inside the configured schema.</summary>
     public const string CheckpointTable = "__melange_applier";
 
+    /// <summary>
+    /// The tables this projection holds a complete copy of, inside the configured schema. A
+    /// backplane table missing from it is new to the projection — declared since the checkpoint
+    /// was anchored — and is copied from the hot store before the applier resumes.
+    /// </summary>
+    public const string ProjectedTable = "__melange_projected";
+
     private readonly string _schema;
 
     public PostgresSchemaManager(string schema) => _schema = schema;
@@ -56,6 +63,17 @@ internal sealed class PostgresSchemaManager
                 "applied_lsn" bigint NOT NULL,
                 "log_epoch" uuid NOT NULL,
                 "updated_at" timestamp with time zone NOT NULL
+            )
+            """,
+            ct).ConfigureAwait(false);
+        await ExecuteAsync(
+            connection,
+            $"""
+            CREATE TABLE IF NOT EXISTS {PostgresIdentifier.Qualify(_schema, ProjectedTable)} (
+                "table_name" text PRIMARY KEY,
+                "since_lsn" bigint NOT NULL,
+                "log_epoch" uuid NOT NULL,
+                "projected_at" timestamp with time zone NOT NULL
             )
             """,
             ct).ConfigureAwait(false);
@@ -175,6 +193,21 @@ internal sealed class PostgresSchemaManager
         }
 
         return builder.ToString().TrimEnd('\n');
+    }
+
+    /// <summary>Which of <paramref name="tables"/> exist in the configured schema right now.</summary>
+    public async Task<HashSet<string>> ExistingTablesAsync(NpgsqlConnection connection, IEnumerable<string> tables, CancellationToken ct)
+    {
+        var existing = new HashSet<string>(StringComparer.Ordinal);
+        await using var command = new NpgsqlCommand(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_name = ANY($2)",
+            connection);
+        command.Parameters.AddWithValue(_schema);
+        command.Parameters.AddWithValue(tables.ToArray());
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            existing.Add(reader.GetString(0));
+        return existing;
     }
 
     private async Task<Dictionary<string, string>> ExistingColumnsAsync(NpgsqlConnection connection, string table, CancellationToken ct)

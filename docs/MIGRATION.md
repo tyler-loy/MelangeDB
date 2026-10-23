@@ -64,10 +64,42 @@ stale client fails `ClientRowShape.Verify` at subscription time — structural r
 garbage. Regenerate bindings with the deploy.
 
 What counts as additive: added columns (any position), reordered columns, added tables, added or
-removed indexes (indexes are projections; recovery rebuilds them from the declaration). What is
+removed indexes (indexes are projections; recovery rebuilds them from the declaration), and a tier
+change between `Hot` and `HotWithRelationalBackplane` (see [Changing a table's
+tier](#changing-a-tables-tier)). What is
 refused as destructive: a removed table, a removed column, a changed column kind, a moved
 `[PrimaryKey]`. A **rename is a removal plus an addition** — the column's name is its identity —
 so rename refuses too; rename it back, or treat it as a deliberate manual migration.
+
+## Changing a table's tier
+
+The shape sidecar records each table's tier, because where a table's rows live is part of what the
+data directory holds. Between `Hot` and `HotWithRelationalBackplane` the rows stay in the hot store
+either way, so the change is additive: the boot is a migration boot (EventId 1006 names the tier
+change), and the new tier governs from the marker.
+
+- **`Hot` → `HotWithRelationalBackplane`.** The Postgres applier skipped the table's ops while it was
+  hot, so its checkpoint is already past the table's whole history and replay cannot produce it.
+  On its next start the applier finds the table missing from its projected-tables registry
+  (`__melange_projected`) and fills its Postgres table from the hot store at one consistent LSN,
+  replacing anything it held, before resuming (EventId 1609, with the row count). Before 0.3 this
+  copy did not happen: the Postgres table was created empty and only rows written after the change
+  ever reached it.
+- **`HotWithRelationalBackplane` → `Hot`.** The rows were in the hot store all along, so nothing moves.
+  The Postgres table is left as is and stops being maintained (EventId 1610); drop it when you no
+  longer want it. Moving the table back onto the backplane later copies it afresh rather than
+  resuming the stale copy.
+
+A recorded tier this build does not recognize — one written by a newer MelangeDB — is refused like any
+destructive change: booting it under a tier whose rows live elsewhere would present an empty table as
+the whole truth.
+
+A sidecar written before tiers were recorded (any 0.2 data directory) has each table's tier filled in
+from the running code on the first 0.3 boot, in place and without a migration (EventId 1009). That is
+the adoption reading again, for one field, so the upgrade rule below covers it: don't change a table's
+tier in the same deploy as the upgrade. The Postgres half needs no such care. A 0.2 projection has no
+registry, so the first 0.3 start seeds it from the backplane tables Postgres already holds, and copies
+any it does not.
 
 ## The refusal
 

@@ -113,7 +113,8 @@ public sealed partial class MelangeEngine : IDisposable
                 _log.BaseLsn,
                 _log.HeadLsn,
                 options.Schema.AllowAdoption,
-                lsn => LogMessages.ShapeAdopted(_logger, options.CommitLog.Path, lsn));
+                lsn => LogMessages.ShapeAdopted(_logger, options.CommitLog.Path, lsn),
+                count => LogMessages.ShapeTiersRecorded(_logger, count, options.CommitLog.Path));
             var store = CreateStore(options, schema, hotStoreProvider, loggers);
             _storeLifetime = store as IDisposable;
 
@@ -1884,6 +1885,17 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void ShapeAdopted(ILogger logger, string directory, ulong headLsn) =>
             ShapeAdoptedMessage(logger, directory, headLsn, null);
+
+        private static readonly Action<ILogger, int, string, Exception?> ShapeTiersRecordedMessage =
+            LoggerMessage.Define<int, string>(
+                LogLevel.Information,
+                new EventId(1009, "ShapeTiersRecorded"),
+                "Recorded the tier of {Count} table(s) in the shape sidecar under '{Directory}', which predates tier " +
+                "recording, taking each from the running code. From here on a changed tier is detected at boot. " +
+                "Correct only if this deploy did not also change a table's tier — the same rule as the sidecar's own adoption.");
+
+        public static void ShapeTiersRecorded(ILogger logger, int count, string directory) =>
+            ShapeTiersRecordedMessage(logger, count, directory, null);
 
         private static readonly Action<ILogger, Guid, ulong, string, DateTimeOffset, DateTimeOffset, Exception?> CloneProvenanceMessage =
             LoggerMessage.Define<Guid, ulong, string, DateTimeOffset, DateTimeOffset>(

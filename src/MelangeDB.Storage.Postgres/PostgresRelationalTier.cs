@@ -230,7 +230,12 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
     {
         var options = _options.CurrentValue.Postgres;
         await using var connection = await _connections.DataSource.OpenConnectionAsync(ct).ConfigureAwait(false);
-        var appliedDdl = await _schemaManager!.EnsureAsync(connection, _relationalTables, options.AutoMigrate, ct).ConfigureAwait(false);
+
+        // Read before EnsureAsync can create anything: whether this projection predates the
+        // projected-tables registry, and which backplane tables Postgres already held.
+        var registryExisted = (await _schemaManager!.ExistingTablesAsync(connection, [PostgresSchemaManager.ProjectedTable], ct).ConfigureAwait(false)).Count > 0;
+        var presentBefore = await _schemaManager.ExistingTablesAsync(connection, _relationalTables.Select(t => t.Name), ct).ConfigureAwait(false);
+        var appliedDdl = await _schemaManager.EnsureAsync(connection, _relationalTables, options.AutoMigrate, ct).ConfigureAwait(false);
         if (appliedDdl.Length > 0)
             LogMessages.SchemaMigrated(_logger, appliedDdl);
 
@@ -265,8 +270,149 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
                 "replaced. Clear the Postgres schema to re-bootstrap, or restore the matching log.");
         }
 
+        // Before the checkpoint is published: a waiter woken at an LSN must find every backplane
+        // table's rows, including a table whose copy is being made right now.
+        await ReconcileProjectedTablesAsync(connection, epoch, checkpointLsn, registryExisted, presentBefore, ct).ConfigureAwait(false);
         Volatile.Write(ref _appliedLsn, checkpointLsn);
         SignalWaiters(checkpointLsn);
+    }
+
+    /// <summary>
+    /// Brings the projected-tables registry in line with the declared backplane tables before the
+    /// applier resumes. A table declared since the checkpoint was anchored — a <c>Hot</c> table
+    /// switched to <c>HotWithRelationalBackplane</c> — has history the applier never projected,
+    /// because it skipped that table's ops while it was hot and its checkpoint is past them; it is
+    /// copied from the hot store at a consistent LSN. A table no longer declared leaves the
+    /// registry, so that declaring it again copies it again rather than resuming a stale copy.
+    /// <para>
+    /// A projection from before the registry existed (0.2) seeds it from the backplane tables
+    /// Postgres already held: those were projected from the anchor on. Any table it did not hold
+    /// is new, and is copied like any other.
+    /// </para>
+    /// </summary>
+    private async Task ReconcileProjectedTablesAsync(
+        NpgsqlConnection connection,
+        Guid epoch,
+        ulong checkpointLsn,
+        bool registryExisted,
+        HashSet<string> presentBefore,
+        CancellationToken ct)
+    {
+        var declared = _relationalTables.Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
+        HashSet<string> projected;
+        if (registryExisted)
+        {
+            projected = await ReadProjectedAsync(connection, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            projected = [.. presentBefore];
+            await RegisterProjectedAsync(connection, transaction: null, projected, checkpointLsn, epoch, ct).ConfigureAwait(false);
+        }
+
+        foreach (var name in projected.Where(name => !declared.Contains(name)).Order(StringComparer.Ordinal).ToList())
+        {
+            await using var command = new NpgsqlCommand(
+                $"DELETE FROM {ProjectedTableName} WHERE \"table_name\" = $1",
+                connection);
+            command.Parameters.AddWithValue(name);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            LogMessages.TableUnprojected(_logger, name);
+        }
+
+        var missing = _relationalTables.Where(t => !projected.Contains(t.Name)).ToList();
+        if (missing.Count > 0)
+            await CopyTablesFromStoreAsync(connection, missing, epoch, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Copies the given tables from the hot store, captured at one consistent LSN, replacing
+    /// whatever Postgres holds for them, and registers them — one Postgres transaction. The
+    /// applier's checkpoint does not move: resuming from it re-applies those tables' ops between
+    /// the checkpoint and the capture LSN over the captured rows, and since every op is a whole-row
+    /// upsert or delete applied in log order, each key still ends at its value as of the capture.
+    /// </summary>
+    private async Task CopyTablesFromStoreAsync(NpgsqlConnection connection, IReadOnlyList<TableSchema> tables, Guid epoch, CancellationToken ct)
+    {
+        Dictionary<TableId, List<byte[]>> rows = tables.ToDictionary(t => t.Id, _ => new List<byte[]>());
+        var anchor = _engine.ReadConsistent(head =>
+        {
+            foreach (var table in tables)
+            {
+                foreach (var pair in _engine.HotStore.Scan(table.Id))
+                    rows[table.Id].Add(pair.Value.ToArray());
+            }
+
+            return head;
+        });
+
+        await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+        var schema = _options.CurrentValue.Postgres.Schema;
+        foreach (var table in tables)
+        {
+            await using var delete = new NpgsqlCommand($"DELETE FROM {PostgresIdentifier.Qualify(schema, table.Name)}", connection, transaction);
+            await delete.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            if (rows[table.Id].Count > 0)
+            {
+                await using var commands = new NpgsqlBatch(connection, transaction);
+                foreach (var row in rows[table.Id])
+                    commands.BatchCommands.Add(_tableSql[table.Id].Upsert(row));
+                await commands.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+        }
+
+        await RegisterProjectedAsync(connection, transaction, tables.Select(t => t.Name), anchor, epoch, ct).ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        foreach (var table in tables)
+            LogMessages.TableCopied(_logger, table.Name, rows[table.Id].Count, anchor);
+    }
+
+    private string ProjectedTableName =>
+        PostgresIdentifier.Qualify(_options.CurrentValue.Postgres.Schema, PostgresSchemaManager.ProjectedTable);
+
+    private async Task<HashSet<string>> ReadProjectedAsync(NpgsqlConnection connection, CancellationToken ct)
+    {
+        var projected = new HashSet<string>(StringComparer.Ordinal);
+        await using var command = new NpgsqlCommand($"SELECT \"table_name\" FROM {ProjectedTableName}", connection);
+        await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            projected.Add(reader.GetString(0));
+        return projected;
+    }
+
+    /// <summary>Records <paramref name="tables"/> as wholly projected from <paramref name="lsn"/> on.</summary>
+    private async Task RegisterProjectedAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction? transaction,
+        IEnumerable<string> tables,
+        ulong lsn,
+        Guid epoch,
+        CancellationToken ct)
+    {
+        foreach (var name in tables)
+        {
+            await using var command = new NpgsqlCommand(
+                $"""
+                INSERT INTO {ProjectedTableName} ("table_name", "since_lsn", "log_epoch", "projected_at")
+                VALUES ($1, $2, $3, now())
+                ON CONFLICT ("table_name") DO UPDATE SET
+                    "since_lsn" = EXCLUDED."since_lsn", "log_epoch" = EXCLUDED."log_epoch", "projected_at" = EXCLUDED."projected_at"
+                """,
+                connection,
+                transaction);
+            command.Parameters.AddWithValue(name);
+            command.Parameters.AddWithValue((long)lsn);
+            command.Parameters.AddWithValue(epoch);
+            await command.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Replaces the registry with every declared backplane table — an anchor that rebuilds the whole projection.</summary>
+    private async Task ReplaceProjectedAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, ulong lsn, Guid epoch, CancellationToken ct)
+    {
+        await using (var clear = new NpgsqlCommand($"DELETE FROM {ProjectedTableName}", connection, transaction))
+            await clear.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+        await RegisterProjectedAsync(connection, transaction, _relationalTables.Select(t => t.Name), lsn, epoch, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -281,7 +427,10 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         }
         else
         {
-            await WriteCheckpointAsync(connection, transaction: null, 0, epoch, ct).ConfigureAwait(false);
+            await using var transaction = await connection.BeginTransactionAsync(ct).ConfigureAwait(false);
+            await WriteCheckpointAsync(connection, transaction, 0, epoch, ct).ConfigureAwait(false);
+            await ReplaceProjectedAsync(connection, transaction, 0, epoch, ct).ConfigureAwait(false);
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
             Volatile.Write(ref _appliedLsn, 0);
         }
     }
@@ -395,6 +544,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
         }
 
         await WriteCheckpointAsync(connection, transaction, anchor, epoch, ct).ConfigureAwait(false);
+        await ReplaceProjectedAsync(connection, transaction, anchor, epoch, ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         // Log before publishing the checkpoint: anyone woken by WaitForAppliedAsync must be able
         // to observe that the anchor came from a bootstrap, not replay.
@@ -618,6 +768,28 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         public static void Bootstrapped(ILogger logger, int rows, ulong lsn) =>
             BootstrappedMessage(logger, rows, lsn, null);
+
+        private static readonly Action<ILogger, string, int, ulong, Exception?> TableCopiedMessage =
+            LoggerMessage.Define<string, int, ulong>(
+                LogLevel.Warning,
+                new EventId(1609, "PostgresTableCopied"),
+                "Table '{Table}' is newly on the relational backplane, so its Postgres table was filled from the hot store: " +
+                "{Rows} row(s) captured consistent at LSN {Lsn}, replacing anything it held. The applier then resumes from " +
+                "its checkpoint as usual. Automatic must not mean silent — this is that line.");
+
+        public static void TableCopied(ILogger logger, string table, int rows, ulong lsn) =>
+            TableCopiedMessage(logger, table, rows, lsn, null);
+
+        private static readonly Action<ILogger, string, Exception?> TableUnprojectedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Warning,
+                new EventId(1610, "PostgresTableUnprojected"),
+                "Table '{Table}' is no longer on the relational backplane. Its Postgres table is left as is and is no " +
+                "longer maintained; it now holds a copy as of the change. Declaring the table on the backplane again " +
+                "copies it afresh from the hot store.");
+
+        public static void TableUnprojected(ILogger logger, string table) =>
+            TableUnprojectedMessage(logger, table, null);
     }
 }
 
@@ -630,7 +802,7 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 public sealed class PostgresCheckpointAheadException(ulong checkpointLsn, ulong headLsn)
     : Exception(
         $"The Postgres applier checkpoint (LSN {checkpointLsn}) is ahead of the log's head ({headLsn}): the relational " +
-        "tier holds a future this log does not contain. Clear the Postgres schema to re-bootstrap from this log, or " +
+        "backplane holds a future this log does not contain. Clear the Postgres schema to re-bootstrap from this log, or " +
         "restore the newer log this projection belongs to.")
 {
     public ulong CheckpointLsn { get; } = checkpointLsn;
