@@ -227,7 +227,10 @@ checkpoint onward, so the mirror silently lacks every row written before the cha
 lost, since the hot store still holds them, but the mirror is quietly incomplete. Recording tier
 fixes this case too, by making the change visible at boot.)
 
-**An archive retention floor.** A new, optional named truncation floor that holds the log back by
+**An archive retention floor.** (As built: the floor lives in the engine's truncation decision
+beside the resume window and is searched the same way, by commit timestamp; the "sharper refusal"
+reuses EventId 1611, whose situation names the lost range and the setting, rather than a new id.)
+A new, optional named truncation floor that holds the log back by
 `Postgres:ArchiveLogRetentionHours` behind the applier's checkpoint, so a Postgres restored from a
 backup taken inside that window can catch up from the log instead of losing the rows in between.
 Off by default (unset or `0`), since it is for deployments without Postgres point-in-time recovery;

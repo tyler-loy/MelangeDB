@@ -763,7 +763,7 @@ type. Collisions are detected at schema registration.
 **Truncation floor** — A named holder of the commit log: a mechanism that still needs old records, providing
 the highest LSN compaction may remove from its perspective. Log truncation takes the minimum across all of
 them and never passes it. The built-in set is `snapshot` (the ceiling — truncation never passes the snapshot
-it was decided behind), `resume-window`, `event-bus`, `backup-pin`, `shard-freeze`, `shard-import`,
+it was decided behind), `resume-window`, `archive-retention`, `event-bus`, `backup-pin`, `shard-freeze`, `shard-import`,
 `shard-sidecar`, `cluster-events`, and one per applier name, plus `unnamed` for a floor registered through
 `AddTruncationFloor(Func<ulong?>)`. The one whose LSN is lowest is the **governing floor**: the answer to "why
 is the log not truncating", named in every truncation's log line, in `melange.log.truncation_floor`'s tag, and

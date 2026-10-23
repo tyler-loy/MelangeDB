@@ -80,6 +80,16 @@ public sealed class PostgresOptions
     /// are ever automatic — destructive ones are refused loudly in both settings.
     /// </summary>
     public bool AutoMigrate { get; set; }
+
+    /// <summary>
+    /// How long the commit log keeps records behind the Postgres applier's checkpoint while archive
+    /// tables are declared, in hours; 0 (the default) is off. Archive rows are in no hot store, so
+    /// once the log truncates past one, Postgres holds the only copy — and a Postgres restored from
+    /// a plain dump comes back with an older checkpoint the log can no longer serve. Set this to at
+    /// least the dump interval plus margin so such a restore catches up from the log. Leave it off
+    /// when Postgres has point-in-time recovery. Fractional hours are allowed.
+    /// </summary>
+    public double ArchiveLogRetentionHours { get; set; }
 }
 
 /// <summary>Diagnostics toggles (<c>MelangeDb:Diagnostics:*</c>).</summary>

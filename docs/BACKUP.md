@@ -177,7 +177,10 @@ this world's past from one of an unrelated world.
 **Archive tables make Postgres part of the backup.** A table declared `Tier = Archive` lives only in
 Postgres: its rows are not in the archive, and once the log truncates past them Postgres holds the
 only copy. Back Postgres up with point-in-time recovery (WAL archiving), and when Postgres itself is
-lost, restore it to the same moment as the log. **Do not clear the schema** in such a deployment: it
+lost, restore it to the same moment as the log. Without point-in-time recovery, set
+`Postgres:ArchiveLogRetentionHours` to at least your dump interval: a plain dump restores an older
+checkpoint, and the log then still holds the archive rows committed since, so the applier catches up
+instead of refusing with the lost range named (EventId 1611). **Do not clear the schema** in such a deployment: it
 deletes the archive's rows for good. A reconcile whose resume point sits below the restored log's
 base — Postgres had fallen behind the archive's snapshot — refuses for the same reason (EventId 1611):
 the archive rows in between exist only in a Postgres backup. A **clone** starts its archive without

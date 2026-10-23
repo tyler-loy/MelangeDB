@@ -358,8 +358,8 @@ the **live** head, which is exactly the number that grows while a stuck holder s
 published at all until a decision has been made — snapshots off, `Snapshots:TruncateLog` off, or no snapshot
 yet: an absent series says "never evaluated", where a zero would say "healthy". The floor names are a small
 static set by construction (they name mechanisms, not instances), which is what keeps the `floor` tag on the
-right side of the cardinality rule: `snapshot`, `resume-window`, `event-bus`, `backup-pin`, `shard-freeze`,
-`shard-import`, `shard-sidecar`, `cluster-events`, one per applier name, and `unnamed` for a third-party floor
+right side of the cardinality rule: `snapshot`, `resume-window`, `archive-retention`, `event-bus`, `backup-pin`,
+`shard-freeze`, `shard-import`, `shard-sidecar`, `cluster-events`, one per applier name, and `unnamed` for a third-party floor
 registered through the overload that takes no name.
 
 ## Logs
@@ -591,7 +591,7 @@ disk. This is the sequence of looks that names the cause.
 2. **Which holder?** `melange.log.truncation_floor`, broken out by the `floor` tag. The lowest series is the
    one governing. `snapshot` being lowest means nothing is holding the log back at all; anything else names a
    mechanism: `event-bus` (the slowest live subscriber's checkpoint), an applier name such as `postgres`,
-   `resume-window`, `backup-pin`, `shard-freeze` / `shard-import` (a handoff saga that never resolved),
+   `resume-window`, `archive-retention`, `backup-pin`, `shard-freeze` / `shard-import` (a handoff saga that never resolved),
    `cluster-events`, or `unnamed` for a floor some third-party code registered without naming.
 3. **Confirm against the log line.** Every truncation decision says the same thing at Information level:
    `1503 LogTruncated` when records went, `1510 LogTruncationPinned` when the decision removed nothing because
@@ -603,7 +603,9 @@ disk. This is the sequence of looks that names the cause.
    stopped; `backup-pin` → a backup stream that never finished (`Backup:StreamStallTimeoutMs`);
    `shard-freeze` / `shard-import` → an unresolved handoff saga, visible in the cluster events;
    `resume-window` → `Resume:RetentionWindowSeconds` is simply larger than the truncation interval, which is
-   configuration rather than a fault.
+   configuration rather than a fault; `archive-retention` → `Postgres:ArchiveLogRetentionHours` keeping the
+   log long enough for a Postgres dump restore to catch up, also configuration — the one floor whose holder
+   is an operator's backup schedule rather than a process.
 
 `melange-retention` is the same finding as an alert: unhealthy once the pinned distance passes
 `HealthChecks:RetentionPinnedThreshold`, with the governing floor named in its description. Truncation

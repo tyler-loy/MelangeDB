@@ -60,8 +60,14 @@ All packages ship together at one version; there is no per-package versioning. S
   as `row_values` jsonb), logged at Error by key and reducer but never by value (EventId 1612),
   counted (`melange.archive.dead_lettered`), and reported as a Degraded `melange-applier` until the
   table is cleared — through the new `IApplierCondition`, which any decoupled applier can implement.
-  **Not yet in this release:** the archive retention floor ([plan-phase-25.md](docs/road-to-0.3/plan-phase-25.md)); until then,
-  back up Postgres with point-in-time recovery and see [docs/BACKUP.md](docs/BACKUP.md).
+  Back up Postgres with point-in-time recovery; see [docs/BACKUP.md](docs/BACKUP.md).
+
+- **`Postgres:ArchiveLogRetentionHours`, the archive retention floor.** Off by default. While archive
+  tables are declared, the log keeps the records committed within the window — a named truncation
+  floor, `archive-retention`, searched by commit timestamp like the resume window — so a Postgres
+  restored from a plain dump taken inside it catches its archive up from the log. Outside it, the
+  refusal names the lost LSN range and the setting (EventId 1611). For deployments without
+  point-in-time recovery; set it to at least the dump interval.
 
 - **Restores record their lineage, and the Postgres projection is reconciled after one.** A restored
   directory's `melange.lineage` names the source epoch and the LSN it forked at, plus that epoch's own

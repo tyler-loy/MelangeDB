@@ -1130,6 +1130,20 @@ public sealed partial class MelangeEngine : IDisposable
         floors.Add(new TruncationFloor(TruncationFloorNames.ResumeWindow, resumeFloor));
         floor = Math.Min(floor, resumeFloor);
 
+        // The archive retention window, searched the same way: records committed within it stay,
+        // so a Postgres restored from a dump taken inside it can catch its archive tables up from
+        // the log. Only while archive tables are declared — a mirror rebuilds from the hot store.
+        if (_archiveTables.Count > 0 && _options.Postgres.ArchiveLogRetentionHours > 0)
+        {
+            var archiveFloor = floor;
+            var archiveCutoff = _time.GetUtcNow().AddHours(-_options.Postgres.ArchiveLogRetentionHours);
+            var archiveCutoffMicros = Timestamp.FromDateTimeOffset(archiveCutoff).UnixTimeMicroseconds;
+            if (_log.FirstLsnAtOrAfter(archiveCutoffMicros, _log.BaseLsn + 1, floor) is { } oldestInArchiveWindow)
+                archiveFloor = oldestInArchiveWindow - 1;
+            floors.Add(new TruncationFloor(TruncationFloorNames.ArchiveRetention, archiveFloor));
+            floor = Math.Min(floor, archiveFloor);
+        }
+
         var governing = floors[0];
         foreach (var candidate in floors)
         {

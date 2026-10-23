@@ -191,6 +191,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Transport.HeartbeatTimeoutMs = next.Transport.HeartbeatTimeoutMs;
         live.Transport.MaxInitialSetChunkBytes = next.Transport.MaxInitialSetChunkBytes;
         live.Resume.RetentionWindowSeconds = next.Resume.RetentionWindowSeconds;
+        live.Postgres.ArchiveLogRetentionHours = next.Postgres.ArchiveLogRetentionHours;
         live.Subscriptions.MaxPerConnection = next.Subscriptions.MaxPerConnection;
         live.Subscriptions.BackpressurePolicy = next.Subscriptions.BackpressurePolicy;
         live.Subscriptions.MaxBufferedBytes = next.Subscriptions.MaxBufferedBytes;

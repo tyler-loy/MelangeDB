@@ -303,6 +303,20 @@ public sealed class PostgresRelationalTier : ILogApplier, ICommitObserver, IHost
 
         if (checkpointLsn < _engine.Log.BaseLsn)
         {
+            // Same epoch, checkpoint below the base: Postgres went back in time on its own — the
+            // dump-restore case. A mirror re-bootstraps once the schema is cleared; archive rows in
+            // the gap are gone, and the refusal names exactly which.
+            var archives = ArchiveTableNames;
+            if (archives.Count > 0)
+            {
+                throw new PostgresArchiveUnrecoverableException(
+                    archives,
+                    _engine.Log.BaseLsn,
+                    $"its checkpoint (LSN {checkpointLsn}) is below the log's base, as when Postgres is restored from a dump " +
+                    $"older than the log retains — archive rows committed at LSNs {checkpointLsn + 1} to {_engine.Log.BaseLsn} " +
+                    "are in neither. Postgres:ArchiveLogRetentionHours, set to at least the dump interval, keeps that range in the log");
+            }
+
             throw new InvalidOperationException(
                 $"The commit log was truncated up to LSN {_engine.Log.BaseLsn}, past the postgres applier's checkpoint " +
                 $"at LSN {checkpointLsn}. Truncation floors should make this impossible; the log directory was likely " +
