@@ -61,6 +61,14 @@ One stacked PR each, in this order.
   transaction opens, off the write lock, which the `IHotStore` contract does not allow. It now
   evaluates against a pinned view, or inside `ReadConsistent` on a store without one.
 
+**As built:** two more findings went into the same PR. The gateway's `IShardStrategy` had the same
+unlocked read and now goes through the same `MelangeEngine.ReadCommitted`. And snapshot-isolated
+reducers opened their pinned view *without* the write lock, which `IReadViewSource` requires. On the
+in-memory store a two-table commit could land mid-capture, giving a view that was half one commit;
+a test reproduces it within about 100 ms. Views are now opened under the lock. `AsOfLsn` also waits
+for the log to be durable through that LSN, because a pinned view can include a commit whose fsync
+is still in flight, and the overlay reads only durable records.
+
 ### 2. `[Producer]` and the generator
 
 - `ProducerAttribute` (`Name`, `Policy`, `Site`) and `ProducerContext` (`Caller`, `Claims`,

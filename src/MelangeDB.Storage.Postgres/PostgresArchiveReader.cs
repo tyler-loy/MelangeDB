@@ -46,13 +46,15 @@ internal sealed class PostgresArchiveReader : IArchiveReader
         var filter = Filter.From(table, query);
         var key = table.PrimaryKey;
         var after = query.After is null ? (RowKey?)null : SchemaKeyCodec.Encode(key, query.After);
+        if (query.AsOfLsn is { } asOf)
+            await WaitDurableAsync(asOf, cancellationToken).ConfigureAwait(false);
 
         // Overlay first, to know how many tombstones the Postgres page must over-fetch to stay full.
         var schemaName = _options.CurrentValue.Postgres.Schema;
         await using var connection = await _connections.DataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.RepeatableRead, cancellationToken).ConfigureAwait(false);
         var (checkpointLsn, checkpointEpoch) = await ReadCheckpointAsync(connection, transaction, schemaName, cancellationToken).ConfigureAwait(false);
-        var overlay = checkpointEpoch == _engine.Log.EpochId ? Overlay(table, checkpointLsn, filter, after, query.Descending) : null;
+        var overlay = checkpointEpoch == _engine.Log.EpochId ? Overlay(table, checkpointLsn, filter, after, query.Descending, query.AsOfLsn) : null;
 
         var page = await ReadPageAsync(connection, transaction, schemaName, table, filter, query, limit + (overlay?.Tombstones ?? 0), cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -76,10 +78,27 @@ internal sealed class PostgresArchiveReader : IArchiveReader
 
     private sealed record OverlayResult(Dictionary<RowKey, object?> Rows, int Tombstones);
 
-    /// <summary>The unapplied tail's effect on this table, by key: a row, or null for a delete. Null when it is too long to read.</summary>
-    private OverlayResult? Overlay(TableSchema table, ulong checkpointLsn, Filter filter, RowKey? after, bool descending)
+    /// <summary>
+    /// Waits until the log is durable through <paramref name="asOf"/>, because the overlay reads only
+    /// durable records: a pinned view can include a commit whose fsync is still in flight, and an
+    /// overlay stopping short of it would miss a row the view already shows as moved out of hot.
+    /// </summary>
+    private async Task WaitDurableAsync(ulong asOf, CancellationToken cancellationToken)
     {
-        var durable = _engine.Log.DurableLsn;
+        var log = _engine.Log;
+        if (asOf > log.HeadLsn)
+            throw new ArgumentException($"AsOfLsn {asOf} is past the log head ({log.HeadLsn}); pass a pinned view's Lsn.", "query");
+        if (asOf > log.DurableLsn)
+            await Task.Run(() => log.WaitDurable(asOf), cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The unapplied tail's effect on this table, by key: a row, or null for a delete. Null when it
+    /// is too long to read. Stops at <paramref name="asOf"/> when one is given.
+    /// </summary>
+    private OverlayResult? Overlay(TableSchema table, ulong checkpointLsn, Filter filter, RowKey? after, bool descending, ulong? asOf)
+    {
+        var durable = Math.Min(_engine.Log.DurableLsn, asOf ?? ulong.MaxValue);
         if (durable <= checkpointLsn)
             return new OverlayResult([], 0);
         if (durable - checkpointLsn > (ulong)_maxOverlayRecords)
@@ -153,6 +172,12 @@ internal sealed class PostgresArchiveReader : IArchiveReader
         {
             command.Parameters.Add(PostgresTypeMap.Parameter(key, query.After));
             where.Add($"{PostgresIdentifier.Quote(key.Name)} {(query.Descending ? "<" : ">")} ${command.Parameters.Count}");
+        }
+
+        if (query.AsOfLsn is { } asOf)
+        {
+            command.Parameters.Add(new NpgsqlParameter { Value = checked((long)asOf) });
+            where.Add($"{PostgresIdentifier.Quote(PostgresSchemaManager.LsnColumn)} <= ${command.Parameters.Count}");
         }
 
         command.CommandText =

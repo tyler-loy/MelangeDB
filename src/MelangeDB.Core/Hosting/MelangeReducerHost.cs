@@ -195,8 +195,10 @@ public sealed class MelangeReducerHost
                 $"Reducer '{descriptor.Name}': policy type {descriptor.Policy} does not implement IReducerPolicy.");
         }
 
-        var context = new PolicyContext(caller, source.CallerIsGuest, _engine.CommittedView);
-        if (!policy.MayCall(descriptor.Name, context))
+        // Evaluated before the transaction opens, so off the write lock: the policy reads a pinned
+        // view rather than the live store, which a commit could be applying to mid-read.
+        var allowed = _engine.ReadCommitted(db => policy.MayCall(descriptor.Name, new PolicyContext(caller, source.CallerIsGuest, db)));
+        if (!allowed)
             throw new ReducerDeniedException($"Reducer '{descriptor.Name}' denied by {descriptor.Policy.Name}.");
     }
 }

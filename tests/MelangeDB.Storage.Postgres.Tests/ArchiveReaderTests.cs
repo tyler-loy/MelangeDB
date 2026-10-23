@@ -97,6 +97,67 @@ public class ArchiveReaderTests(PostgresContainerFixture postgres)
     }
 
     [Fact]
+    public async Task AsOfLsn_leaves_out_rows_committed_after_it_in_Postgres_and_in_the_overlay()
+    {
+        postgres.SkipUnlessAvailable();
+        await using var harness = new TierHarness(postgres.ConnectionString, PostgresContainerFixture.NewSchema(), registry: WithArchive);
+        await harness.StartTierAsync();
+        var first = Record(harness, "gold", 1);
+        var second = Record(harness, "gold", 2);
+        var asOf = harness.Engine.Log.HeadLsn;
+        var applied = Record(harness, "gold", 3);
+        await harness.WaitAppliedAsync(harness.Engine.Log.HeadLsn);
+        await harness.StopTierAsync();
+        var overlaid = Record(harness, "gold", 4);
+
+        var reader = Reader(harness);
+        var query = new ArchiveQuery { Column = "Metric", Equal = "gold" };
+        var then = await reader.ReadAsync<Stat>(query with { AsOfLsn = asOf }, TestContext.Current.CancellationToken);
+        var now = await reader.ReadAsync<Stat>(query, TestContext.Current.CancellationToken);
+
+        Assert.Equal([first, second], then.Rows.Select(static row => row.Id));
+        Assert.Equal([first, second, applied, overlaid], now.Rows.Select(static row => row.Id));
+    }
+
+    [Fact]
+    public async Task A_hot_and_archive_read_at_one_lsn_counts_a_row_moved_in_between_exactly_once()
+    {
+        postgres.SkipUnlessAvailable();
+        await using var harness = new TierHarness(postgres.ConnectionString, PostgresContainerFixture.NewSchema(), registry: WithArchive);
+        await harness.StartTierAsync();
+        harness.Invoke("Count", ctx => ctx.Db.HotCounter.Insert(new HotCounter { Id = 7, Count = 70 }));
+        using var view = harness.Engine.OpenReadView();
+
+        // The sweep moves the row from hot to archive after the view pinned and before the archive read.
+        harness.Invoke("Sweep", ctx =>
+        {
+            ctx.Db.HotCounter.Id.Delete(7L);
+            ctx.Db.Stat.Insert(new Stat { Metric = "counter-7", Value = 70, At = ctx.Timestamp });
+        });
+        await harness.WaitAppliedAsync(harness.Engine.Log.HeadLsn);
+
+        var query = new ArchiveQuery { Column = "Metric", Equal = "counter-7" };
+        var reader = Reader(harness);
+        var hot = view.Find<HotCounter>(7L) is null ? 0 : 1;
+        var asOf = await reader.ReadAsync<Stat>(query with { AsOfLsn = view.Lsn }, TestContext.Current.CancellationToken);
+        var latest = await reader.ReadAsync<Stat>(query, TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, hot + asOf.Rows.Count);
+        Assert.Equal(2, hot + latest.Rows.Count); // what an unpinned archive read would have double counted
+    }
+
+    [Fact]
+    public async Task AsOfLsn_past_the_log_head_is_refused()
+    {
+        postgres.SkipUnlessAvailable();
+        await using var harness = new TierHarness(postgres.ConnectionString, PostgresContainerFixture.NewSchema(), registry: WithArchive);
+        await harness.StartTierAsync();
+
+        var query = new ArchiveQuery { AsOfLsn = harness.Engine.Log.HeadLsn + 10 };
+        await Assert.ThrowsAsync<ArgumentException>(() => Reader(harness).ReadAsync<Stat>(query, TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
     public async Task Only_archive_tables_and_indexed_columns_are_readable()
     {
         postgres.SkipUnlessAvailable();

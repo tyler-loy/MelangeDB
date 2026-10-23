@@ -424,6 +424,54 @@ public sealed partial class MelangeEngine : IDisposable
     private IDbView? _committedView;
 
     /// <summary>
+    /// Whether the hot store offers pinned reads (<see cref="IReadViewSource"/>), which is what
+    /// <see cref="OpenReadView"/>, snapshot isolation, and producers need. Both shipped stores do.
+    /// </summary>
+    public bool SupportsReadViews => _readViewSource is not null;
+
+    /// <summary>
+    /// Opens a read-only view pinned at the hot store's current applied LSN — the way to read
+    /// committed state off the write lock, across awaits and threads, without seeing a commit land
+    /// halfway. Dispose it promptly: the store retains superseded versions for as long as it is
+    /// held. Throws on a store without <see cref="IReadViewSource"/>; check
+    /// <see cref="SupportsReadViews"/>, or use <see cref="ReadCommitted{T}"/>, which falls back.
+    /// </summary>
+    public PinnedReadView OpenReadView()
+    {
+        var source = _readViewSource ?? throw new NotSupportedException(
+            $"The hot store ({HotStore.GetType().Name}) does not implement IReadViewSource, so it cannot pin a read view. " +
+            "Use a store that does (the in-memory and FASTER stores both do).");
+        return new PinnedReadView(Schema, OpenPinned(source), _tableGuard);
+    }
+
+    /// <summary>
+    /// Runs a synchronous read of committed state from off the write lock — a policy evaluated
+    /// before its transaction opens, a strategy consulted from a gateway. Pins a view for the read
+    /// when the store can; otherwise runs it under the write lock against <see cref="CommittedView"/>,
+    /// which is correct and merely holds up commits for as long as the read takes.
+    /// </summary>
+    public T ReadCommitted<T>(Func<IDbView, T> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        if (_readViewSource is null)
+            return ReadConsistent(_ => read(CommittedView));
+        using var view = OpenReadView();
+        return read(view);
+    }
+
+    /// <summary>
+    /// Opens the store's pinned view under the write lock, as <see cref="IReadViewSource"/>
+    /// requires: no apply can run while the store captures its tables, so the view is one LSN across
+    /// every table rather than one table after a multi-table commit and another before it. Cheap —
+    /// the capture is references, not rows.
+    /// </summary>
+    private IHotStoreReadView OpenPinned(IReadViewSource source)
+    {
+        lock (_writeLock)
+            return source.OpenReadView();
+    }
+
+    /// <summary>
     /// Invokes a reducer body as one transaction. <paramref name="reducerName"/> and
     /// <paramref name="arguments"/> are recorded as log metadata for audit; the write set is the
     /// authoritative payload. Nested invocations are forbidden and throw.
@@ -1543,9 +1591,10 @@ public sealed partial class MelangeEngine : IDisposable
         double? bodyMs = null;
         try
         {
-            // Disposed before the lock is taken: the pin is the body's, and holding it across the
-            // commit would keep versions alive for no reader.
-            using (var view = source.OpenReadView())
+            // Opened under the write lock for an instant, so the pin cannot straddle a multi-table
+            // commit; disposed before the lock is taken for this transaction's own commit: the pin
+            // is the body's, and holding it across the commit would keep versions alive for no reader.
+            using (var view = OpenPinned(source))
             {
                 var context = new ReducerContext(
                     caller,

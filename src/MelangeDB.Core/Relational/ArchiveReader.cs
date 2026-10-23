@@ -26,6 +26,19 @@ public sealed record ArchiveQuery
     /// <summary>The primary key of the last row already read; the page starts after it.</summary>
     public object? After { get; init; }
 
+    /// <summary>
+    /// Read the archive as of this LSN rather than now: rows committed after it are left out, both
+    /// from Postgres and from the overlaid log tail. Pass a pinned view's <c>Lsn</c> — a producer's
+    /// <c>ctx.Lsn</c> — so hot and archive reads answer for the same commit, and a row that moves
+    /// from one to the other in between is neither counted twice nor missed. Null reads the latest.
+    /// <para>
+    /// One gap: archive deletes carry no LSN, so a delete committed after this LSN that Postgres has
+    /// already applied is visible early — the row is absent. The read waits for the log to be
+    /// durable through this LSN first, so the overlay can reach it.
+    /// </para>
+    /// </summary>
+    public ulong? AsOfLsn { get; init; }
+
     /// <summary>Rows per page, at most <see cref="MaxLimit"/>.</summary>
     public int Limit { get; init; } = 100;
 

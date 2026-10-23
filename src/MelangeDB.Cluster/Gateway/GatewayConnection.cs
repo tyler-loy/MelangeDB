@@ -368,8 +368,8 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         var strategy = _gateway.Strategy
             ?? throw new InvalidOperationException("No IShardStrategy is registered; shard-executed traffic cannot be routed.");
         var session = _session!;
-        var shard = strategy.ShardForSession(new SessionContext(
-            session.Identity, session.IsGuest, _gateway.Hub.Engine.CommittedView));
+        var shard = _gateway.Hub.Engine.ReadCommitted(db => strategy.ShardForSession(new SessionContext(
+            session.Identity, session.IsGuest, db)));
 
         await _attachmentLock.WaitAsync(ct).ConfigureAwait(false);
         try

@@ -104,6 +104,20 @@ All packages ship together at one version; there is no per-package versioning. S
   a backplane-only deployment used to stop at EventId 1605 until the schema was cleared; it now
   reconciles on its own. Clearing the schema still works.
 
+- **`MelangeEngine.OpenReadView()` — committed state pinned at one LSN, readable off the write
+  lock.** A `PinnedReadView` is a read-only `IDbView` with an `Lsn`, safe to read from several
+  threads (each read and each step of a lazy query runs under its own lock), that throws on a read
+  after disposal rather than reading a released pin. `SupportsReadViews` says whether the store can
+  pin, and `ReadCommitted(db => ...)` runs a synchronous read through a pin or, without one, under
+  the write lock. It is the read scope phase 26's producers run in.
+
+- **`ArchiveQuery.AsOfLsn` — read the archive as of a pinned view's LSN.** Postgres rows committed
+  after it and the overlaid log tail beyond it are left out, so a reader that merges hot and archive
+  rows sees a row the sweep moved in between exactly once, rather than twice (archive read later) or
+  not at all (archive read first). The read waits for the log to be durable through that LSN, since
+  the overlay reads only durable records. Archive deletes carry no LSN, so a delete committed after
+  it and already applied shows early.
+
 ### Fixed
 
 - **A table switched from `Hot` to the relational backplane now gets its existing rows in
@@ -116,6 +130,19 @@ All packages ship together at one version; there is no per-package versioning. S
   leaves the backplane leaves the registry (EventId 1610), so moving it back copies it afresh
   instead of resuming a stale copy. A 0.2 projection seeds the registry from the tables Postgres
   already holds. See [docs/MIGRATION.md](docs/MIGRATION.md#changing-a-tables-tier).
+
+- **A snapshot-isolated reducer on the in-memory store could read a commit half applied.**
+  `IReadViewSource` requires the pinned view to be opened while no apply runs, and the engine opened
+  it without the write lock. A commit writing to two tables could land between the two captures, so
+  the body saw the first table after the commit and the second before it. The FASTER store takes its
+  own lock and was not affected. The view is now opened under the write lock for the instant the
+  capture takes (references only).
+
+- **Reducer policies, and the cluster gateway's shard strategy, read the live store off the write
+  lock.** `MayCall` runs before its transaction opens, and `IShardStrategy.ShardForSession` runs on
+  the gateway, both against `CommittedView`, which the `IHotStore` contract allows only on paths the
+  engine serializes. Both now read through `MelangeEngine.ReadCommitted`: a pinned view, or the write
+  lock on a store without one.
 
 ## [0.2.3] — 2026-10-19
 
