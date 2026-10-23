@@ -477,7 +477,9 @@ never ticks.
 
 Since phase 26: `1107 UnpolicedProducers`, the unpoliced report's producer half — producers with no
 `[Producer(Policy = ...)]`, each an open read of whatever it returns. It is logged beside `1104` under the same
-`Policies:UnpolicedReducerReport` setting, and `Fail` refuses to start naming reducers and producers together.
+`Policies:UnpolicedReducerReport` setting, and `Fail` refuses to start naming reducers and producers together. `1206 ProducerCallFailed`
+is `1204`'s producer twin: a producer threw something other than a rejection, a timeout, or an oversized
+result during a socket or HTTP call, and the caller was told only to see the logs.
 
 Reaping a shard (issue #112) is the one cluster operation that destroys durable state, so both of its
 receipts are warnings and the refusal is not: `1747 ShardReaped` (node-side — the shard held nothing of

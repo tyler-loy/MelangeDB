@@ -301,7 +301,7 @@ to its admin console without also serving unauthenticated-in-effect bulk writes 
 | `Transport:CompressionEnabled` | bool | `true` | restart | 03 | `permessage-deflate`. Terrain blobs are already RLE-compressed; delta frames of many small rows are what benefit. |
 | `Transport:HeartbeatIntervalMs` | int | `15000` | live | 03 | |
 | `Transport:HeartbeatTimeoutMs` | int | `45000` | live | 03 | A closed socket is not the only way a client goes away; this is what makes `ClientDisconnected` fire on ungraceful drops. |
-| `Transport:HttpEndpointsEnabled` | bool | `true` | restart | 03 | One-shot reducer calls, bulk ingestion, tickets. WebSocket is the wrong shape for CLI tools and admin consoles. Bulk ingestion additionally requires its own opt-in — see the Bulk ingestion section. |
+| `Transport:HttpEndpointsEnabled` | bool | `true` | restart | 03 | One-shot reducer calls, producer calls (`POST {path}/producers/{name}`, phase 26), bulk ingestion, tickets. WebSocket is the wrong shape for CLI tools and admin consoles. Bulk ingestion additionally requires its own opt-in — see the Bulk ingestion section. |
 | `Transport:SchemaEndpointEnabled` | bool? | *(unset)* | live | 12 | Serves the module's [schema manifest](CLIENT-BINDINGS.md) at `{path}/schema` — the Swagger pattern. Unset follows the host environment (on in Development, off elsewhere); `true`/`false` overrides in either direction. Anonymous while on, by design: the manifest carries only what every client already receives. Off means a plain 404. |
 | `Transport:MaxInitialSetChunkBytes` | int | `262144` | live | 03 | Large initial sets are chunked and interleaved so a 30MB terrain subscription can't block a movement reducer response. |
 | `Resume:RetentionWindowSeconds` | int | `300` | live | 03 | How far back a reconnecting client can resume. Too small and every blip becomes a full resync; too large and it fights log compaction. |
@@ -343,6 +343,7 @@ change that adds them. Added by the frame-tick pump, issue #26.
 | `RateLimit:PerReducer:<ReducerName>` | int | — | live | 04 | Per-reducer override of the global rate. Producers share these buckets' settings, keyed by the producer's name (one namespace with reducers), each with a bucket of its own. |
 | `Producers:TimeoutSeconds` | double | `10` | live | 26 | How long one producer call may run. At the deadline its `CancellationToken` fires and the call answers `timeout`, whether or not the body honours the token — a body that ignores it is abandoned, and its pinned read view released. This is also the bound on how long one call makes the hot store keep superseded row versions. |
 | `Producers:MaxResponseBytes` | int | `1048576` | live | 26 | The largest encoded producer result. Encoding stops at the cap rather than building the whole answer, and the call answers `too_many_bytes`. Page a large history through the producer's own arguments. |
+| `Producers:MaxConcurrentPerConnection` | int | `4` | live | 26 | Producer calls one socket connection may have in flight. Each holds a pinned read view while it runs, so this bounds the superseded versions one client can make the hot store keep. A call past it answers `rate_limited` without running. Socket only: an HTTP call is one request. |
 
 ## Scheduling
 

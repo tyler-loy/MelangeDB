@@ -92,6 +92,73 @@ internal static class MelangeHttpEndpoints
     }
 
     /// <summary>
+    /// POST {path}/producers/{producer} — a producer call: a JSON array of arguments in (trailing
+    /// defaulted ones may be left off), <c>{"ok":true,"lsn":N,"result":...}</c> out, the result
+    /// rendered as JSON by <see cref="ProducerCalls.RenderJson"/>. Errors carry the socket's codes.
+    /// </summary>
+    public static async Task CallProducerAsync(HttpContext context, MelangeTransport transport)
+    {
+        if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
+            return;
+        var producer = (string)context.Request.RouteValues["producer"]!;
+        if (transport.Producers is not { } producers)
+        {
+            await WriteErrorAsync(context, StatusCodes.Status404NotFound, MelangeErrorCodes.UnknownProducer, $"No producer named '{producer}' is registered.").ConfigureAwait(false);
+            return;
+        }
+
+        object?[] arguments;
+        try
+        {
+            using var body = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted).ConfigureAwait(false);
+            arguments = body.RootElement.ValueKind switch
+            {
+                JsonValueKind.Array => body.RootElement.EnumerateArray().Select(ToArgument).ToArray(),
+                JsonValueKind.Null or JsonValueKind.Undefined => [],
+                _ => throw new JsonException("The request body must be a JSON array of arguments."),
+            };
+        }
+        catch (JsonException exception)
+        {
+            await WriteErrorAsync(context, StatusCodes.Status400BadRequest, MelangeErrorCodes.InvalidArguments, exception.Message).ConfigureAwait(false);
+            return;
+        }
+
+        ProducerResult result;
+        try
+        {
+            result = await producers.CallAsync(
+                producer,
+                session.Identity,
+                ConnectionId.None,
+                ReducerArguments.Encode(arguments),
+                Activity.Current?.Context ?? default,
+                CallSource.Client(session.IsGuest),
+                session.CapturedClaims,
+                context.RequestAborted,
+                ProducerCalls.RenderJson).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception exception)
+        {
+            var (code, status, message) = ProducerCalls.Classify(exception, producer, transport.Logger);
+            await WriteErrorAsync(context, status, code, message).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
+        {
+            writer.WriteBoolean("ok", true);
+            writer.WriteNumber("lsn", result.Lsn);
+            writer.WritePropertyName("result");
+            writer.WriteRawValue(result.Payload.Span, skipInputValidation: true);
+        }).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// POST {path}/bulk — bulk ingestion: <c>{"tables": {"TableName": [{...row}, ...]}}</c>,
     /// appended as one write set, one log record, not one transaction per row. Off until
     /// <c>Bulk:Enabled</c> opts in, and requires the caller's <c>Bulk:OwnerRole</c> claim —

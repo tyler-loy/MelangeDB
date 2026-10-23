@@ -45,6 +45,8 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     private volatile bool _pingSolicited; // A ping went out after the last inbound frame; only then may silence convict.
     private ITimer? _heartbeat;
     private bool _handshaken;
+    private int _protocolVersion;
+    private int _producerCallsInFlight;
     private bool _lifecycleConnected;
     private volatile bool _senderBusy;
     private int _terminated;
@@ -332,6 +334,9 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             case CallReducerFrame call:
                 HandleCallReducer(call);
                 break;
+            case CallProducerFrame call:
+                HandleCallProducer(call);
+                break;
             case SubscribeFrame subscribe:
                 HandleSubscribe(subscribe);
                 break;
@@ -356,13 +361,16 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
     private async Task HandleHelloAsync(HelloFrame hello)
     {
-        if (hello.MinVersion > MessagePackFrameSerializer.ProtocolVersion || hello.MaxVersion < MessagePackFrameSerializer.ProtocolVersion)
+        if (MessagePackFrameSerializer.Negotiate(hello.MinVersion, hello.MaxVersion) is not { } version)
         {
             EnqueuePriority(new ErrorFrame(
                 MelangeErrorCodes.UnsupportedVersion,
-                $"This server speaks protocol version {MessagePackFrameSerializer.ProtocolVersion}; the client offered {hello.MinVersion}-{hello.MaxVersion}."));
+                $"This server speaks protocol versions {MessagePackFrameSerializer.MinProtocolVersion}-{MessagePackFrameSerializer.ProtocolVersion}; " +
+                $"the client offered {hello.MinVersion}-{hello.MaxVersion}."));
             throw new MelangeProtocolException("No common protocol version.");
         }
+
+        _protocolVersion = version;
 
         if (_session is null)
         {
@@ -404,7 +412,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
         _handshaken = true;
         EnqueuePriority(new WelcomeFrame(
-            MessagePackFrameSerializer.ProtocolVersion,
+            _protocolVersion,
             ConnectionId.Value,
             _transport.Engine.Log.EpochId,
             _transport.Engine.Log.HeadLsn,
@@ -515,6 +523,88 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         }
 
         EnqueuePriority(new ReducerResultFrame(call.RequestId, true, lsn, null, null) { Channel = MelangeChannels.Calls });
+    }
+
+    /// <summary>
+    /// Starts a producer call off the read loop — a producer may await I/O, and the loop must keep
+    /// reading meanwhile. The connection's close token cancels every call in flight, and
+    /// <c>Producers:MaxConcurrentPerConnection</c> bounds how many pinned views one client holds.
+    /// </summary>
+    private void HandleCallProducer(CallProducerFrame call)
+    {
+        if (_protocolVersion < 3)
+        {
+            var message = $"CallProducer requires protocol version 3; this connection negotiated {_protocolVersion}.";
+            EnqueuePriority(new ErrorFrame(MelangeErrorCodes.Protocol, message, call.RequestId));
+            throw new MelangeProtocolException(message);
+        }
+
+        if (_transport.Producers is not { } producers)
+        {
+            ReplyProducer(new ProducerResultFrame(
+                call.RequestId, false, 0, ReadOnlyMemory<byte>.Empty, MelangeErrorCodes.UnknownProducer, $"No producer named '{call.Producer}' is registered."));
+            return;
+        }
+
+        var limit = _transport.Options.Producers.MaxConcurrentPerConnection;
+        if (Interlocked.Increment(ref _producerCallsInFlight) > limit)
+        {
+            Interlocked.Decrement(ref _producerCallsInFlight);
+            ReplyProducer(new ProducerResultFrame(
+                call.RequestId, false, 0, ReadOnlyMemory<byte>.Empty, MelangeErrorCodes.RateLimited,
+                $"This connection already has Producers:MaxConcurrentPerConnection ({limit}) producer calls in flight."));
+            return;
+        }
+
+        _ = RunProducerAsync(call, producers);
+    }
+
+    private async Task RunProducerAsync(CallProducerFrame call, MelangeProducerHost producers)
+    {
+        try
+        {
+            var parentContext = default(ActivityContext);
+            if (call.TraceParent is { } traceparent)
+                ActivityContext.TryParse(traceparent, null, isRemote: true, out parentContext);
+
+            var result = await producers.CallAsync(
+                call.Producer,
+                Caller,
+                ConnectionId,
+                call.Arguments,
+                parentContext,
+                CallSource.Client(_session?.IsGuest ?? false),
+                _session?.CapturedClaims,
+                _closed.Token).ConfigureAwait(false);
+            ReplyProducer(new ProducerResultFrame(call.RequestId, true, result.Lsn, result.Payload, null, null));
+        }
+        catch (OperationCanceledException) when (_closed.IsCancellationRequested)
+        {
+            // The connection is gone; there is no one to answer.
+        }
+        catch (Exception exception)
+        {
+            var (code, _, message) = ProducerCalls.Classify(exception, call.Producer, _logger);
+            ReplyProducer(new ProducerResultFrame(call.RequestId, false, 0, ReadOnlyMemory<byte>.Empty, code, message));
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _producerCallsInFlight);
+        }
+    }
+
+    private void ReplyProducer(ProducerResultFrame frame)
+    {
+        // A call can outlive its connection; once the socket is closing there is no one to answer.
+        if (_closed.IsCancellationRequested)
+            return;
+        try
+        {
+            EnqueuePriority(frame with { Channel = MelangeChannels.Calls });
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     private void HandleSubscribe(SubscribeFrame subscribe)

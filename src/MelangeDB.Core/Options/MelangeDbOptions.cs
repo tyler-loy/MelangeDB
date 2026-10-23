@@ -451,6 +451,13 @@ public sealed class ProducersOptions
     /// Encoding stops at the cap rather than building the whole answer first.
     /// </summary>
     public int MaxResponseBytes { get; set; } = 1024 * 1024;
+
+    /// <summary>
+    /// Producer calls one socket connection may have in flight. Each holds a pinned read view for
+    /// as long as it runs, so this bounds the versions one client can make the hot store keep. A
+    /// call past it answers <c>rate_limited</c> without running.
+    /// </summary>
+    public int MaxConcurrentPerConnection { get; set; } = 4;
 }
 
 /// <summary>Whether ad-hoc SQL results pass through row and column policies.</summary>

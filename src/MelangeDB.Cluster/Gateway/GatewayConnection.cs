@@ -158,15 +158,26 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         }
     }
 
+    /// <summary>
+    /// The newest version the gateway offers clients. It does not route producer calls yet, so it
+    /// settles on version 2 — where a client knows not to send them — rather than accept a frame it
+    /// would have to refuse.
+    /// </summary>
+    private const int MaxGatewayVersion = 2;
+
+    private int _protocolVersion;
+
     private async Task HandleHelloAsync(HelloFrame hello, CancellationToken ct)
     {
-        if (hello.MinVersion > MessagePackFrameSerializer.ProtocolVersion || hello.MaxVersion < MessagePackFrameSerializer.ProtocolVersion)
+        if (MessagePackFrameSerializer.Negotiate(hello.MinVersion, Math.Min(hello.MaxVersion, MaxGatewayVersion)) is not { } version)
         {
             await SendToClientAsync(new ErrorFrame(
                 MelangeErrorCodes.UnsupportedVersion,
-                $"This gateway speaks protocol version {MessagePackFrameSerializer.ProtocolVersion}."), ct).ConfigureAwait(false);
+                $"This gateway speaks protocol versions {MessagePackFrameSerializer.MinProtocolVersion}-{MaxGatewayVersion}."), ct).ConfigureAwait(false);
             throw new InvalidOperationException("No common protocol version.");
         }
+
+        _protocolVersion = version;
 
         switch (await _gateway.Authenticator.ValidateAsync(hello.Token).ConfigureAwait(false))
         {
@@ -190,7 +201,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         _moveRegistration = _gateway.Hub.ShardMoves.Register(this);
         _handshaken = true;
         await SendToClientAsync(new WelcomeFrame(
-            MessagePackFrameSerializer.ProtocolVersion,
+            _protocolVersion,
             Guid.NewGuid(),
             _hub.Welcome.EpochId,
             _hub.Welcome.HeadLsn,

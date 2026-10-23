@@ -58,7 +58,8 @@ public static class MelangeEndpointRouteBuilderExtensions
             authenticator,
             services.GetService<MelangeSessions>() ?? new MelangeSessions(),
             new PolicySet(services, engine.Schema),
-            services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>()?.ApplicationStopping ?? default);
+            services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>()?.ApplicationStopping ?? default,
+            services.GetService<MelangeProducerHost>());
         var basePath = (path ?? options.CurrentValue.Transport.Path).TrimEnd('/');
 
         // endpoints.Map (not MapGet) carries no method constraint, so both the HTTP/1.1 GET
@@ -68,6 +69,7 @@ public static class MelangeEndpointRouteBuilderExtensions
         if (options.CurrentValue.Transport.HttpEndpointsEnabled)
         {
             endpoints.MapPost(basePath + "/call/{reducer}", context => MelangeHttpEndpoints.CallAsync(context, transport));
+            endpoints.MapPost(basePath + "/producers/{producer}", context => MelangeHttpEndpoints.CallProducerAsync(context, transport));
             endpoints.MapPost(basePath + "/bulk", context => MelangeHttpEndpoints.BulkAsync(context, transport));
             endpoints.MapPost(basePath + "/sql", context => MelangeHttpEndpoints.SqlAsync(context, transport));
             endpoints.MapPost(basePath + "/ticket", context => MelangeHttpEndpoints.TicketAsync(context, transport));

@@ -128,6 +128,17 @@ All packages ship together at one version; there is no per-package versioning. S
   pinned reads refuses to start once any producer is registered. Telemetry: the `melange.producer`
   span and `melange.producer.calls`, `.duration`, and `.pin.duration`.
 
+  On the wire, producers are **protocol version 3**: `CallProducer` (17) and `ProducerResult` (18)
+  on the calls channel, with error codes `unknown_producer` and `timeout` beside the reducer ones.
+  The server negotiates 2–3 and serves a version-2 client exactly as before, refusing it only if it
+  sends a producer frame; `MelangeClient` offers 2–3 and gains `CallProducerAsync`, whose result
+  `ProducerResultReader` decodes. The socket runs calls off the read loop, cancels them when the
+  connection closes, and holds at most `Producers:MaxConcurrentPerConnection` at once (EventId 1206
+  for an unexpected failure). Over HTTP, `POST {path}/producers/{name}` takes a JSON array of
+  arguments and answers `{"ok", "lsn", "result"}`, the result rendered as JSON under the response
+  cap while the read view is still pinned. The cluster gateway still settles on version 2 until it
+  routes producer calls.
+
 - **`MelangeEngine.OpenReadView()` — committed state pinned at one LSN, readable off the write
   lock.** A `PinnedReadView` is a read-only `IDbView` with an `Lsn`, safe to read from several
   threads (each read and each step of a lazy query runs under its own lock), that throws on a read

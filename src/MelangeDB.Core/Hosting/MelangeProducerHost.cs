@@ -70,6 +70,9 @@ public sealed class MelangeProducerHost
     /// <see cref="ProducerTimeoutException"/>, <see cref="ProducerResultTooLargeException"/>, or
     /// whatever the body throws (a <see cref="RejectedException"/> is the body saying no).
     /// <paramref name="cancellationToken"/> is the caller's — a transport cancels it on disconnect.
+    /// <paramref name="render"/> replaces the binary encoding — the HTTP endpoint renders JSON — and
+    /// runs where the encoder would, while the pin is held, given the value and
+    /// <c>Producers:MaxResponseBytes</c>.
     /// </summary>
     public async Task<ProducerResult> CallAsync(
         string producerName,
@@ -79,7 +82,8 @@ public sealed class MelangeProducerHost
         ActivityContext parentContext = default,
         CallSource source = default,
         CallerClaims? claims = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Func<object?, int, ReadOnlyMemory<byte>>? render = null)
     {
         if (_stopping)
             throw new InvalidOperationException("MelangeDB is shutting down; no further producer calls are accepted.");
@@ -109,7 +113,7 @@ public sealed class MelangeProducerHost
                 CallAuthorization.Authorize(_engine, "Producer", descriptor.Name, descriptor.Policy, caller, source, options.Policies, scope.ServiceProvider);
             var instance = scope.ServiceProvider.GetRequiredService(descriptor.ProducerClass);
 
-            var result = await RunPinnedAsync(descriptor, instance, caller, connectionId, encodedArguments, options, claims, cancellationToken).ConfigureAwait(false);
+            var result = await RunPinnedAsync(descriptor, instance, caller, connectionId, encodedArguments, options, claims, render, cancellationToken).ConfigureAwait(false);
             outcome = "ok";
             return result;
         }
@@ -155,6 +159,7 @@ public sealed class MelangeProducerHost
         ReadOnlyMemory<byte> encodedArguments,
         MelangeDbOptions options,
         CallerClaims? claims,
+        Func<object?, int, ReadOnlyMemory<byte>>? render,
         CancellationToken cancellationToken)
     {
         var timeout = TimeSpan.FromSeconds(options.Producers.TimeoutSeconds);
@@ -196,9 +201,16 @@ public sealed class MelangeProducerHost
             }
 
             // Encoded while the pin is held: a lazy query inside the result reads it now.
-            var writer = new ProducerResultWriter(options.Producers.MaxResponseBytes);
-            descriptor.Encode(writer, value);
-            payload = writer.Written;
+            if (render is not null)
+            {
+                payload = render(value, options.Producers.MaxResponseBytes);
+            }
+            else
+            {
+                var writer = new ProducerResultWriter(options.Producers.MaxResponseBytes);
+                descriptor.Encode(writer, value);
+                payload = writer.Written;
+            }
         }
         finally
         {

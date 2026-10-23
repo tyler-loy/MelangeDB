@@ -68,6 +68,9 @@ internal sealed class TransportTestHost : IAsyncDisposable
     /// <summary>What reducers saw on <c>ReducerContext.Claims</c>, shared across restarts.</summary>
     public ClaimsProbe Claims { get; } = new();
 
+    /// <summary>What the transport-test producers observed; see <see cref="TransportProducers"/>.</summary>
+    public ProducerProbe ProducerProbe { get; } = new();
+
     public IServiceProvider Services => _app!.Services;
 
     /// <summary>
@@ -232,9 +235,11 @@ internal sealed class TransportTestHost : IAsyncDisposable
         builder.Services.AddSingleton<MelangeSessions>();
         builder.Services.AddSingleton(SessionEvents);
         builder.Services.AddSingleton(Claims);
+        builder.Services.AddSingleton(ProducerProbe);
         builder.Services.AddMelangeDb(melange => melange
             .AddTablesFrom(typeof(Chunk).Assembly)
-            .AddReducersFrom(typeof(TransportReducers).Assembly));
+            .AddReducersFrom(typeof(TransportReducers).Assembly)
+            .AddProducersFrom(typeof(TransportProducers).Assembly));
         _services?.Invoke(builder.Services);
 
         var app = builder.Build();
