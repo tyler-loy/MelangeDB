@@ -84,6 +84,26 @@ public class ArchiveDeadLetterTests
     }
 
     [Fact]
+    public async Task With_keep_keys_a_duplicate_is_refused_in_the_reducer_and_never_reaches_postgres()
+    {
+        _postgres.SkipUnlessAvailable();
+        await using var harness = new TierHarness(
+            _postgres.ConnectionString,
+            PostgresContainerFixture.NewSchema(),
+            registry: () => TierHarness.RegistryWithTier("HotCounter", StorageTier.Archive, keepKeys: true));
+        await harness.StartTierAsync();
+        Archive(harness, 1, 10);
+
+        var head = harness.Engine.Log.HeadLsn;
+        Assert.ThrowsAny<InvalidOperationException>(() => Archive(harness, 1, 99));
+        Assert.Equal(head, harness.Engine.Log.HeadLsn);
+
+        await harness.WaitAppliedAsync(head);
+        Assert.Equal(0L, await harness.ScalarAsync($"SELECT count(*) FROM \"{harness.Schema}\".\"__melange_archive_dead_letter\""));
+        Assert.Null(harness.Tier.Degraded);
+    }
+
+    [Fact]
     public async Task A_delete_then_insert_of_one_key_in_one_transaction_replaces_the_row()
     {
         _postgres.SkipUnlessAvailable();

@@ -71,6 +71,7 @@ internal sealed record DiagnosticInfo(string DescriptorId, LocationInfo Location
         "MELANGE0024" => Diagnostics.ArchiveTablePublic,
         "MELANGE0025" => Diagnostics.UniqueOnArchiveTable,
         "MELANGE0026" => Diagnostics.ArchiveTableDeclaration,
+        "MELANGE0027" => Diagnostics.KeepKeysOnNonArchiveTable,
         _ => throw new InvalidOperationException($"Unknown diagnostic id {id}."),
     };
 }
@@ -151,7 +152,8 @@ internal sealed record TableModel(
     string? Scheduled,
     EquatableArray<ColumnModel> Columns,
     EquatableArray<DiagnosticInfo> Diagnostics,
-    EquatableArray<EnumModel> Enums = default)
+    EquatableArray<EnumModel> Enums = default,
+    bool KeepKeys = false)
 {
     public bool IsValid => Diagnostics.Items.All(d => d.DescriptorId is "MELANGE0003" or "MELANGE0007");
 }

@@ -44,7 +44,15 @@ public static class ShapeCompatibility
 
         foreach (var (name, shape) in persisted.Tables.OrderBy(static p => p.Key, StringComparer.Ordinal))
         {
-            if (!schema.TryGetByName(name, out var table))
+            if (!schema.TryGetByName(name, out var table) && ArchiveKeySet.IsKeySet(name, out var keptFor))
+            {
+                // A key set is derived from the archive's ops, never the only copy of anything:
+                // dropping it loses nothing but the ability to ask.
+                additive.Add($"table '{keptFor}': its key set ('{name}') is no longer kept");
+                continue;
+            }
+
+            if (table is null)
             {
                 destructive.Add(
                     $"table '{name}' was removed; its rows are still in the log and dropping a table's " +
@@ -90,8 +98,18 @@ public static class ShapeCompatibility
 
         foreach (var table in schema.Tables)
         {
-            if (!persisted.Tables.ContainsKey(table.Name))
-                additive.Add($"new table '{table.Name}'");
+            if (persisted.Tables.ContainsKey(table.Name))
+                continue;
+            if (ArchiveKeySet.IsKeySet(table.Name, out var archive) && persisted.Tables.ContainsKey(archive))
+            {
+                destructive.Add(
+                    $"table '{archive}' now declares KeepKeys, but it already existed: the keys it has archived so far live " +
+                    "only in Postgres, so its key set would start incomplete and Contains would answer false for them. " +
+                    "Declare KeepKeys on a new archive table and move to it, or keep this one without");
+                continue;
+            }
+
+            additive.Add($"new table '{table.Name}'");
         }
 
         return new ShapeDiff

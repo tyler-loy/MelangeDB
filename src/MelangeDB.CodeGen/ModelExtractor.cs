@@ -21,6 +21,7 @@ internal static class ModelExtractor
         string? declaredPlacement = null;
         string? shardBy = null;
         string? scheduled = null;
+        var keepKeys = false;
         foreach (var named in attribute.NamedArguments)
         {
             switch (named.Key)
@@ -47,6 +48,9 @@ internal static class ModelExtractor
                     break;
                 case "Scheduled":
                     scheduled = named.Value.Value as string;
+                    break;
+                case "KeepKeys":
+                    keepKeys = named.Value.Value is true;
                     break;
             }
         }
@@ -79,6 +83,13 @@ internal static class ModelExtractor
             isPublic = false;
             placement = "Local";
             shardBy = null;
+        }
+
+        // A key set is kept for an archive table's rows; no other table's rows live anywhere else.
+        if (keepKeys && tier != "Archive")
+        {
+            diagnostics.Add(new DiagnosticInfo("MELANGE0027", typeLocation, new EquatableArray<string>([tableName, $"Tier = {tier}"])));
+            keepKeys = false;
         }
 
         // An archive table lives only in Postgres: nothing of it is in the hot store, so anything
@@ -177,7 +188,8 @@ internal static class ModelExtractor
             Scheduled: scheduled,
             Columns: new EquatableArray<ColumnModel>([.. columns]),
             Diagnostics: new EquatableArray<DiagnosticInfo>([.. diagnostics]),
-            Enums: new EquatableArray<EnumModel>([.. enums]));
+            Enums: new EquatableArray<EnumModel>([.. enums]),
+            KeepKeys: keepKeys);
     }
 
     public static ReducerModel? ExtractReducer(GeneratorAttributeSyntaxContext context)

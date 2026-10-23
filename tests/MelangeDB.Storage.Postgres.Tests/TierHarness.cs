@@ -212,8 +212,8 @@ internal sealed class TierHarness : IAsyncDisposable
         new(new MelangeDB.Generated.MelangeModel().Tables().Where(t => t.Name != table));
 
     /// <summary>The generated schema with one table declared on another tier — the same table as a later deploy declares it.</summary>
-    public static SchemaRegistry RegistryWithTier(string table, StorageTier tier) =>
+    public static SchemaRegistry RegistryWithTier(string table, StorageTier tier, bool keepKeys = false) =>
         new(new MelangeDB.Generated.MelangeModel().Tables().Select(t => t.Name != table
             ? t
-            : new TableSchema(t.RowType, t.Name, t.Columns, t.IsPublic, tier, t.Residency, t.Placement, t.ShardBy, t.Scheduled, t.Codec)));
+            : new TableSchema(t.RowType, t.Name, t.Columns, t.IsPublic, tier, t.Residency, t.Placement, t.ShardBy, t.Scheduled, t.Codec, keepKeys)));
 }

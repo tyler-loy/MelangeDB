@@ -105,4 +105,16 @@ public sealed class TableAttribute : Attribute
     /// it is not client-callable.
     /// </summary>
     public string? Scheduled { get; set; }
+
+    /// <summary>
+    /// For an <see cref="StorageTier.Archive"/> table only: keep a key-only set in the hot store,
+    /// one key per archived row and no payload. The generated accessor then offers
+    /// <c>Contains(key)</c> — so a reducer can ask whether a key was ever archived, which an
+    /// idempotency check needs — and an insert refuses a duplicate key before commit instead of
+    /// it being dead-lettered in Postgres after. The cost is the key set itself, which grows with
+    /// history at the size of a key. Off by default. Must be declared when the table is first
+    /// created: turning it on later would start the set without the keys already archived, so boot
+    /// refuses it. Declaring it on any other tier is compile error MELANGE0027.
+    /// </summary>
+    public bool KeepKeys { get; set; }
 }

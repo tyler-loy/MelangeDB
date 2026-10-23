@@ -596,6 +596,13 @@ Postgres holds the only copy. Requires `AddPostgres(...)`; refused at compile ti
 Replicated, or declaring a Residency (MELANGE0024–0026). See
 [plan-phase-25.md](road-to-0.3/plan-phase-25.md).
 
+**Key set (`__keys_<Table>`)** — The key-only hot table behind an archive table declared `KeepKeys = true`: one
+key per archived row and no payload, maintained by the engine from the archive's ops, so a reducer can ask
+`Contains(key)` — an idempotency check across the hot window — and a duplicate archive insert is refused before
+commit rather than dead-lettered after. An ordinary hot table, so snapshots, paging, recovery and backups carry
+it. Must be declared when the archive table is created; turning it on later is refused at boot, turning it off
+drops a derived set and is not. The prefix is reserved.
+
 **Lineage (`melange.lineage`)** — Which earlier epochs a log descends from, and the LSN it forked from each: a
 restore writes its source epoch and restored head, extending the lineage the archive carried. LSNs run on along a
 lineage, so an (epoch, LSN) pair is this log's history when the epoch is the current one or an ancestor and the

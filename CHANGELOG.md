@@ -62,6 +62,15 @@ All packages ship together at one version; there is no per-package versioning. S
   table is cleared — through the new `IApplierCondition`, which any decoupled applier can implement.
   Back up Postgres with point-in-time recovery; see [docs/BACKUP.md](docs/BACKUP.md).
 
+- **`KeepKeys`: an archive table's keys kept in the hot store.** Opt-in per archive table
+  (`[Table(Tier = StorageTier.Archive, KeepKeys = true)]`, off by default). The engine maintains a
+  key-only hot table, `__keys_<Table>`, from the archive's ops; the generated accessor gains
+  `Contains(key)`, so a reducer can check an idempotency key that has left the hot window, and an
+  insert refuses an already-archived key before commit instead of it being dead-lettered after.
+  `IDbView.ContainsKey<TRow>` is the untyped form, a default interface method. Must be declared when
+  the table is created; turning it on later refuses boot, turning it off doesn't. MELANGE0027 refuses
+  it on any other tier.
+
 - **`Postgres:ArchiveLogRetentionHours`, the archive retention floor.** Off by default. While archive
   tables are declared, the log keeps the records committed within the window — a named truncation
   floor, `archive-retention`, searched by commit timestamp like the resume window — so a Postgres

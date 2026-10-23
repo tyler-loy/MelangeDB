@@ -97,6 +97,12 @@ live only in Postgres. The supported path is the one the tier is designed around
 `Archive` table and move rows into it with a reducer — `Insert` into the archive and `Delete` from the
 hot table in the same transaction, in batches, which makes each move atomic.
 
+`KeepKeys` on an archive table follows the same logic. Turning it on for an archive table that already
+exists is refused, because the keys archived so far live only in Postgres and the new key set would
+start without them — `Contains` would answer false for exactly the keys an idempotency check exists to
+catch. Declare it on a new archive table and move to it. Turning it off is allowed: the key set is derived
+from the archive's ops, so dropping it loses nothing but the ability to ask.
+
 A recorded tier this build does not recognize — one written by a newer MelangeDB — is refused like any
 destructive change: booting it under a tier whose rows live elsewhere would present an empty table as
 the whole truth.

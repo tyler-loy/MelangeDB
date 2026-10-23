@@ -393,6 +393,14 @@ source, fix the key allocation, and re-apply or discard each dead-lettered row d
 
 ### Existence checks: idempotency keys that outlive the hot window
 
+**As built:** the key set is a synthesized hot table, `__keys_<Table>`, registered beside the archive
+table and maintained by the engine from the archive's ops in the same place it strips them from the
+hot store. Being an ordinary hot table is what lets snapshots, paging, recovery and backups carry it
+with no machinery of its own. `IDbView.ContainsKey<TRow>` is the untyped form. One rule the decision
+below did not foresee: `KeepKeys` must be declared when the archive table is created, because turning
+it on later starts the set without the keys already in Postgres — boot refuses that; turning it off is
+fine.
+
 The first real consumer of this shape already needs one reducer-side read of archived rows. Its
 `WalletEntry.Id` is the idempotency key for credits, refunds, and redelivered saga legs. The hot
 table is capped at each player's newest lines and older lines move to an archive, and the reducer

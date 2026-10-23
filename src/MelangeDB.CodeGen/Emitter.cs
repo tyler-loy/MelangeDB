@@ -190,7 +190,8 @@ internal static class Emitter
         builder.AppendLine($"                placement: global::MelangeDB.Placement.{table.Placement},");
         builder.AppendLine($"                shardBy: {(table.ShardBy is null ? "null" : Literal(table.ShardBy))},");
         builder.AppendLine($"                scheduled: {(table.Scheduled is null ? "null" : Literal(table.Scheduled))},");
-        builder.AppendLine("                codec: Instance);");
+        builder.AppendLine("                codec: Instance,");
+        builder.AppendLine($"                keepKeys: {(table.KeepKeys ? "true" : "false")});");
         builder.AppendLine();
     }
 
@@ -320,8 +321,17 @@ internal static class Emitter
             builder.AppendLine();
             builder.AppendLine($"        public {accessor}(global::MelangeDB.IDbView db) => _db = db;");
             builder.AppendLine();
-            builder.AppendLine("        /// <summary>Deletes the row with this key if Postgres holds one. Blind: a reducer cannot see whether it exists.</summary>");
+            builder.AppendLine(table.KeepKeys
+                ? "        /// <summary>Deletes the archived row with this key; its key leaves the key set too.</summary>"
+                : "        /// <summary>Deletes the row with this key if Postgres holds one. Blind: a reducer cannot see whether it exists.</summary>");
             builder.AppendLine($"        public void Delete({column.ClrFqn} key) => _db.Delete<{row}>(key);");
+            if (table.KeepKeys)
+            {
+                builder.AppendLine();
+                builder.AppendLine("        /// <summary>Whether a row with this key has been archived (and not deleted), from the key set in the hot store.</summary>");
+                builder.AppendLine($"        public bool Contains({column.ClrFqn} key) => _db.ContainsKey<{row}>(key);");
+            }
+
             builder.AppendLine("    }");
         }
     }

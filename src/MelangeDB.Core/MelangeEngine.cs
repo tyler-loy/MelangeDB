@@ -209,9 +209,10 @@ public sealed partial class MelangeEngine : IDisposable
     /// </summary>
     /// <summary>
     /// The record as the hot store sees it: archive-tier ops removed, because those rows live only
-    /// in Postgres. Done here rather than in each store so that every <see cref="IHotStore"/>,
-    /// including one this assembly never saw, holds nothing of an archive table. The AutoInc
-    /// sequencer and every decoupled applier still see the whole record.
+    /// in Postgres — and, for an archive table that keeps a key set, replaced by the same op on its
+    /// key set, carrying the key alone. Done here rather than in each store so that every
+    /// <see cref="IHotStore"/>, including one this assembly never saw, holds nothing of an archive
+    /// table but its keys. The AutoInc sequencer and every decoupled applier still see the whole record.
     /// </summary>
     private CommitRecord WithoutArchiveOps(CommitRecord record)
     {
@@ -231,6 +232,8 @@ public sealed partial class MelangeEngine : IDisposable
                         kept.Add(record.WriteSet[j]);
                 }
 
+                if (Schema.KeySetFor(op.Table) is { } keySet)
+                    kept.Add(KeySetOp(keySet, op));
                 continue;
             }
 
@@ -249,6 +252,15 @@ public sealed partial class MelangeEngine : IDisposable
             Events = record.Events,
             SerializedLength = record.SerializedLength,
         };
+    }
+
+    private static RowOp KeySetOp(TableSchema keySet, in RowOp op)
+    {
+        if (op.Kind == RowOpKind.Delete)
+            return new RowOp(RowOpKind.Delete, keySet.Id, op.Key);
+        var key = keySet.PrimaryKey;
+        var row = RowSerializer.SerializeValues(keySet, new Dictionary<string, object?> { [key.Name] = SchemaKeyCodec.Decode(key, op.Key) });
+        return new RowOp(op.Kind, keySet.Id, op.Key, row);
     }
 
     private void CompleteShapeMigration(IHotStore store)

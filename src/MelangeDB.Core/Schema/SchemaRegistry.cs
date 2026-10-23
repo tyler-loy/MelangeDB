@@ -11,6 +11,10 @@ public sealed class SchemaRegistry
 {
     private readonly Dictionary<Type, TableSchema> _byType;
     private readonly Dictionary<TableId, TableSchema> _byId;
+    private readonly Dictionary<TableId, TableSchema> _keySets;
+
+    /// <summary>The key set kept for a <c>KeepKeys</c> archive table, or null when it keeps none.</summary>
+    public TableSchema? KeySetFor(TableId archiveTable) => _keySets.GetValueOrDefault(archiveTable);
 
     /// <summary>Registers pre-built schemas — the generated-registration seam.</summary>
     public SchemaRegistry(IEnumerable<TableSchema> tables)
@@ -18,7 +22,17 @@ public sealed class SchemaRegistry
         ArgumentNullException.ThrowIfNull(tables);
         _byType = [];
         _byId = [];
-        foreach (var table in tables.OrderBy(t => t.Name, StringComparer.Ordinal))
+        var declared = tables.ToList();
+        foreach (var table in declared)
+        {
+            if (ArchiveKeySet.IsKeySet(table.Name, out _))
+                throw new ArgumentException($"Table '{table.Name}': the '{ArchiveKeySet.Prefix}' prefix is reserved for archive key sets.");
+        }
+
+        // Each KeepKeys archive table brings its key set: an ordinary hot table the engine maintains.
+        var keySets = declared.Where(static t => t.KeepKeys).Select(ArchiveKeySet.SchemaFor).ToList();
+        _keySets = keySets.ToDictionary(static k => TableId.FromName(k.Name.Substring(ArchiveKeySet.Prefix.Length)), static k => k);
+        foreach (var table in declared.Concat(keySets).OrderBy(t => t.Name, StringComparer.Ordinal))
         {
             if (_byType.ContainsKey(table.RowType))
                 throw new ArgumentException($"Type {table.RowType} is registered twice.");
@@ -126,7 +140,8 @@ public sealed class SchemaRegistry
             attribute.Residency,
             attribute.Placement,
             attribute.ShardBy,
-            attribute.Scheduled);
+            attribute.Scheduled,
+            keepKeys: attribute.KeepKeys);
     }
 
     private static ColumnKind KindOf(Type table, string column, Type type)

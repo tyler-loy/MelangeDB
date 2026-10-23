@@ -4,7 +4,7 @@ namespace MelangeDB.CodeGen;
 
 /// <summary>
 /// Every diagnostic MelangeDB reports at compile time. Ids are stable public API: MELANGE0001
-/// through MELANGE0026, never renumbered, each with a fires-test and a compiles-clean test.
+/// through MELANGE0027, never renumbered, each with a fires-test and a compiles-clean test.
 /// </summary>
 public static class Diagnostics
 {
@@ -227,6 +227,16 @@ public static class Diagnostics
         "MELANGE0026",
         "Archive table declares something only a hot table can honour",
         "Table '{0}' is Tier = Archive and declares {1}, which it cannot honour: {2}. Drop the declaration.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor KeepKeysOnNonArchiveTable = new(
+        "MELANGE0027",
+        "KeepKeys applies only to archive tables",
+        "Table '{0}' declares KeepKeys but is {1}. KeepKeys keeps an archive table's keys in the hot store because its " +
+        "rows live only in Postgres; a table in the hot store already has its keys there. Drop KeepKeys, or declare " +
+        "Tier = StorageTier.Archive.",
         Category,
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);

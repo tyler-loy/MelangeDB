@@ -76,7 +76,8 @@ Four orthogonal knobs, and conflating any two of them is a design error:
 - **`Tier`** — *where the row is stored.* Hot (default); HotWithRelationalBackplane — hot, with a
   Postgres copy the applier projects from the log (called `Relational` until 0.3); or Archive —
   Postgres only, for unbounded history: reducers append and delete by key and cannot read, and the
-  rows are in no hot store, snapshot, or backup archive. Postgres is opt-in, so a table only lands
+  rows are in no hot store, snapshot, or backup archive. `KeepKeys = true` keeps an archive table's
+  keys alone in the hot store, so a reducer can still ask `Contains(key)`. Postgres is opt-in, so a table only lands
   there if it asks to, and a deployment only needs Postgres if some table asks to.
 - **`Public`** — *may this table sync to clients at all?* **Private by default.** A private table is
   server-internal and no subscription may name it.

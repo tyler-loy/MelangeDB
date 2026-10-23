@@ -16,7 +16,8 @@ public sealed class TableSchema
         Placement placement = Placement.Partitioned,
         string? shardBy = null,
         string? scheduled = null,
-        RowCodec? codec = null)
+        RowCodec? codec = null,
+        bool keepKeys = false)
     {
         ArgumentNullException.ThrowIfNull(rowType);
         ArgumentException.ThrowIfNullOrEmpty(name);
@@ -26,6 +27,8 @@ public sealed class TableSchema
 
         // The runtime mirror of MELANGE0024-0026 for the reflection path: an archive table lives
         // only in Postgres, so anything that needs its rows in the hot store cannot be honoured.
+        if (keepKeys && tier != StorageTier.Archive)
+            throw new NotSupportedException($"Table '{name}' declares KeepKeys, which only an archive table can (MELANGE0027).");
         if (tier == StorageTier.Archive)
         {
             if (isPublic)
@@ -126,7 +129,11 @@ public sealed class TableSchema
         ShardBy = shardBy;
         Scheduled = scheduled;
         Codec = codec;
+        KeepKeys = keepKeys;
     }
+
+    /// <summary>For an archive table: whether a key-only set is kept in the hot store. See <see cref="ArchiveKeySet"/>.</summary>
+    public bool KeepKeys { get; }
 
     public Type RowType { get; }
 

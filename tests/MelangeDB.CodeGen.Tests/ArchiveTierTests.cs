@@ -123,3 +123,64 @@ public class ArchiveTierTests
         Assert.Contains(result.Errors, d => d.Id is "CS1061" or "CS0117");
     }
 }
+
+/// <summary>
+/// <c>KeepKeys</c> at compile time: MELANGE0027 keeps it to archive tables, and an archive table
+/// that keeps its keys gets <c>Contains</c> while one that does not never does.
+/// </summary>
+public class ArchiveKeySetTests
+{
+    private static string Table(string attribute) => $$"""
+        using MelangeDB;
+
+        [Table({{attribute}})]
+        public partial struct LedgerArchive
+        {
+            [PrimaryKey] public long Id;
+            public long Delta;
+        }
+
+        public sealed class Reducers
+        {
+            [Reducer]
+            public void Apply(ReducerContext ctx, long key)
+            {
+                if (!ctx.Db.LedgerArchive.Id.Contains(key))
+                    ctx.Db.LedgerArchive.Insert(new LedgerArchive { Id = key, Delta = 1 });
+            }
+        }
+        """;
+
+    [Fact]
+    public void An_archive_table_that_keeps_its_keys_offers_contains()
+    {
+        var result = GeneratorTestHost.RunGenerator(Table("Tier = StorageTier.Archive, KeepKeys = true"));
+        Assert.Empty(result.MelangeDiagnostics);
+        Assert.Empty(result.Errors);
+        var (_, table) = Assert.Single(result.GeneratedSources, s => s.HintName.EndsWith("LedgerArchive.Table.g.cs", StringComparison.Ordinal));
+        Assert.Contains("keepKeys: true", table, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Without_keep_keys_there_is_no_contains()
+    {
+        var result = GeneratorTestHost.RunGenerator(Table("Tier = StorageTier.Archive"));
+        Assert.Contains(result.Errors, d => d.Id == "CS1061");
+    }
+
+    [Fact]
+    public void Melange0027_fires_for_keep_keys_on_a_hot_table()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(KeepKeys = true)]
+            public partial struct Wallet
+            {
+                [PrimaryKey] public long Id;
+            }
+            """);
+        var diagnostic = Assert.Single(result.MelangeDiagnostics, d => d.Id == "MELANGE0027");
+        Assert.Contains("Tier = Hot", diagnostic.GetMessage(), StringComparison.Ordinal);
+    }
+}
