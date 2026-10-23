@@ -585,6 +585,15 @@ which is the opposite of the tier's posture. **Open:** a cap on the overlay when
 
 ### Where the client-facing read lives
 
+**Settled differently: clients never read archive tables directly.** No generic endpoint, and no
+visibility knob on a tier that is private by construction. History reaches a client through server
+code that shapes and authorizes it — a new kind of server-side action, the **producer**: a typed,
+read-only, async call with typed inputs and outputs (`List<WalletLine> History(int page)`), which may
+inject `IArchiveReader`. It is a protocol change with its own design record,
+[design/producers.md](../design/producers.md), and is not part of this phase. Server-side code that
+is not a client keeps using `IArchiveReader` directly, as the wallet sample does. The original
+leaning is kept below as the record of what was considered.
+
 A paginated history read is neither a subscription nor a reducer.
 
 **Leaning:** HTTP first, under the existing policy ladder, because it is request/response by nature

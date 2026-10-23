@@ -31,6 +31,7 @@ arguable.
 | [22](plan-phase-22.md) | `MelangeDB.Testing` — the reducer test kit | Planned |
 | [23](plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate` | Planned |
 | 24 | Scheduler lane — player reducers ahead of simulation work | [Design record](../design/scheduler-lanes.md) written; may not become a phase |
+| — | Producers: typed, read-only calls a client makes for data — how archive history reaches clients | [Design record](../design/producers.md) written; not scheduled, sequenced against 23 |
 | [25](plan-phase-25.md) | The archive tier — relational-only tables for unbounded history; **breaking:** `Relational` renamed to hot with a relational backplane | Planned |
 
 **Phase 20 comes first and gates two things**, and it is now the decision-gating half only — the head-to-head comparison against SpacetimeDB is split out and undecided, because its frozen baseline has diverged from the live workload in capability rather than merely in size. It is not a feature; it is the measurement half
