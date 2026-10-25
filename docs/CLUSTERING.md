@@ -665,4 +665,6 @@ bigger term and needs no coordination layer at all.
   mapping and the client never learns it. See docs/road-to-0.1/plan-phase-09.md.
 - **Does the hub shard?** For a very large deployment the hub's `Global` tables become the ceiling. Since
   they're the Postgres tier, the answer is probably "Postgres's problem, not ours" — but it needs saying.
-  Explicitly out of phase 09's scope; still open.
+  Explicitly out of phase 09's scope; still open. That answer only covers hubs whose `Global` tables are
+  on the relational tier; an identity-sharded shape for the rest, and the measurement that would reopen
+  it, is [idea-bin/identity-sharded-hub.md](idea-bin/identity-sharded-hub.md).
