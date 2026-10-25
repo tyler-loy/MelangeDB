@@ -67,6 +67,15 @@ central or becomes a saga:
 None of these makes the shape impossible, but together they make it a migration of the consumer's
 transaction boundaries, not a placement flag.
 
+## The argument for building it early
+
+That migration is also why waiting until it's needed is the expensive choice. A saturated hub caps
+every player at once, and the fix is not a config change. It means moving tables, turning
+cross-identity writes into sagas, and re-testing the flows that touch them. None of that can be done
+during an outage. Once a game knows it is aiming for a population one hub can't carry, building the
+mechanism before that population arrives is cheaper than building it under load. So the trigger below
+is a *projection*, not a saturation event.
+
 ## Considered and rejected: lending identity rows to the world shard
 
 The tempting variant: while a player is docked, hand ownership of their wallet row to the station's
@@ -102,13 +111,18 @@ application.
 
 ## Reopening trigger
 
-**Clustered telemetry shows the hub saturating under realistic load**: the hub's write lock held for
-a significant share of wall time, or its p99 `melange_commit_duration` driven by hub commit rate.
-That measurement only counts *after* two cheaper fixes have landed:
+**A load test or clustered telemetry projects the hub saturating before a consumer's target
+population.** That means the hub's write lock is held for a large share of wall time, or its p99
+`melange_commit_duration` is rising with hub commit rate, on a curve that crosses the ceiling before
+the player count the game is planning for. Acting on the projection, not on saturation itself, leaves
+the lead time the migration needs.
 
-1. single-row commit latency that is unexplained by fsync, which currently dominates lock-held time
-   on its own and which sharding would not fix;
+The projection should be taken after two cheaper fixes land, so it measures the hub rather than
+something else:
+
+1. single-row commit latency that fsync doesn't explain, which currently dominates lock-held time on
+   its own and which sharding wouldn't fix;
 2. the application's unindexed periodic scans on the hub.
 
-Neither has a clustered measurement today. The consumer runs one node, so there is no evidence the hub
-is the limit. Until that changes, the deferral stands.
+No clustered measurement exists yet, so the deferral stands for now. Taking that measurement is the
+next step, not a reason to stop looking.

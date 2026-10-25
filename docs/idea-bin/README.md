@@ -51,7 +51,7 @@ links the entry, and neither restates the other's argument.
 | [read-side-fanout.md](read-side-fanout.md) | Move subscription fan-out off the write lock | Phase 20 shows subscriber count, not commit rate, is the crowded-shard limit |
 | [dev-host-hot-migration.md](dev-host-hot-migration.md) | `dotnet watch` migrates in place instead of dropping clients | The reconnect loop costs more than the fix |
 | [engine-sagas.md](engine-sagas.md) | Declared cross-node sagas: engine-owned outbox, retry, receipts, parking | Every listed consumer flow fits with less code than today |
-| [identity-sharded-hub.md](identity-sharded-hub.md) | Hub `Global` tables partitioned by identity into fixed buckets | Clustered telemetry shows the hub saturating, after the cheaper fixes |
+| [identity-sharded-hub.md](identity-sharded-hub.md) | Hub `Global` tables partitioned by identity into fixed buckets | Load test or telemetry projects hub saturation before the target population |
 
 Six of these came from an outside review of the project, each claim checked against the code before
 it was written down here; the seventh (additional client languages) came out of scoping the
