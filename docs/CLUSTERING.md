@@ -519,6 +519,8 @@ Settled in phase 10, and the order is the design:
    ACID**: between a debit and its remote credit (or compensating refund) the value is simply in flight, and
    delivery is at-least-once, so steps must be idempotent-enough for the game's semantics. If a flow cannot
    tolerate that, the answer is placement (put the tables together), not a distributed transaction.
+   (An undecided proposal against this line, for flows placement cannot fix, is
+   [idea-bin/distributed-reducers.md](idea-bin/distributed-reducers.md).)
 
 One structural rule falls out of how re-homing works: **`ShardBy` must not be the primary key** (compile
 error MELANGE0018, mirrored at schema registration). Handoff rewrites the row's `ShardBy` column while the

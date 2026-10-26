@@ -105,7 +105,8 @@ for itself:
 the whole reducer body ([DESIGN.md §4](../DESIGN.md)). A prepared transaction waiting on another node
 would stall every write on that shard for a network round trip, and indefinitely if the coordinator
 dies. Sagas stay **eventually consistent, explicitly not ACID**, exactly as CLUSTERING.md states.
-This entry makes them cheap and safe to write; it does not make them atomic.
+This entry makes them cheap and safe to write; it does not make them atomic. The atomic version, built so it doesn't stall a shard, is
+[distributed-reducers.md](distributed-reducers.md).
 
 ## What it costs and what it touches
 
