@@ -89,6 +89,7 @@ public sealed class FileCommitLog : ICommitLog
     private long _fsyncCount;
 
     private Timer? _flushTimer;
+    private int _intervalFlushActive;
     private ulong _headLsn;
     private ulong _baseLsn;
     private Exception? _failure;
@@ -272,9 +273,10 @@ public sealed class FileCommitLog : ICommitLog
     internal Action? BetweenCompactionPhases { get; set; }
 
     /// <summary>
-    /// Test-only fault injection, invoked by the group flusher immediately before the fsync — the
-    /// window where a batch-wide durability failure lands, and (as a blocking delegate) the hook
-    /// that holds a flush hostage so a test can force a batch to form behind it.
+    /// Test-only fault injection, invoked by the group flusher and the interval flusher immediately
+    /// before the fsync — the window where a batch-wide durability failure lands, and (as a blocking
+    /// delegate) the hook that holds a flush hostage so a test can force a batch to form behind it,
+    /// or prove an append is not waiting behind it.
     /// </summary>
     internal Action? FlushFaultInjection { get; set; }
 
@@ -1339,25 +1341,61 @@ public sealed class FileCommitLog : ICommitLog
         _flushTimer ??= new Timer(_ => FlushTimerTick(), null, interval, interval);
     }
 
+    /// <summary>
+    /// One interval flush, shaped like <see cref="FlushBatch"/>: capture the buffered head under the
+    /// append lock, then fsync through the flush handle with that lock <em>free</em>. Holding it
+    /// across the fsync put the disk back on the commit path this policy exists to keep it off —
+    /// every append landing during a flush waited the flush out under the engine's write lock, and
+    /// a flush slower than the interval queued the next tick behind it, so a slow disk held the
+    /// lock almost continuously. <c>_fsyncLock</c> alone still serializes this against a stream
+    /// swap or disposal. A tick with nothing appended since the last flush does no fsync at all,
+    /// and a tick that finds the previous one still flushing skips: the timer does not wait for its
+    /// callbacks, so on a disk slower than the interval queued ticks would otherwise park one pool
+    /// thread each, without bound. The next tick after the slow one covers what it missed.
+    /// </summary>
     private void FlushTimerTick()
+    {
+        if (Interlocked.Exchange(ref _intervalFlushActive, 1) == 1)
+            return;
+        try
+        {
+            FlushInterval();
+        }
+        finally
+        {
+            Volatile.Write(ref _intervalFlushActive, 0);
+        }
+    }
+
+    private void FlushInterval()
     {
         ulong head;
         long length;
         double elapsed;
         lock (_fsyncLock)
         {
+            SafeFileHandle handle;
             lock (_lock)
             {
                 if (_flushTimer is null || _disposed || _failure is not null)
                     return;
                 if (_options.FsyncPolicy != FsyncPolicy.Interval)
                     return;
-                var started = Stopwatch.GetTimestamp();
-                _stream.Flush(flushToDisk: true);
-                elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
                 head = _headLsn;
                 length = _stream.Length;
+                handle = _flushHandle;
             }
+
+            lock (_flushGate)
+            {
+                if (head <= _durableLsn)
+                    return;
+            }
+
+            var started = Stopwatch.GetTimestamp();
+            FlushFaultInjection?.Invoke();
+            RandomAccess.FlushToDisk(handle);
+            elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         }
 
         _telemetry?.RecordFsyncDuration(elapsed);

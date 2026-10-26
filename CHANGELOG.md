@@ -10,7 +10,19 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
+  fsynced while holding the log's append lock, so every commit that landed during a flush waited
+  for it under the engine's write lock. A consumer game saw one-row commits of 63–206 ms with a
+  0.1 ms reducer body, and a flush slower than the interval let timer ticks queue behind each
+  other, keeping the lock held almost continuously. The flusher now does what the group flusher has
+  done since 0.2: it takes the head under the lock, then fsyncs through its own file handle with the
+  lock free. With an 80 ms fsync on a 50 ms interval, append latency went from p50 78 ms / p99
+  254 ms to p50 0.05 ms / p99 0.5 ms. Two smaller changes in the same path: a tick with nothing new
+  to flush no longer fsyncs (an idle log used to fsync 20 times a second at 50 ms), and a tick that
+  finds the previous flush still running skips instead of parking a pool thread. Durability is
+  unchanged: the loss window is still the interval plus one flush.
 
 ## [0.3.0] — 2026-10-23
 
