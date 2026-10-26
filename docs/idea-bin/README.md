@@ -35,7 +35,8 @@ built — an idea with no stated trigger has not met that bar yet.
 It must not soften a recorded refusal. If `ROADMAP.md` says something is deferred with reasoning,
 that reasoning stands until the trigger fires; a bin entry proposing a shape for it is a proposal
 against a live decision, not a quiet reversal. Where the two overlap — currently
-[shard-ha-warm-replica.md](shard-ha-warm-replica.md) — the entry links the deferral and the deferral
+[shard-ha-warm-replica.md](shard-ha-warm-replica.md) and
+[identity-sharded-hub.md](identity-sharded-hub.md) — the entry links the deferral and the deferral
 links the entry, and neither restates the other's argument.
 
 ## The bin
@@ -49,10 +50,15 @@ links the entry, and neither restates the other's argument.
 | [client-interpolation-helpers.md](client-interpolation-helpers.md) | Buffer-and-interpolate helpers — the stated answer to "no UDP" | The interpolation answer gets challenged with a real jitter measurement |
 | [read-side-fanout.md](read-side-fanout.md) | Move subscription fan-out off the write lock | Phase 20 shows subscriber count, not commit rate, is the crowded-shard limit |
 | [dev-host-hot-migration.md](dev-host-hot-migration.md) | `dotnet watch` migrates in place instead of dropping clients | The reconnect loop costs more than the fix |
+| [engine-sagas.md](engine-sagas.md) | Declared cross-node sagas: engine-owned outbox, retry, receipts, parking | Every listed consumer flow fits with less code than today |
+| [identity-sharded-hub.md](identity-sharded-hub.md) | Hub `Global` tables partitioned by identity into fixed buckets | Load test or telemetry projects hub saturation before the target population |
+| [distributed-reducers.md](distributed-reducers.md) | A reducer spanning declared participants, optimistic body, short prepare, presumed abort | A named flow a saga cannot make correct, after engine sagas ship |
 
 Six of these came from an outside review of the project, each claim checked against the code before
 it was written down here; the seventh (additional client languages) came out of scoping the
-TypeScript client. Two items from that review are **not** here because they are already recorded
+TypeScript client; the last three came from a consuming game's review of its own hand-written sagas
+and hub load. Two items from the outside review are **not** here because they are already recorded
 refusals with reasoning in [ROADMAP.md](../ROADMAP.md): sharding the hub, and
-interpolation-instead-of-UDP as a transport question. A third — a stock admin console — was added to
+interpolation-instead-of-UDP as a transport question. Sharding the hub has since gained a bin entry
+proposing a shape against that refusal, under the overlap rule above. A third — a stock admin console — was added to
 that deferrals list rather than to this bin, because it is decided.

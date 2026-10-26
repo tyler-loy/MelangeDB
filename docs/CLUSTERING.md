@@ -519,6 +519,8 @@ Settled in phase 10, and the order is the design:
    ACID**: between a debit and its remote credit (or compensating refund) the value is simply in flight, and
    delivery is at-least-once, so steps must be idempotent-enough for the game's semantics. If a flow cannot
    tolerate that, the answer is placement (put the tables together), not a distributed transaction.
+   (An undecided proposal against this line, for flows placement cannot fix, is
+   [idea-bin/distributed-reducers.md](idea-bin/distributed-reducers.md).)
 
 One structural rule falls out of how re-homing works: **`ShardBy` must not be the primary key** (compile
 error MELANGE0018, mirrored at schema registration). Handoff rewrites the row's `ShardBy` column while the
@@ -665,4 +667,6 @@ bigger term and needs no coordination layer at all.
   mapping and the client never learns it. See docs/road-to-0.1/plan-phase-09.md.
 - **Does the hub shard?** For a very large deployment the hub's `Global` tables become the ceiling. Since
   they're the Postgres tier, the answer is probably "Postgres's problem, not ours" — but it needs saying.
-  Explicitly out of phase 09's scope; still open.
+  Explicitly out of phase 09's scope; still open. That answer only covers hubs whose `Global` tables are
+  on the relational tier; an identity-sharded shape for the rest, and the measurement that would reopen
+  it, is [idea-bin/identity-sharded-hub.md](idea-bin/identity-sharded-hub.md).

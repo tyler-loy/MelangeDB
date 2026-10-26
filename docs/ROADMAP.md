@@ -169,7 +169,9 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
   What stays deferred: dynamic boundary *splitting* (the quadtree; its narrowed customer and
   reopening trigger are recorded in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)),
   [shard-level HA](idea-bin/shard-ha-warm-replica.md) (a warm-replica shape and its reopening
-  trigger are in the idea bin; this deferral stands until that trigger fires), and sharding the hub.
+  trigger are in the idea bin; this deferral stands until that trigger fires), and
+  [sharding the hub](idea-bin/identity-sharded-hub.md) (likewise: an identity-sharded shape and its
+  trigger are in the idea bin, and this deferral stands until it fires).
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
 - **A complete read-modify-write detector for snapshot reducers.** The detectable common shape —
   `Find`, then `Update` of the same row, inside a body declared `Isolation.Snapshot` — is built as
@@ -204,4 +206,5 @@ the measurement or named consumer that would turn it into a phase. An idea there
 and not a soft refusal — it is an argument left open on purpose.
 
 Where an idea proposes a shape for something the list above already refuses — currently
-[shard-level HA](idea-bin/shard-ha-warm-replica.md) — the deferral stands until its trigger fires.
+[shard-level HA](idea-bin/shard-ha-warm-replica.md) and
+[sharding the hub](idea-bin/identity-sharded-hub.md) — the deferral stands until its trigger fires.
