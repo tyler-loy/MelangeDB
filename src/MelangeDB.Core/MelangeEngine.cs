@@ -268,6 +268,19 @@ public sealed partial class MelangeEngine : IDisposable
         if (!_shapes.MigrationPending)
             return;
 
+        // A reign that governs no record — an engine that never committed, such as a cluster node
+        // holding no partitions (issue #184) — has nothing to migrate: no stored byte was written
+        // under it, and its marker would land on its own FromLsn. Rewrite it in place instead, and
+        // write no marker, so a fresh engine stays fresh (init reducers test HeadLsn == 0).
+        if (_shapes.History.Current.FromLsn > _log.HeadLsn)
+        {
+            _shapes.History.ReplaceCurrent(Schema);
+            _shapes.NoteEntryAppended();
+            _shapes.History.Save(_shapes.SidecarPath);
+            LogMessages.ShapeMigrated(_logger, string.Join("; ", _shapes.Changes), _shapes.History.Current.FromLsn);
+            return;
+        }
+
         var request = new CommitRequest(
             Timestamp.FromDateTimeOffset(_time.GetUtcNow()),
             ShapeMarkerCaller,

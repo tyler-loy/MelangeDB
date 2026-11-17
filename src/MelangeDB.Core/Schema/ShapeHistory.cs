@@ -183,6 +183,16 @@ public sealed class ShapeHistory
     }
 
     /// <summary>
+    /// Rewrites the current reign's shapes in place, keeping its <see cref="ShapeEntry.FromLsn"/>.
+    /// Sound only when that reign governs no record yet — the log's head is below its
+    /// <see cref="ShapeEntry.FromLsn"/> — because then no stored byte was written under the shapes
+    /// being replaced. The caller owns that check; this is the migration of a reign with nothing
+    /// to migrate.
+    /// </summary>
+    public void ReplaceCurrent(SchemaRegistry schema) =>
+        _entries[^1] = EntryOf(schema, Current.FromLsn);
+
+    /// <summary>
     /// Drops entries no record can need anymore: an entry is dead when its successor's reign began
     /// at or below the truncation base — every record the dead entry governed has been truncated
     /// away, and no reader can hold a cursor below the base because everything that reads records

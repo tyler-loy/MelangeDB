@@ -59,6 +59,12 @@ migration matches columns **by name** — and redeploy. On boot, per engine:
 4. The Postgres tier, if configured, does its phase 08 half of the same deploy: the additive DDL
    under `Postgres:AutoMigrate`, or a stall with the exact DDL printed when that is off.
 
+One engine skips steps 2 and 3's marker and snapshot: one whose log has never been committed to,
+such as a cluster node that holds no partitions yet. No stored byte was written under its current
+shape, so there is nothing to rebuild. The sidecar's entry is rewritten in place, EventId 1006
+still logs the change, and the log stays empty, so the engine still counts as fresh and its init
+reducers still run on its first open.
+
 Client bindings are the other half of the story and already ship: the schema hash changes, and a
 stale client fails `ClientRowShape.Verify` at subscription time — structural refusal, not decode
 garbage. Regenerate bindings with the deploy.

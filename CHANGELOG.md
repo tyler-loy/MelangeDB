@@ -12,6 +12,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 Nothing yet.
 
+## [0.3.1] — 2026-11-16
+
+### Fixed
+
+- **An additive schema change no longer crashes an engine that has never committed** ([#184](https://github.com/tyler-loy/MelangeDB/issues/184)).
+  A cluster node holding no partitions has an empty log, so the shape it adopted and the
+  migration's marker record both started at LSN 1, and the boot threw `Shape entry from LSN 1
+  does not follow the current entry's 1` — every schema change forced a wipe of the nodes'
+  stores. A reign that governs no record now has its sidecar entry rewritten in place, with no
+  marker and no snapshot, so the engine stays fresh and its init reducers still run.
+
 ## [0.3.0] — 2026-10-23
 
 ### Breaking
