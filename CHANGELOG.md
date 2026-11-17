@@ -10,6 +10,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.1] — 2026-11-16
+
 ### Fixed
 
 - **An additive schema change no longer crashes an engine that has never committed** ([#184](https://github.com/tyler-loy/MelangeDB/issues/184)).
