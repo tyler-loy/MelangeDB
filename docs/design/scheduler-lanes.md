@@ -4,11 +4,25 @@
 client-initiated work when the two contend for one shard's write lock, instead of being ordered by
 whichever happened to ask first.
 
-**Status:** **open, and possibly unnecessary.** Three shipped mechanisms already attack most of what
-this proposal is usually asked for, and the residue they leave has never been measured. The
-measurement that decides whether this becomes a feature is a named deliverable of
-[road-to-0.3 phase 20](../road-to-0.3/plan-phase-20.md). This record exists so the decision is made
-against evidence rather than re-argued from intuition every few months — which is what has been
+**Status:** **not needed on the measured workload; recorded, not refused for all time**
+(2026-11-20). [Road-to-0.3 phase 20](../road-to-0.3/plan-phase-20.md) measured the residue below
+from the reference workload's production traces. Across two six-hour windows, its fourteen scheduled
+reducers hold the write lock **0.18% of wall time**. The longest single hold in twelve hours was
+**8.9 ms** (`SimulateCreaturePopulation`, p99 5.3 ms), under one 60 Hz frame. A player's call finds
+the lock held by scheduled work about one time in 550, for a few milliseconds at most. The long
+`melange.reducer` spans that looked like contention, up to 194 ms, are fsync after the lock was
+released ([REFERENCE-WORKLOAD.md](../REFERENCE-WORKLOAD.md)). There is no residue for a lane to
+remove.
+
+**What would reopen it**, stated so the next argument starts from evidence:
+
+- the same query, re-run after a period with players on the shard, showing scheduled lock duty
+  above about 5% or a single scheduled hold above one frame (16 ms); or
+- a new scheduled reducer whose body scales with world size or population.
+
+The caveat that matters: the production deployment had no player traffic in the retention window,
+so the player-side p99 is derived from the hold distribution, not observed. This record exists so
+that decision is made against evidence and not re-argued from intuition, which is what had been
 happening.
 
 **Depends on:** [plan-phase-01](../road-to-0.1/plan-phase-01.md) (the single write lock),

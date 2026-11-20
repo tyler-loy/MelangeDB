@@ -143,7 +143,8 @@ internal static class LoadTestDriver
                 metrics.Inconsistencies(player.Inconsistencies);
 
             var result = Summarize(
-                options, metrics, players, measured, bytesBaseline, finalStats, handoffBaseline, abortBaseline, output);
+                options, metrics, players, measured, bytesBaseline, finalStats, handoffBaseline, abortBaseline, output,
+                LockSplitShare(measuredStats, finalStats));
             if (options.OutPath is { } path)
             {
                 WriteSeries(path, series);
@@ -168,7 +169,8 @@ internal static class LoadTestDriver
         ServerStats? finalStats,
         long? handoffBaseline,
         long? abortBaseline,
-        TextWriter output)
+        TextWriter output,
+        (long Transactions, double Share, double MeanLockedMs)? lockSplit)
     {
         var latency = metrics.CallToDelta.Total();
         var crossing = metrics.CrossingContinuity.Total();
@@ -195,6 +197,12 @@ internal static class LoadTestDriver
             ? "Server process:  unreachable — memory not measured (drive the serve host locally or scrape its console)"
             : $"Server process:  working set {finalStats.WorkingSetBytes / (1024 * 1024)} MiB, GC heap " +
               $"{finalStats.GcHeapBytes / (1024 * 1024)} MiB, collections {finalStats.Gen0Collections}/{finalStats.Gen1Collections}/{finalStats.Gen2Collections}");
+        if (lockSplit is { } split)
+        {
+            output.WriteLine(Invariant(
+                $"Write lock:      post-commit (fan-out) is {split.Share:P1} of locked time over {split.Transactions} Move transactions (mean lock hold {split.MeanLockedMs * 1000:F0} µs)"));
+        }
+
         output.WriteLine($"Client health:   {metrics.Disconnects} disconnects, {metrics.ResyncErrors} resync errors, " +
             $"{metrics.InconsistencyCount} cache inconsistencies");
 
@@ -219,6 +227,7 @@ internal static class LoadTestDriver
             Invariant($"handoffs_aborted={handoffsAborted?.ToString(CultureInfo.InvariantCulture) ?? "unavailable"} ") +
             Invariant($"delta_rows_per_s={metrics.DeltaRows / seconds:F0} delta_bytes_per_s={bytes / seconds:F0} ") +
             Invariant($"disconnects={metrics.Disconnects} inconsistencies={metrics.InconsistencyCount}") +
+            (lockSplit is { } s ? Invariant($" post_commit_share={s.Share:F4} lock_split_transactions={s.Transactions} mean_locked_us={s.MeanLockedMs * 1000:F0}") : string.Empty) +
             (pass ? string.Empty : $" failures=[{string.Join("; ", failures)}]");
         output.WriteLine();
         output.WriteLine(summary);
@@ -230,6 +239,18 @@ internal static class LoadTestDriver
             Attempted = metrics.Attempted,
             HandoffsCompleted = handoffs,
         };
+    }
+
+    /// <summary>The measured window's post-commit share of locked time, from the serve side's running sums; null when not traced.</summary>
+    private static (long Transactions, double Share, double MeanLockedMs)? LockSplitShare(ServerStats? start, ServerStats? end)
+    {
+        if (start is null || end is null)
+            return null;
+        var transactions = end.LockSplitTransactions - start.LockSplitTransactions;
+        var locked = end.LockedMsSum - start.LockedMsSum;
+        return transactions <= 0 || locked <= 0
+            ? null
+            : (transactions, (end.PostCommitMsSum - start.PostCommitMsSum) / locked, locked / transactions);
     }
 
     private static void WriteSeries(string path, List<TimeSeriesSample> series)

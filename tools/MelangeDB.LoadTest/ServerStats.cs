@@ -43,4 +43,11 @@ public sealed record ServerStats
     public required int Gen1Collections { get; init; }
 
     public required int Gen2Collections { get; init; }
+
+    // The write-lock split (serve --lock-split), summed over every traced Move; zero when off.
+    public long LockSplitTransactions { get; init; }
+
+    public double LockedMsSum { get; init; }
+
+    public double PostCommitMsSum { get; init; }
 }

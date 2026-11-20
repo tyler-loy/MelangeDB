@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using MelangeDB.Cluster;
 using MelangeDB.Core;
 using MelangeDB.Server;
+using MelangeDB.Storage.Faster;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -28,16 +29,19 @@ internal sealed class LoadTestServer : IAsyncDisposable
     private const string ClusterSecret = "melange-loadtest-cluster-secret";
 
     private readonly LoadTestOptions _options;
+    private readonly ServeTuning _tuning;
     private readonly string _root;
     private readonly bool _ownsRoot;
-    private readonly List<WebApplication> _nodeApps = [];
+    private readonly List<(string Name, WebApplication? App)> _nodeApps = [];
+    private LockSplitListener? _lockSplit;
     private WebApplication _hubApp = null!;
     private int _hubHttpPort;
     private int _nodeListenPort;
 
-    private LoadTestServer(LoadTestOptions options, string root, bool ownsRoot)
+    private LoadTestServer(LoadTestOptions options, ServeTuning tuning, string root, bool ownsRoot)
     {
         _options = options;
+        _tuning = tuning;
         _root = root;
         _ownsRoot = ownsRoot;
     }
@@ -46,11 +50,12 @@ internal sealed class LoadTestServer : IAsyncDisposable
 
     public HubRuntime Hub => _hubApp.Services.GetRequiredService<HubRuntime>();
 
-    public static async Task<LoadTestServer> StartAsync(LoadTestOptions options, TextWriter output, CancellationToken ct = default)
+    public static async Task<LoadTestServer> StartAsync(
+        LoadTestOptions options, TextWriter output, CancellationToken ct = default, ServeTuning? tuning = null)
     {
         var ownsRoot = options.DataPath is null;
         var root = options.DataPath ?? Directory.CreateTempSubdirectory("melange-loadtest-").FullName;
-        var server = new LoadTestServer(options, root, ownsRoot);
+        var server = new LoadTestServer(options, tuning ?? ServeTuning.Serve, root, ownsRoot);
         try
         {
             await server.StartCoreAsync(output, ct).ConfigureAwait(false);
@@ -68,7 +73,8 @@ internal sealed class LoadTestServer : IAsyncDisposable
         output.WriteLine(
             $"Serve: hub + {_options.Nodes} shard node(s), world {_options.World} " +
             $"({_options.WorldChunksX}x{_options.WorldChunksY} chunks), band {_options.BandChunks}, " +
-            $"fsync {_options.Fsync}{(_options.Fsync == "interval" ? $" ({_options.FsyncIntervalMs} ms)" : string.Empty)}.");
+            $"fsync {_options.Fsync}{(_options.Fsync == "interval" ? $" ({_options.FsyncIntervalMs} ms)" : string.Empty)}, " +
+            $"hot store {_options.HotStore}, heartbeat {HeartbeatMs} ms, failure timeout {FailureTimeoutMs} ms.");
 
         // FreePort is allocate-close-rebind, so another process can win a port in the gap and the
         // real bind then fails — one stolen port out of the dozens churning on a busy CI machine
@@ -76,6 +82,8 @@ internal sealed class LoadTestServer : IAsyncDisposable
         // the cluster tests does the same); an explicitly requested --port is never moved — it is
         // the caller's scripted address — so if that port itself is taken, the retries exhaust
         // and the failure stays loud.
+        if (_options.LockSplit)
+            _lockSplit = new LockSplitListener("Move");
         _hubApp = await WithFreshPortsRetryAsync(() =>
         {
             _hubHttpPort = _options.Port != 0 ? _options.Port : FreePort();
@@ -85,7 +93,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
         for (var i = 0; i < _options.Nodes; i++)
         {
             var name = $"node-{i}";
-            _nodeApps.Add(await WithFreshPortsRetryAsync(() => StartAppAsync(name, ClusterRole.Shard, FreePort())).ConfigureAwait(false));
+            _nodeApps.Add((name, await WithFreshPortsRetryAsync(() => StartAppAsync(name, ClusterRole.Shard, FreePort())).ConfigureAwait(false)));
         }
 
         var hub = Hub;
@@ -119,9 +127,48 @@ internal sealed class LoadTestServer : IAsyncDisposable
         output.WriteLine("READY");
     }
 
-    private ShardRuntime? TryGetShard(ShardKey shard) =>
-        _nodeApps.Select(app => app.Services.GetRequiredService<ShardNodeRuntime>().TryGetShard(shard))
+    private int HeartbeatMs => _options.HeartbeatMs ?? _tuning.HeartbeatMs;
+
+    private int FailureTimeoutMs => _options.FailureTimeoutMs ?? _tuning.FailureTimeoutMs;
+
+    public ShardRuntime? TryGetShard(ShardKey shard) =>
+        _nodeApps.Where(static n => n.App is not null)
+            .Select(n => n.App!.Services.GetRequiredService<ShardNodeRuntime>().TryGetShard(shard))
             .FirstOrDefault(static r => r is not null);
+
+    /// <summary>The live shard node runtime by name, or null when that node is down.</summary>
+    public ShardNodeRuntime? Node(string name) =>
+        _nodeApps.Single(n => n.Name == name).App?.Services.GetRequiredService<ShardNodeRuntime>();
+
+    /// <summary>
+    /// Kills a shard node the way the cluster tests do: a bounded stop, then disposal, with no
+    /// goodbye to the hub — the hub learns only from heartbeat silence, exactly as it would from a
+    /// crashed process. Its data directory stays, as a dead machine's shared storage would.
+    /// </summary>
+    /// <param name="dead">Invoked the moment the runtime is gone, before the host teardown: the instant after which nothing on this node can commit.</param>
+    public async Task KillNodeAsync(string name, Action? dead = null)
+    {
+        var index = _nodeApps.FindIndex(n => n.Name == name);
+        var app = _nodeApps[index].App ?? throw new InvalidOperationException($"Node {name} is already down.");
+        _nodeApps[index] = (name, null);
+
+        // The runtime first, synchronously: its heartbeats and shard engines stop at once, the
+        // way a crash stops them. A host stop alone keeps heartbeating while Kestrel drains the
+        // gateway's upstream sockets, which would add up to its grace period to the window.
+        app.Services.GetRequiredService<ShardNodeRuntime>().Dispose();
+        dead?.Invoke();
+        await StopAsync(app, TimeSpan.Zero).ConfigureAwait(false);
+    }
+
+    /// <summary>Starts a killed node again under its old name; it re-registers and owns nothing until assigned.</summary>
+    public async Task RestartNodeAsync(string name)
+    {
+        var index = _nodeApps.FindIndex(n => n.Name == name);
+        if (_nodeApps[index].App is not null)
+            throw new InvalidOperationException($"Node {name} is already running.");
+        var app = await WithFreshPortsRetryAsync(() => StartAppAsync(name, ClusterRole.Shard, FreePort())).ConfigureAwait(false);
+        _nodeApps[index] = (name, app);
+    }
 
     /// <summary>The same counters the stats endpoint serves, for the serve console's periodic line.</summary>
     public ServerStats Stats() => CollectStats();
@@ -148,6 +195,9 @@ internal sealed class LoadTestServer : IAsyncDisposable
             Gen0Collections = GC.CollectionCount(0),
             Gen1Collections = GC.CollectionCount(1),
             Gen2Collections = GC.CollectionCount(2),
+            LockSplitTransactions = _lockSplit?.Transactions ?? 0,
+            LockedMsSum = _lockSplit?.LockedMs ?? 0,
+            PostCommitMsSum = _lockSplit?.PostCommitMs ?? 0,
         };
     }
 
@@ -168,8 +218,9 @@ internal sealed class LoadTestServer : IAsyncDisposable
             // The measurement should include the guards a correct deployment runs with; the
             // hotspot-ceiling methodology (HotspotMeasurementTests) measured with them on too.
             ["MelangeDb:Cluster:ShardSpanCheck"] = "Always",
-            ["MelangeDb:Cluster:HeartbeatIntervalMs"] = "250",
-            ["MelangeDb:Cluster:FailureTimeoutMs"] = "15000",
+            ["MelangeDb:Cluster:HeartbeatIntervalMs"] = HeartbeatMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["MelangeDb:Cluster:FailureTimeoutMs"] = FailureTimeoutMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["MelangeDb:HotStore:Engine"] = _options.HotStore == "faster" ? "Faster" : "InMemory",
             ["MelangeDb:Cluster:BorderBandChunks"] = _options.BandChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMarginChunks"] = _options.MarginChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMinIntervalMs"] = _options.HandoffMinIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
@@ -177,6 +228,10 @@ internal sealed class LoadTestServer : IAsyncDisposable
             // One shared root: the phase 09 shared-storage assumption for reassignment.
             ["MelangeDb:Cluster:ShardDataPath"] = Path.Combine(_root, "shards"),
         };
+        foreach (var (key, value) in _tuning.Settings)
+            settings[key] = value;
+        if (_options.LockSplit)
+            settings["MelangeDb:Telemetry:SlowReducerMs"] = "0";
         if (role == ClusterRole.Hub)
         {
             settings["MelangeDb:Cluster:NodeListenPort"] = _nodeListenPort.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -194,6 +249,11 @@ internal sealed class LoadTestServer : IAsyncDisposable
         builder.Logging.ClearProviders();
         builder.Logging.AddSimpleConsole();
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+
+        // --lock-split makes every transaction a "slow" one so its split is recorded; the warning
+        // each would log is the measurement's mechanism, not a finding.
+        if (_options.LockSplit)
+            builder.Logging.AddFilter("MelangeDB.Core.MelangeEngine", LogLevel.Error);
         var listen = role == ClusterRole.Hub ? ListenAddress() : IPAddress.Loopback;
         builder.WebHost.ConfigureKestrel(kestrel =>
             kestrel.Listen(listen, httpPort, static l => l.Protocols = HttpProtocols.Http1));
@@ -208,9 +268,14 @@ internal sealed class LoadTestServer : IAsyncDisposable
                     System.Text.Encoding.UTF8.GetBytes(DevTokens.SigningKey)),
             };
         });
-        builder.Services.AddMelangeDb(melange => melange
-            .AddTablesFrom(typeof(Terrain).Assembly)
-            .AddReducersFrom(typeof(WalkerReducers).Assembly));
+        builder.Services.AddMelangeDb(melange =>
+        {
+            melange
+                .AddTablesFrom(typeof(Terrain).Assembly)
+                .AddReducersFrom(typeof(WalkerReducers).Assembly);
+            if (_options.HotStore == "faster")
+                melange.UseFasterHotStore();
+        });
         builder.Services.AddSingleton<IShardStrategy>(provider => new SpatialShardStrategy(
             provider.GetRequiredService<SchemaRegistry>(),
             new SpatialGeometry
@@ -310,13 +375,15 @@ internal sealed class LoadTestServer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var app in _nodeApps)
+        foreach (var (_, app) in _nodeApps)
         {
-            await StopAsync(app).ConfigureAwait(false);
+            if (app is not null)
+                await StopAsync(app).ConfigureAwait(false);
         }
 
         if (_hubApp is not null)
             await StopAsync(_hubApp).ConfigureAwait(false);
+        _lockSplit?.Dispose();
         if (_ownsRoot)
         {
             try
@@ -327,24 +394,29 @@ internal sealed class LoadTestServer : IAsyncDisposable
             {
             }
         }
+    }
 
-        static async Task StopAsync(WebApplication app)
+    /// <param name="grace">
+    /// How long the host may drain. A kill passes zero: Kestrel aborts its connections and stops
+    /// accepting at once, as a crashed process's port would — with any grace, the dead node's
+    /// listener keeps accepting the gateway's reconnects for that long and the window measures it.
+    /// </param>
+    private static async Task StopAsync(WebApplication app, TimeSpan? grace = null)
+    {
+        try
         {
-            try
-            {
-                // Bounded, like the cluster fixture: the gateway holds live websockets that only
-                // close when their client does, and a full graceful drain would wait for them.
-                using var abrupt = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-                await app.StopAsync(abrupt.Token).ConfigureAwait(false);
-            }
-            catch (Exception)
-            {
-                // Shutdown is best-effort; disposal below releases the log handles regardless.
-            }
-            finally
-            {
-                await app.DisposeAsync().ConfigureAwait(false);
-            }
+            // Bounded, like the cluster fixture: the gateway holds live websockets that only
+            // close when their client does, and a full graceful drain would wait for them.
+            using var abrupt = new CancellationTokenSource(grace ?? TimeSpan.FromSeconds(3));
+            await app.StopAsync(abrupt.Token).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Shutdown is best-effort; disposal below releases the log handles regardless.
+        }
+        finally
+        {
+            await app.DisposeAsync().ConfigureAwait(false);
         }
     }
 }

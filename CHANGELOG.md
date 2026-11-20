@@ -29,6 +29,11 @@ All packages ship together at one version; there is no per-package versioning. S
   it never comes back as a different identity.
 - **`MelangeClientOptions.TokenProvider`** supplies the token for every dial, for expiring
   credentials.
+- **The load-test tool measures failover and fan-out** (road-to-0.3 phase 20). A `failover`
+  subcommand kills a crowded shard's owner the way a crash would, and times detection, reopen,
+  first write, and each client's restore; `--hot-store faster` runs it on the FASTER store.
+  `--lock-split` and `--movers` report the post-commit (fan-out) share of write-lock time at a fixed
+  commit rate. Results are in docs/LOAD-TESTING.md.
 
 ### Changed
 
@@ -43,6 +48,9 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The load-test tool's call-to-delta latency collected no samples** from protocol v2 (0.2.0) on,
+  because the driver matched its own row's `Identity` column as `byte[]`. The smoke test now
+  asserts the metric has samples. Results recorded before 2026-08-06 are unaffected.
 - **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
   fsynced while holding the log's append lock, so every commit that landed during a flush waited
   for it under the engine's write lock. A consumer game saw one-row commits of 63–206 ms with a

@@ -1,6 +1,6 @@
 # Phase 20 — The measurement pass
 
-**Status: Planned.**
+**Status: Measured (2026-11-20).** The decision-gating half is recorded; findings are issues [#198](https://github.com/tyler-loy/MelangeDB/issues/198)–[#204](https://github.com/tyler-loy/MelangeDB/issues/204). See [As built](#as-built).
 
 **Scope note:** this phase is the *decision-gating* half only. The head-to-head comparison against SpacetimeDB is deferred, and whether it runs at all is its own open decision — see [Decisions to settle](#settled-this-is-two-phases-and-only-the-first-is-scheduled).
 
@@ -224,6 +224,13 @@ is already the document that audits the design against the real game. The risk o
 performance document is real; the alternative — a rig document that is half a competitive comparison
 — seems worse.
 
+**Settled (2026-11-20): no `BENCHMARKS.md` yet.** It was for the head-to-head, which is deferred, and
+creating an empty one would be the third document with nothing in it. The rig's numbers (failover,
+fan-out, the fsync re-run) went into [LOAD-TESTING.md](../LOAD-TESTING.md) next to the ladder they
+extend. The workload's numbers (scheduled-reducer cost, the 20 km world) went into
+[REFERENCE-WORKLOAD.md](../REFERENCE-WORKLOAD.md). If the comparison ever runs, it gets
+`BENCHMARKS.md` as leaned.
+
 ### What makes the SpacetimeDB comparison fair, and whether it can be
 
 This is a comparison run by the people who built one side, against the system they ported off,
@@ -291,6 +298,14 @@ about a real world's shape. Reducer latency percentiles and the reassignment win
 rig, because they need repetition and controlled load. Terrain streaming probably needs both and
 that is the one to decide with data in hand.
 
+**Settled (2026-11-20), and differently from the leaning in one place.** The rig produced the fan-out
+share and the reassignment window, as leaned. The scheduled-reducer cost came from **the reference
+workload's production telemetry**, read with queries and no load added. That was cheaper than either
+option and more real than the rig. The catch: the deployment had no players in its 30-day retention,
+so it gives the cost side only (see [As built](#as-built)). The 20 km world came from the workload's
+own host and generator on this machine. Terrain streaming stayed with the deferred half, since it
+needs the fleet.
+
 ### What "concurrent players per node" counts
 
 The rig's synthetic players are not the game's players — they call reducers at a chosen rate with no
@@ -313,6 +328,11 @@ run so the new figures remain comparable with the recorded ladder rather than si
 with numbers measured differently. If a second machine is not available, the caveat stays and the
 headline number is stated as a lower bound in the headline, not in the caveat.
 
+**Settled (2026-11-20): one machine, and the caveat stays.** No second machine was used. Every rig
+number in this phase is a single-machine figure, and LOAD-TESTING.md says so at each table. None of
+them is a headline capacity number, and the capacity number this caveat was written for (concurrent
+players per node) is in the deferred half.
+
 ### Whether ROADMAP's blanket warning comes off entirely
 
 The current text says to treat *every* benchmark in these docs as a dev-machine measurement. This
@@ -323,3 +343,84 @@ was missing.
 linked, and what remains is a plain statement of what hardware produced the numbers. The distinction
 phase 11 was drawing is between *unmeasured* and *measured on a known box*, and only the first one
 is debt.
+
+**Settled (2026-11-20): narrowed, as leaned.** [ROADMAP.md](../ROADMAP.md) now points at the
+recorded numbers and keeps the warning for what they are not: a characterization of the reference
+workload under players, which its deployment has not had.
+
+## As built
+
+Measured 2026-11-20 on the machine LOAD-TESTING.md describes (Windows 11, Ryzen 9 9950X3D 16C/32T,
+128 GiB, NVMe; Release builds; workstation GC). Each result's full table lives in the document named;
+this is the record of what was done and what it decided.
+
+### What was built to measure
+
+`tools/MelangeDB.LoadTest` gained, per *Out of scope*'s rule that extending the rig is in scope:
+
+- **`failover`**, the reassignment-window measurement. It kills a crowded shard's owner the way a
+  crash would, then times detect, reopen, first write, and per-client restore. It also times
+  recovery alone, and checks the owner's heartbeat staleness before each kill so a quiet owner
+  can't masquerade as a fast hub. `--hot-store faster` measures the reference workload's store.
+- **`--lock-split`** (serve) and **`--movers`** (drive): the fan-out share at a fixed commit rate.
+- **A fix:** call-to-delta had reported "no samples" since protocol v2 (2026-08-06), because the
+  driver matched its own row's `Identity` column as `byte[]`. The smoke test now asserts samples,
+  and LOAD-TESTING.md records which recorded results predate the break (all of them).
+
+### The four deliverables
+
+**1. Scheduled-reducer cost: phase 24 is not needed on the measured workload.** Two six-hour windows
+of production traces, a week apart. All scheduled work holds the write lock **0.180% / 0.178%** of
+wall time, and the longest hold in twelve hours was **8.9 ms**. The 194 ms spans that looked like
+contention are fsync after the lock released. Recorded in [REFERENCE-WORKLOAD.md](../REFERENCE-WORKLOAD.md)
+and in [design/scheduler-lanes.md](../design/scheduler-lanes.md)'s status, with the re-read trigger.
+**Not delivered as planned:** the player-side p99 is a bound derived from the hold distribution,
+not an observation, because the deployment had no player traffic in 30 days.
+
+The query, for the re-read. Over OpenObserve's trace stream, pair each `melange.reducer` span with
+its `melange.commit` child:
+
+- **Hold** = commit `start_time` − reducer `start_time` + commit `duration`.
+- A reducer with no commit is read-only, and its whole span is the hold.
+- Sum per reducer, then divide by the window's wall time.
+
+**2. Fan-out share: read-side fan-out's trigger fired.** One shard at ~750 commits/s. Post-commit is
+**66% of locked time at 50 subscribers and 87% at 200** (bar: 25% at 200). It grows linearly, at about
+5.5 µs per subscriber per commit, and saturates the lock at about 200 subscribers. Recorded in
+[LOAD-TESTING.md](../LOAD-TESTING.md); the idea-bin entry is reopened with the profile and with the
+cheaper lever to measure first.
+
+**3. Reassignment window: 12–19 s, and detection is most of it.** At default timing, detect is
+10.6–13.4 s, independent of shard size (the hub's sweep adds up to half the timeout: #201).
+Reopen is 1–6 s and grows with size (recovery alone: 0.1 s at 10k rows, 0.5 s at 100k, 3.5 s at
+1M). Clients come back with the server on process death. Phase 30's framing changed the same day
+this was measured: the project owner decided production systems get HA, so this number now shapes
+the design instead of gating it. See [idea-bin/shard-ha-warm-replica.md](../idea-bin/shard-ha-warm-replica.md)
+and the [0.4 README](../road-to-0.4/README.md).
+
+**4. The 20 km world: 294 MiB working set on one node,** under a 137.5 MiB declared footprint. It's a
+*sparse* world, though: 23,020 of 98,596 chunks are land since the workload's archipelago work. A
+land-dense bake needs a generator preset the workload doesn't have, and the settled managed heap was
+not taken (attaching `dotnet-gcdump` was not permitted in the session). Recorded in
+[REFERENCE-WORKLOAD.md](../REFERENCE-WORKLOAD.md).
+
+**And the post-group-commit re-run:** the prediction held for p90 (per-commit fsync 522 ms → 19 ms,
+level with interval fsync) and partly for p99 (1,294 ms → about 170 ms, still about 5× interval's).
+
+### Findings, per *Out of scope*: recorded, not fixed
+
+| Issue | Finding |
+| --- | --- |
+| [#198](https://github.com/tyler-loy/MelangeDB/issues/198) | A node opens an adopted shard inside its heartbeat loop. A 1M-row recovery silenced the adopter for 7 s, and with the timeout below the recovery time the hub declared the *adopter* dead mid-recovery. |
+| [#199](https://github.com/tyler-loy/MelangeDB/issues/199) | FASTER at 1M rows: after reassignment churn, out-of-line payloads go missing, scans skip rows, and `TakeSnapshot` throws. It reproduces 2/2; three simpler hypotheses are ruled out in the issue. |
+| [#200](https://github.com/tyler-loy/MelangeDB/issues/200) | The gateway's upstream connect has no timeout (machine death: 21 s on Windows, about 127 s on stock Linux), and its 20 × 250 ms retry budget is shorter than detection on a fast-refusing OS. |
+| [#201](https://github.com/tyler-loy/MelangeDB/issues/201) | The hub's death sweep runs at `FailureTimeoutMs/2`, so detection is 1.0–1.5× the timeout. |
+| [#202](https://github.com/tyler-loy/MelangeDB/issues/202) | Calls racing a shard engine's disposal log `ObjectDisposedException` as unexpected errors. |
+| [#203](https://github.com/tyler-loy/MelangeDB/issues/203) | Production telemetry: about 125 scheduled spans over the 50 ms threshold in a week, but five `1003` warnings in 30 days. Cause not established. |
+| [#204](https://github.com/tyler-loy/MelangeDB/issues/204) | A flaky `ScaleInTests` curve test under suite load (noticed during phases 27–28, filed here). |
+
+Also observed and not filed as its own issue: during a 1M-row bulk write on the FASTER store, the
+live owner went silent for 13.7 s and was declared dead. The in-memory store with the same seed did
+not. The mechanism is not established (`Statistics()` is O(tables) on both stores, and a tight writer
+delays a `ReadConsistent` caller by at most about 144 ms in a probe), so it's recorded inside #199,
+where it's the first step of that repro.

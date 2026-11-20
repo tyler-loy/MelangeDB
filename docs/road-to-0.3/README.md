@@ -26,11 +26,11 @@ arguable.
 
 | | Phase | Status |
 | --- | --- | --- |
-| [20](plan-phase-20.md) | The measurement pass, decision-gating half — the scheduled-reducer cost, the fan-out share, the reassignment window | Planned; carried into [0.4](../road-to-0.4/README.md) |
+| [20](plan-phase-20.md) | The measurement pass, decision-gating half — the scheduled-reducer cost, the fan-out share, the reassignment window | **Measured** 2026-11-20, in [0.4](../road-to-0.4/README.md) |
 | [21](plan-phase-21.md) | `melange inspect` — time-travel over the commit log | Planned |
 | [22](plan-phase-22.md) | `MelangeDB.Testing` — the reducer test kit | Planned; carried into [0.4](../road-to-0.4/README.md) |
 | [23](plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate` | Planned; carried into [0.4](../road-to-0.4/README.md) |
-| 24 | Scheduler lane — player reducers ahead of simulation work | [Design record](../design/scheduler-lanes.md) written; may not become a phase |
+| 24 | Scheduler lane — player reducers ahead of simulation work | [Design record](../design/scheduler-lanes.md); **not needed on the measured workload** (phase 20: scheduled work holds the lock 0.18% of the time) |
 | [25](plan-phase-25.md) | The archive tier — relational-only tables for unbounded history; **breaking:** `Relational` renamed to hot with a relational backplane | **Shipped** in 0.3.0 |
 | [26](plan-phase-26.md) | Producers — typed, read-only calls a client makes for data; how archive history reaches clients ([design record](../design/producers.md)) | **Shipped** in 0.3.0 |
 
