@@ -191,6 +191,48 @@ public class AutoReconnectTests
     }
 
     [Fact]
+    public async Task A_refused_attempt_whose_socket_dies_after_the_give_up_starts_nothing()
+    {
+        // The race CI found: the identity refusal aborts the attempt's socket and gives up, and
+        // that socket's teardown runs on its own thread. When the teardown lost the race to the
+        // give-up, it saw no reconnect in progress and started a fresh loop — a client that had
+        // given up came back to try again. The gate holds that teardown until the give-up has run.
+        await using var host = await TransportTestHost.StartAsync();
+        var first = true;
+        await using var client = host.CreateClient(o =>
+        {
+            o.Token = null;
+            o.Reconnect = Fast;
+            o.TokenProvider = _ =>
+            {
+                var token = first ? TestTokens.Default : TestTokens.For("someone-else");
+                first = false;
+                return ValueTask.FromResult(token);
+            };
+        });
+        var lifecycle = new Lifecycle();
+        lifecycle.Attach(client);
+        var gaveUp = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.OnReconnectFailed += _ => gaveUp.TrySetResult();
+
+        // Armed once the original socket's teardown has consumed nothing: the next loop to die is
+        // the refused attempt's, and it is held until the give-up is done.
+        client.OnReconnecting += attempt =>
+        {
+            if (attempt.Attempt == 1)
+                client.ReceiveTeardownGate = () => gaveUp.Task;
+        };
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+
+        client.Abort();
+        await gaveUp.Task.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+        await Task.Delay(300, TestContext.Current.CancellationToken);
+
+        Assert.Equal(["disconnected", "reconnecting 1", "failed"], lifecycle.Events);
+        Assert.False(client.IsReconnecting);
+    }
+
+    [Fact]
     public async Task Without_a_policy_nothing_reconnects()
     {
         await using var host = await TransportTestHost.StartAsync();
