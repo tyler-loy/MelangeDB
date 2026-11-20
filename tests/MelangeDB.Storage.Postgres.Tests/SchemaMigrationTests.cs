@@ -123,4 +123,83 @@ public class SchemaMigrationTests
         // Nothing was applied — the projection stayed untouched rather than partially migrated.
         Assert.Null(await harness.StoredCheckpointAsync());
     }
+    // -- Uniqueness changes (road-to-0.4 phase 27) -------------------------------------------------
+
+    private static string StatDdl(string schema) =>
+        $"""
+        CREATE TABLE "{schema}"."Stat" (
+            "Id" bigint NOT NULL PRIMARY KEY,
+            "Metric" text,
+            "Value" bigint NOT NULL,
+            "At" timestamp with time zone NOT NULL
+        )
+        """;
+
+    private static Task<object?> IndexCountAsync(TierHarness harness, string index) =>
+        harness.ScalarAsync($"SELECT count(*) FROM pg_indexes WHERE schemaname = '{harness.Schema}' AND indexname = '{index}'");
+
+    [Fact]
+    public async Task Dropping_unique_drops_its_postgres_index_so_the_applier_takes_duplicates()
+    {
+        _postgres.SkipUnlessAvailable();
+        var schema = PostgresContainerFixture.NewSchema();
+
+        // A deployment whose Stat.Metric was [Unique]: its projection carries ux_Stat_Metric. The
+        // code now declares a plain [Index], so the hot store accepts two rows with one Metric —
+        // and a unique index left behind in Postgres would refuse the second.
+        await using var harness = new TierHarness(_postgres.ConnectionString, schema);
+        await harness.ExecuteAsync($"CREATE SCHEMA \"{schema}\"");
+        await harness.ExecuteAsync(StatDdl(schema));
+        await harness.ExecuteAsync($"CREATE UNIQUE INDEX \"ux_Stat_Metric\" ON \"{schema}\".\"Stat\" (\"Metric\")");
+
+        await harness.StartTierAsync();
+        harness.Invoke("First", ctx => ctx.Db.Stat.Insert(new Stat { Metric = "same", Value = 1, At = ctx.Timestamp }));
+        var lsn = harness.Invoke("Second", ctx => ctx.Db.Stat.Insert(new Stat { Metric = "same", Value = 2, At = ctx.Timestamp }));
+        await harness.WaitAppliedAsync(lsn);
+
+        Assert.Equal(2L, await harness.ScalarAsync($"SELECT count(*) FROM \"{schema}\".\"Stat\" WHERE \"Metric\" = 'same'"));
+        Assert.Equal(0L, await IndexCountAsync(harness, "ux_Stat_Metric"));
+        Assert.Equal(1L, await IndexCountAsync(harness, "ix_Stat_Metric"));
+        Assert.Contains(harness.Logs.Events, e => e.EventId == 1603 && e.Message.Contains("DROP INDEX IF EXISTS"));
+    }
+
+    [Fact]
+    public async Task A_column_that_became_unique_loses_the_plain_index_its_unique_one_supersedes()
+    {
+        _postgres.SkipUnlessAvailable();
+        var schema = PostgresContainerFixture.NewSchema();
+
+        // A deployment whose Account.Email was a plain [Index]; the code now declares [Unique].
+        await using var harness = new TierHarness(_postgres.ConnectionString, schema);
+        await harness.ExecuteAsync($"CREATE SCHEMA \"{schema}\"");
+        await harness.ExecuteAsync($"CREATE TABLE \"{schema}\".\"Account\" (\"Id\" bigint NOT NULL PRIMARY KEY, \"Email\" text)");
+        await harness.ExecuteAsync($"CREATE INDEX \"ix_Account_Email\" ON \"{schema}\".\"Account\" (\"Email\")");
+
+        await harness.StartTierAsync();
+        var lsn = harness.Invoke("Register", ctx => ctx.Db.Account.Insert(new Account { Email = "a@b.test" }));
+        await harness.WaitAppliedAsync(lsn);
+
+        Assert.Equal(0L, await IndexCountAsync(harness, "ix_Account_Email"));
+        Assert.Equal(1L, await IndexCountAsync(harness, "ux_Account_Email"));
+    }
+
+    [Fact]
+    public async Task AutoMigrate_off_refuses_a_stale_unique_index_with_the_drop_it_needs()
+    {
+        _postgres.SkipUnlessAvailable();
+        var schema = PostgresContainerFixture.NewSchema();
+        await using var harness = new TierHarness(_postgres.ConnectionString, schema, autoMigrate: false);
+        await harness.ExecuteAsync($"CREATE SCHEMA \"{schema}\"");
+        await harness.ExecuteAsync(StatDdl(schema));
+        await harness.ExecuteAsync($"CREATE UNIQUE INDEX \"ux_Stat_Metric\" ON \"{schema}\".\"Stat\" (\"Metric\")");
+
+        await harness.StartTierAsync();
+        harness.Invoke("RecordStat", ctx => ctx.Db.Stat.Insert(new Stat { Metric = "pending", Value = 1, At = ctx.Timestamp }));
+
+        await TierHarness.WaitUntilAsync(() => harness.Logs.Has(1604), "the migration refusal (EventId 1604)");
+        Assert.True(harness.Tier.IsStalled);
+        var refusal = harness.Logs.Events.First(e => e.EventId == 1604);
+        Assert.Contains($"DROP INDEX IF EXISTS \"{schema}\".\"ux_Stat_Metric\";", refusal.Message);
+        Assert.Equal(1L, await IndexCountAsync(harness, "ux_Stat_Metric"));
+    }
 }

@@ -347,20 +347,22 @@ internal static partial class Emitter
         IReadOnlyDictionary<string, string> tableTypeNames,
         string site)
     {
+        var names = string.Join(", ", reducer.Parameters.Items.Select(static p => p.Name));
+        var count = $"reader.ExpectCount({reducer.RequiredParameters}, {reducer.Parameters.Length}, {Literal(names)});";
         builder.AppendLine("                new global::MelangeDB.Core.ReducerDescriptor(");
         builder.AppendLine($"                    {Literal(reducer.ReducerName)},");
         builder.AppendLine($"                    global::MelangeDB.ReducerKind.{reducer.Kind},");
         builder.AppendLine($"                    typeof({reducer.ContainingTypeFqn}),");
         builder.AppendLine("                    static (ref global::MelangeDB.Core.ReducerArgsReader reader) =>");
         builder.AppendLine("                    {");
-        builder.AppendLine($"                        reader.ExpectCount({reducer.Parameters.Length});");
+        builder.AppendLine("                        " + count);
         for (var i = 0; i < reducer.Parameters.Length; i++)
             EmitArgumentRead(builder, reducer.Parameters[i], i, "                        ", bind: false, tableTypeNames);
         builder.AppendLine("                        reader.End();");
         builder.AppendLine("                    },");
         builder.AppendLine("                    static (object instance, global::MelangeDB.ReducerContext context, ref global::MelangeDB.Core.ReducerArgsReader reader) =>");
         builder.AppendLine("                    {");
-        builder.AppendLine($"                        reader.ExpectCount({reducer.Parameters.Length});");
+        builder.AppendLine("                        " + count);
         for (var i = 0; i < reducer.Parameters.Length; i++)
             EmitArgumentRead(builder, reducer.Parameters[i], i, "                        ", bind: true, tableTypeNames);
         var arguments = string.Concat(Enumerable.Range(0, reducer.Parameters.Length).Select(static i => $", arg{i}"));
@@ -381,6 +383,13 @@ internal static partial class Emitter
         bool bind,
         IReadOnlyDictionary<string, string> tableTypeNames)
     {
+        if (parameter.HasDefault)
+        {
+            // Read only when the call carries it, else the declared default: the producers' path.
+            EmitProducerArgumentRead(builder, parameter, index, indent, bind);
+            return;
+        }
+
         if (parameter.IsTimerRow)
         {
             // The timer row travels as one blob argument: the scheduler encodes the stored row

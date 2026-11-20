@@ -119,7 +119,9 @@ internal static class SnapshotFile
             stream.Flush(flushToDisk: true);
         }
 
-        File.Move(tempPath, path, overwrite: true);
+        // Durable before the log compacts past it: a reverted rename would pair the older snapshot
+        // with a log that no longer holds the records between the two.
+        DurableFile.Replace(tempPath, path);
     }
 
     /// <summary>Opens a snapshot for streamed reading; the header is parsed eagerly.</summary>

@@ -62,7 +62,7 @@ public static class MelangeBackup
             summary = new BackupSummary([engine], writer.BytesWritten);
         }
 
-        File.Move(tempPath, outputPath, overwrite: true);
+        DurableFile.Replace(tempPath, outputPath);
         return summary;
     }
 

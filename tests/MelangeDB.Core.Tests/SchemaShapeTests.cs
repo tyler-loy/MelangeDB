@@ -102,7 +102,7 @@ public class SchemaShapeTests : IDisposable
     private static TableSchema CounterTable<TRow>() where TRow : struct => Declare<TRow>("Counter", "Id", autoInc: "Id");
 
     /// <summary>The direct-construction seam: a TableSchema from a struct's fields, no attributes.</summary>
-    internal static TableSchema Declare<TRow>(string name, string key, string? autoInc = null, string? index = null)
+    internal static TableSchema Declare<TRow>(string name, string key, string? autoInc = null, string? index = null, string? unique = null)
         where TRow : struct
     {
         var columns = typeof(TRow).GetFields()
@@ -115,6 +115,7 @@ public class SchemaShapeTests : IDisposable
                 IsPrimaryKey = f.Name == key,
                 IsAutoInc = f.Name == autoInc,
                 IsIndexed = f.Name == index,
+                IsUnique = f.Name == unique,
                 GetValue = row => f.GetValue(row),
                 SetValue = (row, value) => f.SetValue(row, value),
             })
@@ -368,6 +369,34 @@ public class SchemaShapeTests : IDisposable
         using var again = Boot(options, HeroTable<HeroV2>());
         var hero = Assert.Single(Rows<HeroV2>(again));
         Assert.Equal((3, 0, "grace"), (hero.X, hero.Level, hero.Name));
+    }
+
+    [Fact]
+    public void An_engine_that_never_committed_takes_an_additive_change_without_a_marker()
+    {
+        // Issue #184: a cluster node with no partitions has an empty log, so its adopted reign and
+        // the migration's marker would both start at LSN 1. A reign that governs no record has
+        // nothing to migrate: it is rewritten in place, and the log stays empty so an engine that
+        // was fresh is still fresh — init reducers test HeadLsn == 0.
+        var root = NewRoot();
+        var options = OptionsFor(root);
+        using (var v1 = Boot(options, HeroTable<HeroV1>()))
+        {
+            Assert.Equal(0UL, v1.Log.HeadLsn);
+        }
+
+        using (var v2 = Boot(options, HeroTable<HeroV2>()))
+        {
+            Assert.Equal(0UL, v2.Log.HeadLsn);
+            var entry = Assert.Single(Sidecar(options).Entries);
+            Assert.Equal(1UL, entry.FromLsn);
+            Assert.True(entry.Tables["Hero"].SameAs(TableShape.Of(v2.Schema.Get(typeof(HeroV2)))));
+            v2.Invoke("Seed", EngineHarness.Caller, ctx => ctx.Db.Insert(new HeroV2 { Id = 1, X = 7, Level = 2, Name = "jo", Alive = true }));
+        }
+
+        using var again = Boot(options, HeroTable<HeroV2>());
+        var hero = Assert.Single(Rows<HeroV2>(again));
+        Assert.Equal((7, 2, "jo", true), (hero.X, hero.Level, hero.Name, hero.Alive));
     }
 
     // -- Compaction ------------------------------------------------------------------------------

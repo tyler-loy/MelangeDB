@@ -176,6 +176,26 @@ internal sealed class PostgresSchemaManager
             if (table.Tier == StorageTier.Archive && !existing.ContainsKey(LsnColumn))
                 await ApplyOrCollectAsync(ArchiveColumnsDdl(table)).ConfigureAwait(false);
 
+            // Index DDL is create-if-not-exists by name, and a unique index is named apart from a
+            // plain one, so a uniqueness change used to leave the old index behind. A stale unique
+            // index is not harmless: it keeps enforcing a constraint the hot store dropped, and the
+            // applier's first duplicate fails against it — so dropping it is a migration step like
+            // an added column, applied or refused with the rest. A plain index a unique one now
+            // supersedes is only redundant, and is dropped when migration is automatic.
+            foreach (var (name, unique) in await StaleIndexesAsync(connection, table, ct).ConfigureAwait(false))
+            {
+                var drop = $"DROP INDEX IF EXISTS {PostgresIdentifier.Qualify(_schema, name)};";
+                if (unique)
+                {
+                    await ApplyOrCollectAsync(drop).ConfigureAwait(false);
+                }
+                else if (autoMigrate)
+                {
+                    await ExecuteScriptAsync(connection, drop, ct).ConfigureAwait(false);
+                    appliedDdl.AppendLine(drop);
+                }
+            }
+
             if (autoMigrate)
                 await ExecuteScriptAsync(connection, IndexDdl(table), ct).ConfigureAwait(false);
         }
@@ -266,6 +286,41 @@ internal sealed class PostgresSchemaManager
         }
 
         return builder.ToString().TrimEnd('\n');
+    }
+
+    /// <summary>
+    /// The indexes this manager created for <paramref name="table"/> under a uniqueness the table no
+    /// longer declares: <c>ux_</c> on a column that is not unique any more (<c>unique</c> true), and
+    /// <c>ix_</c> on a column that now is (false). Only names this manager's own convention produces
+    /// are ever matched, so an index an operator added by hand is never touched.
+    /// </summary>
+    private async Task<List<(string Name, bool Unique)>> StaleIndexesAsync(NpgsqlConnection connection, TableSchema table, CancellationToken ct)
+    {
+        var existing = new HashSet<string>(StringComparer.Ordinal);
+        await using (var command = new NpgsqlCommand(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2", connection))
+        {
+            command.Parameters.AddWithValue(_schema);
+            command.Parameters.AddWithValue(table.Name);
+            await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+                existing.Add(reader.GetString(0));
+        }
+
+        var stale = new List<(string, bool)>();
+        foreach (var column in table.Columns)
+        {
+            if (column.IsPrimaryKey)
+                continue;
+            var unique = $"ux_{table.Name}_{column.Name}";
+            var plain = $"ix_{table.Name}_{column.Name}";
+            if (!column.IsUnique && existing.Contains(unique))
+                stale.Add((unique, true));
+            if (column.IsUnique && existing.Contains(plain))
+                stale.Add((plain, false));
+        }
+
+        return stale;
     }
 
     /// <summary>Which of <paramref name="tables"/> exist in the configured schema right now.</summary>

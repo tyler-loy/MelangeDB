@@ -21,6 +21,11 @@ public sealed record ShapeColumn(string Name, ColumnKind Kind);
 /// so it has to be detectable at boot like any other change to what the directory holds. It takes
 /// no part in <see cref="SameAs"/>, which stays the byte-compatibility question.
 /// </para>
+/// <para>
+/// And its <see cref="Unique"/> columns, for the same kind of reason: uniqueness changes nothing
+/// about the bytes, but it is a claim <em>about</em> them, and a claim added over rows that already
+/// break it has to be caught at the boot that adds it (road-to-0.4 phase 27, issue #192).
+/// </para>
 /// </summary>
 public sealed class TableShape
 {
@@ -34,6 +39,14 @@ public sealed class TableShape
     /// </summary>
     public string? Tier { get; init; }
 
+    /// <summary>
+    /// The table's <c>[Unique]</c> columns by name, in ordinal order, or null in a sidecar written
+    /// before uniqueness was recorded — every unique column of such a directory is checked against
+    /// its rows once, then <see cref="ShapeHistory.RecordUnique"/> fills this in. The primary key is
+    /// never listed: it is unique by construction.
+    /// </summary>
+    public IReadOnlyList<string>? Unique { get; init; }
+
     public bool SameAs(TableShape other) =>
         Key == other.Key && Columns.SequenceEqual(other.Columns);
 
@@ -43,7 +56,16 @@ public sealed class TableShape
         Key = table.PrimaryKey.Name,
         Columns = table.Columns.Select(c => new ShapeColumn(c.Name, c.Kind)).ToArray(),
         Tier = ShapeTiers.NameOf(table.Tier),
+        Unique = UniqueOf(table),
     };
+
+    /// <summary>The table's unique non-key columns, as <see cref="Unique"/> records them.</summary>
+    public static string[] UniqueOf(TableSchema table) =>
+        table.Columns
+            .Where(static c => c.IsUnique && !c.IsPrimaryKey)
+            .Select(static c => c.Name)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 }
 
 /// <summary>
@@ -161,7 +183,34 @@ public sealed class ShapeHistory
             if (shape.Tier is not null || !schema.TryGetByName(name, out var table))
                 continue;
             tables ??= new Dictionary<string, TableShape>(current.Tables);
-            tables[name] = new TableShape { Key = shape.Key, Columns = shape.Columns, Tier = ShapeTiers.NameOf(table.Tier) };
+            tables[name] = new TableShape { Key = shape.Key, Columns = shape.Columns, Tier = ShapeTiers.NameOf(table.Tier), Unique = shape.Unique };
+            filled++;
+        }
+
+        if (tables is not null)
+            _entries[^1] = new ShapeEntry { FromLsn = current.FromLsn, Tables = tables };
+        return filled;
+    }
+
+    /// <summary>
+    /// Fills in the unique columns of every table in the current entry that has none recorded — a
+    /// sidecar written before uniqueness was — from the booting schema, and returns how many were
+    /// filled. In place, as <see cref="RecordMissingTiers"/> is, because uniqueness never changes
+    /// what a record's bytes mean. Unlike the tier, it must only run <em>after</em> the engine has
+    /// checked those columns against the rows: a sidecar that claimed a uniqueness the data breaks
+    /// would let every later boot skip the check that would have caught it.
+    /// </summary>
+    public int RecordUnique(SchemaRegistry schema)
+    {
+        var current = Current;
+        Dictionary<string, TableShape>? tables = null;
+        var filled = 0;
+        foreach (var (name, shape) in current.Tables)
+        {
+            if (shape.Unique is not null || !schema.TryGetByName(name, out var table))
+                continue;
+            tables ??= new Dictionary<string, TableShape>(current.Tables);
+            tables[name] = new TableShape { Key = shape.Key, Columns = shape.Columns, Tier = shape.Tier, Unique = TableShape.UniqueOf(table) };
             filled++;
         }
 
@@ -181,6 +230,16 @@ public sealed class ShapeHistory
 
         _entries.Add(entry);
     }
+
+    /// <summary>
+    /// Rewrites the current reign's shapes in place, keeping its <see cref="ShapeEntry.FromLsn"/>.
+    /// Sound only when that reign governs no record yet — the log's head is below its
+    /// <see cref="ShapeEntry.FromLsn"/> — because then no stored byte was written under the shapes
+    /// being replaced. The caller owns that check; this is the migration of a reign with nothing
+    /// to migrate.
+    /// </summary>
+    public void ReplaceCurrent(SchemaRegistry schema) =>
+        _entries[^1] = EntryOf(schema, Current.FromLsn);
 
     /// <summary>
     /// Drops entries no record can need anymore: an entry is dead when its successor's reign began
@@ -229,13 +288,14 @@ public sealed class ShapeHistory
         return new ShapeHistory(ordered);
     }
 
-    /// <summary>Writes the sidecar atomically — temp file, then rename over.</summary>
+    /// <summary>
+    /// Writes the sidecar atomically and durably — see <see cref="DurableFile"/>. A sidecar that
+    /// power loss left zero-length would refuse the next boot.
+    /// </summary>
     public void Save(string path)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(new Persisted { Entries = _entries }, JsonOptions);
-        var temp = path + ".tmp";
-        File.WriteAllBytes(temp, bytes);
-        File.Move(temp, path, overwrite: true);
+        DurableFile.WriteAllBytes(path, bytes);
     }
 
     /// <summary>Serializes the history for a caller that stores it elsewhere (the backup archive).</summary>

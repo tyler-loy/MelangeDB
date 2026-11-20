@@ -116,6 +116,10 @@ public class ProducerManifestTests
         Assert.Contains("public sealed partial record Item", model, StringComparison.Ordinal);
         Assert.Contains("public partial record struct Point", model, StringComparison.Ordinal);
         Assert.Contains("int page = 1, string after = default, Rarity rarity = (Rarity)(2), double scale = 1.5D, bool all = true", model, StringComparison.Ordinal);
+
+        // A record a newer server extended is read past, not refused (road-to-0.4 phase 28).
+        Assert.Contains("if (count < ", model, StringComparison.Ordinal);
+        Assert.Contains("reader.SkipValue();", model, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -10,6 +10,37 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **Clients built against an older schema survive additive server changes** (road-to-0.4 phase 28).
+  A typed subscription used to refuse any descriptor that was not identical to its bindings, so
+  every added column broke every client not yet rebuilt, which a shipped game client cannot avoid.
+  Bindings now map columns by name and skip the ones they predate: an added column at any position,
+  or a reorder. An update that only changes such a column fires no `OnUpdate`. A removed, renamed,
+  or re-kinded column still refuses, naming it. Producer result records tolerate *appended* fields.
+- **Reducer parameters may declare defaults**, as producer parameters already could. A trailing
+  defaulted parameter may be left off a call, so a client whose bindings predate it keeps calling.
+  A required parameter after a defaulted one is refused at compile time (MELANGE0009).
+- **Automatic reconnect**, opt-in through `MelangeClientOptions.Reconnect`. A dropped connection
+  is re-dialed with exponential backoff and jitter and resumed through the existing
+  `ReconnectAsync` path, so caches, subscriptions, and handlers survive the drop.
+  `OnReconnecting`, `OnReconnected`, and `OnReconnectFailed` report it, and `IsReconnecting` says
+  it is under way. It stops on dispose, on `MaxAttempts`, or on a refusal retrying cannot fix, and
+  it never comes back as a different identity.
+- **`MelangeClientOptions.TokenProvider`** supplies the token for every dial, for expiring
+  credentials.
+
+### Changed
+
+- **A reducer call with the wrong number of arguments names the problem.** Instead of
+  `Expected 3 argument(s); the call carries 2.`, a short call is told which parameters it is
+  missing and that only a defaulted parameter can be left off, and a long one is told the
+  parameter list. Generated dispatch now calls `ReducerArgsReader.ExpectCount(required, declared,
+  names)`, so regenerating a module changes its generated source.
+- **`ClientRowShape.Verify` checks readability, not identity.** It used to throw on any difference,
+  including a reorder or an added column. It now throws only when the bindings could not read the
+  rows.
+
 ### Fixed
 
 - **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
@@ -23,6 +54,43 @@ All packages ship together at one version; there is no per-package versioning. S
   to flush no longer fsyncs (an idle log used to fsync 20 times a second at 50 ms), and a tick that
   finds the previous flush still running skips instead of parking a pool thread. Durability is
   unchanged: the loss window is still the interval plus one flush.
+- **Under Manual dispatch, a full resync no longer swallows a queued `OnDisconnected`** that no
+  `FrameTick` had delivered yet.
+
+- **A `[Unique]` declared over existing rows is checked against them**
+  ([#192](https://github.com/tyler-loy/MelangeDB/issues/192), road-to-0.4 phase 27). Adding
+  `[Unique]` was classified as an index change, and indexes are rebuilt projections, so a boot over
+  duplicate rows succeeded, the unique index held several rows for one value, and only later
+  writes were refused. The boot that adds `[Unique]` now scans the table once and refuses, naming
+  each duplicated value and the keys holding it. Nothing is recorded, and the previous declaration
+  still boots. The shape sidecar now records each table's unique columns. **On upgrade**, a
+  directory whose sidecar predates this checks every `[Unique]` column once, so duplicates an
+  earlier build let in refuse that boot rather than staying hidden. See
+  [MIGRATION.md](docs/MIGRATION.md#adding-or-removing-unique).
+- **Removing `[Unique]` from a table with a relational backplane drops its Postgres unique index.**
+  Index DDL was create-if-not-exists by name, so `ux_<table>_<column>` stayed behind and refused
+  the applier's first duplicate. It is now dropped on the tier's start, or printed in the refusal's
+  DDL when `Postgres:AutoMigrate` is off. A plain index superseded by a new unique one is dropped too.
+
+- **The engine's file swaps survive power loss, not only a crash.** The commit log's compaction
+  swap, its base and epoch sidecars, the epoch lineage, the shape sidecar, snapshots, and backup
+  archives were written temp-then-rename, which is atomic against a process crash; but on Linux
+  and macOS a rename is not durable until its directory is fsynced, and the sidecars' temp files
+  were never flushed before the rename. Power loss could revert the compaction swap — orphaning
+  appends already acknowledged as durable in the new file — or leave a zero-length shape sidecar
+  that refuses the next boot. Renames now fsync the containing directory (Windows renames with
+  `MOVEFILE_WRITE_THROUGH`), and every sidecar's contents reach disk before its rename.
+
+## [0.3.1] — 2026-11-16
+
+### Fixed
+
+- **An additive schema change no longer crashes an engine that has never committed** ([#184](https://github.com/tyler-loy/MelangeDB/issues/184)).
+  A cluster node holding no partitions has an empty log, so the shape it adopted and the
+  migration's marker record both started at LSN 1, and the boot threw `Shape entry from LSN 1
+  does not follow the current entry's 1` — every schema change forced a wipe of the nodes'
+  stores. A reign that governs no record now has its sidecar entry rewritten in place, with no
+  marker and no snapshot, so the engine stays fresh and its init reducers still run.
 
 ## [0.3.0] — 2026-10-23
 

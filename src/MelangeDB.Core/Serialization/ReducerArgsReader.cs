@@ -38,6 +38,35 @@ public ref struct ReducerArgsReader
     /// <summary>The argument count the payload declares.</summary>
     public int Count { get; }
 
+    /// <summary>
+    /// Rejects the call unless it carries between <paramref name="required"/> and
+    /// <paramref name="declared"/> arguments, naming what is wrong: the parameters a short call is
+    /// missing, or the most a long one may carry. <paramref name="parameterNames"/> is every
+    /// parameter's name, comma-separated in order — a generated literal, split only on failure. A
+    /// short call is usually an older client whose bindings predate a parameter, and the message
+    /// says how to let it through (road-to-0.4 phase 28).
+    /// </summary>
+    public void ExpectCount(int required, int declared, string parameterNames)
+    {
+        if (Count >= required && Count <= declared)
+            return;
+
+        var names = string.IsNullOrEmpty(parameterNames)
+            ? []
+            : parameterNames.Split(", ", StringSplitOptions.None);
+        if (Count < required)
+        {
+            var missing = string.Join(", ", names.Skip(Count).Take(required - Count).Select(static n => $"'{n}'"));
+            throw new ReducerArgumentException(
+                $"The call carries {Count} argument(s) and is missing {missing}. A caller whose bindings predate a parameter " +
+                "can only leave it off if the parameter declares a default value; otherwise regenerate the caller's bindings.");
+        }
+
+        throw new ReducerArgumentException(
+            $"The call carries {Count} argument(s); this one takes at most {declared}" +
+            (names.Length > 0 ? $" ({parameterNames})." : "."));
+    }
+
     /// <summary>Rejects the call unless the payload carries exactly the declared argument count.</summary>
     public void ExpectCount(int declared)
     {

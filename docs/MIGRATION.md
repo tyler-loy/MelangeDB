@@ -59,17 +59,66 @@ migration matches columns **by name** — and redeploy. On boot, per engine:
 4. The Postgres tier, if configured, does its phase 08 half of the same deploy: the additive DDL
    under `Postgres:AutoMigrate`, or a stall with the exact DDL printed when that is off.
 
-Client bindings are the other half of the story and already ship: the schema hash changes, and a
-stale client fails `ClientRowShape.Verify` at subscription time — structural refusal, not decode
-garbage. Regenerate bindings with the deploy.
+One engine skips steps 2 and 3's marker and snapshot: one whose log has never been committed to,
+such as a cluster node that holds no partitions yet. No stored byte was written under its current
+shape, so there is nothing to rebuild. The sidecar's entry is rewritten in place, EventId 1006
+still logs the change, and the log stays empty, so the engine still counts as fresh and its init
+reducers still run on its first open.
+
+Client bindings are the other half of the story. Since road-to-0.4 phase 28, a client whose bindings
+predate an additive change keeps working: added and reordered columns are mapped by name, and a
+reducer parameter added *with a default* may be left off by older callers. A removed, renamed, or
+re-kinded column still refuses at subscription time, and a parameter added without a default
+refuses the call, naming it. The full table is in
+[CLIENT-BINDINGS.md](CLIENT-BINDINGS.md). **For a shipped game
+client, add reducer parameters with defaults**: the default is what lets builds already on players'
+machines keep calling.
 
 What counts as additive: added columns (any position), reordered columns, added tables, added or
-removed indexes (indexes are projections; recovery rebuilds them from the declaration), and a tier
-change between `Hot` and `HotWithRelationalBackplane` (see [Changing a table's
-tier](#changing-a-tables-tier)). What is
+removed `[Index]` (indexes are projections; recovery rebuilds them from the declaration), adding or
+removing `[Unique]` — checked against the existing rows when added; see [Adding or removing
+`[Unique]`](#adding-or-removing-unique) — and a tier change between `Hot` and
+`HotWithRelationalBackplane` (see [Changing a table's tier](#changing-a-tables-tier)). What is
 refused as destructive: a removed table, a removed column, a changed column kind, a moved
 `[PrimaryKey]`. A **rename is a removal plus an addition** — the column's name is its identity —
 so rename refuses too; rename it back, or treat it as a deliberate manual migration.
+
+## Adding or removing `[Unique]`
+
+`[Unique]` is an index *and* a claim about the data, and the claim is checked at the boot that
+makes it. Declaring a column `[Unique]` over a table that already has rows makes that boot scan
+the table once. If any value is held by more than one row, the boot refuses and records nothing.
+The refusal names each duplicated value, up to ten per column, and the primary keys holding it, up
+to five per value. The directory still boots under the previous declaration. If the values are all
+distinct, the change is recorded like any other additive one: a marker record, a new entry in the
+shape sidecar, and EventId 1006 naming it.
+
+**The engine cannot dedupe for you**, because which row survives is a decision about your game.
+Boot the previous declaration, run a reducer that rewrites or deletes all but one row per
+duplicated value, then redeploy with `[Unique]`.
+
+**A column added as `[Unique]` in the same deploy** starts at its default in every existing row,
+which is a duplicate as soon as two rows exist. Declare it nullable (null is never a duplicate),
+or add it without `[Unique]`, fill it with distinct values, and declare it unique in a later deploy.
+The refusal says so when this is the cause.
+
+**Removing `[Unique]`** relaxes the claim, so nothing is checked and the change is recorded the
+same way. On a table with a relational backplane, the Postgres projection's `ux_<table>_<column>`
+index is dropped on the tier's next start, because a unique index left in Postgres would refuse the
+applier's first duplicate. With `Postgres:AutoMigrate` off, that drop is part of the refusal's
+printed DDL, like an added column. A plain `ix_` index that a new unique index supersedes is
+dropped too, under `AutoMigrate`.
+
+**Upgrading from a build before 0.4**: those builds never recorded uniqueness in the sidecar, and
+never checked a `[Unique]` added over existing rows (issue
+[#192](https://github.com/tyler-loy/MelangeDB/issues/192)). So the first boot after upgrading
+checks every `[Unique]` column once. If it finds duplicates an earlier build let in, it refuses
+exactly as above. If it finds none, it records the columns in place, with no marker, and logs
+EventId 1010.
+
+`/melange/bulk` checks uniqueness against committed rows but not within its own batch, so a single
+bulk load can still commit duplicates (see `MelangeEngine.BulkInsert`). The next boot that checks
+the column will name them.
 
 ## Changing a table's tier
 
