@@ -182,6 +182,69 @@ public class GroupCommitTests : IDisposable
     }
 
     [Fact]
+    public async Task An_interval_fsync_in_flight_does_not_hold_up_appends()
+    {
+        // The interval flusher used to fsync under the append lock, so an append landing during a
+        // slow flush waited it out — under the engine's write lock, as a 60-200 ms "commit" for one
+        // row. Hold the timer's fsync hostage and prove an append completes while it is held.
+        var ct = TestContext.Current.CancellationToken;
+        using var log = new FileCommitLog(new CommitLogOptions
+        {
+            Path = Path.Combine(_root, "log"),
+            FsyncPolicy = FsyncPolicy.Interval,
+            FsyncIntervalMs = 10,
+        });
+        using var flushEntered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        log.FlushFaultInjection = () =>
+        {
+            flushEntered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(30), ct), "the test released the hostage flush");
+        };
+
+        log.Append(MakeRequest("ArmsTheTimer"));
+        Assert.True(flushEntered.Wait(TimeSpan.FromSeconds(30), ct), "the interval flush started");
+
+        var during = Task.Run(() => log.Append(MakeRequest("During")), ct);
+        var finished = await Task.WhenAny(during, Task.Delay(TimeSpan.FromSeconds(5), ct));
+        log.FlushFaultInjection = null;
+        release.Set();
+
+        Assert.Same(during, finished);
+        Assert.Equal(2UL, (await during).Lsn);
+
+        // The hostage flush covered only what it captured; a later tick covers the rest.
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (log.FsyncedLsn < 2 && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+        Assert.Equal(2UL, log.FsyncedLsn);
+    }
+
+    [Fact]
+    public async Task An_interval_tick_with_nothing_new_does_no_fsync()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var log = new FileCommitLog(new CommitLogOptions
+        {
+            Path = Path.Combine(_root, "log"),
+            FsyncPolicy = FsyncPolicy.Interval,
+            FsyncIntervalMs = 10,
+        });
+        log.Append(MakeRequest("Only"));
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (log.FsyncedLsn < 1 && DateTime.UtcNow < deadline)
+            await Task.Delay(10, ct);
+        Assert.Equal(1UL, log.FsyncedLsn);
+
+        // Twenty-odd ticks over an idle log: none of them has anything to make durable.
+        var fsyncs = 0;
+        log.FlushFaultInjection = () => Interlocked.Increment(ref fsyncs);
+        await Task.Delay(250, ct);
+
+        Assert.Equal(0, Volatile.Read(ref fsyncs));
+    }
+
+    [Fact]
     public void Recovery_truncates_a_multi_record_torn_tail_even_past_intact_looking_records()
     {
         var options = OptionsFor();
