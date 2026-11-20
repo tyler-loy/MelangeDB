@@ -1,7 +1,7 @@
 # Phase 27 — Constraint changes are migrations
 
-**Status: Planned.** The refusal half should ship as a 0.3.x fix ahead of the milestone. See
-[Splitting the phase](#splitting-the-phase).
+**Status: Planned.** Tracks [#192](https://github.com/tyler-loy/MelangeDB/issues/192). Ships
+whole with 0.4, not split into an earlier fix. See [Splitting the phase](#splitting-the-phase).
 
 **Goal:** adding `[Unique]` to a column that already holds rows checks those rows. Duplicates refuse
 the boot loudly and name the duplicated values and the keys that hold them, the way a destructive
@@ -68,10 +68,13 @@ predicted, had uniqueness been in the shape.
 
 ## Splitting the phase
 
-**Leaning: split.** The refusal is small, has a failing test today, and closes a correctness hole
-in shipped code. It should not wait for a milestone; ship it as a 0.3.x fix. What remains for the
-phase is the shape-history half and the relational-tier half, which change a file format and
-need the decisions below.
+**Settled (2026-11-20): not split; the whole phase ships with 0.4.** The case for splitting was
+that the refusal is small, has a failing test today, and closes a correctness hole in shipped code,
+so it could ship as a 0.3.x fix ahead of the shape-history and relational-tier halves. The decision
+was to fix it once, with the milestone, rather than ship an interim check that the shape-history
+half would then replace. Until 0.4, the hole is recorded in
+[#192](https://github.com/tyler-loy/MelangeDB/issues/192), and the workaround is to dedupe before
+adding `[Unique]`.
 
 ## Decisions to settle
 
@@ -81,9 +84,10 @@ Without uniqueness in the shape, the only safe place to check is every unique-in
 always correct and costs a duplicate check per unique index on every boot that rebuilds, which is
 cheap next to the rebuild itself. With uniqueness in the shape, the check runs once.
 
-**Leaning:** both, in order. The 0.3.x fix checks on every build, because it needs no format change.
-The phase then adds the shape field and narrows the check to the migration, keeping the rebuild
-check behind a debug assertion.
+**Leaning:** check at the recorded migration, and keep the every-build check behind a debug
+assertion. With the phase shipping whole, there is no interim release that needs the every-build
+check as its only defence. The next decision covers deployments upgraded from sidecars that never
+recorded uniqueness.
 
 ### Old sidecars that do not record uniqueness
 

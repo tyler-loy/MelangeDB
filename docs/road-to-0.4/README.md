@@ -49,7 +49,7 @@ this project chose "Postgres-backed membership, not Raft" in phase 09 for reason
 | [20](../road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half. **Carried from 0.3**; in this milestone because phase 30's trigger is one of its numbers | Planned |
 | [22](../road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: the reducer test kit. **Carried from 0.3** | Planned |
 | [23](../road-to-0.3/plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate`. **Carried from 0.3** | Planned |
-| [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | Planned; its refusal half should not wait for 0.4 |
+| [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | Planned; tracks [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | Planned |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | Planned |
 | 30 | Shard HA as a warm replica | Conditional on phase 20; gets a design record before a plan, as [phase 24](../design/scheduler-lanes.md) did |
@@ -62,11 +62,12 @@ release.
 
 ## Ordering
 
-**Phase 27 first, and its refusal half sooner still.** Planning found that a `[Unique]` added to a
-column that already holds duplicates boots without complaint, and the index then holds two rows
-for one "unique" value. Only the next insert is refused. That is a correctness bug in shipped code,
-not a missing feature, and the refusal is small. It should ship as a 0.3.x fix ahead of the
-milestone. The rest of phase 27 is making a constraint change a recorded, named migration.
+**Phase 27 first.** Planning found that a `[Unique]` added to a column that already holds
+duplicates boots without complaint, and the index then holds two rows for one "unique" value. Only
+the next insert is refused. That is a correctness bug in shipped code, not a missing feature
+([#192](https://github.com/tyler-loy/MelangeDB/issues/192)). It was considered for an earlier 0.3.x
+fix and deliberately kept with the milestone, so the refusal and the shape-history record that
+replaces it land together. Until then, dedupe before adding `[Unique]`.
 
 **Phase 28 lands before phase 23**, for the same reason [phase 26](../road-to-0.3/plan-phase-26.md)
 did. Phase 23 writes the client contract down for a second runtime. Tolerating additive changes
