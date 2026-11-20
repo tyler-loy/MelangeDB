@@ -80,12 +80,9 @@ public sealed class EpochLineage
         }
     }
 
-    /// <summary>Writes the sidecar atomically — temp file, then rename over.</summary>
+    /// <summary>Writes the sidecar atomically and durably — see <see cref="DurableFile"/>.</summary>
     public void Save(string directory)
     {
-        var path = Path.Combine(directory, FileName);
-        var temp = path + ".tmp";
-        File.WriteAllBytes(temp, JsonSerializer.SerializeToUtf8Bytes(Ancestors));
-        File.Move(temp, path, overwrite: true);
+        DurableFile.WriteAllBytes(Path.Combine(directory, FileName), JsonSerializer.SerializeToUtf8Bytes(Ancestors));
     }
 }

@@ -10,7 +10,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The engine's file swaps survive power loss, not only a crash.** The commit log's compaction
+  swap, its base and epoch sidecars, the epoch lineage, the shape sidecar, snapshots, and backup
+  archives were written temp-then-rename, which is atomic against a process crash; but on Linux
+  and macOS a rename is not durable until its directory is fsynced, and the sidecars' temp files
+  were never flushed before the rename. Power loss could revert the compaction swap — orphaning
+  appends already acknowledged as durable in the new file — or leave a zero-length shape sidecar
+  that refuses the next boot. Renames now fsync the containing directory (Windows renames with
+  `MOVEFILE_WRITE_THROUGH`), and every sidecar's contents reach disk before its rename.
 
 ## [0.3.1] — 2026-11-16
 
