@@ -11,14 +11,31 @@ server code. Sharing the module assembly would drag server types across a bounda
 doesn't share, and could never describe reducers anyway, whose bodies exist only in the server
 compilation.
 
-That makes the manifest load-bearing in a way it was not under protocol v1, and the bindings say so
-loudly. Ordered bytes carry no names, so a client generated from a stale manifest would read a
-renamed, reordered, or re-kinded column into *plausible garbage* rather than failing. The generated
-codec therefore carries the column shape it was built from, and it is compared against the server's
-descriptor once per subscription, before any row decodes — a mismatch throws
-`MelangeSchemaMismatchException` naming the column and both kinds. Re-export the manifest when the
-module's tables change; the mismatch is the reminder, and it arrives at subscribe time rather than as
-wrong data.
+That makes the manifest load-bearing in a way it was not under protocol v1. Ordered bytes carry no
+names, so a client decoding by position from a stale manifest would read a renamed, reordered, or
+re-kinded column into *plausible garbage* rather than failing. The generated codec therefore
+carries the column shape it was built from, and the library compares it against the server's
+descriptor once per subscription, before any row decodes.
+
+The descriptor names every column, so that comparison is a **mapping by name**, not an equality
+(since road-to-0.4 phase 28). A client built against an older schema keeps working against a server
+that changed it additively. That matters because a game client on a player's machine cannot be
+rebuilt in lockstep with a server deploy.
+
+| The server changed | Older bindings |
+| --- | --- |
+| Added a column, anywhere in the table | Keep working; the column is skipped. An update that only changes it fires no `OnUpdate`, because there is nothing the bindings could show. |
+| Reordered columns | Keep working; columns are found by name. |
+| Added a table, reducer, or producer | Keep working; they never ask for it. |
+| Added a trailing reducer parameter **with a default** | Keep working; calls that leave it off get the default. |
+| Added a trailing reducer parameter without a default | Calls fail, naming the missing parameter. |
+| Appended a field to a producer's result record | Keep working; the extra fields are read past. Records are positional, so only *appended* fields are tolerated. |
+| Removed, renamed, or re-kinded a column the bindings read | Subscriptions fail with `MelangeSchemaMismatchException` naming the column. A rename is a removal plus an addition. |
+
+When the shapes match, which is the common case, rows decode exactly as they arrive. When they
+differ, each row is rewritten into the bindings' layout as raw column slices, with no decode and
+re-encode. Regenerating the bindings is still how a client sees new columns, and it removes that
+per-row copy.
 
 ## The workflow
 

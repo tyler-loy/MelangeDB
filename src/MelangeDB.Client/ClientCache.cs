@@ -183,18 +183,22 @@ public sealed class ClientCache<TRow>
         MelangeRow row,
         ref List<Action>? pending)
     {
-        binding.VerifyShape(_codec, row);
+        // In the bindings' layout: the server's bytes when the shapes match, a projection when the
+        // server has columns these bindings predate. Comparing the projected bytes means an update
+        // that only touched a column these bindings cannot see fires no OnUpdate — there is no
+        // change they could represent.
+        var bytes = binding.BytesFor(_codec, row);
         var newlyCovered = binding.Covered.Add(key);
         if (_entries.TryGetValue(key, out var entry))
         {
             if (newlyCovered)
                 entry.RefCount++;
-            if (!entry.Bytes.Span.SequenceEqual(row.Row.Span))
+            if (!entry.Bytes.Span.SequenceEqual(bytes.Span))
             {
                 var previous = entry.Row;
-                var current = _codec.DecodeRow(row.Row.Span);
+                var current = _codec.DecodeRow(bytes.Span);
                 entry.Row = current;
-                entry.Bytes = row.Row;
+                entry.Bytes = bytes;
                 var fire = OnUpdate;
                 if (fire is not null)
                     (pending ??= []).Add(() => fire(previous, current));
@@ -203,8 +207,8 @@ public sealed class ClientCache<TRow>
             return;
         }
 
-        var inserted = _codec.DecodeRow(row.Row.Span);
-        _entries[key] = new Entry { Row = inserted, Bytes = row.Row, RefCount = 1 };
+        var inserted = _codec.DecodeRow(bytes.Span);
+        _entries[key] = new Entry { Row = inserted, Bytes = bytes, RefCount = 1 };
         var fireInsert = OnInsert;
         if (fireInsert is not null)
             (pending ??= []).Add(() => fireInsert(inserted));
@@ -262,6 +266,7 @@ internal sealed class TypedCacheBinding<TRow> : ISubscriptionSink
 {
     private readonly ClientCache<TRow> _cache;
     private WireDescriptor? _verified;
+    private ClientRowProjection? _projection;
 
     internal TypedCacheBinding(ClientCache<TRow> cache) => _cache = cache;
 
@@ -269,21 +274,22 @@ internal sealed class TypedCacheBinding<TRow> : ISubscriptionSink
     internal HashSet<ByteKey> Covered { get; } = [];
 
     /// <summary>
-    /// Checks, once per descriptor, that the server's shape is the one these bindings were
-    /// generated from — and per row, that no column policy narrowed it. A binding belongs to one
-    /// subscription, which holds one descriptor instance for its life, so the structural comparison
-    /// runs once per initial set and the per-row cost is an emptiness test on a span.
+    /// The row's bytes in the layout these bindings decode. Plans the mapping once per descriptor —
+    /// throwing when a column the bindings need is missing or retyped — and checks per row that no
+    /// column policy narrowed it. A binding belongs to one subscription, which holds one descriptor
+    /// instance for its life, so the plan runs once per initial set; a matching shape (the common
+    /// case) costs an emptiness test per row and returns the server's bytes untouched.
     /// </summary>
-    internal void VerifyShape(IClientRowCodec<TRow> codec, MelangeRow row)
+    internal ReadOnlyMemory<byte> BytesFor(IClientRowCodec<TRow> codec, MelangeRow row)
     {
         if (!ReferenceEquals(_verified, row.Descriptor))
         {
-            ClientRowShape.Verify(codec.TableName, codec.Columns, row.Descriptor);
+            _projection = ClientRowShape.Plan(codec.TableName, codec.Columns, row.Descriptor);
             _verified = row.Descriptor;
         }
 
         if (row.ColumnMask.IsEmpty)
-            return;
+            return _projection is null ? row.Row : _projection.Project(row.Row.Span);
 
         throw new MelangeSchemaMismatchException(
             $"Table '{codec.TableName}': a column policy masked columns out of this row, so it cannot fill the generated row struct. "

@@ -72,7 +72,75 @@ public sealed class MelangeClientOptions
     /// <see cref="MelangeClient.ReconnectAsync"/> resume path once the app ticks again.
     /// </summary>
     public int DispatchQueueLimit { get; set; } = 65536;
+
+    /// <summary>
+    /// Automatic reconnect. Null — the default — leaves reconnecting to the application, through
+    /// <see cref="MelangeClient.ReconnectAsync"/>. Set, a dropped connection is re-dialed with
+    /// backoff and resumed through that same path: the client's caches, subscriptions, and handlers
+    /// stay usable across the drop, and the identity must not change. See <see cref="ReconnectPolicy"/>.
+    /// </summary>
+    public ReconnectPolicy? Reconnect { get; set; }
+
+    /// <summary>
+    /// Supplies the token for every dial — the first connect and every reconnect — taking precedence
+    /// over <see cref="Token"/> and <see cref="TokenStore"/>. For expiring credentials: return a fresh
+    /// token each time, and a dial after expiry presents it rather than the one that expired. The
+    /// phase 04 rule holds: a token for a different identity fails a reconnect rather than switching
+    /// the client to another player mid-session.
+    /// </summary>
+    public Func<CancellationToken, ValueTask<string>>? TokenProvider { get; set; }
 }
+
+/// <summary>
+/// How <see cref="MelangeClient"/> reconnects on its own (road-to-0.4 phase 28): exponential backoff
+/// with jitter, capped, optionally bounded. Every attempt runs the ordinary
+/// <see cref="MelangeClient.ReconnectAsync"/> path — resume from the last acknowledged LSN, or a full
+/// re-establishment when the server cannot serve the gap — so a reconnect reconciles the caches
+/// exactly as a hand-written one would.
+/// </summary>
+public sealed class ReconnectPolicy
+{
+    /// <summary>The wait before the first attempt. Short, because most drops are blips.</summary>
+    public TimeSpan InitialDelay { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>The ceiling on the wait between attempts.</summary>
+    public TimeSpan MaxDelay { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>How much each wait grows over the last, before jitter.</summary>
+    public double Multiplier { get; set; } = 2.0;
+
+    /// <summary>
+    /// The fraction of each wait taken off at random, 0 to 1, so a server restart is not met by
+    /// every client at the same instant.
+    /// </summary>
+    public double Jitter { get; set; } = 0.2;
+
+    /// <summary>
+    /// How many attempts before giving up and raising <see cref="MelangeClient.OnReconnectFailed"/>;
+    /// null, the default, keeps trying for as long as the client lives.
+    /// </summary>
+    public int? MaxAttempts { get; set; }
+
+    /// <summary>How long one attempt — dial, handshake, resume — may take before it counts as failed.</summary>
+    public TimeSpan AttemptTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>The wait before attempt <paramref name="attempt"/> (1-based), jitter applied.</summary>
+    public TimeSpan DelayFor(int attempt, Random random)
+    {
+        ArgumentNullException.ThrowIfNull(random);
+        var exponent = Math.Clamp(attempt - 1, 0, 64);
+        var raw = InitialDelay.TotalMilliseconds * Math.Pow(Math.Max(Multiplier, 1.0), exponent);
+        var capped = Math.Min(raw, MaxDelay.TotalMilliseconds);
+        var jittered = capped * (1 - (Math.Clamp(Jitter, 0, 1) * random.NextDouble()));
+        return TimeSpan.FromMilliseconds(Math.Max(jittered, 0));
+    }
+}
+
+/// <summary>One automatic reconnect attempt about to start, after <see cref="Delay"/>.</summary>
+/// <param name="Attempt">1 for the first attempt after a drop.</param>
+/// <param name="Delay">The backoff wait before this attempt.</param>
+/// <param name="LastError">Why the previous attempt failed; null before the first.</param>
+public sealed record ReconnectAttempt(int Attempt, TimeSpan Delay, Exception? LastError);
 
 /// <summary>How a <see cref="MelangeClient"/> dispatches data frames and connection events.</summary>
 public enum DispatchMode

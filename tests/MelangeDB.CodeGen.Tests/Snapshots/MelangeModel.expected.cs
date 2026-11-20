@@ -24,12 +24,12 @@ namespace MelangeDB.Generated
                     typeof(global::Snapshot.CreatureReducers),
                     static (ref global::MelangeDB.Core.ReducerArgsReader reader) =>
                     {
-                        reader.ExpectCount(0);
+                        reader.ExpectCount(0, 0, "");
                         reader.End();
                     },
                     static (object instance, global::MelangeDB.ReducerContext context, ref global::MelangeDB.Core.ReducerArgsReader reader) =>
                     {
-                        reader.ExpectCount(0);
+                        reader.ExpectCount(0, 0, "");
                         ((global::Snapshot.CreatureReducers)instance).Cull(context);
                         reader.End();
                     },
@@ -42,7 +42,7 @@ namespace MelangeDB.Generated
                     typeof(global::Snapshot.CreatureReducers),
                     static (ref global::MelangeDB.Core.ReducerArgsReader reader) =>
                     {
-                        reader.ExpectCount(3);
+                        reader.ExpectCount(3, 3, "chunkId, name, stats");
                         _ = reader.ReadUInt16();
                         _ = reader.ReadString();
                         var count2 = reader.BeginArray();
@@ -52,7 +52,7 @@ namespace MelangeDB.Generated
                     },
                     static (object instance, global::MelangeDB.ReducerContext context, ref global::MelangeDB.Core.ReducerArgsReader reader) =>
                     {
-                        reader.ExpectCount(3);
+                        reader.ExpectCount(3, 3, "chunkId, name, stats");
                         var arg0 = reader.ReadUInt16();
                         var arg1 = reader.ReadString();
                         int[] arg2 = null;

@@ -196,6 +196,13 @@ Two places, both of which need explicit protocol support:
 
 - **Client → server.** The `CallReducer` frame carries a `traceparent`, so a click in a Godot client links to
   the server-side reducer span. Without this, client and server traces are two disconnected stories.
+- **Client lifecycle.** The client library emits no telemetry of its own: what it observes, it reports to
+  the application. Automatic reconnect (road-to-0.4 phase 28) is reported through `OnReconnecting` (once
+  per attempt, with the attempt number, its backoff, and why the last one failed), `OnReconnected`
+  (whether the gap was resumed or re-established), and `OnReconnectFailed` (why it stopped). The
+  server's side of the same story is already counted: every attempt is a connection, so
+  `melange.connections.active` and the transport's disconnect logs show a reconnect storm from where it
+  lands.
 - **Node → node.** Handoff and cross-shard sagas propagate context, so a player transfer is one trace across
   both nodes rather than two unrelated spans. A handoff bug is close to undebuggable otherwise.
 - **Server → client, on failure.** Every HTTP error response carries the ids that find it again, so a user

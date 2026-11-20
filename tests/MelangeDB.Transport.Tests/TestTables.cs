@@ -359,6 +359,20 @@ public sealed class TransportReducers(ClaimsProbe claims)
             ctx.Db.PlayerState.Insert(player);
     }
 
+    /// <summary>
+    /// <see cref="Spawn"/> with the room added later, defaulted: a caller whose bindings predate
+    /// <c>roomId</c> leaves it off and lands in room 42 (road-to-0.4 phase 28).
+    /// </summary>
+    [Reducer]
+    public void SpawnInRoom(ReducerContext ctx, string name, int roomId = 42)
+    {
+        var player = new PlayerState { Id = ctx.Caller, RoomId = roomId, Name = name, X = 0 };
+        if (ctx.Db.PlayerState.Id.Find(ctx.Caller) is not null)
+            ctx.Db.PlayerState.Update(player);
+        else
+            ctx.Db.PlayerState.Insert(player);
+    }
+
     [Reducer]
     public void Move(ReducerContext ctx, float x)
     {

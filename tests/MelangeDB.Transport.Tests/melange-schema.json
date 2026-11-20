@@ -1,7 +1,7 @@
 {
   "format": 2,
   "generator": "0.3.2.0",
-  "schemaHash": "e0a1b6f4cf4eda8d4d2d2dd9ac2e73600140aa7e73451857bd69ce87a36372a6",
+  "schemaHash": "7b13f9862ca01eccca496ceda85f8a59c0e058a353ceccb52cd84af20b3497f8",
   "module": "MelangeDB.Transport.Tests",
   "enums": [
     {
@@ -669,6 +669,21 @@
         {
           "name": "nextThinkAt",
           "kind": "UInt64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "SpawnInRoom",
+      "params": [
+        {
+          "name": "name",
+          "kind": "String",
+          "isArray": false
+        },
+        {
+          "name": "roomId",
+          "kind": "Int32",
           "isArray": false
         }
       ]
