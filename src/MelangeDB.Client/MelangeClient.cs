@@ -58,6 +58,13 @@ public sealed class MelangeClient : IAsyncDisposable
     private int _reconnecting;
     private Task? _reconnectLoop;
 
+    // The socket a successful connect or reconnect handed back. Only its death is an outage:
+    // a socket a failing attempt opened was never the connection, and its teardown — which runs
+    // on its own thread and may land after the loop has already given up — must neither announce
+    // a disconnect nor start a reconnect. Without this, a refused attempt whose teardown lost the
+    // race to the give-up restarted the loop it had just ended.
+    private ClientWebSocket? _established;
+
     public MelangeClient(MelangeClientOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -157,6 +164,7 @@ public sealed class MelangeClient : IAsyncDisposable
         if (IsConnected)
             throw new InvalidOperationException("Already connected.");
         await DialAsync(cancellationToken).ConfigureAwait(false);
+        _established = _socket;
     }
 
     /// <summary>
@@ -339,6 +347,7 @@ public sealed class MelangeClient : IAsyncDisposable
             if (result.Accepted)
             {
                 await ReestablishAsync(_subscriptions.Values.Where(s => !s.IsLive), cancellationToken).ConfigureAwait(false);
+                _established = _socket;
                 return true;
             }
         }
@@ -352,6 +361,7 @@ public sealed class MelangeClient : IAsyncDisposable
         foreach (var subscription in _subscriptions.Values)
             subscription.ResetForResync();
         await ReestablishAsync(_subscriptions.Values, cancellationToken).ConfigureAwait(false);
+        _established = _socket;
         return false;
     }
 
@@ -637,10 +647,13 @@ public sealed class MelangeClient : IAsyncDisposable
                 // frame that arrived before it. Failing the pendings above stays immediate —
                 // those complete awaited Tasks and must never wait for a tick.
                 //
-                // A socket an automatic reconnect attempt opened and lost is not a new outage —
-                // the one in progress already was announced, and OnReconnecting reports each
-                // attempt — so it tears down silently.
-                if (!IsReconnecting)
+                // With automatic reconnect, only the established connection's death is an outage.
+                // A socket an attempt opened and lost was never the connection — the outage in
+                // progress was already announced, and OnReconnecting reports each attempt — so it
+                // tears down silently and starts nothing, whenever its teardown happens to run.
+                // Without a policy every current socket's death is announced, as it always was.
+                var established = ReferenceEquals(_established, socket);
+                if (!IsReconnecting && (established || _options.Reconnect is null))
                 {
                     if (_options.Dispatch == DispatchMode.Manual)
                         EnqueueEvent(new DispatchEntry(era, EntryKind.Disconnected, null));
@@ -648,7 +661,8 @@ public sealed class MelangeClient : IAsyncDisposable
                         OnDisconnected?.Invoke();
                 }
 
-                StartAutoReconnect();
+                if (established)
+                    StartAutoReconnect();
             }
         }
     }
@@ -697,9 +711,14 @@ public sealed class MelangeClient : IAsyncDisposable
                     RaiseLifecycle(() => OnReconnected?.Invoke(resumed));
 
                     // The new socket may have died between the attempt succeeding and the flag
-                    // clearing; its teardown saw a reconnect in progress and started nothing.
+                    // clearing; its teardown saw a reconnect in progress and announced and started
+                    // nothing. It was an outage of the established connection, so do both here.
                     if (!IsConnected)
+                    {
+                        RaiseLifecycle(() => OnDisconnected?.Invoke());
                         StartAutoReconnect();
+                    }
+
                     return;
                 }
                 catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
