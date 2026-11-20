@@ -3,9 +3,10 @@
 Where MelangeDB is, how it got here, and what's left.
 
 0.1 was sequenced as twelve phases and all twelve have shipped; 0.2 added seven more, also shipped;
-0.3 plans five. Each phase's full plan — deliverables, what was explicitly out of scope, and the
-reasoning behind every decision it settled — lives in [road-to-0.1/](road-to-0.1/),
-[road-to-0.2/](road-to-0.2/), and [road-to-0.3/](road-to-0.3/). Those are the authoritative record
+0.3.0 shipped two of 0.3's phases, and 0.4 carries three of the rest forward and adds four. Each
+phase's full plan — deliverables, what was explicitly out of scope, and the reasoning behind every
+decision it settled — lives in [road-to-0.1/](road-to-0.1/), [road-to-0.2/](road-to-0.2/),
+[road-to-0.3/](road-to-0.3/), and [road-to-0.4/](road-to-0.4/). Those are the authoritative record
 of *why* things are the way they are; this page is the summary.
 
 ## Standing conventions
@@ -95,7 +96,7 @@ deferred — mutually independent, in any order.
 | [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Shipped |
 | [19](road-to-0.2/plan-phase-19.md) | Backup, second pass: `restore --check` (the boot-proof), `melange clone` (explicitly a different world), `restore --at-lsn` | **Shipped** |
 
-## M5 — 0.3: the day-to-day surface · planned
+## M5 — 0.3: the day-to-day surface · 0.3.0 shipped; 20–23 still planned
 
 Post-0.2 work, planned in [road-to-0.3/](road-to-0.3/). 0.1 built the engine and 0.2 was capacity
 and operations; both made the database do more. 0.3 is the surface a team building on this every day
@@ -105,18 +106,36 @@ the measurement debt below, and three separate decisions are waiting on it.
 
 | Phase | Title | Status |
 | --- | --- | --- |
-| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half: the reassignment window and the per-tick cost of scheduled reducers. The head-to-head comparison is split out and undecided | Planned |
+| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half: the reassignment window and the per-tick cost of scheduled reducers. The head-to-head comparison is split out and undecided | Planned; carried into [0.4](road-to-0.4/README.md) |
 | [21](road-to-0.3/plan-phase-21.md) | `melange inspect`: time-travel over the commit log — jump to an LSN, see the world, the reducer that produced it, and its write set | Planned |
-| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Planned |
-| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Planned |
+| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Planned; carried into [0.4](road-to-0.4/README.md) |
+| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Planned; carried into [0.4](road-to-0.4/README.md) |
 | 24 | Scheduler lane: simulation work yields to client-initiated work when they contend | [Design record](design/scheduler-lanes.md) written; conditional on a phase 20 measurement, and may close as a refusal |
-| [25](road-to-0.3/plan-phase-25.md) | The archive tier: tables that live in Postgres only — reducers append, everything else reads — so unbounded history leaves the hot store, snapshots, and backups. **Breaking:** `StorageTier.Relational` is renamed to say what it is — hot with a relational backplane | Planned |
-| [26](road-to-0.3/plan-phase-26.md) | Producers: typed, read-only calls a client makes for data — `List<WalletLine> History(int page)` — which is how archived history reaches a client. Protocol version 3 | Built |
+| [25](road-to-0.3/plan-phase-25.md) | The archive tier: tables that live in Postgres only — reducers append, everything else reads — so unbounded history leaves the hot store, snapshots, and backups. **Breaking:** `StorageTier.Relational` is renamed to say what it is — hot with a relational backplane | **Shipped** in 0.3.0 |
+| [26](road-to-0.3/plan-phase-26.md) | Producers: typed, read-only calls a client makes for data — `List<WalletLine> History(int page)` — which is how archived history reaches a client. Protocol version 3 | **Shipped** in 0.3.0 |
 
 Phases 21–23 are mutually independent and land in any order. Phase 24 is gated on 20 for its sizing
 and gets a design record before a plan, the way
 [design/elastic-rebalancing.md](design/elastic-rebalancing.md) preceded 13–14 — it is the only one
 of the set that changes engine semantics.
+
+## M6 — 0.4: closing the gaps SpacetimeDB opened · planned
+
+Planned in [road-to-0.4/](road-to-0.4/README.md), after a review on 2026-11-20 of every SpacetimeDB
+release from 2.7.0, the version this project was started against, to 2.16.1. On the three
+complaints MelangeDB exists to fix it is still ahead. But SpacetimeDB shipped six things in that
+time a team would expect and not find here, and planning found a seventh. 0.4 answers each in this
+project's own terms, and not by copying.
+
+| Phase | Title | Status |
+| --- | --- | --- |
+| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, carried from 0.3 — here because phase 30's trigger is one of its numbers | Planned |
+| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`, carried from 0.3 — SpacetimeDB has had module unit testing since 2.12 | Planned |
+| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client and client conformance, carried from 0.3 | Planned |
+| [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — **today it is not, which is a bug**; the refusal half should ship as a 0.3.x fix | Planned |
+| [28](road-to-0.4/plan-phase-28.md) | Clients that outlive a deploy: old bindings survive added columns at any position, and reconnect is automatic with backoff and token refresh. Lands before 23 | Planned |
+| [29](road-to-0.4/plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, SQL, and published signals; reducer calls by name only. A protocol, not the refused admin console | Planned |
+| 30 | Shard HA as a warm replica — [idea-bin](idea-bin/shard-ha-warm-replica.md) | Conditional on phase 20's reassignment window; design record before a plan, and may close as a refusal |
 
 ## What's left
 

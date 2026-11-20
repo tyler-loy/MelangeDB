@@ -26,13 +26,13 @@ arguable.
 
 | | Phase | Status |
 | --- | --- | --- |
-| [20](plan-phase-20.md) | The measurement pass, decision-gating half — the scheduled-reducer cost, the fan-out share, the reassignment window | Planned |
+| [20](plan-phase-20.md) | The measurement pass, decision-gating half — the scheduled-reducer cost, the fan-out share, the reassignment window | Planned; carried into [0.4](../road-to-0.4/README.md) |
 | [21](plan-phase-21.md) | `melange inspect` — time-travel over the commit log | Planned |
-| [22](plan-phase-22.md) | `MelangeDB.Testing` — the reducer test kit | Planned |
-| [23](plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate` | Planned |
+| [22](plan-phase-22.md) | `MelangeDB.Testing` — the reducer test kit | Planned; carried into [0.4](../road-to-0.4/README.md) |
+| [23](plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate` | Planned; carried into [0.4](../road-to-0.4/README.md) |
 | 24 | Scheduler lane — player reducers ahead of simulation work | [Design record](../design/scheduler-lanes.md) written; may not become a phase |
-| [25](plan-phase-25.md) | The archive tier — relational-only tables for unbounded history; **breaking:** `Relational` renamed to hot with a relational backplane | Planned |
-| [26](plan-phase-26.md) | Producers — typed, read-only calls a client makes for data; how archive history reaches clients ([design record](../design/producers.md)) | Built |
+| [25](plan-phase-25.md) | The archive tier — relational-only tables for unbounded history; **breaking:** `Relational` renamed to hot with a relational backplane | **Shipped** in 0.3.0 |
+| [26](plan-phase-26.md) | Producers — typed, read-only calls a client makes for data; how archive history reaches clients ([design record](../design/producers.md)) | **Shipped** in 0.3.0 |
 
 **Phase 20 comes first and gates two things**, and it is now the decision-gating half only — the head-to-head comparison against SpacetimeDB is split out and undecided, because its frozen baseline has diverged from the live workload in capability rather than merely in size. It is not a feature; it is the measurement half
 [phase 11](../road-to-0.1/plan-phase-11.md) called its deliverable and did not record. Everything
