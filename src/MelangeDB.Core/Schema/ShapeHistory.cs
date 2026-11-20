@@ -239,13 +239,14 @@ public sealed class ShapeHistory
         return new ShapeHistory(ordered);
     }
 
-    /// <summary>Writes the sidecar atomically — temp file, then rename over.</summary>
+    /// <summary>
+    /// Writes the sidecar atomically and durably — see <see cref="DurableFile"/>. A sidecar that
+    /// power loss left zero-length would refuse the next boot.
+    /// </summary>
     public void Save(string path)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(new Persisted { Entries = _entries }, JsonOptions);
-        var temp = path + ".tmp";
-        File.WriteAllBytes(temp, bytes);
-        File.Move(temp, path, overwrite: true);
+        DurableFile.WriteAllBytes(path, bytes);
     }
 
     /// <summary>Serializes the history for a caller that stores it elsewhere (the backup archive).</summary>

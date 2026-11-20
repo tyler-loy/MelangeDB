@@ -1059,9 +1059,11 @@ public sealed class FileCommitLog : ICommitLog
             // A fresh log file is a fresh incarnation: any epoch or truncation base left behind by
             // a deleted log must not survive it, or an old resume cursor would count against the
             // wrong history.
-            EpochId = MintEpoch();
+            // The base sidecar goes first so the epoch write's directory fsync also makes the
+            // deletion — and the new log file's own directory entry — durable.
             if (File.Exists(BaseFilePath))
                 File.Delete(BaseFilePath);
+            EpochId = MintEpoch();
             _baseLsn = 0;
             return;
         }
@@ -1257,7 +1259,9 @@ public sealed class FileCommitLog : ICommitLog
                     WriteBaseLsn(upToLsn);
                     _flushHandle.Dispose();
                     _stream.Dispose();
-                    File.Move(tempPath, FilePath, overwrite: true);
+                    // Durable, not merely atomic: appends acknowledged after this point land in the
+                    // new file, and a rename that power loss reverts would orphan them.
+                    DurableFile.Replace(tempPath, FilePath);
                     _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
                     _stream.Seek(0, SeekOrigin.End);
                     _flushHandle = OpenFlushHandle();
@@ -1302,15 +1306,13 @@ public sealed class FileCommitLog : ICommitLog
     {
         var bytes = new byte[8];
         BinaryPrimitives.WriteUInt64LittleEndian(bytes, baseLsn);
-        var tempPath = BaseFilePath + ".tmp";
-        File.WriteAllBytes(tempPath, bytes);
-        File.Move(tempPath, BaseFilePath, overwrite: true);
+        DurableFile.WriteAllBytes(BaseFilePath, bytes);
     }
 
     private Guid MintEpoch()
     {
         var epoch = Guid.NewGuid();
-        File.WriteAllBytes(EpochFilePath, epoch.ToByteArray());
+        DurableFile.WriteAllBytes(EpochFilePath, epoch.ToByteArray());
         return epoch;
     }
 
