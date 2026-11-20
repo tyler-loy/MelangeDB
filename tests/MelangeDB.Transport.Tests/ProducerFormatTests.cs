@@ -86,4 +86,70 @@ public class ProducerFormatTests
         var failure = Assert.Throws<ProducerResultFormatException>(() => new ProducerResultReader(writer.Written.Span).ReadInt64());
         Assert.Contains("regenerate", failure.Message, StringComparison.Ordinal);
     }
+
+    // -- Records a newer server extended (road-to-0.4 phase 28) ----------------------------------
+
+    [Fact]
+    public void SkipValue_reads_past_one_value_of_every_shape()
+    {
+        var writer = new ProducerResultWriter();
+        writer.WriteNull();
+        writer.WriteBool(true);
+        writer.WriteInt64(-5);
+        writer.WriteUInt64(5);
+        writer.WriteFloat64(1.5);
+        writer.WriteString("héllo");
+        writer.WriteBytes([1, 2, 3]);
+        writer.WriteIdentity(Identity.Hash("x"));
+        writer.WriteTimestamp(new Timestamp(9));
+        writer.WriteArrayHeader(2);
+        writer.WriteArrayHeader(1);
+        writer.WriteString(null);
+        writer.WriteInt64(1);
+        writer.WriteString("after");
+
+        var reader = new ProducerResultReader(writer.Written.Span);
+        for (var i = 0; i < 10; i++)
+            reader.SkipValue();
+        Assert.Equal("after", reader.ReadString());
+        reader.End();
+    }
+
+    [Fact]
+    public void Generated_bindings_read_past_fields_appended_to_a_record()
+    {
+        // ChunkView is (Id, X, AskedBy) to these bindings; this server has appended two fields.
+        var asker = Identity.Hash("asker");
+        var writer = new ProducerResultWriter();
+        writer.WriteArrayHeader(5);
+        writer.WriteInt64(7);
+        writer.WriteInt64(-3);
+        writer.WriteIdentity(asker);
+        writer.WriteString("appended later");
+        writer.WriteArrayHeader(2);
+        writer.WriteBool(true);
+        writer.WriteNull();
+
+        var reader = new ProducerResultReader(writer.Written.Span);
+        var view = MelangeDB.Types.MelangeProducerDecoders.Read_ChunkView(ref reader);
+        reader.End();
+
+        Assert.Equal((7L, -3L, asker), (view.Id, view.X, view.AskedBy));
+    }
+
+    [Fact]
+    public void Generated_bindings_still_refuse_a_record_with_fewer_fields_than_they_read()
+    {
+        var writer = new ProducerResultWriter();
+        writer.WriteArrayHeader(2);
+        writer.WriteInt64(7);
+        writer.WriteInt64(-3);
+
+        var failure = Assert.Throws<ProducerResultFormatException>(() =>
+        {
+            var reader = new ProducerResultReader(writer.Written.Span);
+            MelangeDB.Types.MelangeProducerDecoders.Read_ChunkView(ref reader);
+        });
+        Assert.Contains("2 fields where the bindings expect 3", failure.Message, StringComparison.Ordinal);
+    }
 }

@@ -243,6 +243,7 @@ internal static partial class ModelExtractor
         }
         else
         {
+            var defaulted = false;
             for (var i = 1; i < method.Parameters.Length; i++)
             {
                 var parameter = method.Parameters[i];
@@ -280,6 +281,20 @@ internal static partial class ModelExtractor
                         LocationInfo.From(parameter.Locations.FirstOrDefault() ?? Location.None),
                         new EquatableArray<string>([reducerName, parameter.Name, parameter.Type.ToDisplayString()])));
                     continue;
+                }
+
+                // A default lets a caller leave the parameter off — the producers' rule, and what lets
+                // an older client whose bindings predate the parameter keep calling (road-to-0.4
+                // phase 28). Only trailing parameters can be left off a positional call.
+                if (parameter.HasExplicitDefaultValue)
+                {
+                    var (literal, json) = DefaultValue(parameter);
+                    model = model with { DefaultLiteral = literal, DefaultJson = json };
+                    defaulted = true;
+                }
+                else if (defaulted)
+                {
+                    AddSignature(diagnostics, location, reducerName, $"has parameter '{parameter.Name}' with no default after one with a default");
                 }
 
                 if (model.IsEnum)

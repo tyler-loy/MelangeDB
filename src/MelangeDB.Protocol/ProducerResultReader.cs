@@ -132,6 +132,39 @@ public ref struct ProducerResultReader
         return ReadLength();
     }
 
+    /// <summary>
+    /// Reads past one value of any shape, nested arrays included. This is how bindings tolerate a
+    /// record that a newer server extended: fields are positional with no names, so only fields
+    /// <em>appended</em> to a record can be told apart from the ones the bindings know — those are
+    /// skipped; anything else still fails the read (road-to-0.4 phase 28).
+    /// </summary>
+    public void SkipValue()
+    {
+        switch (ReadTag())
+        {
+            case Tag.Null:
+                break;
+            case Tag.Bool:
+                Take(1);
+                break;
+            case Tag.Int64 or Tag.UInt64 or Tag.Float64 or Tag.Timestamp:
+                Take(8);
+                break;
+            case Tag.String or Tag.Bytes:
+                Take(ReadLength());
+                break;
+            case Tag.Identity:
+                Take(Identity.Size);
+                break;
+            case Tag.Array:
+                for (var remaining = ReadLength(); remaining > 0; remaining--)
+                    SkipValue();
+                break;
+            case var unknown:
+                throw new ProducerResultFormatException($"The producer result holds an unknown value tag {(byte)unknown}.");
+        }
+    }
+
     /// <summary>Throws unless the whole result was read — a shape mismatch rather than silently ignored bytes.</summary>
     public readonly void End()
     {

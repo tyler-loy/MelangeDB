@@ -10,6 +10,29 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **Clients built against an older schema survive additive server changes** (road-to-0.4 phase 28).
+  A typed subscription used to refuse any descriptor that was not identical to its bindings, so
+  every added column broke every client not yet rebuilt, which a shipped game client cannot avoid.
+  Bindings now map columns by name and skip the ones they predate: an added column at any position,
+  or a reorder. An update that only changes such a column fires no `OnUpdate`. A removed, renamed,
+  or re-kinded column still refuses, naming it. Producer result records tolerate *appended* fields.
+- **Reducer parameters may declare defaults**, as producer parameters already could. A trailing
+  defaulted parameter may be left off a call, so a client whose bindings predate it keeps calling.
+  A required parameter after a defaulted one is refused at compile time (MELANGE0009).
+
+### Changed
+
+- **A reducer call with the wrong number of arguments names the problem.** Instead of
+  `Expected 3 argument(s); the call carries 2.`, a short call is told which parameters it is
+  missing and that only a defaulted parameter can be left off, and a long one is told the
+  parameter list. Generated dispatch now calls `ReducerArgsReader.ExpectCount(required, declared,
+  names)`, so regenerating a module changes its generated source.
+- **`ClientRowShape.Verify` checks readability, not identity.** It used to throw on any difference,
+  including a reorder or an added column. It now throws only when the bindings could not read the
+  rows.
+
 ### Fixed
 
 - **A `[Unique]` declared over existing rows is checked against them**

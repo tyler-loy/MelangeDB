@@ -65,9 +65,14 @@ shape, so there is nothing to rebuild. The sidecar's entry is rewritten in place
 still logs the change, and the log stays empty, so the engine still counts as fresh and its init
 reducers still run on its first open.
 
-Client bindings are the other half of the story and already ship: the schema hash changes, and a
-stale client fails `ClientRowShape.Verify` at subscription time — structural refusal, not decode
-garbage. Regenerate bindings with the deploy.
+Client bindings are the other half of the story. Since road-to-0.4 phase 28, a client whose bindings
+predate an additive change keeps working: added and reordered columns are mapped by name, and a
+reducer parameter added *with a default* may be left off by older callers. A removed, renamed, or
+re-kinded column still refuses at subscription time, and a parameter added without a default
+refuses the call, naming it. The full table is in
+[CLIENT-BINDINGS.md](CLIENT-BINDINGS.md). **For a shipped game
+client, add reducer parameters with defaults**: the default is what lets builds already on players'
+machines keep calling.
 
 What counts as additive: added columns (any position), reordered columns, added tables, added or
 removed `[Index]` (indexes are projections; recovery rebuilds them from the declaration), adding or

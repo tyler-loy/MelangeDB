@@ -124,10 +124,14 @@ internal static class ClientProducerEmitter
         decoders.AppendLine(type.IsValueType
             ? $"                throw new global::MelangeDB.Protocol.ProducerResultFormatException(\"A null where the bindings expect a {type.Name}.\");"
             : "                return null;");
-        decoders.AppendLine($"            if (count != {type.Fields.Length})");
+        // Fewer fields than the bindings know is a shape they cannot read; more is a server that
+        // appended fields since these bindings were generated, which they read past.
+        decoders.AppendLine($"            if (count < {type.Fields.Length})");
         decoders.AppendLine($"                throw new global::MelangeDB.Protocol.ProducerResultFormatException($\"A {type.Name} with {{count}} fields where the bindings expect {type.Fields.Length}; regenerate them against the server's manifest.\");");
         for (var i = 0; i < type.Fields.Length; i++)
             decoders.AppendLine($"            var f{i} = {ReadExpression(type.Fields[i].Type, types, enums, lists)};");
+        decoders.AppendLine($"            for (var extra = {type.Fields.Length}; extra < count; extra++)");
+        decoders.AppendLine("                reader.SkipValue();");
         var assignments = string.Join(", ", type.Fields.Items.Select((field, i) => $"{ClientEmitter.ParameterName(field.Name)} = f{i}"));
         decoders.AppendLine($"            return new {type.Name} {{ {assignments} }};");
         decoders.AppendLine("        }");

@@ -175,7 +175,7 @@ internal sealed record ParameterModel(
     string? DefaultLiteral = null,
     string? DefaultJson = null)
 {
-    /// <summary>Whether the parameter declares a default value, which a caller may then leave off (producers only).</summary>
+    /// <summary>Whether the parameter declares a default value, which a caller may then leave off.</summary>
     public bool HasDefault => DefaultLiteral is not null;
 }
 
@@ -198,6 +198,23 @@ internal sealed record ReducerModel(
 
     /// <summary>Whether any parameter is a <c>[Table]</c> struct — the scheduled-reducer shape.</summary>
     public bool HasTimerRowParameter => Parameters.Items.Any(static p => p.IsTimerRow);
+
+    /// <summary>How many leading parameters a caller must supply: those before the first default.</summary>
+    public int RequiredParameters
+    {
+        get
+        {
+            var required = 0;
+            foreach (var parameter in Parameters.Items)
+            {
+                if (parameter.HasDefault)
+                    break;
+                required++;
+            }
+
+            return required;
+        }
+    }
 
     /// <summary>
     /// Resolves the reducer's execution site against the compilation's tables. Lifecycle reducers

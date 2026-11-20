@@ -59,14 +59,109 @@ public class ClientRowShapeTests
     }
 
     [Fact]
-    public void Reordered_columns_are_caught_although_the_set_is_identical()
+    public void A_column_that_went_missing_is_caught_by_name()
     {
-        // Position is contract under v2 — the same names in a different order is a different
-        // format. A set comparison would call this equal, which is exactly why it is not one.
-        var reordered = new WireDescriptor("Chunk", [Expected[1], Expected[0], Expected[2]]);
+        // A removal — and a rename, which is a removal plus an addition — leaves the bindings
+        // reading a column the server no longer sends.
+        var removed = new WireDescriptor("Chunk", [Expected[0], Expected[2]]);
 
-        Assert.Throws<MelangeSchemaMismatchException>(
-            () => ClientRowShape.Verify("Chunk", Expected, reordered));
+        var failure = Assert.Throws<MelangeSchemaMismatchException>(
+            () => ClientRowShape.Verify("Chunk", Expected, removed));
+
+        Assert.Contains("'X'", failure.Message);
+    }
+
+    // -- Additive drift: tolerated, mapped by name (road-to-0.4 phase 28) -------------------------
+    // Position used to be contract: any difference from the bindings' column list refused the
+    // subscription, so every additive server deploy broke every client not yet rebuilt. The
+    // descriptor names every column, so a client can find its own columns wherever they are.
+
+    [Fact]
+    public void An_exact_match_needs_no_projection()
+    {
+        Assert.Null(ClientRowShape.Plan("Chunk", Expected, new WireDescriptor("Chunk", Expected)));
+    }
+
+    [Fact]
+    public void Reordered_columns_are_mapped_by_name()
+    {
+        var reordered = new WireDescriptor("Chunk", [Expected[2], Expected[0], Expected[1]]);
+        var row = Row(writer =>
+        {
+            writer.WriteBytes([9, 8]);
+            writer.WriteInt64(7);
+            writer.WriteInt64(-3);
+        });
+
+        var projected = ClientRowShape.Plan("Chunk", Expected, reordered)!.Project(row);
+
+        var (id, x, data) = Read(projected);
+        Assert.Equal((7L, -3L), (id, x));
+        Assert.Equal([9, 8], data);
+    }
+
+    [Fact]
+    public void Added_columns_anywhere_are_skipped()
+    {
+        // A string and an Identity in the middle, a nullable string and a ScheduleAt at the end:
+        // variable-width, fixed-width, null, and the nine-byte kind, all walked past by kind.
+        var widened = new WireDescriptor("Chunk",
+        [
+            Expected[0],
+            new WireColumn("Label", ColumnKind.String),
+            new WireColumn("Owner", ColumnKind.Identity),
+            Expected[1],
+            Expected[2],
+            new WireColumn("Note", ColumnKind.String),
+            new WireColumn("Due", ColumnKind.ScheduleAt),
+        ]);
+        var row = Row(writer =>
+        {
+            writer.WriteInt64(7);
+            writer.WriteString("ignored");
+            writer.WriteIdentity(Identity.Hash("someone"));
+            writer.WriteInt64(-3);
+            writer.WriteBytes(null);
+            writer.WriteString(null);
+            writer.WriteScheduleAt(ScheduleAt.FromMicroseconds(interval: true, 5));
+        });
+
+        var projected = ClientRowShape.Plan("Chunk", Expected, widened)!.Project(row);
+
+        Assert.Equal((7L, -3L, (byte[]?)null), Read(projected));
+    }
+
+    private static byte[] Row(Action<RowWriterBox> write)
+    {
+        var box = new RowWriterBox();
+        write(box);
+        return box.ToArray();
+    }
+
+    private static (long Id, long X, byte[]? Data) Read(byte[] projected)
+    {
+        var reader = new RowReader(projected);
+        var result = (reader.ReadInt64(), reader.ReadInt64(), reader.ReadBytes());
+        Assert.Equal(projected.Length, reader.Position);
+        return result;
+    }
+
+    /// <summary>A class wrapper so a lambda can write to the mutable <see cref="RowWriter"/> struct.</summary>
+    private sealed class RowWriterBox
+    {
+        private RowWriter _writer = new(64);
+
+        public void WriteInt64(long value) => _writer.WriteInt64(value);
+
+        public void WriteString(string? value) => _writer.WriteString(value);
+
+        public void WriteBytes(byte[]? value) => _writer.WriteBytes(value);
+
+        public void WriteIdentity(Identity value) => _writer.WriteIdentity(value);
+
+        public void WriteScheduleAt(ScheduleAt value) => _writer.WriteScheduleAt(value);
+
+        public byte[] ToArray() => _writer.ToArray();
     }
 
     [Fact]
