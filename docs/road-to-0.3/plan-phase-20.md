@@ -51,7 +51,7 @@ list.
 | Number | Status |
 | --- | --- |
 | 10 km memory vs SpacetimeDB | **Decaying** — the baseline has drifted; see below |
-| 20 km memory | **Fine** — one-sided capability claim, needs no SpacetimeDB |
+| 20 km memory | **Fine** — one-sided capability claim, needs no SpacetimeDB; no longer a claim about what SpacetimeDB cannot do (see below) |
 | Reducer p50/p99 | **Two of four reducers are not exercised** |
 | Terrain streaming | **Partial** — crossings counted, throughput needs the OTel metrics |
 | Concurrent players per node | **Harness-bound, not server-bound** |
@@ -117,8 +117,13 @@ that does not exist yet; what is not struck needs neither, which is the whole ba
   current MelangeDB; this one number does not, and says so where it is published. The alternative,
   live-against-frozen, biases *against* MelangeDB by thirteen tables, which is the safe direction for
   a self-run benchmark and also the direction that makes the number mean nothing.
-- **Memory for the 20 km world SpacetimeDB cannot host** — the full 20 km world (98,596 chunks) on
-  one node within a fixed budget. This is complaint 2, the RAM ceiling, either demonstrated or not.
+- **Memory for the 20 km world** — the full 20 km world (98,596 chunks) on one node within a fixed
+  budget. This is complaint 2, the RAM ceiling, either demonstrated or not. It used to be billed as
+  the world SpacetimeDB cannot host, which held at the port: SpacetimeDB 2.7 kept every table in
+  memory. SpacetimeDB 2.16.1 (2026-11-20) added opt-in per-table tiered storage — rows can leave
+  memory, indexes cannot yet — so whether a current SpacetimeDB hosts this world is an open
+  empirical question this phase does not answer. Publish the number as what MelangeDB does, not as
+  what SpacetimeDB cannot.
   **Kept in this half**, unlike its sibling above: it is a capability claim about MelangeDB alone,
   it needs no baseline, and so none of the drift that deferred the head-to-head touches it. Report
   it against [LOAD-TESTING.md](../LOAD-TESTING.md)'s methodology — settled managed heap, GC mode and
@@ -228,8 +233,9 @@ has to be handled explicitly rather than hoped past.
 **Leaning:** pin and publish the SpacetimeDB version and configuration; run both at documented
 defaults and tune neither; publish the world, the client count, and the machine; and state the
 conflict of interest in the document rather than in a footnote. Where a number cannot be made fair
-— the 20 km world SpacetimeDB cannot host is a capability claim, not a benchmark — say which kind of
-claim it is.
+— the 20 km world is a capability claim about MelangeDB, not a benchmark — say which kind of claim
+it is, and do not extend it to SpacetimeDB without running SpacetimeDB: since 2.16.1 its tables can
+opt into tiered storage, so "cannot host" is no longer a safe default.
 
 **The audit sharpens this considerably.** The baseline is not merely partial, it is *decaying*: 82
 table files against 97, three weeks apart, widening every week the game ships. Pinning both sides at the

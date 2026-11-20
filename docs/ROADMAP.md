@@ -123,8 +123,10 @@ of the set that changes engine semantics.
 **The measurements phase 11 promised.** The port itself has landed — the reference workload runs on
 MelangeDB and is developed on it — but the controlled comparison the plan called its deliverable has
 not been recorded in this repo: memory for the 10km world against SpacetimeDB's and for the 20km
-world it cannot host, reducer latency p50/p99 for gather/move/attack/craft, terrain-streaming
-throughput across chunk boundaries, and concurrent players per node. Until those land here, **treat
+world the port's SpacetimeDB version could not host (2.16.1 has since added opt-in tiered storage,
+so that is a historical claim, not a current one), reducer latency p50/p99 for
+gather/move/attack/craft, terrain-streaming throughput across chunk boundaries, and concurrent
+players per node. Until those land here, **treat
 every benchmark in these docs as a dev-machine measurement rather than a production
 characteristic** — that distinction is the whole reason the phase asked for numbers, and phase 11's
 own risk register is explicit that a port reporting only wins is not evidence.
