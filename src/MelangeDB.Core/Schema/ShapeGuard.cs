@@ -22,10 +22,26 @@ public sealed class ShapeDiff
     /// </summary>
     public required IReadOnlyList<string> AdditiveChanges { get; init; }
 
+    /// <summary>
+    /// The <c>[Unique]</c> columns whose existing rows the boot must check before it may enforce
+    /// them: columns this boot newly declares unique, and — in a sidecar that predates uniqueness
+    /// recording — every unique column, once. Not itself a verdict: the shapes cannot say whether
+    /// the rows hold duplicates, so the engine checks after recovery and refuses there. See
+    /// <c>UniqueConstraintCheck</c>.
+    /// </summary>
+    public IReadOnlyList<ShapeUniqueColumn> UniqueToCheck { get; init; } = [];
+
     public bool IsDestructive => DestructiveReasons.Count > 0;
 
     public bool IsAdditive => !IsIdentical && !IsDestructive;
 }
+
+/// <summary>
+/// A <c>[Unique]</c> column whose existing rows must be checked at boot. <see cref="ColumnIsNew"/>
+/// is true when the column itself is added by the same boot: every existing row then holds its
+/// default, which is a duplicate the moment two rows exist — worth saying in the refusal.
+/// </summary>
+public sealed record ShapeUniqueColumn(string Table, string Column, bool ColumnIsNew);
 
 /// <summary>
 /// Compares persisted table shapes against the booting code's schema, classifying the difference
@@ -41,6 +57,7 @@ public static class ShapeCompatibility
         ArgumentNullException.ThrowIfNull(schema);
         List<string> destructive = [];
         List<string> additive = [];
+        List<ShapeUniqueColumn> toCheck = [];
 
         foreach (var (name, shape) in persisted.Tables.OrderBy(static p => p.Key, StringComparer.Ordinal))
         {
@@ -94,6 +111,7 @@ public static class ShapeCompatibility
             }
 
             CompareTier(name, shape.Tier, current.Tier!, destructive, additive);
+            CompareUnique(name, shape, current, additive, toCheck);
         }
 
         foreach (var table in schema.Tables)
@@ -109,6 +127,7 @@ public static class ShapeCompatibility
                 continue;
             }
 
+            // A new table has no rows, so its unique columns have nothing to check.
             additive.Add($"new table '{table.Name}'");
         }
 
@@ -117,6 +136,7 @@ public static class ShapeCompatibility
             IsIdentical = destructive.Count == 0 && additive.Count == 0,
             DestructiveReasons = destructive,
             AdditiveChanges = additive,
+            UniqueToCheck = toCheck,
         };
     }
 
@@ -165,6 +185,42 @@ public static class ShapeCompatibility
             "decides where this table's rows live, and moving them across the hot store's boundary would lose them");
     }
 
+    /// <summary>
+    /// A uniqueness change is classified as additive — a recorded reign, like a tier change between
+    /// hot tiers — because no stored byte changes; but a column that <em>becomes</em> unique is also
+    /// a claim about rows that already exist, so it is queued for the engine to check after
+    /// recovery, where a duplicate refuses the boot. Dropping <c>[Unique]</c> only relaxes a claim
+    /// and needs no check. A recorded set of null predates uniqueness recording: nothing is reported
+    /// as changed, and every unique column is queued, because earlier builds never checked a
+    /// <c>[Unique]</c> added over existing rows (issue #192) and this is the one boot that can.
+    /// </summary>
+    private static void CompareUnique(
+        string name, TableShape recorded, TableShape current, List<string> additive, List<ShapeUniqueColumn> toCheck)
+    {
+        var now = current.Unique ?? [];
+        bool IsNew(string column) => recorded.Columns.All(c => c.Name != column);
+
+        if (recorded.Unique is null)
+        {
+            foreach (var column in now)
+                toCheck.Add(new ShapeUniqueColumn(name, column, IsNew(column)));
+            return;
+        }
+
+        foreach (var column in now.Except(recorded.Unique, StringComparer.Ordinal))
+        {
+            additive.Add($"table '{name}': column '{column}' is now [Unique] (its existing rows are checked at boot)");
+            toCheck.Add(new ShapeUniqueColumn(name, column, IsNew(column)));
+        }
+
+        foreach (var column in recorded.Unique.Except(now, StringComparer.Ordinal))
+        {
+            additive.Add(current.Columns.Any(c => c.Name == column)
+                ? $"table '{name}': column '{column}' is no longer [Unique]"
+                : $"table '{name}': [Unique] column '{column}' was removed");
+        }
+    }
+
     private static bool IsHotResident(string tier) =>
         tier is ShapeTiers.Hot or ShapeTiers.HotWithRelationalBackplane;
 }
@@ -206,6 +262,12 @@ internal sealed class ShapeResolution
 
     /// <summary>The additive changes driving <see cref="MigrationPending"/>, for the migration log line.</summary>
     public IReadOnlyList<string> Changes { get; init; } = [];
+
+    /// <summary>
+    /// The unique columns the engine must check against the recovered rows before this boot may
+    /// complete; a duplicate refuses it. See <see cref="ShapeDiff.UniqueToCheck"/>.
+    /// </summary>
+    public IReadOnlyList<ShapeUniqueColumn> UniqueToCheck { get; init; } = [];
 
     /// <summary>Re-encodes one record's write-set rows to the current shape; pass-through when nothing differs.</summary>
     public CommitRecord TransformRecord(CommitRecord record)
@@ -372,7 +434,18 @@ internal static class ShapeGuard
 
             history = ShapeHistory.Adopt(schema, fromLsn: 1);
             history.Save(path);
-            return new ShapeResolution(history, schema, path);
+
+            // Adoption records the code's uniqueness as already holding. Over existing records that
+            // is the same unprovable assumption as the shapes themselves, but unlike them it can be
+            // proved: check every unique column once, as an old sidecar's are.
+            return new ShapeResolution(history, schema, path)
+            {
+                UniqueToCheck = headLsn == 0
+                    ? []
+                    : schema.Tables
+                        .SelectMany(t => TableShape.UniqueOf(t).Select(c => new ShapeUniqueColumn(t.Name, c, ColumnIsNew: false)))
+                        .ToArray(),
+            };
         }
 
         var compacted = history.Compact(baseLsn);
@@ -398,6 +471,7 @@ internal static class ShapeGuard
         {
             MigrationPending = diff.IsAdditive,
             Changes = diff.AdditiveChanges,
+            UniqueToCheck = diff.UniqueToCheck,
         };
     }
 }

@@ -12,6 +12,21 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A `[Unique]` declared over existing rows is checked against them**
+  ([#192](https://github.com/tyler-loy/MelangeDB/issues/192), road-to-0.4 phase 27). Adding
+  `[Unique]` was classified as an index change, and indexes are rebuilt projections, so a boot over
+  duplicate rows succeeded, the unique index held several rows for one value, and only later
+  writes were refused. The boot that adds `[Unique]` now scans the table once and refuses, naming
+  each duplicated value and the keys holding it. Nothing is recorded, and the previous declaration
+  still boots. The shape sidecar now records each table's unique columns. **On upgrade**, a
+  directory whose sidecar predates this checks every `[Unique]` column once, so duplicates an
+  earlier build let in refuse that boot rather than staying hidden. See
+  [MIGRATION.md](docs/MIGRATION.md#adding-or-removing-unique).
+- **Removing `[Unique]` from a table with a relational backplane drops its Postgres unique index.**
+  Index DDL was create-if-not-exists by name, so `ux_<table>_<column>` stayed behind and refused
+  the applier's first duplicate. It is now dropped on the tier's start, or printed in the refusal's
+  DDL when `Postgres:AutoMigrate` is off. A plain index superseded by a new unique one is dropped too.
+
 - **The engine's file swaps survive power loss, not only a crash.** The commit log's compaction
   swap, its base and epoch sidecars, the epoch lineage, the shape sidecar, snapshots, and backup
   archives were written temp-then-rename, which is atomic against a process crash; but on Linux

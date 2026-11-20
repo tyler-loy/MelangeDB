@@ -153,7 +153,12 @@ public sealed partial class MelangeEngine : IDisposable
             ReportCloneProvenance(options.CommitLog.Path);
             if (options.Residency.ReportOnStartup)
                 ReportResidency(store);
+
+            // Before the migration is recorded: a refusal here must leave the directory exactly as
+            // bootable under the previous declaration as it was before this boot.
+            VerifyUniqueConstraints(store);
             CompleteShapeMigration(store);
+            RecordUniqueness(options.CommitLog.Path);
         }
         catch
         {
@@ -261,6 +266,47 @@ public sealed partial class MelangeEngine : IDisposable
         var key = keySet.PrimaryKey;
         var row = RowSerializer.SerializeValues(keySet, new Dictionary<string, object?> { [key.Name] = SchemaKeyCodec.Decode(key, op.Key) });
         return new RowOp(op.Kind, keySet.Id, op.Key, row);
+    }
+
+    /// <summary>
+    /// Checks the recovered rows of every <c>[Unique]</c> column this boot must not take on trust —
+    /// a column newly declared unique, or every unique column of a sidecar that predates uniqueness
+    /// recording — and refuses the boot, naming the duplicates, when any value is held twice. Without
+    /// it a constraint added over rows that already break it is enforced on new writes only, and a
+    /// unique index promises one row per value while holding several (issue #192).
+    /// </summary>
+    private void VerifyUniqueConstraints(IHotStore store)
+    {
+        if (_shapes.UniqueToCheck.Count == 0)
+            return;
+
+        var violations = UniqueConstraintCheck.FindViolations(store, Schema, _shapes.UniqueToCheck);
+        if (violations.Count == 0)
+            return;
+
+        throw new SchemaShapeException(
+            "Existing rows break a [Unique] constraint this boot would enforce. Enforcing it anyway would promise one " +
+            "row per value from an index holding several, so the boot refuses and records nothing:\n  - " +
+            string.Join("\n  - ", violations) +
+            "\nDedupe under the previous declaration — a reducer that rewrites or deletes all but one row per value; the " +
+            "engine cannot choose which row survives — then redeploy with [Unique]. A data directory that predates " +
+            "uniqueness recording has every [Unique] column checked once, so duplicates written before a [Unique] was " +
+            "added under an earlier build are caught here too. See docs/MIGRATION.md.",
+            violations);
+    }
+
+    /// <summary>
+    /// Records the unique columns of a sidecar that predates uniqueness recording, now that
+    /// <see cref="VerifyUniqueConstraints"/> has proved them against the rows. After a migration the
+    /// new reign already records them and this fills nothing.
+    /// </summary>
+    private void RecordUniqueness(string directory)
+    {
+        var filled = _shapes.History.RecordUnique(Schema);
+        if (filled == 0)
+            return;
+        _shapes.History.Save(_shapes.SidecarPath);
+        LogMessages.ShapeUniqueRecorded(_logger, filled, _shapes.UniqueToCheck.Count, directory);
     }
 
     private void CompleteShapeMigration(IHotStore store)
@@ -2057,6 +2103,17 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void ShapeTiersRecorded(ILogger logger, int count, string directory) =>
             ShapeTiersRecordedMessage(logger, count, directory, null);
+
+        private static readonly Action<ILogger, int, string, int, Exception?> ShapeUniqueRecordedMessage =
+            LoggerMessage.Define<int, string, int>(
+                LogLevel.Information,
+                new EventId(1010, "ShapeUniqueRecorded"),
+                "Recorded the [Unique] columns of {Count} table(s) in the shape sidecar under '{Directory}', which predates " +
+                "uniqueness recording, after checking {Columns} unique column(s) against their existing rows and finding no " +
+                "duplicates. From here on a newly declared [Unique] is checked once, at the boot that adds it.");
+
+        public static void ShapeUniqueRecorded(ILogger logger, int tables, int columns, string directory) =>
+            ShapeUniqueRecordedMessage(logger, tables, directory, columns, null);
 
         private static readonly Action<ILogger, Guid, ulong, string, DateTimeOffset, DateTimeOffset, Exception?> CloneProvenanceMessage =
             LoggerMessage.Define<Guid, ulong, string, DateTimeOffset, DateTimeOffset>(

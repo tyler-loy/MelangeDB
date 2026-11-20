@@ -30,7 +30,7 @@ seventh:
 | --- | --- | --- | --- |
 | Unit testing for module code | 2.12 | Planned, not built | [Phase 22](../road-to-0.3/plan-phase-22.md), carried from 0.3 |
 | A TypeScript client | 1.x | Planned, not built | [Phase 23](../road-to-0.3/plan-phase-23.md), carried from 0.3 |
-| A constraint added by migration is checked against existing rows | 2.7 | **Not checked — see phase 27** | [Phase 27](plan-phase-27.md) |
+| A constraint added by migration is checked against existing rows | 2.7 | Built in phase 27 | [Phase 27](plan-phase-27.md) |
 | Old clients survive added columns | 2.16.1 | A stale client is refused at subscribe | [Phase 28](plan-phase-28.md) |
 | Automatic reconnect with backoff and token refresh | 2.12 | Manual `ReconnectAsync` | [Phase 28](plan-phase-28.md) |
 | An agent (MCP) endpoint over schema, SQL, and reducer calls | 2.7–2.10 | Nothing | [Phase 29](plan-phase-29.md) |
@@ -49,7 +49,7 @@ this project chose "Postgres-backed membership, not Raft" in phase 09 for reason
 | [20](../road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half. **Carried from 0.3**; in this milestone because phase 30's trigger is one of its numbers | Planned |
 | [22](../road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: the reducer test kit. **Carried from 0.3** | Planned |
 | [23](../road-to-0.3/plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate`. **Carried from 0.3** | Planned |
-| [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | Planned; tracks [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
+| [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | **Built**; fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | Planned |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | Planned |
 | 30 | Shard HA as a warm replica | Conditional on phase 20; gets a design record before a plan, as [phase 24](../design/scheduler-lanes.md) did |

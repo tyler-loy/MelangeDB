@@ -1,7 +1,8 @@
 # Phase 27 — Constraint changes are migrations
 
-**Status: Planned.** Tracks [#192](https://github.com/tyler-loy/MelangeDB/issues/192). Ships
-whole with 0.4, not split into an earlier fix. See [Splitting the phase](#splitting-the-phase).
+**Status: Built.** Fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192). Ships whole
+with 0.4, not split into an earlier fix. See [Splitting the phase](#splitting-the-phase) and
+[As built](#as-built).
 
 **Goal:** adding `[Unique]` to a column that already holds rows checks those rows. Duplicates refuse
 the boot loudly and name the duplicated values and the keys that hold them, the way a destructive
@@ -84,10 +85,13 @@ Without uniqueness in the shape, the only safe place to check is every unique-in
 always correct and costs a duplicate check per unique index on every boot that rebuilds, which is
 cheap next to the rebuild itself. With uniqueness in the shape, the check runs once.
 
-**Leaning:** check at the recorded migration, and keep the every-build check behind a debug
-assertion. With the phase shipping whole, there is no interim release that needs the every-build
-check as its only defence. The next decision covers deployments upgraded from sidecars that never
-recorded uniqueness.
+**Built as leaned: at the recorded migration.** With the phase shipping whole there is no interim
+release that needs an every-build check. The check runs at the boot that adds a `[Unique]`, once
+on the first boot over a sidecar that predates uniqueness recording, and once when adopting over
+existing records. The steady-state boot checks nothing. The debug-only rebuild assertion the
+leaning mentioned was not built: write-time enforcement already covers every path except bulk
+ingestion's within-batch gap (see [As built](#as-built)), and an assertion that only fires in
+Debug would not have caught #192 in production either.
 
 ### Old sidecars that do not record uniqueness
 
@@ -96,12 +100,51 @@ unique" would make the first post-upgrade boot look like it adds every `[Unique]
 and check them all, which is correct and costs one pass. Treating it as "unknown, adopt silently"
 would skip the check for exactly the deployments that might have been bitten by the bug.
 
-**Leaning:** absent means "check everything once". It is the same adoption cost phase 16 paid, and
-it is the only reading that finds damage the bug already did.
+**Built as leaned: absent means "check everything once".** An absent field is not reported as a
+change, so it makes no marker or reign. Every unique column is checked, and on success the field
+is filled in place (EventId 1010), the way `RecordMissingTiers` fills tiers. The fill runs only
+after the check passes. A sidecar that recorded uniqueness the rows break would let every later
+boot skip the check that should have caught it.
 
 ### What a refusal tells an operator to do
 
 The engine cannot dedupe for them, but a refusal that only says "duplicates exist" sends the
-operator to write a reducer under the old declaration. **Open:** whether `melange` grows a read-only
+operator to write a reducer under the old declaration. Open was whether `melange` grows a read-only
 verb that lists the duplicates from a data directory offline, or whether the refusal message,
 bounded, is enough.
+
+**Built: the bounded message, no verb.** The refusal names up to ten duplicated values per column
+and up to five keys per value, with counts for the rest. It also adds a specific hint when the
+column is new in the same deploy, since then every row holds its default. That is enough to write
+the dedupe reducer. A verb can follow if a refusal ever names more than an operator can act on.
+
+## As built
+
+- **Where it lives.** `TableShape.Unique` records each table's non-key unique columns, null in old
+  sidecars. `ShapeCompatibility` classifies an added or removed `[Unique]` as additive (a recorded
+  reign, like a hot-to-hot tier change) and lists the columns to check in
+  `ShapeDiff.UniqueToCheck`. `UniqueConstraintCheck` runs after recovery and before
+  `CompleteShapeMigration`, so a refusal leaves no marker and no new reign.
+  `ShapeHistory.RecordUnique` fills old sidecars after the check passes.
+- **Cost.** One sequential `Scan` per table, holding the values seen so far for each checked
+  column: at most one extra copy of what that column's in-memory secondary index already holds, for
+  a check that runs once per change. An ordered walk of the index would need less memory, but it
+  would need a new member on the public `IHotStore`, which every third-party store would then have
+  to implement.
+- **The relational backplane, established.** The tier is constructed from the engine, so the hot
+  tier's refusal always fires before any Postgres DDL. What was broken was the other direction:
+  `ux_`/`ix_` naming plus create-if-not-exists meant **removing** `[Unique]` left `ux_<table>_<column>`
+  enforcing in Postgres, and the applier's first duplicate failed against it.
+  `PostgresSchemaManager` now drops it, applied under `AutoMigrate` or printed in the refusal
+  otherwise, and drops a plain `ix_` that a new `ux_` supersedes.
+- **Not addressed, recorded.** `/melange/bulk` checks uniqueness against committed rows but not
+  within its own batch (documented on `MelangeEngine.BulkInsert`), so one bulk load can still commit
+  duplicates. The next boot that checks the column names them, but nothing checks between boots.
+  Separately, a `CREATE UNIQUE INDEX` over a Postgres copy that lags the hot store could meet
+  duplicates the hot store has already resolved. That would stall the tier until it catches up, and
+  it is unchanged by this phase.
+- **Tests.** `UniqueConstraintMigrationTests` (Core): the #192 probe as a refusal; distinct rows
+  migrate and are recorded; removal; a column added as unique; an empty table; old sidecars, both
+  clean and with duplicates; adoption; nulls; the dry-run diff; the refusal's bounds. Three
+  `SchemaMigrationTests` (Postgres): a stale `ux_` dropped so duplicates apply, a superseded `ix_`
+  dropped, and the `AutoMigrate`-off refusal printing the drop.
