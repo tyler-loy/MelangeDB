@@ -176,6 +176,14 @@ separately, because it touches the connection lifecycle rather than decoding.
     wrong once the client reconnects on its own. The clear now keeps it.
   - `TokenProvider` is consulted on every dial, not only reconnects, and makes `token_expired`
     retryable.
+  - **A race CI found after merge, fixed in a follow-up.** When the loop refused an attempt and gave
+    up, the refused socket's teardown ran on its own thread, and on a slow runner it landed *after*
+    the give-up. It then saw no reconnect in progress and started a new loop. The client now records
+    the *established* socket, the one a successful connect or reconnect handed back. Only that
+    socket's death announces an outage or starts a reconnect, so an attempt's socket can tear down
+    whenever it likes. The regression test holds that teardown on the existing
+    `ReceiveTeardownGate` seam until the give-up has run, so it fails deterministically rather than
+    only on a 2-vCPU runner.
   - No client-side telemetry was added, because the client library has none. The events are the
     observation surface, as OBSERVABILITY.md now says.
   - Tests: `AutoReconnectTests` (9), covering a drop resumed with the cache intact, a server restart
