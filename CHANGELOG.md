@@ -21,6 +21,14 @@ All packages ship together at one version; there is no per-package versioning. S
 - **Reducer parameters may declare defaults**, as producer parameters already could. A trailing
   defaulted parameter may be left off a call, so a client whose bindings predate it keeps calling.
   A required parameter after a defaulted one is refused at compile time (MELANGE0009).
+- **Automatic reconnect**, opt-in through `MelangeClientOptions.Reconnect`. A dropped connection
+  is re-dialed with exponential backoff and jitter and resumed through the existing
+  `ReconnectAsync` path, so caches, subscriptions, and handlers survive the drop.
+  `OnReconnecting`, `OnReconnected`, and `OnReconnectFailed` report it, and `IsReconnecting` says
+  it is under way. It stops on dispose, on `MaxAttempts`, or on a refusal retrying cannot fix, and
+  it never comes back as a different identity.
+- **`MelangeClientOptions.TokenProvider`** supplies the token for every dial, for expiring
+  credentials.
 
 ### Changed
 
@@ -34,6 +42,9 @@ All packages ship together at one version; there is no per-package versioning. S
   rows.
 
 ### Fixed
+
+- **Under Manual dispatch, a full resync no longer swallows a queued `OnDisconnected`** that no
+  `FrameTick` had delivered yet.
 
 - **A `[Unique]` declared over existing rows is checked against them**
   ([#192](https://github.com/tyler-loy/MelangeDB/issues/192), road-to-0.4 phase 27). Adding

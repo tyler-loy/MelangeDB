@@ -51,6 +51,13 @@ public sealed class MelangeClient : IAsyncDisposable
     private int _eraFloor;
     private int _ticking;
 
+    // Automatic reconnect (road-to-0.4 phase 28). One loop at a time, owned by the flag; the
+    // lifetime token is what DisposeAsync cancels so a loop never outlives the client.
+    private readonly CancellationTokenSource _lifetime = new();
+    private volatile bool _disposed;
+    private int _reconnecting;
+    private Task? _reconnectLoop;
+
     public MelangeClient(MelangeClientOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -109,6 +116,33 @@ public sealed class MelangeClient : IAsyncDisposable
     /// <see cref="FrameTick"/> after every frame received before it.
     /// </summary>
     public event Action? OnDisconnected;
+
+    /// <summary>
+    /// Automatic reconnect only: an attempt is about to start, after its backoff. Fires once per
+    /// attempt — the hook for a "reconnecting…" indicator. While a reconnect is in progress,
+    /// <see cref="OnDisconnected"/> does not fire again for each failed attempt's socket; this does.
+    /// Under Manual dispatch it fires from <see cref="FrameTick"/>, like every lifecycle event.
+    /// </summary>
+    public event Action<ReconnectAttempt>? OnReconnecting;
+
+    /// <summary>
+    /// Automatic reconnect only: the connection is back and every subscription is live again. The
+    /// argument is true when the server served the gap (no initial set was refetched), false after
+    /// a full re-establishment — <see cref="ReconnectAsync"/>'s return value.
+    /// </summary>
+    public event Action<bool>? OnReconnected;
+
+    /// <summary>
+    /// Automatic reconnect only: the client stopped trying — <see cref="ReconnectPolicy.MaxAttempts"/>
+    /// ran out, or the server refused in a way retrying cannot fix (an unauthorized or expired token
+    /// with no <see cref="MelangeClientOptions.TokenProvider"/>, a token for a different identity, an
+    /// unsupported protocol version). The client stays disconnected; <see cref="ReconnectAsync"/> is
+    /// still there for the application to call.
+    /// </summary>
+    public event Action<Exception>? OnReconnectFailed;
+
+    /// <summary>Whether an automatic reconnect is in progress.</summary>
+    public bool IsReconnecting => Volatile.Read(ref _reconnecting) != 0;
 
     /// <summary>
     /// Test seam, consumed once by the next receive loop to die: awaited at the top of that
@@ -269,10 +303,28 @@ public sealed class MelangeClient : IAsyncDisposable
     /// apply before the resumed gap, in order); the full-resync path clears it, because a frame
     /// from the dead era must never apply against the reset caches.
     /// </summary>
-    public async Task<bool> ReconnectAsync(CancellationToken cancellationToken = default)
+    public Task<bool> ReconnectAsync(CancellationToken cancellationToken = default) =>
+        ReconnectCoreAsync(expectedIdentity: null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="ReconnectAsync"/>, optionally refusing a handshake that welcomed a different
+    /// identity — before any subscription resumes, so not one row of another identity's view
+    /// reaches the caches. The automatic loop always passes the identity it is reconnecting.
+    /// </summary>
+    private async Task<bool> ReconnectCoreAsync(Identity? expectedIdentity, CancellationToken cancellationToken)
     {
         var previousEpoch = LogEpochId;
         await DialAsync(cancellationToken).ConfigureAwait(false);
+        if (expectedIdentity is { } expected && Identity != expected)
+        {
+            var welcomed = Identity;
+            Identity = expected;
+            _socket?.Abort();
+            throw new MelangeCallException(
+                MelangeErrorCodes.IdentityChanged,
+                $"The reconnect was welcomed as {welcomed}, but this client is {expected}: a reconnect never switches identity. " +
+                "Give the token provider a token for the same subject, or connect a new client for the new identity.");
+        }
 
         var liveSubscriptions = _subscriptions.Values.Where(s => s.IsLive).ToList();
         if (liveSubscriptions.Count > 0 && LogEpochId == previousEpoch)
@@ -305,6 +357,11 @@ public sealed class MelangeClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // First, so the teardown the close below triggers starts no reconnect, and a loop already
+        // running stops at its next await.
+        _disposed = true;
+        await _lifetime.CancelAsync().ConfigureAwait(false);
+
         if (_socket is { } socket)
         {
             try
@@ -332,6 +389,19 @@ public sealed class MelangeClient : IAsyncDisposable
             {
             }
         }
+
+        if (_reconnectLoop is { } reconnect)
+        {
+            try
+            {
+                await reconnect.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        _lifetime.Dispose();
     }
 
     /// <summary>Abandons the socket without a close frame — an ungraceful drop, for testing heartbeats.</summary>
@@ -339,7 +409,9 @@ public sealed class MelangeClient : IAsyncDisposable
 
     private async Task DialAsync(CancellationToken cancellationToken)
     {
-        var token = _options.Token ?? await _options.TokenStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var token = _options.TokenProvider is { } provider
+            ? await provider(cancellationToken).ConfigureAwait(false)
+            : _options.Token ?? await _options.TokenStore.LoadAsync(cancellationToken).ConfigureAwait(false);
         var uri = _options.Uri;
         string? helloToken = token;
         if (_options.UseTicket)
@@ -564,12 +636,126 @@ public sealed class MelangeClient : IAsyncDisposable
                 // dispatch it joins the queue, so handlers hear about the drop only after every
                 // frame that arrived before it. Failing the pendings above stays immediate —
                 // those complete awaited Tasks and must never wait for a tick.
-                if (_options.Dispatch == DispatchMode.Manual)
-                    EnqueueEvent(new DispatchEntry(era, EntryKind.Disconnected, null));
-                else
-                    OnDisconnected?.Invoke();
+                //
+                // A socket an automatic reconnect attempt opened and lost is not a new outage —
+                // the one in progress already was announced, and OnReconnecting reports each
+                // attempt — so it tears down silently.
+                if (!IsReconnecting)
+                {
+                    if (_options.Dispatch == DispatchMode.Manual)
+                        EnqueueEvent(new DispatchEntry(era, EntryKind.Disconnected, null));
+                    else
+                        OnDisconnected?.Invoke();
+                }
+
+                StartAutoReconnect();
             }
         }
+    }
+
+    /// <summary>Starts the automatic reconnect loop, unless one is running, none is configured, or the client is disposed.</summary>
+    private void StartAutoReconnect()
+    {
+        if (_options.Reconnect is not { } policy || _disposed)
+            return;
+        if (Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0)
+            return;
+        _reconnectLoop = Task.Run(() => AutoReconnectAsync(policy, Identity), CancellationToken.None);
+    }
+
+    /// <summary>
+    /// The automatic reconnect loop: back off, attempt, repeat — until the connection is back, the
+    /// policy gives up, the server refuses in a way retrying cannot fix, or the client is disposed.
+    /// Each attempt is <see cref="ReconnectCoreAsync"/> pinned to <paramref name="identity"/>.
+    /// </summary>
+    private async Task AutoReconnectAsync(ReconnectPolicy policy, Identity identity)
+    {
+        var lifetime = _lifetime.Token;
+        Exception? last = null;
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                if (policy.MaxAttempts is { } max && attempt > max)
+                {
+                    GiveUp(new MelangeCallException(
+                        last is MelangeCallException { Code: var code } ? code : MelangeErrorCodes.Transient,
+                        $"Gave up reconnecting after {max} attempt(s)" + (last is null ? "." : $"; the last failed with: {last.Message}")));
+                    return;
+                }
+
+                var delay = policy.DelayFor(attempt, Random.Shared);
+                var announced = new ReconnectAttempt(attempt, delay, last);
+                RaiseLifecycle(() => OnReconnecting?.Invoke(announced));
+                await Task.Delay(delay, lifetime).ConfigureAwait(false);
+                try
+                {
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime);
+                    timeout.CancelAfter(policy.AttemptTimeout);
+                    var resumed = await ReconnectCoreAsync(identity, timeout.Token).ConfigureAwait(false);
+                    Volatile.Write(ref _reconnecting, 0);
+                    RaiseLifecycle(() => OnReconnected?.Invoke(resumed));
+
+                    // The new socket may have died between the attempt succeeding and the flag
+                    // clearing; its teardown saw a reconnect in progress and started nothing.
+                    if (!IsConnected)
+                        StartAutoReconnect();
+                    return;
+                }
+                catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (MelangeCallException refused) when (IsPermanent(refused))
+                {
+                    GiveUp(refused);
+                    return;
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    // Dial, handshake, resume, or the attempt's own timeout: worth another try.
+                    last = exception;
+                    _socket?.Abort();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            if (lifetime.IsCancellationRequested)
+                Volatile.Write(ref _reconnecting, 0);
+        }
+    }
+
+    /// <summary>A refusal another attempt would only repeat.</summary>
+    private bool IsPermanent(MelangeCallException refused) => refused.Code switch
+    {
+        MelangeErrorCodes.Unauthorized or MelangeErrorCodes.IdentityChanged or MelangeErrorCodes.UnsupportedVersion or MelangeErrorCodes.Denied => true,
+
+        // An expired token is permanent only when nothing can supply a fresh one.
+        MelangeErrorCodes.TokenExpired => _options.TokenProvider is null,
+        _ => false,
+    };
+
+    private void GiveUp(Exception reason)
+    {
+        Volatile.Write(ref _reconnecting, 0);
+        RaiseLifecycle(() => OnReconnectFailed?.Invoke(reason));
+    }
+
+    /// <summary>
+    /// Raises a reconnect lifecycle event — immediately, or under Manual dispatch through the queue
+    /// so it fires on the host's thread. Queued with the maximum era: no full resync's floor may
+    /// discard it, because unlike a frame it describes the connection, not an era's data.
+    /// </summary>
+    private void RaiseLifecycle(Action raise)
+    {
+        if (_options.Dispatch == DispatchMode.Manual)
+            EnqueueEvent(new DispatchEntry(int.MaxValue, EntryKind.Lifecycle, null, raise));
+        else
+            raise();
     }
 
     private void HandleFrame(Frame frame, ClientWebSocket socket, int era)
@@ -721,6 +907,9 @@ public sealed class MelangeClient : IAsyncDisposable
                     case EntryKind.Disconnected:
                         OnDisconnected?.Invoke();
                         break;
+                    case EntryKind.Lifecycle:
+                        entry.Raise!();
+                        break;
                 }
 
                 return true;
@@ -823,8 +1012,24 @@ public sealed class MelangeClient : IAsyncDisposable
         {
             _eraFloor = Volatile.Read(ref _era);
             _overflowError = null;
-            while (_dispatchQueue.TryDequeue(out _))
+            List<DispatchEntry>? lifecycle = null;
+            while (_dispatchQueue.TryDequeue(out var dropped))
+            {
                 Interlocked.Decrement(ref _dispatchCount);
+                if (dropped.Kind is EntryKind.Lifecycle or EntryKind.Disconnected)
+                    (lifecycle ??= []).Add(dropped);
+            }
+
+            // The disconnect and the reconnect events describe the connection, not the dead era's
+            // data: they survive the clear, in order, ahead of everything the re-established
+            // subscriptions will queue — re-tagged with the maximum era, so the floor just raised
+            // cannot discard them on the way out either. (Before automatic reconnect, a full
+            // resync swallowed a queued OnDisconnected that no tick had delivered yet.)
+            if (lifecycle is not null)
+            {
+                foreach (var entry in lifecycle)
+                    EnqueueEvent(entry with { Era = int.MaxValue });
+            }
         }
     }
 
@@ -877,6 +1082,9 @@ public sealed class MelangeClient : IAsyncDisposable
         Data,
         Error,
         Disconnected,
+
+        /// <summary>An automatic-reconnect event; see <see cref="RaiseLifecycle"/>.</summary>
+        Lifecycle,
     }
 
     /// <summary>
@@ -884,5 +1092,5 @@ public sealed class MelangeClient : IAsyncDisposable
     /// tagged with the era (dial generation) it arrived on, which is what lets a full resync
     /// declare everything before it dead without racing the queue.
     /// </summary>
-    private readonly record struct DispatchEntry(int Era, EntryKind Kind, Frame? Frame);
+    private readonly record struct DispatchEntry(int Era, EntryKind Kind, Frame? Frame, Action? Raise = null);
 }

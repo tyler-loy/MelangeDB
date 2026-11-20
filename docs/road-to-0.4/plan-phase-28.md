@@ -1,6 +1,6 @@
 # Phase 28 — Clients that outlive a deploy
 
-**Status: Schema tolerance built; automatic reconnect next.** See [As built](#as-built).
+**Status: Built.** See [As built](#as-built).
 
 **Goal:** a client built against schema *N* keeps working against a server running an additive
 change to *N*: added columns at any position, added tables, added reducers. A client that loses its
@@ -129,10 +129,12 @@ single line to enable. Turning it on by default would change what `OnDisconnecte
 existing consumer, which is a breaking change to make deliberately in a later release, not a
 default to slip in alongside the feature.
 
+**Built as leaned.** `o.Reconnect = new ReconnectPolicy()` is the one line.
+
 ## As built
 
-Schema tolerance shipped first, as its own change. Automatic reconnect follows separately, because
-it touches the connection lifecycle rather than decoding.
+Schema tolerance shipped first, as its own change. Automatic reconnect shipped second and
+separately, because it touches the connection lifecycle rather than decoding.
 
 - **Rows.** `ClientRowShape.Plan` maps the bindings' columns onto the descriptor by name, refusing a
   missing or re-kinded column with the column named. It returns null when the shapes are identical,
@@ -159,4 +161,25 @@ it touches the connection lifecycle rather than decoding.
   `SkipValue` over every tag, and the generated `Read_ChunkView` reading past appended fields or
   refusing too few. `ReducerDefaultsTests` (generator): the emitted arity check and guarded reads,
   and MELANGE0009 for a gap.
-
+- **Automatic reconnect.** `MelangeClientOptions.Reconnect` (a `ReconnectPolicy`) starts one loop from
+  the receive loop's teardown, which already knew whether the *current* socket died. Each attempt is
+  the ordinary `ReconnectAsync` path, so cache reconciliation is the code that already existed. Notes:
+  - The loop pins the identity it is reconnecting. A handshake welcomed as anyone else is aborted
+    *before* any subscription resumes, so not one row of another identity's view reaches the caches.
+    That's the phase 04 rule applied to a dial rather than a re-authentication.
+  - `OnDisconnected` fires once per outage. Sockets a failing attempt opens and loses tear down
+    silently, and `OnReconnecting` reports each attempt instead.
+  - Under Manual dispatch the lifecycle events go through the frame queue like `OnDisconnected`,
+    tagged so neither a full resync's clear nor its era floor can drop them.
+  - **A fix found on the way:** a full resync used to swallow a queued `OnDisconnected` that no tick
+    had delivered yet. That was harmless when the application had called `ReconnectAsync` itself, and
+    wrong once the client reconnects on its own. The clear now keeps it.
+  - `TokenProvider` is consulted on every dial, not only reconnects, and makes `token_expired`
+    retryable.
+  - No client-side telemetry was added, because the client library has none. The events are the
+    observation surface, as OBSERVABILITY.md now says.
+  - Tests: `AutoReconnectTests` (9), covering a drop resumed with the cache intact, a server restart
+    ridden out, giving up after `MaxAttempts`, the token provider on every dial, an identity switch
+    refused, no policy meaning no reconnect, dispose stopping an endless loop, Manual-dispatch
+    delivery from `FrameTick`, and the backoff arithmetic. Looped 8 times with the existing
+    reconnect and frame-tick tests (19 per run), all green.
