@@ -102,7 +102,7 @@ public class SchemaShapeTests : IDisposable
     private static TableSchema CounterTable<TRow>() where TRow : struct => Declare<TRow>("Counter", "Id", autoInc: "Id");
 
     /// <summary>The direct-construction seam: a TableSchema from a struct's fields, no attributes.</summary>
-    internal static TableSchema Declare<TRow>(string name, string key, string? autoInc = null, string? index = null)
+    internal static TableSchema Declare<TRow>(string name, string key, string? autoInc = null, string? index = null, string? unique = null)
         where TRow : struct
     {
         var columns = typeof(TRow).GetFields()
@@ -115,6 +115,7 @@ public class SchemaShapeTests : IDisposable
                 IsPrimaryKey = f.Name == key,
                 IsAutoInc = f.Name == autoInc,
                 IsIndexed = f.Name == index,
+                IsUnique = f.Name == unique,
                 GetValue = row => f.GetValue(row),
                 SetValue = (row, value) => f.SetValue(row, value),
             })

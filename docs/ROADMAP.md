@@ -132,7 +132,7 @@ project's own terms, and not by copying.
 | [20](road-to-0.3/plan-phase-20.md) | The measurement pass, carried from 0.3 — here because phase 30's trigger is one of its numbers | Planned |
 | [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`, carried from 0.3 — SpacetimeDB has had module unit testing since 2.12 | Planned |
 | [23](road-to-0.3/plan-phase-23.md) | The TypeScript client and client conformance, carried from 0.3 | Planned |
-| [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — **today it is not, which is a bug** ([#192](https://github.com/tyler-loy/MelangeDB/issues/192)) | Planned |
+| [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) | **Built** |
 | [28](road-to-0.4/plan-phase-28.md) | Clients that outlive a deploy: old bindings survive added columns at any position, and reconnect is automatic with backoff and token refresh. Lands before 23 | Planned |
 | [29](road-to-0.4/plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, SQL, and published signals; reducer calls by name only. A protocol, not the refused admin console | Planned |
 | 30 | Shard HA as a warm replica — [idea-bin](idea-bin/shard-ha-warm-replica.md) | Conditional on phase 20's reassignment window; design record before a plan, and may close as a refusal |

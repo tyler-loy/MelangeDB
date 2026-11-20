@@ -383,7 +383,11 @@ also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flus
 marker LSN the new shape governs from; Warning-level because automatic must never mean silent
 (road-to-0.2 phase 16, [MIGRATION.md](MIGRATION.md)) — `1009 ShapeTiersRecorded` — a boot that filled in each table's tier in a shape sidecar written before
 tiers were recorded, taking it from the running code; Information, and once per data directory
-(road-to-0.3 phase 25) — `1008 ShapeAdopted` — a boot that *adopted*
+(road-to-0.3 phase 25) — `1010 ShapeUniqueRecorded` — a boot that checked every `[Unique]` column
+of a shape sidecar written before uniqueness was recorded against its existing rows, found no
+duplicates, and recorded the columns in place; Information, and once per data directory
+(road-to-0.4 phase 27; a boot that finds duplicates refuses instead, and logs nothing under this id)
+— `1008 ShapeAdopted` — a boot that *adopted*
 the running code's schema as the meaning of records already on disk, because no shape sidecar
 existed: the only possible reading of those bytes, correct only if the upgrade rule was followed,
 and until it had an id the one step in this area that happened in silence. Warning, and only ever
