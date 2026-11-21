@@ -118,8 +118,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
     public ClusterMetrics Metrics { get; } = new();
 
-    /// <summary>Test hook: while true, heartbeats stop — a partition, as the hub sees it.</summary>
+    /// <summary>Test hook: while true, heartbeats and pings stop — a partition, as the hub sees it.</summary>
     internal bool SuspendHeartbeats { get; set; }
+
+    /// <summary>
+    /// Test hook: while true, only the thread-pool heartbeat loop stops; the liveness pinger keeps
+    /// going. A node whose pool is starved, as the hub sees it.
+    /// </summary>
+    internal bool StallHeartbeatLoop { get; set; }
 
     /// <summary>
     /// Test hook: runs at the start of every shard open, on the open's own task — a slow (or
@@ -257,6 +263,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             _link = link;
             AdoptHubTimeout(auth.FailureTimeoutMs);
             RenewLease(authSent);
+            StartPinger(link, ct);
             ApplyAssignments(auth.Assignments);
             await SubscribeReplicationAsync(link, ct).ConfigureAwait(false);
             KickForwarders();
@@ -266,7 +273,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             while (!ct.IsCancellationRequested && link.IsAlive)
             {
                 await Task.Delay(cluster.HeartbeatIntervalMs, ct).ConfigureAwait(false);
-                if (SuspendHeartbeats)
+                if (SuspendHeartbeats || StallHeartbeatLoop)
                     continue;
                 var loads = CollectLoads();
                 var sent = _time.GetTimestamp();
@@ -299,8 +306,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// </summary>
     private void RenewLease(long sentTimestamp)
     {
-        var previous = Interlocked.Exchange(ref _lastRenewalSentTimestamp, sentTimestamp);
-        if (previous != 0)
+        // Two sources renew (the pinger and the heartbeat), so a reply can arrive for a request
+        // older than one already counted; only a newer send is a new renewal.
+        var previous = Interlocked.Read(ref _lastRenewalSentTimestamp);
+        if (sentTimestamp > previous
+            && Interlocked.CompareExchange(ref _lastRenewalSentTimestamp, sentTimestamp, previous) == previous
+            && previous != 0)
         {
             var gap = _time.GetElapsedTime(previous);
             Metrics.LeaseRenewalGaps.Record(gap);
@@ -318,6 +329,49 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 return;
         }
         while (Interlocked.CompareExchange(ref _leaseValidUntilTimestamp, until, current) != current);
+    }
+
+    /// <summary>
+    /// Starts the liveness pinger for one link: a dedicated thread, above normal priority, that
+    /// pings the hub every heartbeat interval and renews the lease from each acknowledged ping. The
+    /// heartbeat loop runs on the thread pool, which is what starves first under load; phase 30's
+    /// soak measured its 250 ms delay firing up to 2.4 s late on a healthy node. The pinger depends
+    /// on nothing the pool runs: the link's reader is its own thread, and the hub answers pings on
+    /// its reader too. The heartbeat still runs for loads, assignments and replication, and still
+    /// renews the lease as well. The thread ends with the link.
+    /// </summary>
+    private void StartPinger(NodeLink link, CancellationToken ct) =>
+        new Thread(() => Ping(link, ct))
+        {
+            IsBackground = true,
+            Name = "MelangeDB liveness pinger",
+            Priority = ThreadPriority.AboveNormal,
+        }.Start();
+
+    private void Ping(NodeLink link, CancellationToken ct)
+    {
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct, link.ClosedToken);
+        while (!stop.Token.WaitHandle.WaitOne(Cluster.HeartbeatIntervalMs))
+        {
+            if (SuspendHeartbeats)
+                continue;
+            var sent = _time.GetTimestamp();
+            try
+            {
+                link.Request("ping", null, Volatile.Read(ref _leaseTimeoutMs));
+                RenewLease(sent);
+            }
+            catch (NodeLinkException)
+            {
+                // Refused (the hub has declared this node dead: only a heartbeat, whose reply
+                // carries the assignments, may bring it back), timed out, or the link is closing.
+                // Either way the lease is not renewed, and the next ping tries again.
+            }
+            catch (Exception exception) when (exception is IOException or ObjectDisposedException or OperationCanceledException)
+            {
+                return; // The link is gone; the heartbeat loop reconnects and starts a new pinger.
+            }
+        }
     }
 
     /// <summary>

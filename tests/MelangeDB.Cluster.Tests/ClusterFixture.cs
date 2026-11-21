@@ -221,14 +221,14 @@ internal sealed class ClusterFixture : IAsyncDisposable
         });
     }
 
-    /// <summary>Total non-heartbeat node-link messages across the whole cluster — the network-call count.</summary>
+    /// <summary>Total non-liveness node-link messages across the whole cluster — the network-call count.</summary>
     public long TotalLinkMessages()
     {
-        var total = Hub.Metrics.TotalSentExcept("heartbeat", "heartbeat-ok");
+        var total = Hub.Metrics.TotalSentExcept("heartbeat", "heartbeat-ok", "ping", "ping-ok");
         foreach (var node in Nodes)
         {
             if (node.App is not null)
-                total += node.Metrics.TotalSentExcept("heartbeat", "heartbeat-ok");
+                total += node.Metrics.TotalSentExcept("heartbeat", "heartbeat-ok", "ping", "ping-ok");
         }
 
         return total;

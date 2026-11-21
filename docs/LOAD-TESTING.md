@@ -437,9 +437,31 @@ collapse and has no row.) The lease-renewal gaps the nodes measured track the hu
 milliseconds.
 
 - **At sustainable load there is room for a 2 s timeout:** the longest gap was under half a second.
-- **Past the knee, heartbeats stall with everything else.** At 200 players a 2 s timeout would have
-  declared a healthy node dead 35–43 times in five minutes, and 3 s 2–9 times. Each one moves a
-  shard onto nodes that are just as overloaded.
+- **Past the knee, heartbeats stalled with everything else.** At 200 players a 2 s timeout would
+  have declared a healthy node dead 35–43 times in five minutes, and 3 s 2–9 times. Each one moves
+  a shard onto nodes that are just as overloaded. Timing each hop showed almost all of it was
+  waiting for thread-pool threads: the heartbeat loop's 250 ms delay fired up to 2.4 s late, and
+  the hub waited up to 1.3 s for a thread to handle the beat.
+
+**With the liveness ping** (a dedicated pinger thread on the node, answered on the hub's link
+reader thread) and synchronous link sends under a plain lock, the same sweep:
+
+| Players | Hot store | Longest gap | > 1 s | > 2 s | > 3 s | > 5 s | Deaths / lapses |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 | in-memory | 272 ms | 0 | 0 | 0 | 0 | 0 / 0 |
+| 200 | in-memory | 1.1 s | 2 | 0 | 0 | 0 | 0 / 0 |
+| 200 | FASTER | 1.8 s | 5 | 0 | 0 | 0 | 0 / 0 |
+| 300 | FASTER | 3.2 s | 4 | 4 | 4 | 0 | 0 / 0 |
+
+- **The ping alone was half the fix.** Its first version still waited up to 1.5 s for the link's
+  send lock, a `SemaphoreSlim` that handed itself on release to queued async waiters whose
+  continuations needed pool threads; no write held it longer than 23 ms. Sends are now synchronous
+  writes under a plain lock, so the waiters are threads already running.
+- **What remains is a few discrete multi-second pauses at collapse,** four in five minutes at 300
+  players, likely full collections of a 3 GiB heap. A dedicated thread sleeping 10 ms never woke
+  more than 54 ms late at 200 players.
+- **Throughput rose too:** 200 players acked ~770–800k calls in five minutes, from ~690k, now that
+  the pool no longer cycles through send-lock handoffs.
 - **Recovering a big shard does not stall the adopter.** `failover --rows 1000000 --hot-store
   faster --heartbeat-ms 250 --failure-timeout-ms 15000 --fast-failover`: the longest gap across two
   7 s recoveries was 335 ms, with no false death or lapse (#198's fix holding).

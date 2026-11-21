@@ -1446,6 +1446,8 @@ internal sealed partial class HubRuntime : IDisposable
             var session = new NodeSession { ServerNonce = LinkProof.NewNonce() };
             link.Tag = session;
             link.Handler = (l, type, body) => HandleAsync(l, session, type, body);
+            link.InlineType = "ping";
+            link.InlineHandler = (_, _) => AcceptPing(session);
             link.Closed += OnLinkClosed;
             link.Start();
             _ = link.NotifyAsync("challenge", new { session.ServerNonce }, ct);
@@ -1838,10 +1840,11 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 if (!node.Alive)
                     continue;
-                var silence = _time.GetElapsedTime(_heardTimestamps.GetValueOrDefault(node.NodeName, _startedTimestamp));
+                long? heard = _heardTimestamps.TryGetValue(node.NodeName, out var h) ? h : null;
+                var silence = _time.GetElapsedTime(heard ?? _startedTimestamp);
                 if (silence <= timeout)
                     continue;
-                DeclareDeadLocked(node.NodeName, silence, now, linkLost: false);
+                DeclareDeadLocked(node.NodeName, heard, silence, now, linkLost: false);
             }
         }
 
@@ -1886,7 +1889,7 @@ internal sealed partial class HubRuntime : IDisposable
                     linkLost = linkLost && _linkLostTimestamps.ContainsKey(name) && !_linksByNode.ContainsKey(name);
                     if (silence <= timeout && !linkLost)
                         continue;
-                    DeclareDeadLocked(name, silence, now, linkLost && silence <= timeout);
+                    DeclareDeadLocked(name, heardNow, silence, now, linkLost && silence <= timeout);
                 }
             }
         }
@@ -1906,13 +1909,43 @@ internal sealed partial class HubRuntime : IDisposable
     {
         var now = _time.GetTimestamp();
         if (_heardTimestamps.TryGetValue(nodeName, out var previous))
-        {
-            var gap = _time.GetElapsedTime(previous, now);
-            Metrics.HeartbeatGaps.Record(gap);
-            _heartbeatGap.Record(gap.TotalMilliseconds, new KeyValuePair<string, object?>("node", nodeName));
-        }
-
+            RecordGap(nodeName, previous, now);
         _heardTimestamps[nodeName] = now;
+    }
+
+    private void RecordGap(string nodeName, long previous, long now)
+    {
+        var gap = _time.GetElapsedTime(previous, now);
+        Metrics.HeartbeatGaps.Record(gap);
+        _heartbeatGap.Record(gap.TotalMilliseconds, new KeyValuePair<string, object?>("node", nodeName));
+    }
+
+    /// <summary>
+    /// The liveness ping, answered on the node link's reader thread (never queued for the thread
+    /// pool, which is what starves under load and delayed heartbeats from healthy nodes by seconds).
+    /// It only moves the node's deadline: loads, assignments and revival stay with the heartbeat.
+    /// <para>
+    /// A ping never revives a node declared dead. Its reply renews the node's lease, and unlike a
+    /// heartbeat's reply it carries no assignments to take away the shards the hub just
+    /// reassigned. So it is accepted only by a compare-and-swap on the node's deadline entry, which
+    /// fails once a declaration has removed that entry; the declaration removes it by a
+    /// compare-and-remove against the timestamp it judged, so a ping that lands first cancels it.
+    /// </para>
+    /// </summary>
+    private object? AcceptPing(NodeSession session)
+    {
+        var name = session.NodeName ?? throw new InvalidOperationException("The link is not authenticated.");
+        while (true)
+        {
+            if (!_heardTimestamps.TryGetValue(name, out var previous))
+                throw new InvalidOperationException("This node is not live at the hub; its next heartbeat re-registers it.");
+            var now = _time.GetTimestamp();
+            if (_heardTimestamps.TryUpdate(name, now, previous))
+            {
+                RecordGap(name, previous, now);
+                return null;
+            }
+        }
     }
 
     /// <summary>
@@ -1920,10 +1953,33 @@ internal sealed partial class HubRuntime : IDisposable
     /// <see cref="_deathLock"/>. The node leaves the in-memory deadline table, so neither check
     /// declares it twice; its next heartbeat or registration puts it back.
     /// </summary>
-    private void DeclareDeadLocked(string nodeName, TimeSpan silence, DateTimeOffset now, bool linkLost)
+    private void DeclareDeadLocked(string nodeName, long? heard, TimeSpan silence, DateTimeOffset now, bool linkLost)
     {
-        var moved = _membership.MarkDead(nodeName, now);
-        _heardTimestamps.TryRemove(nodeName, out _);
+        // Claim the death first, against the very timestamp judged silent: a ping or heartbeat
+        // that landed since then wins, and a ping arriving after this is refused (AcceptPing).
+        if (heard is { } judged)
+        {
+            if (!_heardTimestamps.TryRemove(new KeyValuePair<string, long>(nodeName, judged)))
+                return;
+        }
+        else
+        {
+            _heardTimestamps.TryRemove(nodeName, out _);
+        }
+
+        IReadOnlyList<ShardAssignment> moved;
+        try
+        {
+            moved = _membership.MarkDead(nodeName, now);
+        }
+        catch
+        {
+            // Not dead after all, as far as anyone can tell: the next check judges it again.
+            if (heard is { } restore)
+                _heardTimestamps.TryAdd(nodeName, restore);
+            throw;
+        }
+
         _linkLostTimestamps.TryRemove(nodeName, out _);
         Metrics.NodeDeclaredDead();
         _nodesDeclaredDead.Add(1, new KeyValuePair<string, object?>("reason", linkLost ? "link_lost" : "timeout"));

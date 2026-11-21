@@ -251,6 +251,13 @@ public sealed class LivenessGaps
 /// the hub and shard runtimes, which install a handler. Every frame is counted in
 /// <see cref="ClusterMetrics"/>; serialization is real, which is the point of running multi-node
 /// tests in one process.
+/// <para>
+/// The reader is a dedicated thread doing blocking reads, not a thread-pool loop: replies, and the
+/// one request type answered inline (<see cref="InlineType"/>, the liveness ping), must not wait for
+/// a pool thread. Under load the pool is what starves first, and a heartbeat that waits for it can
+/// arrive seconds late from a healthy node (phase 30's liveness soak). Every other request is still
+/// dispatched to the pool, so a slow handler cannot stall the link.
+/// </para>
 /// </summary>
 internal sealed class NodeLink : IDisposable
 {
@@ -259,22 +266,41 @@ internal sealed class NodeLink : IDisposable
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private readonly ClusterMetrics _metrics;
-    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private readonly Lock _sendLock = new();
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement?>> _pending = new();
     private readonly CancellationTokenSource _closed = new();
     private long _nextId;
-    private Task? _readLoop;
 
     public NodeLink(TcpClient client, ClusterMetrics metrics)
     {
         _client = client;
         _client.NoDelay = true;
+
+        // Sends block (see Send), so a peer that stops reading must not hold the sender forever:
+        // a write that cannot drain within the link's request timeout kills the link, the same
+        // verdict a request would reach.
+        _client.SendTimeout = 15_000;
         _stream = client.GetStream();
         _metrics = metrics;
     }
 
     /// <summary>Set by the owner before <see cref="Start"/>: answers inbound requests and notifications.</summary>
     public Func<NodeLink, string, JsonElement?, Task<object?>>? Handler { get; set; }
+
+    /// <summary>
+    /// The one request type answered on the reader thread itself by <see cref="InlineHandler"/>,
+    /// with its reply written synchronously: never queued behind the thread pool. For liveness only;
+    /// the handler must be fast and must not block. Only one end of a link may set it: the reply
+    /// can wait for the send lock behind a large frame, which is safe only while the peer's reader
+    /// is free to drain that frame, and a peer answering inline too could be waiting on us.
+    /// </summary>
+    public string? InlineType { get; set; }
+
+    /// <summary>Answers <see cref="InlineType"/> requests on the reader thread; throwing sends an error reply.</summary>
+    public Func<NodeLink, JsonElement?, object?>? InlineHandler { get; set; }
+
+    /// <summary>Cancelled when the link dies.</summary>
+    public CancellationToken ClosedToken => _closed.Token;
 
     /// <summary>Fires once when the read loop ends — link death, however it happened.</summary>
     public event Action<NodeLink>? Closed;
@@ -284,7 +310,44 @@ internal sealed class NodeLink : IDisposable
 
     public bool IsAlive => !_closed.IsCancellationRequested && _client.Connected;
 
-    public void Start() => _readLoop = Task.Run(ReadLoopAsync);
+    public void Start() =>
+        new Thread(ReadLoop) { IsBackground = true, Name = "MelangeDB node link reader" }.Start();
+
+    /// <summary>
+    /// Sends a request and blocks the calling thread for the reply: for a dedicated thread that must
+    /// not depend on the thread pool (the liveness pinger). The reader completes the reply directly,
+    /// so nothing on this path waits for a pool thread.
+    /// </summary>
+    /// <exception cref="NodeLinkException">An error reply, a timeout, or the link closing.</exception>
+    public JsonElement? Request(string type, object? body, int timeoutMs)
+    {
+        var id = Interlocked.Increment(ref _nextId);
+        var tcs = new TaskCompletionSource<JsonElement?>();
+        _pending[id] = tcs;
+        try
+        {
+            Send(new WireFrame(id, 0, type, ToElement(body)));
+            try
+            {
+                if (!tcs.Task.Wait(timeoutMs, _closed.Token))
+                    throw new NodeLinkException($"Node-link request '{type}' timed out.");
+            }
+            catch (OperationCanceledException)
+            {
+                throw new NodeLinkException("The node link closed.");
+            }
+            catch (AggregateException exception) when (exception.InnerException is NodeLinkException inner)
+            {
+                throw inner;
+            }
+
+            return tcs.Task.Result;
+        }
+        finally
+        {
+            _pending.TryRemove(id, out _);
+        }
+    }
 
     /// <summary>Sends a request and awaits the peer's response body; throws <see cref="NodeLinkException"/> on an error reply.</summary>
     public async Task<JsonElement?> RequestAsync(string type, object? body, CancellationToken ct = default, int timeoutMs = 15_000)
@@ -314,26 +377,57 @@ internal sealed class NodeLink : IDisposable
     private static JsonElement? ToElement(object? body) =>
         body is null ? null : JsonSerializer.SerializeToElement(body, body.GetType());
 
-    private async Task SendAsync(WireFrame frame, CancellationToken ct)
+    private static (byte[] Buffer, int PayloadLength) Encode(WireFrame frame)
     {
         var payload = JsonSerializer.SerializeToUtf8Bytes(frame);
         var buffer = new byte[4 + payload.Length];
         BinaryPrimitives.WriteInt32LittleEndian(buffer, payload.Length);
         payload.CopyTo(buffer, 4);
-        await _sendLock.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            await _stream.WriteAsync(buffer, ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _sendLock.Release();
-        }
-
-        _metrics.RecordSent(frame.Type, payload.Length);
+        return (buffer, payload.Length);
     }
 
-    private async Task ReadLoopAsync()
+    /// <summary>
+    /// Every send is a synchronous write under a plain lock, held only while the frame is copied
+    /// into the socket. An async send under a <see cref="SemaphoreSlim"/> handed the lock, on each
+    /// release, to a queued waiter whose continuation then waited for a thread-pool thread, so under
+    /// load a liveness ping sat behind that queue for up to 1.5 s while no write held the lock for
+    /// more than 23 ms (phase 30's soak). Waiters on a plain lock are threads already running.
+    /// </summary>
+    private void Send(WireFrame frame)
+    {
+        var (buffer, length) = Encode(frame);
+        _closed.Token.ThrowIfCancellationRequested();
+        lock (_sendLock)
+        {
+            try
+            {
+                _stream.Write(buffer);
+            }
+            catch (IOException)
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        _metrics.RecordSent(frame.Type, length);
+    }
+
+    private Task SendAsync(WireFrame frame, CancellationToken ct)
+    {
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            Send(frame);
+            return Task.CompletedTask;
+        }
+        catch (Exception exception)
+        {
+            return Task.FromException(exception);
+        }
+    }
+
+    private void ReadLoop()
     {
         var ct = _closed.Token;
         try
@@ -341,12 +435,12 @@ internal sealed class NodeLink : IDisposable
             var header = new byte[4];
             while (!ct.IsCancellationRequested)
             {
-                await _stream.ReadExactlyAsync(header, ct).ConfigureAwait(false);
+                _stream.ReadExactly(header);
                 var length = BinaryPrimitives.ReadInt32LittleEndian(header);
                 if (length is <= 0 or > 64 * 1024 * 1024)
                     throw new InvalidDataException($"Node-link frame length {length} is out of range.");
                 var payload = new byte[length];
-                await _stream.ReadExactlyAsync(payload, ct).ConfigureAwait(false);
+                _stream.ReadExactly(payload);
                 var frame = JsonSerializer.Deserialize<WireFrame>(payload)
                     ?? throw new InvalidDataException("Node-link frame deserialized to null.");
                 _metrics.RecordReceived(frame.Type, payload.Length);
@@ -368,6 +462,12 @@ internal sealed class NodeLink : IDisposable
                     continue;
                 }
 
+                if (frame.Id != 0 && frame.Type == InlineType && InlineHandler is { } inline)
+                {
+                    AnswerInline(frame, inline);
+                    continue;
+                }
+
                 // Handled off the read loop so a slow handler cannot stall unrelated traffic;
                 // responses re-serialize through SendAsync like everything else.
                 _ = Task.Run(() => DispatchAsync(frame), CancellationToken.None);
@@ -385,6 +485,21 @@ internal sealed class NodeLink : IDisposable
                 pending.TrySetException(new NodeLinkException("The node link closed."));
             Closed?.Invoke(this);
         }
+    }
+
+    private void AnswerInline(WireFrame frame, Func<NodeLink, JsonElement?, object?> handler)
+    {
+        WireFrame reply;
+        try
+        {
+            reply = new WireFrame(0, frame.Id, frame.Type + "-ok", ToElement(handler(this, frame.Body)));
+        }
+        catch (Exception exception)
+        {
+            reply = new WireFrame(0, frame.Id, "error", ToElement(new { Message = exception.Message }));
+        }
+
+        Send(reply);
     }
 
     private async Task DispatchAsync(WireFrame frame)

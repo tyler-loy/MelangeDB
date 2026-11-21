@@ -12,6 +12,12 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **A liveness ping that a starved thread pool cannot delay** (road-to-0.4 phase 30). Shard nodes
+  ping the hub every `Cluster:HeartbeatIntervalMs` from a dedicated thread, and the hub answers on
+  the node link's reader thread, which is now a dedicated thread too; each acknowledged ping renews
+  the node's lease and the hub's deadline for it. Under load the thread-pool heartbeat arrived up to
+  4 s late from healthy nodes, which ruled out short failure timeouts. A ping cannot revive a node
+  the hub has declared dead; its heartbeat still does.
 - **Liveness instruments** (road-to-0.4 phase 30): `melange.cluster.heartbeat.gap` on the hub and
   `melange.cluster.lease.renewal_gap` on shard nodes time how close a healthy cluster comes to its
   failure timeout, and `melange.cluster.nodes.declared_dead` and `melange.cluster.lease.lapses`

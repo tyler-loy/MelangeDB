@@ -186,6 +186,15 @@ risking two writers; the cost of a false positive becomes a needless promotion, 
   measured false-positive rate and not guessed. #208 showed what a stalled heartbeat looks like; a
   node whose heartbeat shares a thread pool with a heavy shard can pause for seconds. The heartbeat
   loop may need its own thread before the timeout can come down.
+  **Measured** (LOAD-TESTING.md, liveness soak): at sustainable load the longest gap was 0.43 s,
+  but past the capacity knee heartbeats arrived up to 4.3 s apart (10 s at collapse), almost all
+  of it the heartbeat loop's 250 ms delay waiting for a starved thread-pool thread, plus the hub
+  waiting for one to handle it. **Built: a liveness ping** on the existing link, sent from a
+  dedicated node thread and answered inline on the hub's link-reader thread, which renews the lease
+  and the hub's deadline without touching the pool. The heartbeat keeps loads, assignments and
+  revival. A ping never revives a node declared dead: its reply renews the lease but carries no
+  assignments, so the hub accepts it only by compare-and-swap on the node's deadline entry, which
+  a declaration removes by compare-and-remove first.
 - **A fast path for process death.** When the owner's link closes *and* the replica can take the
   shard's `melange.lock`, the owner's process is gone: the operating system dropped both. The hub
   can promote then without waiting out the lease. On storage that honours the lock that takes

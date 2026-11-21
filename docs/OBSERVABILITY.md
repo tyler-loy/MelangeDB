@@ -321,12 +321,13 @@ Meter name: `MelangeDB`.
 These four are what `Cluster:HeartbeatIntervalMs` and `Cluster:FailureTimeoutMs` should be chosen
 from, on the deployment's own hardware and load.
 
-- `melange.cluster.heartbeat.gap` (hub) is the time between consecutive heartbeats from one node,
-  as the hub received them. The hub declares a node dead when this exceeds the failure timeout, so
-  its tail is the margin a healthy cluster keeps. A gap is a pause on either end or on the network
-  between them: a thread-pool starvation on the node, a GC pause on either, a stalled hub.
+- `melange.cluster.heartbeat.gap` (hub) is the time between consecutive signs of life from one
+  node (heartbeats and liveness pings alike), as the hub received them. The hub declares a node
+  dead when this exceeds the failure timeout, so its tail is the margin a healthy cluster keeps.
+  Pings do not wait for the thread pool on either end, so what remains is a GC pause on either
+  end, a node or hub starved of CPU outright, or the network.
 - `melange.cluster.lease.renewal_gap` (shard node) is the time from sending one acknowledged
-  heartbeat to the reply to the next: how long the lease had to last. The lease lapses when it
+  heartbeat or ping to the reply to the next: how long the lease had to last. The lease lapses when it
   exceeds nine tenths of the hub's failure timeout, so this one runs out first. It reads a little
   longer than the hub's gap, by one round trip.
 - `melange.cluster.nodes.declared_dead` (hub, `reason` = `timeout` or `link_lost`) and
