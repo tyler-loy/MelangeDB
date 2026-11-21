@@ -78,19 +78,22 @@ What it says about the design:
    **A warm replica alone removes 1–6 s of a 12–19 s window.** Phase 30's design has to own
    detection too: shorter leases, a faster sweep, or an explicit failure signal from the link. The
    fencing third state below is where the shorter-lease risk lives.
-3. **The cold path can cascade.** A node opens an adopted shard inside its heartbeat loop, so a
-   recovery longer than the failure timeout gets the *adopting* node declared dead
-   ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). A warm replica sidesteps that for the
-   replicated shards. The cold path stays the fallback for everything else and must be fixed
-   regardless.
-4. **Machine death is worse than process death.** The gateway's upstream connect has no timeout, so
-   on a dead machine each client stalls for the OS TCP connect timeout: 21 s on Windows, about 127 s
-   on stock Linux ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). That would cap any
-   gain from a replica until it's fixed.
-5. **FASTER at 1M rows could not be measured.** It hit
-   [#199](https://github.com/tyler-loy/MelangeDB/issues/199), unreadable payloads after
-   reassignment churn. That has to be closed before a replica, which is a second projection of the
-   same shard, is built on the store.
+3. **The cold path could cascade. Fixed.** A node opened an adopted shard inside its heartbeat
+   loop, so a recovery longer than the failure timeout got the *adopting* node declared dead
+   ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). Opens now run off the heartbeat
+   loop. The fix also closed a Replicated-stream gap a newly opened shard could fall into.
+4. **Machine death was worse than process death. Fixed.** The gateway's upstream connect had no
+   timeout, so on a dead machine each client stalled for the OS TCP connect timeout: 21 s on
+   Windows, about 127 s on stock Linux ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)).
+   Handshakes and the attachment retry are now bounded by the failure timeout.
+5. **FASTER at 1M rows could not be measured, and one cause is still open.** The "missing payload"
+   errors ([#199](https://github.com/tyler-loy/MelangeDB/issues/199)) turned out to be a read view
+   outliving its disposed store, now a clean `ObjectDisposedException`. The root cause underneath is
+   not fixed: a snapshot of a FASTER shard larger than its buffer pool can hold a writer under the
+   engine lock for about two minutes, silencing the node's heartbeat
+   ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)). With HA on, that is a false
+   failover, and a replica reads through the same store, so it has to be closed before phase 30
+   builds on FASTER.
 
 ## Reopening trigger (fired)
 
