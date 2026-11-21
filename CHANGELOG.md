@@ -57,6 +57,13 @@ All packages ship together at one version; there is no per-package versioning. S
   entry point checks that before anything else, so the caller gets the transient refusal a drained
   engine already gave. A call already past its append when the engine is disposed still reports an
   internal error, because whether it committed is genuinely unknown.
+- **The rebalance loop no longer moves a shard onto a node only because it couldn't see that
+  node's load** ([#204](https://github.com/tyler-loy/MelangeDB/issues/204)). A shard with no
+  heartbeat sample inside `Cluster:RebalanceWindowSeconds` (a late heartbeat, or a shard that had
+  just moved in) was left out of its node's total, so the node read as idle and the move rule
+  chose it as the target. That moved a hot shard onto an equally hot node. Nodes with a shard of
+  unknown load are now skipped as targets until their window fills; a freshly provisioned node with
+  no shards is still a target. Found as the flaky scale-in curve test.
 - **A border reset no longer freezes its shard, or gets a live node fenced**
   ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)). To rebuild a neighbour's border
   copy (EventId 1715), the owner read every row of the shard under the engine write lock and kept
