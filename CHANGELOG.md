@@ -48,6 +48,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A call to a shard whose engine was just released is refused as retryable, not reported as an
+  internal error** ([#202](https://github.com/tyler-loy/MelangeDB/issues/202)). A shard node
+  disposes a shard's engine when the shard is released, drained, or the node stops, while client
+  calls are still arriving. Each one used to hit the engine's disposed nested-call flag and come back
+  as `ObjectDisposedException`: an internal error to the client and an error-level log line (EventId
+  1204), 547 of them in one failover trial. Disposal now closes the engine first, and every write
+  entry point checks that before anything else, so the caller gets the transient refusal a drained
+  engine already gave. A call already past its append when the engine is disposed still reports an
+  internal error, because whether it committed is genuinely unknown.
 - **A border reset no longer freezes its shard, or gets a live node fenced**
   ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)). To rebuild a neighbour's border
   copy (EventId 1715), the owner read every row of the shard under the engine write lock and kept
