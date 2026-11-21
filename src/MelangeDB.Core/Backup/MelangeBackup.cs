@@ -109,7 +109,7 @@ public static class MelangeBackup
         ArgumentNullException.ThrowIfNull(destination);
         var shardDirectories = Directory.Exists(shardDataPath)
             ? Directory.EnumerateDirectories(shardDataPath, ArchiveFormat.ShardEngineKeyPrefix + "*")
-                .Where(static dir => File.Exists(Path.Combine(dir, "log", "melange.log")))
+                .Where(static dir => LogSegments.IsLogDirectory(Path.Combine(dir, "log")))
                 .OrderBy(static dir => Path.GetFileName(dir), StringComparer.Ordinal)
                 .ToList()
             : [];

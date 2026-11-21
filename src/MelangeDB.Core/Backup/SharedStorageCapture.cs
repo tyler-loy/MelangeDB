@@ -39,8 +39,7 @@ internal static class SharedStorageCapture
     private static BackupEngineSummary CaptureOnce(string shardDirectory, string engineKey, ArchiveFrameWriter writer)
     {
         var logDirectory = Path.Combine(shardDirectory, "log");
-        var logPath = Path.Combine(logDirectory, "melange.log");
-        if (!File.Exists(logPath))
+        if (!LogSegments.IsLogDirectory(logDirectory))
             throw new InvalidOperationException($"'{shardDirectory}' does not contain log/melange.log — it is not a shard data directory.");
 
         var epoch = ReadEpoch(Path.Combine(logDirectory, "melange.epoch"));
@@ -67,11 +66,11 @@ internal static class SharedStorageCapture
             if (snapshot is not null && snapshot.Header.Lsn < baseLsn)
                 throw new InvalidOperationException($"'{shardDirectory}': the snapshot predates the truncation base; a rewrite raced this capture.");
 
-            // Read + write + delete sharing throughout: the owner appends, snapshots, and
-            // compacts underneath these handles, and every one of those must proceed.
-            using var log = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            // Read + write + delete sharing throughout: the owner appends, snapshots, compacts and
+            // seals underneath these handles, and every one of those must proceed.
+            using var log = new LogSegments.Reader(logDirectory);
             return DataDirectoryCapture.CaptureCore(
-                engineKey, writer, log, logPath, shardDirectory, snapshot, epoch, baseLsn,
+                engineKey, writer, log, logDirectory, shardDirectory, snapshot, epoch, baseLsn,
                 fence => BorrowedSidecar(shardDirectory, fence));
         }
         finally

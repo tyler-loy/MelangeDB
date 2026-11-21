@@ -105,6 +105,11 @@ internal sealed partial class ShardRuntime : IDisposable
         Options = MelangeOptionsClone.DeepClone(current);
         Options.HotStore.Path = Path.Combine(shardDirectory, "hot");
         Options.CommitLog.Path = Path.Combine(shardDirectory, "log");
+
+        // The storage fence (phase 30 step 2b): the log opens under this ownership's term, which
+        // seals the previous owner's segment at its cut, and refuses a term older than the one
+        // the directory is already at.
+        Options.CommitLog.Term = fencingToken;
         Options.Events.DeadLetterPath = Path.Combine(shardDirectory, "deadletter");
 
         Engine = new MelangeEngine(
