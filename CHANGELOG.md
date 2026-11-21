@@ -43,6 +43,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A FASTER store that's been disposed no longer reports its rows as corrupt**
+  ([#199](https://github.com/tyler-loy/MelangeDB/issues/199)). A read view that outlived its
+  store, for example a snapshot still running when its shard was released, read paged rows after
+  the store's `deleteOnClose` files were gone, and was told "out-of-line payload ... is missing" or
+  "main record is missing". Scans quietly skipped those rows as unreadable (EventId 1511). Reads on
+  a disposed store now throw `ObjectDisposedException`.
+- **FASTER `Statistics()` no longer takes the store lock.** The lock is held across each paged
+  read, including the disk I/O, so a heartbeat's load sample queued behind a long scan. The
+  counters it reports change only while a commit applies, which happens under the engine write
+  lock that consistent callers already hold.
 - **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
   fsynced while holding the log's append lock, so every commit that landed during a flush waited
   for it under the engine's write lock. A consumer game saw one-row commits of 63–206 ms with a
