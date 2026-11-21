@@ -191,6 +191,139 @@ internal static class LogSegments
             new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
     }
 
+    /// <summary>
+    /// Follows a log directory's segments forward from an LSN: what a follower (phase 30 step 2c)
+    /// reads while another process owns the log. Read-only and reopened per call, because shared
+    /// filesystems cache what an open handle sees (NFS caches attributes), and because the owner
+    /// seals, truncates and compacts underneath. It remembers the byte offset of the next record
+    /// and checks that a record with the expected LSN is still there before trusting it, so a
+    /// compaction that rewrote the live segment is noticed and the record found again.
+    /// </summary>
+    public sealed class Tail(string logDirectory, ulong nextLsn)
+    {
+        private string? _file;
+        private long _offset = -1;
+
+        /// <summary>The LSN the next <see cref="Read"/> returns first.</summary>
+        public ulong NextLsn { get; private set; } = nextLsn;
+
+        /// <summary>
+        /// The records from <see cref="NextLsn"/> on that are complete on disk now, none above
+        /// <paramref name="ceiling"/>, at most <paramref name="max"/>. A record still being written
+        /// at the end of the live segment ends the read; it is read on a later call.
+        /// </summary>
+        /// <exception cref="TailGapException">The record the tail needs is not where the log says it should be (truncated away, or damaged); start again from a snapshot.</exception>
+        public List<CommitRecord> Read(ulong ceiling, int max)
+        {
+            var records = new List<CommitRecord>();
+            if (NextLsn > ceiling)
+                return records;
+            var manifest = Load(logDirectory);
+            var segments = manifest.SealedSegments
+                .Select(static s => (s.File, Cut: (ulong?)s.Cut))
+                .Append((manifest.ActiveSegment.File, Cut: (ulong?)null))
+                .ToList();
+            var index = segments.FindIndex(s => s.Cut is null || s.Cut >= NextLsn);
+            while (records.Count < max)
+            {
+                var (file, cut) = segments[index];
+                if (_file != file)
+                {
+                    _file = file;
+                    _offset = -1;
+                }
+
+                var path = Path.Combine(logDirectory, file);
+                FileStream stream;
+                try
+                {
+                    stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                }
+                catch (FileNotFoundException) when (cut is null)
+                {
+                    return records; // A new term's segment its owner has not created yet.
+                }
+                catch (FileNotFoundException exception)
+                {
+                    throw new TailGapException($"'{path}' was deleted under the tail at LSN {NextLsn}; a truncation passed it.", exception);
+                }
+
+                using (stream)
+                {
+                    if (stream.Length < FileCommitLog.HeaderSize)
+                        return records;
+                    if (_offset < 0 || !RecordStartsAt(stream, _offset, NextLsn))
+                        _offset = Locate(stream, NextLsn);
+                    var frame = new byte[FileCommitLog.FrameSize];
+                    var length = stream.Length;
+                    while (records.Count < max && _offset + FileCommitLog.FrameSize <= length)
+                    {
+                        stream.Seek(_offset, SeekOrigin.Begin);
+                        stream.ReadExactly(frame);
+                        var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+                        var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(4));
+                        if (payloadLength == 0 || payloadLength > FileCommitLog.MaxRecordBytes || _offset + FileCommitLog.FrameSize + payloadLength > length)
+                            break; // Still being written, or a torn tail past the cut.
+                        var payload = new byte[payloadLength];
+                        stream.ReadExactly(payload);
+                        if (Crc32.Compute(payload) != expectedCrc)
+                            break;
+                        var lsn = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(2));
+                        if (cut is { } last && lsn > last)
+                            break;
+                        if (lsn != NextLsn)
+                            throw new TailGapException($"'{path}' holds LSN {lsn} where the tail expected {NextLsn}.");
+                        if (lsn > ceiling)
+                            return records;
+                        records.Add(LogRecordCodec.ReadPayload(payload, (int)(FileCommitLog.FrameSize + payloadLength)));
+                        NextLsn++;
+                        _offset += FileCommitLog.FrameSize + payloadLength;
+                    }
+                }
+
+                // Out of complete records here. Move on only past a sealed segment's cut; the live
+                // segment's end is just where the owner has got to.
+                if (records.Count >= max || cut is not { } sealedCut || NextLsn <= sealedCut)
+                    return records;
+                index++;
+            }
+
+            return records;
+        }
+
+        private static bool RecordStartsAt(FileStream stream, long offset, ulong lsn)
+        {
+            if (offset < FileCommitLog.HeaderSize || offset + FileCommitLog.FrameSize + 10 > stream.Length)
+                return false;
+            Span<byte> head = stackalloc byte[FileCommitLog.FrameSize + 10];
+            stream.Seek(offset, SeekOrigin.Begin);
+            stream.ReadExactly(head);
+            return BinaryPrimitives.ReadUInt32LittleEndian(head) >= 10
+                && BinaryPrimitives.ReadUInt64LittleEndian(head[(FileCommitLog.FrameSize + 2)..]) == lsn;
+        }
+
+        /// <summary>The offset of the first frame whose LSN is at least <paramref name="lsn"/>, hopping headers from the start.</summary>
+        private static long Locate(FileStream stream, ulong lsn)
+        {
+            Span<byte> head = stackalloc byte[FileCommitLog.FrameSize + 10];
+            var position = (long)FileCommitLog.HeaderSize;
+            var length = stream.Length;
+            while (position + head.Length <= length)
+            {
+                stream.Seek(position, SeekOrigin.Begin);
+                stream.ReadExactly(head);
+                var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(head);
+                if (payloadLength < 10 || payloadLength > FileCommitLog.MaxRecordBytes || position + FileCommitLog.FrameSize + payloadLength > length)
+                    return position;
+                if (BinaryPrimitives.ReadUInt64LittleEndian(head[(FileCommitLog.FrameSize + 2)..]) >= lsn)
+                    return position;
+                position += FileCommitLog.FrameSize + payloadLength;
+            }
+
+            return position;
+        }
+    }
+
     private static class LogMessages
     {
         private static readonly Action<ILogger, string, long, ulong, long, Exception?> SegmentSealedMessage =
@@ -201,6 +334,20 @@ internal static class LogSegments
 
         public static void SegmentSealed(ILogger logger, string directory, long term, ulong cut, long newTerm) =>
             SegmentSealedMessage(logger, directory, term, cut, newTerm, null);
+    }
+}
+
+/// <summary>A tail found the log no longer holds the record it needed; the follower starts again from a snapshot.</summary>
+internal sealed class TailGapException : InvalidOperationException
+{
+    public TailGapException(string message)
+        : base(message)
+    {
+    }
+
+    public TailGapException(string message, Exception inner)
+        : base(message, inner)
+    {
     }
 }
 

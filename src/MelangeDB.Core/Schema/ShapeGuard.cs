@@ -396,10 +396,18 @@ internal static class ShapeGuard
         ulong headLsn = 0,
         bool allowAdoption = true,
         Action<ulong>? onAdoptedOverExistingRecords = null,
-        Action<int>? onTiersRecorded = null)
+        Action<int>? onTiersRecorded = null,
+        bool readOnly = false)
     {
         var path = Path.Combine(logDirectory, ShapeHistory.FileName);
         var history = ShapeHistory.Load(path);
+        if (history is null && readOnly)
+        {
+            // A reader of someone else's log (a follower) never names the directory's first shape:
+            // that is the owner's boot to do, and it has not happened yet.
+            throw new ShapeNotRecordedException($"'{path}' does not exist yet; the log's owner writes it at boot.");
+        }
+
         if (history is null)
         {
             // Adoption assumes existing records were written by this schema — the only possible
@@ -450,7 +458,7 @@ internal static class ShapeGuard
 
         var compacted = history.Compact(baseLsn);
         var tiersRecorded = history.RecordMissingTiers(schema);
-        if (compacted || tiersRecorded > 0)
+        if ((compacted || tiersRecorded > 0) && !readOnly)
             history.Save(path);
         if (tiersRecorded > 0)
             onTiersRecorded?.Invoke(tiersRecorded);
@@ -475,6 +483,9 @@ internal static class ShapeGuard
         };
     }
 }
+
+/// <summary>A read-only shape resolution over a directory whose owner has not recorded a shape yet.</summary>
+internal sealed class ShapeNotRecordedException(string message) : InvalidOperationException(message);
 
 /// <summary>The boot refusal for a destructive schema change; see <see cref="ShapeCompatibility"/>.</summary>
 public sealed class SchemaShapeException(string message, IReadOnlyList<string> reasons) : Exception(message)

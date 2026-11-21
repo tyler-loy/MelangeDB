@@ -188,3 +188,9 @@ fault its working set in from disk, which is the reopen cost again in another fo
   interface can hide. `LogSegments` is where the manifest and the sealed segments live, and it is
   the seam a driver would start from. The interface is left to the object-storage idea, which
   would have to design it against a real second implementation.
+- **2c**: `LogFollower` (Core, internal) and `LogSegments.Tail`. The follower bootstraps read-only
+  (no lock, no truncation, no epoch, no shape writes: `ShapeGuard.Resolve(readOnly: true)`), then
+  polls the segments, applying only up to its `Ceiling`. It starts over from the snapshot when a
+  truncation passes its cursor, the epoch changes, or the shape sidecar changes. The tail reopens
+  files per call and verifies its remembered offset, so a compaction of the live segment is
+  re-located rather than misread. Not wired into the cluster yet; that is 2d.
