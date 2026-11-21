@@ -177,7 +177,7 @@ public sealed partial class MelangeEngine : IDisposable
     /// asking for an engine whose package is not registered fails loudly rather than silently
     /// substituting.
     /// </summary>
-    private IHotStore CreateStore(
+    internal static IHotStore CreateStore(
         MelangeDbOptions options,
         SchemaRegistry schema,
         IHotStoreProvider? provider,
@@ -221,16 +221,19 @@ public sealed partial class MelangeEngine : IDisposable
     /// <see cref="IHotStore"/>, including one this assembly never saw, holds nothing of an archive
     /// table but its keys. The AutoInc sequencer and every decoupled applier still see the whole record.
     /// </summary>
-    private CommitRecord WithoutArchiveOps(CommitRecord record)
+    private CommitRecord WithoutArchiveOps(CommitRecord record) => WithoutArchiveOps(record, Schema, _archiveTables);
+
+    /// <summary>The archive filter for any projection of a log, the follower's included (phase 30 step 2c).</summary>
+    internal static CommitRecord WithoutArchiveOps(CommitRecord record, SchemaRegistry schema, IReadOnlySet<TableId> archiveTables)
     {
-        if (_archiveTables.Count == 0)
+        if (archiveTables.Count == 0)
             return record;
 
         List<RowOp>? kept = null;
         for (var i = 0; i < record.WriteSet.Count; i++)
         {
             var op = record.WriteSet[i];
-            if (_archiveTables.Contains(op.Table))
+            if (archiveTables.Contains(op.Table))
             {
                 if (kept is null)
                 {
@@ -239,7 +242,7 @@ public sealed partial class MelangeEngine : IDisposable
                         kept.Add(record.WriteSet[j]);
                 }
 
-                if (Schema.KeySetFor(op.Table) is { } keySet)
+                if (schema.KeySetFor(op.Table) is { } keySet)
                     kept.Add(KeySetOp(keySet, op));
                 continue;
             }
