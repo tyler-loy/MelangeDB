@@ -1,6 +1,6 @@
 # Phase 22 — `MelangeDB.Testing`, the reducer test kit
 
-**Status: Planned.**
+**Status: Built** (road-to-0.4, 2026-11-21). See [TESTING.md](../TESTING.md); the as-built notes are at the end.
 
 **Goal:** a package a game author reaches for on day one, in which ticks, time, identity, and write
 sets are first-class assertions rather than things each consumer re-derives. Writing a test for a
@@ -121,6 +121,9 @@ package rather than inside it.
 
 ## Decisions to settle
 
+All four settled on 2026-11-21: three by the owner, as leaned, and one by what was built since this
+plan was written. The reasoning is kept below.
+
 ### A real commit log on a temp directory, or an in-memory `ICommitLog`
 
 `FileCommitLog` is currently the only implementation. An in-memory log would make tests faster and
@@ -128,9 +131,10 @@ leave no directories behind; it would also be a second implementation of the dur
 — the ordering, the epoch, the torn-tail handling, the group-commit watermark — and the most likely
 thing in this package to silently diverge from the real one.
 
-**Leaning:** the real `FileCommitLog` on a temp directory. It keeps `Restart()` honest, which is the
-kit's most valuable feature, and it means a passing test used the same code path production does.
-**Open:** the default fsync policy. `EngineHarness` defaults to `OnCommit`, which is correct and
+**Settled: the real `FileCommitLog` on a temp directory, `Interval` fsync by default** (owner,
+2026-11-21). Recovery-shaped tests opt up to `OnCommit`, and `TESTING.md` says so where a reader
+will see it. It keeps `Restart()` honest, which is the kit's most valuable feature, and it means a
+passing test used the same code path production does. The question was the default fsync policy. `EngineHarness` defaults to `OnCommit`, which is correct and
 slow across a large suite; the kit probably wants `Interval` by default with recovery-shaped tests
 opting up explicitly, and if so, that trade needs to be stated in `TESTING.md` rather than buried —
 a test suite that never fsyncs is not testing what a crash sees.
@@ -142,7 +146,11 @@ generated into *this* assembly. A consumer's model is generated into theirs, so 
 it: reflect over the consuming assembly for the generated type, or have the source generator emit a
 testing entry point the kit calls directly.
 
-**Leaning:** emit the entry point. The generator already runs in every consuming project, the
+**Settled by what exists now: neither.** Since this plan was written the generator stamps every
+consuming assembly with `[assembly: MelangeGeneratedModel(typeof(...))]`, and the host's
+`AddTablesFrom`/`AddReducersFrom` already read it. The kit takes the game's assembly and goes
+through the same builder, with no new generator output and no new reflection. The original leaning
+follows for the record: emit the entry point. The generator already runs in every consuming project, the
 project's instinct is generator-over-reflection, and `ZeroReflectionTests` exists to keep the
 invocation path clean — setup is not the invocation path, so reflection here would not violate that
 rule, but it would be the first place this codebase reached for reflection when a generator was
@@ -154,19 +162,41 @@ it is dead code in a shipping game.
 Grok's sketch used `AdvanceTo(Timestamp.FromSeconds(60))`; the underlying provider advances a
 `DateTimeOffset`. Scheduled reducers are driven by `ScheduleAt` on timer rows, which is world time.
 
-**Leaning:** offer both and make the difference explicit in the names — `AdvanceBy(TimeSpan)` as the
-common case, `AdvanceToTick(n)` where a consumer's tick cadence is known. **Open:** whether the kit
-should know about tick cadence at all, or whether that is the consumer's helper to write on top of
-`AdvanceBy`. Probably the latter; a database that ships an opinion about tick rate has crossed into
-being a game framework.
+**Settled: time only** (owner, 2026-11-21). `AdvanceBy(TimeSpan)` and `AdvanceTo(DateTimeOffset)`;
+no tick cadence in the kit. A game that counts ticks writes a one-line helper on top of `AdvanceBy`.
+A database that ships an opinion about tick rate has crossed into being a game framework.
 
 ### Whether the kit exposes the engine directly
 
 An escape hatch (`world.Engine`) makes every advanced case possible and makes the curated surface
 optional.
 
-**Leaning:** expose it, documented as an escape hatch and not the intended path. The alternative is
+**Settled: expose it, documented as an escape hatch and not the intended path** (owner,
+2026-11-21). The alternative is
 a consumer blocked on a missing helper with no way forward, which is how a test kit gets abandoned
 after its first gap. What the kit should *not* do is expose it so casually that
 `world.Engine.Invoke(...)` becomes the idiom — which is the ad-hoc-body path this phase exists to
 replace.
+
+## As built
+
+- **`MelangeDB.Testing`**, one package over Core and `Microsoft.Extensions.Hosting`:
+  `MelangeWorld`, `MelangeWorldBuilder`, `ManualClock`, `WorldCommit` with `RowChange<T>`, and
+  `MelangeTestFailure`. A world is a real host (`Host.CreateApplicationBuilder` with defaults off)
+  over a temp directory, with the manual clock registered as the `TimeProvider`.
+- **The model is found the way the host finds it**, through the generated assembly attribute and
+  `AddTablesFrom`/`AddReducersFrom`/`AddProducersFrom`; no generator change.
+- **`Call`** returns the commit it produced (or null), matched by reducer name past the head the
+  call started from, so a tick cannot be mistaken for it. **`Rejects`** also fails if a rejected
+  call moved the log.
+- **`Restart`** is a graceful stop and start on the same directory, clock and services. Graceful
+  stop drains and flushes but takes no snapshot, so the restart replays the log (from any
+  snapshot the engine took on its own). `RestartAndVerify` compares every table byte for byte.
+- **Calls are in-process**, so client-call policies and rate limits are not applied. The plan did
+  not ask for client-originated calls; it is noted in TESTING.md as something the kit does not do.
+- **The two internal clocks are deleted.** The host and transport suites use `ManualClock`; its
+  `ArmedDelays` (the scheduler's re-arm decisions) and `Jump` (a stalled process) are the two copies'
+  extras, merged.
+- **Tests:** `MelangeDB.Testing.Tests`, a small hunting game written as a consumer would, with the
+  four first tests plus substitution, captured `Init`, identities and the clock's jump semantics.
+

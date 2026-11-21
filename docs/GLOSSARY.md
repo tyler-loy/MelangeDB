@@ -365,6 +365,15 @@ moved key, and therefore also a rename — refuses at boot with every reason nam
 AutoInc sequences from it, and dispatches reducers. Phase 02's `AddMelangeDb` wraps it; application code
 stops meeting it directly at that point.
 
+**Test world (`MelangeWorld`)** — `MelangeDB.Testing`'s real engine over a throwaway directory, on a
+manual clock (road-to-0.4, phase 22): the game's tables and reducers, called through the production
+dispatch path, with every commit captured. Not a mock; see [TESTING.md](TESTING.md).
+
+**Manual clock (`ManualClock`)** — The test kit's `TimeProvider`. Time moves only when a test advances
+it, and every timer that comes due fires synchronously on the advancing thread, earliest first,
+before the advance returns: the guarantee scheduled-reducer tests rest on. `Jump` moves time without
+firing anything, as a stalled process would.
+
 **Event bus** — The delivery mechanism for domain events, implemented as a transactional outbox over the commit
 log. A projection, not a second source of truth.
 

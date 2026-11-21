@@ -1,5 +1,6 @@
 using MelangeDB.Core;
 using MelangeDB.Storage.Faster;
+using MelangeDB.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -137,7 +138,7 @@ public class PagedStorageHostTests : IDisposable
     {
         // End-to-end through the hosted service's floor registration: a subscriber blocked on its
         // gate pins the log at its checkpoint; releasing it lets the next snapshot truncate.
-        var time = new ManualTimeProvider();
+        var time = new ManualClock();
         using var host = TestApp.Build(
             _root,
             new Dictionary<string, string?> { ["MelangeDb:Resume:RetentionWindowSeconds"] = "0" },

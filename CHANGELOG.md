@@ -24,6 +24,18 @@ All packages ship together at one version; there is no per-package versioning. S
   running host's endpoint. A `melange.mcp.tool` span per call. See [docs/MCP.md](docs/MCP.md)
   and the new THREAT-MODEL section.
 
+- **`MelangeDB.Testing`, the reducer test kit** (road-to-0.4 phase 22). A new package:
+  `MelangeWorld.Create(gameAssembly).Build()` runs the game's own tables and reducers in a real
+  engine over a throwaway directory, on a `ManualClock` whose due timers fire synchronously before
+  `AdvanceBy` returns, so scheduled-reducer tests are deterministic with no sleeps. `Call` goes
+  through the production dispatch path and returns the commit; `Of<T>()` decodes its write set
+  into the game's row types; `Read` uses the generated accessors; `Rejects` and `Faults` keep a
+  deliberate rejection apart from a bug; `Restart` and `RestartAndVerify` rebuild from disk;
+  `WithServices` substitutes dependencies; `Engine` is the documented escape hatch. Fsync is on an
+  interval by default and `WithDurableCommits()` opts up. No test framework dependency. See
+  [docs/TESTING.md](docs/TESTING.md). This repo's own suites now use its clock; the two internal
+  copies are gone.
+
 - **Warm replicas** (road-to-0.4 phase 30, steps 2c to 2e). With two or more shard nodes, the hub
   places each shard's replica on a node other than its owner (`Cluster:ShardReplicas`, default 1;
   0 opts out). The replica's node follows the shard's log read-only and keeps its hot store current

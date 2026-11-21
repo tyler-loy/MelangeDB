@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using MelangeDB.Core;
+using MelangeDB.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -19,7 +20,7 @@ namespace MelangeDB.Host.Tests;
 public class SchedulerAfterMigrationTests : IDisposable
 {
     private readonly string _root = Directory.CreateTempSubdirectory("melange-sched-mig-").FullName;
-    private readonly ManualTimeProvider _time = new();
+    private readonly ManualClock _time = new();
 
     public void Dispose()
     {

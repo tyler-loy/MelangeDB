@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using System.Text.Json;
 using MelangeDB.Core;
+using MelangeDB.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -18,7 +19,7 @@ namespace MelangeDB.Host.Tests;
 public class EventBusTests : IDisposable
 {
     private readonly string _root = Directory.CreateTempSubdirectory("melange-events-").FullName;
-    private readonly ManualTimeProvider _time = new();
+    private readonly ManualClock _time = new();
     private readonly LogCollector _logs = new();
 
     public void Dispose()
