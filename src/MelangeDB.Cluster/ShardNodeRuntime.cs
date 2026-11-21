@@ -67,7 +67,21 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private readonly CancellationTokenSource _stopped = new();
     private volatile NodeLink? _link;
     private IShardStrategy? _strategy;
-    private long _leaseValidUntilTicks;
+    /// <summary>
+    /// When the lease ends, as a <see cref="TimeProvider.GetTimestamp"/> value: monotonic, so a
+    /// wall-clock step cannot stretch or shrink it. Zero (never renewed) is always expired.
+    /// </summary>
+    private long _leaseValidUntilTimestamp;
+
+    /// <summary>
+    /// The failure timeout the lease is measured against: the hub's, from <see cref="AuthReply"/>,
+    /// once registered. Until then (and against a hub too old to send it) this node's own setting.
+    /// </summary>
+    private int _leaseTimeoutMs;
+
+    private bool _timeoutMismatchLogged;
+
+    private ITimer? _leaseWatchdog;
     private Task? _connectLoop;
     private Task? _reconcileLoop;
     private Task? _borderLoop;
@@ -135,12 +149,13 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     }
 
     /// <summary>
-    /// Whether this node's lease is live: a heartbeat (or registration) succeeded within
-    /// Cluster:FailureTimeoutMs. Expired means self-fenced — the hub has, by the same clock,
-    /// begun to suspect this node dead.
+    /// Whether this node's lease is live. The lease runs from when the last acknowledged heartbeat
+    /// (or registration) was <em>sent</em>, for the hub's failure timeout less a margin (see
+    /// <see cref="RenewLease"/>), so it always ends before the hub can declare this node dead.
+    /// Expired means self-fenced: every commit is refused and the shards are parked.
     /// </summary>
     public bool LeaseValid() =>
-        _time.GetUtcNow().UtcTicks < Interlocked.Read(ref _leaseValidUntilTicks);
+        _time.GetTimestamp() < Interlocked.Read(ref _leaseValidUntilTimestamp);
 
     public void Start()
     {
@@ -163,6 +178,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         engine.AddCommitGuard(new NodeLocalCommitGuard(engine.Schema, cluster.NodeName));
 
         _strategy = _services.GetService<IShardStrategy>();
+        _leaseTimeoutMs = cluster.FailureTimeoutMs;
+        var watchdog = TimeSpan.FromMilliseconds(Math.Max(25, Math.Min(cluster.HeartbeatIntervalMs, cluster.FailureTimeoutMs / 10)));
+        _leaseWatchdog = _time.CreateTimer(_ => ParkShardsIfLeaseExpired(), null, watchdog, watchdog);
         _connectLoop = Task.Run(RunAsync);
         _reconcileLoop = Task.Run(ReconcileHandoffsAsync);
         _borderLoop = Task.Run(MaintainBorderSubscriptionsAsync);
@@ -214,6 +232,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         {
             var hubNonce = await challenge.Task.WaitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false);
             var nodeNonce = LinkProof.NewNonce();
+            var authSent = _time.GetTimestamp();
             var reply = await link.RequestAsync("auth", new AuthRequest(
                 cluster.NodeName,
                 cluster.PublicAddress,
@@ -224,7 +243,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 throw new InvalidOperationException("The hub failed to prove possession of the cluster secret.");
 
             _link = link;
-            RenewLease();
+            AdoptHubTimeout(auth.FailureTimeoutMs);
+            RenewLease(authSent);
             ApplyAssignments(auth.Assignments);
             await SubscribeReplicationAsync(link, ct).ConfigureAwait(false);
             KickForwarders();
@@ -236,8 +256,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 await Task.Delay(cluster.HeartbeatIntervalMs, ct).ConfigureAwait(false);
                 if (SuspendHeartbeats)
                     continue;
-                var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(CollectLoads()), ct).ConfigureAwait(false);
-                RenewLease();
+                var loads = CollectLoads();
+                var sent = _time.GetTimestamp();
+                var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(loads), ct).ConfigureAwait(false);
+                RenewLease(sent);
                 var assignments = beat!.Value.Deserialize<HeartbeatReply>()!.Assignments;
                 ApplyAssignments(assignments);
                 await SubscribeReplicationAsync(link, ct).ConfigureAwait(false);
@@ -253,10 +275,99 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         }
     }
 
-    private void RenewLease() =>
-        Interlocked.Exchange(
-            ref _leaseValidUntilTicks,
-            _time.GetUtcNow().AddMilliseconds(Cluster.FailureTimeoutMs).UtcTicks);
+    /// <summary>
+    /// Renews the lease from <paramref name="sentTimestamp"/>, when the acknowledged request left
+    /// this node, not from when its reply arrived (#214). The hub receives a heartbeat no earlier
+    /// than it was sent and declares death no earlier than <c>FailureTimeoutMs</c> after receiving
+    /// it, on its own monotonic clock; starting the lease at the send, and shortening it by a
+    /// tenth for the two clocks' rates to disagree, makes the lease end strictly first. Measured
+    /// from the reply instead, it outlived the hub's earliest declaration by the hub's processing
+    /// time plus the return trip. Never moves the lease backwards (a late reply to an earlier
+    /// request is not news).
+    /// </summary>
+    private void RenewLease(long sentTimestamp)
+    {
+        var timeoutMs = Volatile.Read(ref _leaseTimeoutMs);
+        var lengthMs = timeoutMs - timeoutMs / 10;
+        var until = sentTimestamp + (long)(lengthMs * (double)_time.TimestampFrequency / 1000d);
+        long current;
+        do
+        {
+            current = Interlocked.Read(ref _leaseValidUntilTimestamp);
+            if (until <= current)
+                return;
+        }
+        while (Interlocked.CompareExchange(ref _leaseValidUntilTimestamp, until, current) != current);
+    }
+
+    /// <summary>
+    /// The lease is measured against the hub's failure timeout, not this node's setting: the hub
+    /// is the one that declares death, and a node configured with a longer timeout held its lease
+    /// past the declaration (#214). A mismatch is logged once, since it is a deployment error.
+    /// </summary>
+    private void AdoptHubTimeout(int hubFailureTimeoutMs)
+    {
+        if (hubFailureTimeoutMs <= 0)
+            return; // A hub that predates the field: keep this node's own setting.
+        Volatile.Write(ref _leaseTimeoutMs, hubFailureTimeoutMs);
+        if (hubFailureTimeoutMs != Cluster.FailureTimeoutMs && !_timeoutMismatchLogged)
+        {
+            _timeoutMismatchLogged = true;
+            LogFailureTimeoutMismatch(_logger, NodeName, Cluster.FailureTimeoutMs, hubFailureTimeoutMs);
+        }
+    }
+
+    /// <summary>
+    /// The lease watchdog's tick: once the lease has lapsed, park every shard (#216). The lease
+    /// is already the write fence (every commit is refused), but an open engine also holds its
+    /// shard's log lock, and on storage that honours the lock a partitioned-but-alive owner kept
+    /// the new owner from opening the shard indefinitely. Parking closes the engines and releases
+    /// the locks; registering again reopens whatever the hub still assigns here, from the log.
+    /// </summary>
+    private void ParkShardsIfLeaseExpired()
+    {
+        try
+        {
+            if (!LeaseValid())
+                ParkShards();
+        }
+        catch (Exception exception)
+        {
+            LogHubLinkLost(_logger, $"parking shards after the lease lapsed failed: {exception.Message}");
+        }
+    }
+
+    private void ParkShards()
+    {
+        List<ShardRuntime> parked;
+        lock (_shardsLock)
+        {
+            if (_shards.Count == 0 && _assigned.Count == 0)
+                return;
+
+            // Nothing is assigned to a node without a lease: an open still recovering sees this
+            // when it finishes and abandons (1754) instead of publishing into a fenced node.
+            _assigned = [];
+            parked = [.. _shards.Values];
+            foreach (var shard in _shards.Keys)
+            {
+                if (_forwarders.Remove(shard, out var forwarder))
+                    forwarder.Dispose();
+                if (_borderPublishers.Remove(shard, out var publisher))
+                    publisher.Dispose();
+                if (_boundaryMonitors.Remove(shard, out var monitor))
+                    monitor.Dispose();
+            }
+
+            _shards.Clear();
+            _replicaSubscribedFrom = ulong.MaxValue;
+        }
+
+        foreach (var runtime in parked)
+            runtime.Dispose();
+        if (parked.Count > 0)
+            LogShardsParked(_logger, NodeName, parked.Count);
+    }
 
     /// <summary>
     /// One load sample per owned shard, taken by the heartbeat loop (its only caller, so the
@@ -340,8 +451,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             foreach (var reaping in _reaping.Keys.ToList())
                 IsReapingLocked(reaping);
 
-            _assigned = assigned;
-            foreach (var assignment in assigned.Values)
+            // A reply that arrived after the lease it renewed had already run out (the lease runs
+            // from the request's send) leaves this node fenced: it opens nothing, or the watchdog
+            // would park what it opened and the two would alternate. The next heartbeat retries.
+            var leaseValid = LeaseValid();
+            _assigned = leaseValid ? assigned : [];
+            foreach (var assignment in leaseValid ? assigned.Values : Enumerable.Empty<ShardAssignment>())
             {
                 if (_shards.ContainsKey(assignment.Shard) || _opening.ContainsKey(assignment.Shard))
                     continue;
@@ -1320,6 +1435,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     public void Dispose()
     {
         _stopped.Cancel();
+        _leaseWatchdog?.Dispose();
         _link?.Dispose();
 
         // An open in flight holds the shard's log and store; let it finish and close itself (it
@@ -1354,6 +1470,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     [LoggerMessage(EventId = 1707, EventName = "ShardOpened", Level = LogLevel.Information,
         Message = "Shard {Shard} opened on node '{NodeName}' in {OpenMs:F0}ms, recovered to LSN {HeadLsn} from its own log.")]
     private static partial void LogShardOpened(ILogger logger, ulong shard, string nodeName, double openMs, ulong headLsn);
+
+    [LoggerMessage(EventId = 1756, EventName = "ShardsParkedOnLeaseExpiry", Level = LogLevel.Warning,
+        Message = "Node '{NodeName}' parked {Count} shard(s): its lease lapsed without a hub heartbeat, so it may already have been declared dead. Their engines are closed and their logs released for whichever node the hub names; registering again reopens any still assigned here.")]
+    private static partial void LogShardsParked(ILogger logger, string nodeName, int count);
+
+    [LoggerMessage(EventId = 1757, EventName = "FailureTimeoutMismatch", Level = LogLevel.Warning,
+        Message = "Node '{NodeName}' is configured with Cluster:FailureTimeoutMs {NodeTimeoutMs} but the hub uses {HubTimeoutMs}; the lease follows the hub's. Set them the same.")]
+    private static partial void LogFailureTimeoutMismatch(ILogger logger, string nodeName, int nodeTimeoutMs, int hubTimeoutMs);
 
     [LoggerMessage(EventId = 1753, EventName = "ShardOpenFailed", Level = LogLevel.Warning,
         Message = "Shard {Shard} could not be opened on node '{NodeName}' ({Reason}); the next heartbeat retries. The hub link and this node's other shards are unaffected.")]

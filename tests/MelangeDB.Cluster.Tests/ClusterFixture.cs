@@ -46,6 +46,9 @@ internal sealed class ClusterFixture : IAsyncDisposable
     private readonly int _failureTimeoutMs;
     private readonly bool _spatial;
     private readonly IReadOnlyDictionary<string, string?>? _extraSettings;
+
+    /// <summary>Settings applied to shard nodes only, after <see cref="_extraSettings"/>: a node configured unlike its hub.</summary>
+    public IReadOnlyDictionary<string, string?>? ShardNodeSettings { get; init; }
     private readonly Action<IServiceCollection>? _configureHub;
     private int _hubHttpPort;
     private int _nodeListenPort;
@@ -87,7 +90,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
         bool spatial = false,
         IReadOnlyDictionary<string, string?>? extraSettings = null,
         Action<IServiceCollection>? configureHub = null,
-        string? dataRoot = null)
+        string? dataRoot = null,
+        IReadOnlyDictionary<string, string?>? shardNodeSettings = null)
     {
         // A caller-provided root is how the restore tests boot a cluster over materialized
         // directories: hub data pre-placed at {root}/hub/log, shard data at {root}/shards.
@@ -98,7 +102,10 @@ internal sealed class ClusterFixture : IAsyncDisposable
         // to declare a healthy node dead mid-test, which is the environment failing, not the
         // cluster. Ratios are preserved — failover tests that provoke detection still see it well
         // inside their equally-dilated deadlines — and at scale 1 nothing changes.
-        var fixture = new ClusterFixture(root, heartbeatMs, TestTime.Scale * failureTimeoutMs, spatial, extraSettings, configureHub);
+        var fixture = new ClusterFixture(root, heartbeatMs, TestTime.Scale * failureTimeoutMs, spatial, extraSettings, configureHub)
+        {
+            ShardNodeSettings = shardNodeSettings,
+        };
         fixture.HubApp = await WithFreshPortsRetryAsync(() =>
         {
             fixture._hubHttpPort = FreePort();
@@ -278,6 +285,12 @@ internal sealed class ClusterFixture : IAsyncDisposable
         };
         foreach (var (key, value) in _extraSettings ?? new Dictionary<string, string?>())
             settings[key] = value;
+        if (role == ClusterRole.Shard)
+        {
+            foreach (var (key, value) in ShardNodeSettings ?? new Dictionary<string, string?>())
+                settings[key] = value;
+        }
+
         if (role == ClusterRole.Hub)
         {
             settings["MelangeDb:Cluster:NodeListenPort"] = _nodeListenPort.ToString();
