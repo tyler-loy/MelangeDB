@@ -4,7 +4,7 @@
 12–19 s. No acknowledged write is lost, and at no instant can two nodes both make a write to the
 same shard durable and acknowledge it.
 
-**Status:** **design settled; step 0 (the fence fixes, #214–#218) and step 1 (detection: deadlines, opt-in fast failover) built** (2026-11-21). [Road-to-0.4](../road-to-0.4/README.md) commits phase 30.
+**Status:** **design settled; step 0 (the fence fixes, #214–#218) and step 1 (detection: deadlines, opt-in fast failover, the liveness ping, defaults 250 ms / 5 s) built** (2026-11-21). [Road-to-0.4](../road-to-0.4/README.md) commits phase 30.
 The project owner set the bar on 2026-11-20: production systems get HA, and the bar for *not*
 building it is high. [Phase 20](../road-to-0.3/plan-phase-20.md) measured the window this record
 starts from ([idea-bin entry](../idea-bin/shard-ha-warm-replica.md), the proposal this replaces).
@@ -263,6 +263,12 @@ for the reasoning.
 3. **Default timing once HA is on.** **Settled: decided from a measurement** (heartbeat 250 ms with
    a 2–3 s timeout as the starting hypothesis, plus a false-positive soak under load) rather than
    picking numbers now. This includes whether the heartbeat loop gets a dedicated thread.
+   **Measured and decided:** the soak showed the thread-pool heartbeat stalling for seconds past
+   the capacity knee, so liveness got its own thread first (the ping, under Detection). With it,
+   the longest silence from a healthy node was 0.28 s at sustainable load, 1.8 s past the knee and
+   3.2 s at collapse. **Defaults: heartbeat 250 ms, failure timeout 5 s**, the one choice with no
+   false death at any load measured; 3 s would have declared about four healthy nodes dead in five
+   minutes at collapse. Not waiting for the replica: the ping makes the shorter timeout safe now.
 4. **Ordering.** **Settled:** step 0 (the fence fixes found above) ships first as its own change,
    then detection (#201 plus the fast path), then the replica. Each step stands alone, and steps 0–1
    alone cut the window to a few seconds with no memory cost.

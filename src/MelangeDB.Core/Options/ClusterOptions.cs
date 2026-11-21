@@ -94,16 +94,21 @@ public sealed class ClusterOptions
     /// </summary>
     public int AssertionTtlSeconds { get; set; } = 300;
 
-    /// <summary>How often a shard node heartbeats the hub over its node link.</summary>
-    public int HeartbeatIntervalMs { get; set; } = 1_000;
+    /// <summary>
+    /// How often a shard node heartbeats the hub over its node link, and how often its dedicated
+    /// liveness thread pings it. 250 ms since phase 30 (was 1000), chosen with
+    /// <see cref="FailureTimeoutMs"/> from a measured soak; see docs/LOAD-TESTING.md.
+    /// </summary>
+    public int HeartbeatIntervalMs { get; set; } = 250;
 
     /// <summary>
     /// Silence after which the hub suspects a shard node dead and reassigns its shards — and,
     /// symmetrically, after which a node that cannot reach the hub considers its own shard leases
     /// expired and fences itself. The self-fencing side is what makes a wrongly-suspected-dead
-    /// node stop writing players it no longer owns.
+    /// node stop writing players it no longer owns. 5 s since phase 30 (was 10 s): with the liveness
+    /// ping, no healthy node went silent that long at any load measured, collapse included.
     /// </summary>
-    public int FailureTimeoutMs { get; set; } = 10_000;
+    public int FailureTimeoutMs { get; set; } = 5_000;
 
     /// <summary>
     /// Hub only, off by default: declare a node dead as soon as its node link closes and it has

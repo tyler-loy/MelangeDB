@@ -40,9 +40,12 @@ internal static class FailoverMeasurement
         options.WorldBlocksX = 1;
         options.WorldBlocksY = 1;
         options.RowBytes = Math.Max(8, options.RowBytes);
+        // The library defaults, read rather than copied: the window measured is the one a
+        // deployment on defaults gets, and a copy silently kept measuring the old ones.
+        var defaults = new MelangeDB.Core.ClusterOptions();
         var tuning = new ServeTuning(
-            HeartbeatMs: 1_000,
-            FailureTimeoutMs: 10_000,
+            HeartbeatMs: defaults.HeartbeatIntervalMs,
+            FailureTimeoutMs: defaults.FailureTimeoutMs,
             new Dictionary<string, string?>
             {
                 // Snapshots are taken by the measurement, before each kill, so the tail recovery

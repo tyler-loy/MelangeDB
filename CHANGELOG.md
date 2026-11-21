@@ -53,6 +53,13 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **Cluster defaults: `Cluster:HeartbeatIntervalMs` 250 (was 1000), `Cluster:FailureTimeoutMs`
+  5000 (was 10000)** (road-to-0.4 phase 30). Chosen from a soak under load: with the liveness ping,
+  no healthy node went silent longer than 3.2 s even with the cluster collapsing. A killed shard
+  owner's shards are writable again in 5.9–6.2 s (were 10.1–11.8 s), and 1.5–1.6 s with
+  `Cluster:FastFailoverOnLinkLoss`. Deployments whose nodes see longer pauses (multi-second
+  collections of very large heaps) should set a longer timeout; `melange.cluster.heartbeat.gap`
+  shows how close they come.
 - **A subscription's initial set is collected off the engine's write lock**
   ([#213](https://github.com/tyler-loy/MelangeDB/issues/213)), for tables without row or column
   policies on a store that can pin a read view (both shipped stores can). The row and byte

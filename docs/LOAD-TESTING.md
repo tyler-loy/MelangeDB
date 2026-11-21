@@ -411,6 +411,14 @@ calls by reason.
 - **Failed calls in these windows are the rate limiter, not the failover.** The probe fires 15
   calls/s without waiting. The gateway holds them through the window and they reach the shard in
   one burst, and `RateLimit:*` turns the excess away.
+- **At the phase 30 defaults (heartbeat 250 ms, timeout 5 s),** same runs:
+
+  | Detection | Detect | Reopen | Server window | Client restore p50 / max |
+  | --- | --- | --- | --- | --- |
+  | At the deadline | 4.9–5.1 s | 0.8–1.3 s | 5.9–6.2 s | 6.1 / 6.4 s |
+  | `--fast-failover` | 0.36–0.39 s | 1.2–1.3 s | 1.5–1.6 s | 1.8 / 1.8 s |
+
+  No false death or lease lapse in either; the longest heartbeat gap was 305 ms.
 - **These runs found a gateway bug.** About one kill in twelve tore down a client's connection:
   a send to a node dying under it was mistaken for the client leaving. Fixed separately; with the
   fix, 30 of 30 kills restored every client.
