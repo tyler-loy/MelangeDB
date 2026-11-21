@@ -865,6 +865,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             var shardUtilization = new Dictionary<ShardKey, double>();
             var nodeUtilization = live.ToDictionary(static node => node, static _ => 0d, StringComparer.Ordinal);
+            var partiallyObserved = new HashSet<string>(StringComparer.Ordinal);
             var fullCoverage = true;
             foreach (var (node, shards) in byNode)
             {
@@ -879,8 +880,10 @@ internal sealed partial class HubRuntime : IDisposable
                     {
                         // A shard without whole-window history makes the fleet's aggregate an
                         // underestimate — hot decisions tolerate that (they only need the covered
-                        // shards to be hot); the cold decision must not act on it.
+                        // shards to be hot); the cold decision must not act on it, and neither may
+                        // target selection: see LeastLoadedObservedTarget.
                         fullCoverage = false;
+                        partiallyObserved.Add(node);
                     }
                 }
             }
@@ -902,13 +905,9 @@ internal sealed partial class HubRuntime : IDisposable
 
             var origin = hottest.Key;
             var originShards = byNode.GetValueOrDefault(origin) ?? [];
-            if (live.Count >= 2 && originShards.Count > 1)
+            if (live.Count >= 2 && originShards.Count > 1
+                && LeastLoadedObservedTarget(nodeUtilization, origin, partiallyObserved) is { } target)
             {
-                var target = nodeUtilization
-                    .Where(pair => pair.Key != origin)
-                    .OrderBy(static pair => pair.Value)
-                    .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
-                    .First();
                 var floorTicks = TimeSpan.TicksPerMillisecond * Math.Max(0, cluster.ShardMoveMinIntervalMs);
                 var candidate = originShards
                     .Where(shard => shardUtilization.GetValueOrDefault(shard) > 0)
@@ -943,7 +942,7 @@ internal sealed partial class HubRuntime : IDisposable
                 if (ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
                     LogRebalanceNoFit(_logger, origin, hottest.Value, target.Key, target.Value);
             }
-            else if (live.Count >= 2 && ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
+            else if (live.Count >= 2 && originShards.Count <= 1 && ShouldLogStuck(origin, now, cluster.ShardMoveMinIntervalMs))
             {
                 LogRebalanceSingleShardHot(_logger, origin, hottest.Value, originShards.Count == 1 ? originShards[0].Value : 0);
             }
@@ -956,6 +955,28 @@ internal sealed partial class HubRuntime : IDisposable
         {
             LogRebalanceEvaluationFailed(_logger, exception.Message);
         }
+    }
+
+    /// <summary>
+    /// The node a rebalance move may land on: the least-loaded live node other than the origin,
+    /// among nodes whose every shard has whole-window history. A node with a shard of unknown load
+    /// is not a node with no load. Counting it as zero made a node whose heartbeat ran late, or
+    /// that had just received a shard, look idle, and the loop moved a hot shard onto an equally
+    /// hot node (#204). A node with no shards at all is fully observed, so a freshly provisioned
+    /// node is still a target. Null when no node qualifies; the move then waits a tick.
+    /// </summary>
+    internal static KeyValuePair<string, double>? LeastLoadedObservedTarget(
+        IReadOnlyDictionary<string, double> nodeUtilization, string origin, IReadOnlySet<string> partiallyObserved)
+    {
+        foreach (var pair in nodeUtilization
+                     .Where(pair => pair.Key != origin && !partiallyObserved.Contains(pair.Key))
+                     .OrderBy(static pair => pair.Value)
+                     .ThenBy(static pair => pair.Key, StringComparer.Ordinal))
+        {
+            return pair;
+        }
+
+        return null;
     }
 
     /// <summary>A stuck-hot situation persists across ticks; its warning repeats on the move floor's cadence, not per second.</summary>
