@@ -507,6 +507,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 // fenced node): the precise reason goes to the client, and nothing is logged —
                 // a seam walker crossing shards is the product working, not an error per crossing.
                 TransientRejectionException => (MelangeErrorCodes.Transient, exception.Message),
+                CommitOutcomeUnknownException => (MelangeErrorCodes.OutcomeUnknown, exception.Message),
                 RateLimitedException => (MelangeErrorCodes.RateLimited, exception.Message),
                 ReducerDeniedException => (MelangeErrorCodes.Denied, exception.Message),
                 // Only a name that did not resolve is "unknown". An ArgumentException escaping a

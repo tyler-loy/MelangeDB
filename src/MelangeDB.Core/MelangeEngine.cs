@@ -27,7 +27,9 @@ public sealed partial class MelangeEngine : IDisposable
     private readonly Lock _writeLock = new();
     private readonly ThreadLocal<bool> _inReducer = new();
     private readonly List<ICommitObserver> _commitObservers = [];
-    private readonly List<ICommitGuard> _commitGuards = [];
+    // Copy-on-write: guards are added under the write lock, and the acknowledgement re-check reads
+    // the array outside it.
+    private ICommitGuard[] _commitGuards = [];
     private readonly List<(string Name, Func<ulong?> Provider)> _truncationFloors = [];
     private readonly List<TruncationPin> _truncationPins = [];
 
@@ -779,7 +781,7 @@ public sealed partial class MelangeEngine : IDisposable
         ArgumentNullException.ThrowIfNull(guard);
         lock (_writeLock)
         {
-            _commitGuards.Add(guard);
+            _commitGuards = [.. _commitGuards, guard];
         }
     }
 
@@ -851,6 +853,7 @@ public sealed partial class MelangeEngine : IDisposable
         // The commit point, outside the lock — the group-commit split; see InvokeCore.
         _log.WaitDurable(record.Lsn);
         CompleteDeferredSnapshot();
+        ConfirmAcknowledgement(reducerName, CommitOrigin.Internal);
         return record;
     }
 
@@ -897,6 +900,32 @@ public sealed partial class MelangeEngine : IDisposable
     {
         foreach (var guard in _commitGuards)
             guard.Validate(reducerName, ops, origin);
+    }
+
+    /// <summary>
+    /// The guards' second look, after durability and before the commit returns: a node that lost
+    /// its authority in between withholds the acknowledgement (<see cref="CommitOutcomeUnknownException"/>).
+    /// Outside the write lock, like the durability wait it follows.
+    /// </summary>
+    private void ConfirmAcknowledgement(string reducerName, CommitOrigin origin)
+    {
+        foreach (var guard in Volatile.Read(ref _commitGuards))
+            guard.ValidateAcknowledgement(reducerName, origin);
+    }
+
+    /// <summary>A reducer's <see cref="ConfirmAcknowledgement"/>, traced and counted as its own outcome: neither a commit nor an abort.</summary>
+    private void ConfirmReducerAcknowledgement(Activity? activity, string reducerName, long started, int rowCount)
+    {
+        try
+        {
+            ConfirmAcknowledgement(reducerName, CommitOrigin.Reducer);
+        }
+        catch (CommitOutcomeUnknownException)
+        {
+            activity?.SetTag("melange.outcome", "outcome_unknown");
+            _telemetry?.RecordTransaction(reducerName, "outcome_unknown", Elapsed(started), rowCount);
+            throw;
+        }
     }
 
     /// <summary>
@@ -1021,6 +1050,7 @@ public sealed partial class MelangeEngine : IDisposable
         // The commit point, outside the lock — the group-commit split; see InvokeCore.
         _log.WaitDurable(bulkRecord.Lsn);
         CompleteDeferredSnapshot();
+        ConfirmAcknowledgement(BulkReducerName, CommitOrigin.Bulk);
         return bulkRecord;
     }
 
@@ -1709,7 +1739,10 @@ public sealed partial class MelangeEngine : IDisposable
         // commit until a restart reconverges state from the durable prefix.
         double? durabilityWaitMs = null;
         if (committedLsn != 0)
+        {
             durabilityWaitMs = _log.WaitDurable(committedLsn);
+            ConfirmReducerAcknowledgement(activity, reducerName, started, rowCount);
+        }
 
         activity?.SetTag("melange.outcome", "commit");
         activity?.SetTag("melange.writeset.rows", rowCount);
@@ -1853,6 +1886,9 @@ public sealed partial class MelangeEngine : IDisposable
             ReportAbort(activity, reducerName, exception, Elapsed(started), bodyMs.GetValueOrDefault(), Elapsed(lockedStarted));
             throw;
         }
+
+        if (committedLsn != 0)
+            ConfirmReducerAcknowledgement(activity, reducerName, started, ops.Count);
 
         activity?.SetTag("melange.outcome", "commit");
         activity?.SetTag("melange.writeset.rows", ops.Count);

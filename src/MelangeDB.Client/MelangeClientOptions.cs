@@ -182,6 +182,13 @@ public sealed class MelangeCallException : Exception
     public bool IsTransient => Code == MelangeErrorCodes.Transient;
 
     /// <summary>
+    /// The call's transaction became durable but the server could not acknowledge it (a cluster
+    /// shard node lost its lease in between), so it may or may not have committed. Not transient:
+    /// read current state before retrying a call that is not idempotent.
+    /// </summary>
+    public bool IsOutcomeUnknown => Code == MelangeErrorCodes.OutcomeUnknown;
+
+    /// <summary>
     /// The HTTP status of the failed response, or null when the failure arrived as a socket frame
     /// (every path but the connect ticket).
     /// </summary>
