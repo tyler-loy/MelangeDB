@@ -78,6 +78,13 @@ public sealed class LoadTestOptions
     /// </summary>
     public bool LockSplit { get; set; }
 
+    /// <summary>
+    /// <c>--fast-failover</c>: sets <c>Cluster:FastFailoverOnLinkLoss</c>, so a killed node is declared
+    /// dead when its link drops rather than at the failure timeout. The harness kills a process on
+    /// one machine, which is exactly the case the option is for.
+    /// </summary>
+    public bool FastFailover { get; set; }
+
     /// <summary>HotStore:Engine for every node: "inmemory" or "faster".</summary>
     public string HotStore { get; set; } = "inmemory";
 
@@ -198,6 +205,9 @@ public sealed class LoadTestOptions
                     continue;
                 case "--lock-split":
                     options.LockSplit = true;
+                    continue;
+                case "--fast-failover":
+                    options.FastFailover = true;
                     continue;
             }
 

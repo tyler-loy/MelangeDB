@@ -48,13 +48,15 @@ internal static class FailoverMeasurement
                 // Snapshots are taken by the measurement, before each kill, so the tail recovery
                 // replays is the --tail it asked for and never an automatic snapshot's leftovers.
                 ["MelangeDb:Snapshots:IntervalTransactions"] = "1000000000000",
+                ["MelangeDb:Cluster:FastFailoverOnLinkLoss"] = options.FastFailover ? "true" : "false",
             });
         var heartbeat = options.HeartbeatMs ?? tuning.HeartbeatMs;
         var failureTimeout = options.FailureTimeoutMs ?? tuning.FailureTimeoutMs;
         output.WriteLine(
             $"Failover: rows [{string.Join(", ", options.FailoverRows)}] x {options.RowBytes} B, tail {options.TailRecords} records, " +
             $"{options.Repeat} kill(s) each, {options.Clients} client(s) at {options.TickHz} Hz, hot store {options.HotStore}, " +
-            $"heartbeat {heartbeat} ms, failure timeout {failureTimeout} ms (hub sweep every {Math.Max(250, failureTimeout / 2)} ms).");
+            $"heartbeat {heartbeat} ms, failure timeout {failureTimeout} ms (deadline check every {Math.Clamp(failureTimeout / 20, 25, 250)} ms), " +
+            $"fast failover {(options.FastFailover ? "on" : "off")}.");
         output.WriteLine(
             $"Machine: {Environment.ProcessorCount} logical cores, Server GC {System.Runtime.GCSettings.IsServerGC}, " +
             $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription}, .NET {Environment.Version}.");
@@ -257,7 +259,13 @@ internal static class FailoverMeasurement
             ClientsUnrestored: probes.Count(static p => p.RestoredAt == 0),
             ResyncErrors: probes.Sum(static p => p.ResyncErrorsSinceArm),
             FailedCalls: probes.Sum(static p => p.FailedSinceArm),
-            preKill);
+            preKill)
+        {
+            FailureReasons = probes
+                .SelectMany(static p => p.FailureReasonsSinceArm)
+                .GroupBy(static pair => pair.Key, StringComparer.Ordinal)
+                .ToDictionary(static g => g.Key, static g => g.Sum(static pair => pair.Value), StringComparer.Ordinal),
+        };
 
         await server.RestartNodeAsync(ownerName).ConfigureAwait(false);
         await WaitUntilAsync(
@@ -346,7 +354,12 @@ internal static class FailoverMeasurement
         int FailedCalls,
         PreKill PreKill)
     {
+        /// <summary>Why the failed calls failed: exception type and message head, with counts.</summary>
+        public IReadOnlyDictionary<string, int> FailureReasons { get; init; } = new Dictionary<string, int>();
+
         public string Line() => Body() +
+            (FailureReasons.Count == 0 ? string.Empty : " Failures: " + string.Join("; ",
+                FailureReasons.OrderByDescending(static pair => pair.Value).Take(4).Select(static pair => $"{pair.Value}x {pair.Key}"))) +
             (PreKill.StalenessAtKillMs > 1_500 ? " WARNING: the owner was already silent at the kill, so detect is short by that much." : string.Empty);
 
         private string Body() => string.Create(
@@ -447,6 +460,10 @@ internal static class FailoverMeasurement
 
         public int FailedSinceArm => Volatile.Read(ref _failed);
 
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _failureReasons = new(StringComparer.Ordinal);
+
+        public IEnumerable<KeyValuePair<string, int>> FailureReasonsSinceArm => _failureReasons;
+
         public bool AckedRecently =>
             Interlocked.Read(ref _lastAckAt) is var last and not 0 && Stopwatch.GetElapsedTime(last) < TimeSpan.FromMilliseconds(500);
 
@@ -465,6 +482,7 @@ internal static class FailoverMeasurement
             Interlocked.Exchange(ref _restoredAt, 0);
             Interlocked.Exchange(ref _resyncErrors, 0);
             Interlocked.Exchange(ref _failed, 0);
+            _failureReasons.Clear();
             Interlocked.Exchange(ref _armedAt, killedAt);
         }
 
@@ -492,10 +510,14 @@ internal static class FailoverMeasurement
                 if (sentAt > Interlocked.Read(ref _armedAt))
                     Interlocked.CompareExchange(ref _restoredAt, ackedAt, 0);
             }
-            catch (Exception) when (!_stop.IsCancellationRequested)
+            catch (Exception exception) when (!_stop.IsCancellationRequested)
             {
                 if (sentAt > Interlocked.Read(ref _armedAt))
+                {
                     Interlocked.Increment(ref _failed);
+                    var message = exception.Message.Length > 80 ? exception.Message[..80] : exception.Message;
+                    _failureReasons.AddOrUpdate($"{exception.GetType().Name}: {message}", 1, static (_, count) => count + 1);
+                }
             }
         }
 

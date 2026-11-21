@@ -87,6 +87,7 @@ noted.
 | `--hot-store` | inmemory | `HotStore:Engine`: `inmemory` or `faster`. |
 | `--heartbeat-ms` | 250 (`failover`: 1000) | `Cluster:HeartbeatIntervalMs`. `failover` defaults to the library's value, because the window it measures is the one a deployment on defaults gets. |
 | `--failure-timeout-ms` | 15000 (`failover`: 10000) | `Cluster:FailureTimeoutMs`. Same reasoning. |
+| `--fast-failover` | off | `failover`: sets `Cluster:FastFailoverOnLinkLoss`, so a killed node is declared dead when its link drops rather than at the failure timeout. The harness kills a process, the case the option is for. |
 | `--lock-split` | — | serve: trace every Move and sum its write-lock split, locked time and the post-commit part of it where subscription fan-out runs, into the stats endpoint; the driver reports the measured window's post-commit share. Sets `Telemetry:SlowReducerMs` to 0, because the split rides the slow-reducer event, and tracing every transaction costs a little. |
 | `--movers` | everyone | drive: only the first N players move; the rest connect, subscribe, and receive. Holds the commit rate fixed across a subscriber sweep. |
 | `--port` / `--listen` | 0 / 127.0.0.1 | Hub bind (gateway + stats). `--listen 0.0.0.0` accepts a remote driver. |
@@ -383,6 +384,28 @@ The reading:
   loop** ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). With the failure timeout set
   below the recovery time (`--failure-timeout-ms 3000`), the hub declares the *adopting* node dead
   mid-recovery, a cascade from a single kill. **Since fixed:** opens run off the heartbeat loop.
+
+#### After phase 30 step 1 (detection), 2026-11-21
+
+Same machine, defaults, 100k rows, 4 clients, 3 kills each. The run line now also lists failed
+calls by reason.
+
+| Detection | Detect | Reopen | Server window | Client restore p50 / max |
+| --- | --- | --- | --- | --- |
+| At the deadline ([#201](https://github.com/tyler-loy/MelangeDB/issues/201)) | 9.0–9.9 s | 1.0–1.9 s | 10.1–11.7 s | 10.3 / 12.0 s |
+| `--fast-failover` | 1.0–1.2 s | 0.9–1.9 s | 1.9–3.2 s | 3.1 / 3.3 s |
+
+- **Detection is now a timeout after the last heartbeat,** checked every twentieth of the timeout.
+  It used to be up to half a timeout later. Measured from the kill it reads 9–10 s, because the last
+  heartbeat landed up to a second before the kill.
+- **With fast failover a process death costs about a heartbeat plus the reopen.** The reopen is
+  now the larger share of the window. That share is what phase 30's warm replica removes.
+- **Failed calls in these windows are the rate limiter, not the failover.** The probe fires 15
+  calls/s without waiting. The gateway holds them through the window and they reach the shard in
+  one burst, and `RateLimit:*` turns the excess away.
+- **These runs found a gateway bug.** About one kill in twelve tore down a client's connection:
+  a send to a node dying under it was mistaken for the client leaving. Fixed separately; with the
+  fix, 30 of 30 kills restored every client.
 
 ### Soak — memory over five minutes
 

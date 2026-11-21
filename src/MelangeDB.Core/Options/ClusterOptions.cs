@@ -105,6 +105,22 @@ public sealed class ClusterOptions
     /// </summary>
     public int FailureTimeoutMs { get; set; } = 10_000;
 
+    /// <summary>
+    /// Hub only, off by default: declare a node dead as soon as its node link closes and it has
+    /// not reconnected within one <see cref="HeartbeatIntervalMs"/>, instead of waiting out
+    /// <see cref="FailureTimeoutMs"/>. A dead process drops its link at once, so this cuts process
+    /// death's detection from about the failure timeout to about a heartbeat.
+    /// <para>
+    /// <b>Requires shared storage that enforces exclusive file locks across hosts</b> (SMB,
+    /// NFSv4 with locking, most cloud file services). The node whose link dropped may still be
+    /// alive and still hold its lease; what keeps the new owner from opening the shard beside it
+    /// is the old engine's lock on the shard's log, which the node holds until it dies or parks
+    /// its shards at lease expiry. On storage that ignores that lock across hosts, this setting
+    /// allows two writers. Phase 30's per-term log segments will remove the requirement.
+    /// </para>
+    /// </summary>
+    public bool FastFailoverOnLinkLoss { get; set; }
+
     /// <summary>See <see cref="ShardSpanCheckMode"/>.</summary>
     public ShardSpanCheckMode ShardSpanCheck { get; set; } = ShardSpanCheckMode.DebugOnly;
 
