@@ -89,12 +89,16 @@ happens, and it shaped it a lot ([idea-bin entry](../idea-bin/shard-ha-warm-repl
   removes only the 1–6 s of rebuild. Fencing forbids promoting it before the dead owner's lease
   expires, so phase 30's design record has to own detection as well. It still starts with the
   fencing third state, because shortening leases is where that risk sharpens.
-- **Three cold-path bugs come first.** A node opens an adopted shard inside its heartbeat loop and
-  can be fenced by its own recovery ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)).
-  The gateway's upstream connect has no timeout, so a dead *machine* stalls clients for the OS
-  connect timeout ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). And a FASTER shard
-  loses payloads under reassignment churn ([#199](https://github.com/tyler-loy/MelangeDB/issues/199)).
-  The cold path stays every shard's fallback, so these are fixed whether or not a replica exists.
+- **Three cold-path bugs came first; two are fixed, one has a root cause still open.** A node
+  opened an adopted shard inside its heartbeat loop and could be fenced by its own recovery
+  ([#198](https://github.com/tyler-loy/MelangeDB/issues/198), fixed). The gateway's upstream connect
+  had no timeout, so a dead *machine* stalled clients for the OS connect timeout
+  ([#200](https://github.com/tyler-loy/MelangeDB/issues/200), fixed). A FASTER shard appeared to
+  lose payloads under reassignment churn ([#199](https://github.com/tyler-loy/MelangeDB/issues/199)):
+  that was a read view outliving its store, fixed, but underneath it a large FASTER snapshot can
+  hold a writer under the engine lock long enough to starve the heartbeat
+  ([#208](https://github.com/tyler-loy/MelangeDB/issues/208), open). Under HA that is a false
+  failover, so #208 is closed before phase 30 builds on FASTER.
 
 On the phase 28 interaction: the client assumed was phase 28's, with automatic reconnect on. It
 makes no difference to the window, because the client never disconnects. The gateway holds or fails

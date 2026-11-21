@@ -424,3 +424,10 @@ live owner went silent for 13.7 s and was declared dead. The in-memory store wit
 not. The mechanism is not established (`Statistics()` is O(tables) on both stores, and a tight writer
 delays a `ReadConsistent` caller by at most about 144 ms in a probe), so it's recorded inside #199,
 where it's the first step of that repro.
+
+**Afterwards (still 2026-11-20).** The table records the findings as filed. Since then #198 and
+#200 are fixed, and #199 turned out to be a read view outliving its disposed store, also fixed. The
+13.7 s silence above was then narrowed to its own issue,
+[#208](https://github.com/tyler-loy/MelangeDB/issues/208): a FASTER snapshot larger than the buffer
+pool holds an ordinary writer under the engine lock for about two minutes. That is the one cold-path
+finding still open before phase 30.
