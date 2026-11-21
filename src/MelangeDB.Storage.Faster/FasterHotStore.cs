@@ -314,26 +314,34 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
+    /// <summary>
+    /// Every table's counters, read <b>without</b> the store lock. A cluster node calls this from
+    /// its heartbeat (the load sample), and the store lock is held across each paged read, disk
+    /// I/O included, so a long scan over a store larger than its buffer pool made the heartbeat
+    /// queue behind it (#199). Nothing here needs the lock. The table map is fixed at
+    /// construction, the current version is published volatile, and the counters are 64-bit values
+    /// written only while a commit applies, which happens under the engine's write lock. That lock
+    /// is the one a caller needing consistency across tables already holds
+    /// (<c>MelangeEngine.ReadConsistent</c>, as the load sample does). The scan and fault counters
+    /// are advisory and may run a read behind.
+    /// </summary>
     public HotStoreStatistics Statistics()
     {
-        lock (_lock)
+        var tables = new List<HotStoreTableStatistics>(_tables.Count);
+        foreach (var schema in _registry.Tables)
         {
-            var tables = new List<HotStoreTableStatistics>(_tables.Count);
-            foreach (var schema in _registry.Tables)
-            {
-                var state = _tables[schema.Id];
-                tables.Add(new HotStoreTableStatistics(
-                    schema.Id,
-                    schema.Name,
-                    state.IsResident ? Residency.Resident : Residency.Paged,
-                    state.RowCount,
-                    state.ResidentBytes,
-                    state.PageFaults,
-                    state.RowsScanned));
-            }
-
-            return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes };
+            var state = _tables[schema.Id];
+            tables.Add(new HotStoreTableStatistics(
+                schema.Id,
+                schema.Name,
+                state.IsResident ? Residency.Resident : Residency.Paged,
+                state.RowCount,
+                state.ResidentBytes,
+                state.PageFaults,
+                state.RowsScanned));
         }
+
+        return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes };
     }
 
     public void ApplyResidency(string tableName, Residency residency)
@@ -654,6 +662,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private byte[]? ReadRow(TableState table, TableVersion version, in RowKey key)
     {
+        // A disposed store's devices are deleteOnClose: its log files are gone, and every paged
+        // read would come back "main record missing" or "out-of-line payload missing", which reads
+        // as corruption and which the scan path below would quietly skip as unreadable rows. A
+        // read view that outlived its store (a snapshot still running when the shard was released
+        // under it, #199) must hear that the store is gone, not that its data is. Every caller
+        // holds the store lock, and Dispose sets the flag under it.
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (version.IsResident)
             return version.ResidentRows.TryGetValue(key, out var resident) ? resident : null;
         if (!version.Directory.TryGetValue(key, out var entry))

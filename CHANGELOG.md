@@ -43,6 +43,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A FASTER store that's been disposed no longer reports its rows as corrupt**
+  ([#199](https://github.com/tyler-loy/MelangeDB/issues/199)). A read view that outlived its
+  store, for example a snapshot still running when its shard was released, read paged rows after
+  the store's `deleteOnClose` files were gone, and was told "out-of-line payload ... is missing" or
+  "main record is missing". Scans quietly skipped those rows as unreadable (EventId 1511). Reads on
+  a disposed store now throw `ObjectDisposedException`.
+- **FASTER `Statistics()` no longer takes the store lock.** The lock is held across each paged
+  read, including the disk I/O, so a heartbeat's load sample queued behind a long scan. The
+  counters it reports change only while a commit applies, which happens under the engine write
+  lock that consistent callers already hold.
 - **A client on a shard whose machine died no longer hangs**
   ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). The gateway's upstream connect had
   no timeout. A dead process refuses connections, but a dead machine answers nothing, so the
