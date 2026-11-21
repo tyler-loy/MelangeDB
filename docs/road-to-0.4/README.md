@@ -53,7 +53,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | **Built**; fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | Planned |
-| 30 | Shard HA ([step 2 plan](plan-phase-30.md)) | **Committed** 2026-11-20; [design record](../design/shard-ha.md) settled 2026-11-21: fence (step 0, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), then detection, then the warm replica |
+| 30 | Shard HA ([step 2 plan](plan-phase-30.md)) | **Built** 2026-11-21: the fence (step 0, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), detection, then the warm replica and promotion ([design record](../design/shard-ha.md)). Fast failover stays opt-in |
 | 31 | Throughput: the capacity ceiling re-measured, then shared fan-out | Planned, **last in 0.4** (owner, 2026-11-21); ideas below |
 
 The plans for 20, 22, and 23 stay where they were written, in [road-to-0.3/](../road-to-0.3/).
