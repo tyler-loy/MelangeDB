@@ -74,6 +74,14 @@ public static class MelangeErrorCodes
     /// </summary>
     public const string Transient = "transient";
 
+    /// <summary>
+    /// The call's transaction became durable, but the server lost its authority to acknowledge it
+    /// first (a cluster shard node whose lease ended in between), so it may or may not be part of
+    /// history. Unlike <see cref="Transient"/>, it does not promise the call was not applied: read
+    /// current state before retrying a call that is not idempotent.
+    /// </summary>
+    public const string OutcomeUnknown = "outcome_unknown";
+
     public const string Internal = "internal";
     public const string UnknownTable = "unknown_table";
     public const string UnknownColumn = "unknown_column";

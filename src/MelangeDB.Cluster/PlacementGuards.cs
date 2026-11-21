@@ -227,6 +227,23 @@ internal sealed class ShardCommitGuard : ICommitGuard
         _borrowedOwner = borrowedOwner;
     }
 
+    /// <summary>
+    /// The lease, again, after durability (phase 30 step 2a). <see cref="Validate"/> checked it
+    /// before the append; a node that paused between the two (a GC, a stalled disk, a VM
+    /// migration) may have been declared dead meanwhile, and its shard's new owner may have cut the
+    /// log before this record. Acknowledging it would tell the caller a write happened that history
+    /// may not contain, so the outcome is reported as unknown instead.
+    /// </summary>
+    public void ValidateAcknowledgement(string reducerName, CommitOrigin origin)
+    {
+        if (!_leaseValid())
+        {
+            throw new CommitOutcomeUnknownException(
+                $"'{reducerName}' was written to {_shard}'s log, but this node's lease expired before it could be acknowledged, " +
+                "and the shard may already have a new owner. It may or may not have committed; read current state before retrying.");
+        }
+    }
+
     public void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin)
     {
         // Every origin, internal ones included (#215): replica batches, border copies, and

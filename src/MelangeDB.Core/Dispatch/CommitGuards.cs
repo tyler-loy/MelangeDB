@@ -27,6 +27,18 @@ public interface ICommitGuard
 {
     /// <summary>Validates one write set; throw to abort the transaction.</summary>
     void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin);
+
+    /// <summary>
+    /// Re-validates a committed transaction after it became durable and before the commit returns
+    /// to its caller, outside the write lock. The transaction is already in the log, so this cannot
+    /// abort it: throwing <see cref="CommitOutcomeUnknownException"/> withholds the acknowledgement.
+    /// The cluster layer re-checks its lease here, because a node that paused between
+    /// <see cref="Validate"/> and this point may have been replaced, and the new owner may have cut
+    /// the log before the record. Default: nothing to re-check.
+    /// </summary>
+    void ValidateAcknowledgement(string reducerName, CommitOrigin origin)
+    {
+    }
 }
 
 /// <summary>How a transaction is touching a table — the table-access guard discriminates on it.</summary>

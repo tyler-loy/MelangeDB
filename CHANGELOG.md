@@ -12,6 +12,13 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`outcome_unknown`**, a new call error code (road-to-0.4 phase 30, step 2a). A cluster shard
+  node now re-checks its lease after a commit is durable and before acknowledging it. If the lease
+  ended in between, the shard may already have a new owner that cut the log before the record, so
+  the caller is told the outcome is unknown instead of success. It is not `transient`: the write may
+  have happened. `MelangeCallException.IsOutcomeUnknown` names it; over HTTP it is a 503 with that
+  code. `ICommitGuard` gains `ValidateAcknowledgement`, a default no-op, which the engine calls
+  after durability on every commit path.
 - **A liveness ping that a starved thread pool cannot delay** (road-to-0.4 phase 30). Shard nodes
   ping the hub every `Cluster:HeartbeatIntervalMs` from a dedicated thread, and the hub answers on
   the node link's reader thread, which is now a dedicated thread too; each acknowledged ping renews

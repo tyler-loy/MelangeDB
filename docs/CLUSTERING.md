@@ -464,6 +464,13 @@ because each is the answer to a specific failure mode:
   ignore the log. The retry contract is named on the client as `MelangeCallException.IsTransient`: retry the
   call unchanged on the next tick. `rejected` stays reserved for what reducer code itself decided; `internal`
   for genuine faults, which still log.
+- **A commit that outlived its lease is `outcome_unknown`** (phase 30 step 2a). The lease is checked before
+  the append and again after the record is durable, before the caller hears anything. A node that paused in
+  between (a long GC, a stalled disk) may have been declared dead, and the shard's next owner may have cut the
+  log before the record, so the write may or may not be history. The client gets `outcome_unknown`
+  (`MelangeCallException.IsOutcomeUnknown`), deliberately not `transient`: a transient refusal promises
+  nothing was applied, and this one can't. Read current state before retrying a call that is not idempotent.
+  Bulk ingestion keeps its retryable error, because bulk rows are upserts.
 - **Stale origins cannot transfer** (defense in depth, each independently sufficient for its case): the hub
   drops a request whose sender is not the entity's recorded owner (1722); a freeze refuses to collect
   borrowed rows and aborts on an empty transfer set; the monitor never signals frozen or borrowed rows. A

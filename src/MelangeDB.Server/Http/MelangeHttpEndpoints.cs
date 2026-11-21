@@ -67,6 +67,12 @@ internal static class MelangeHttpEndpoints
             // 409, retry unchanged — not a server fault, so nothing is logged.
             await WriteErrorAsync(context, StatusCodes.Status409Conflict, MelangeErrorCodes.Transient, exception.Message).ConfigureAwait(false);
         }
+        catch (CommitOutcomeUnknownException exception)
+        {
+            // Durable, but the node lost its lease before acknowledging: not a fault, and not a
+            // promise the call was not applied either. The code tells the caller to look first.
+            await WriteErrorAsync(context, StatusCodes.Status503ServiceUnavailable, MelangeErrorCodes.OutcomeUnknown, exception.Message).ConfigureAwait(false);
+        }
         catch (RateLimitedException exception)
         {
             await WriteErrorAsync(context, StatusCodes.Status429TooManyRequests, MelangeErrorCodes.RateLimited, exception.Message).ConfigureAwait(false);
