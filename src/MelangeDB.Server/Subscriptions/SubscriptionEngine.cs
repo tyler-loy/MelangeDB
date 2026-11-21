@@ -30,6 +30,12 @@ internal sealed class SubscriptionEngine
     private readonly ConcurrentDictionary<string, int> _activeByTable = new(StringComparer.Ordinal);
     private readonly ServerTelemetry? _telemetry;
 
+    /// <summary>
+    /// Initial sets being collected off the write lock, each recording the commits that land while
+    /// it reads. Mutated and read only under the engine's write lock (Fanout runs under it).
+    /// </summary>
+    private readonly List<CatchUp> _catchUps = [];
+
     public SubscriptionEngine(MelangeEngine engine, ServerTelemetry? telemetry)
     {
         _engine = engine;
@@ -54,11 +60,25 @@ internal sealed class SubscriptionEngine
         PolicySet? policies = null,
         PolicyContext? context = null)
     {
-        var subscription = ServerSubscription.Compile(sink, id, query, _engine.Schema, limits, policies, context);
+        var subscription = Compile(sink, id, query, limits, policies, context);
         var initialSet = computeInitialSet
-            ? CollectWithCeilings(subscription, limits, anchorLsn)
+            ? CollectWithCeilings(subscription, limits, anchorLsn, _engine.HotStore)
             : new InitialSet(anchorLsn, [], 0);
+        Add(subscription);
+        return (subscription, initialSet);
+    }
 
+    /// <summary>Compiles a subscription without registering it; needs no lock.</summary>
+    public ServerSubscription Compile(
+        IDeltaSink sink, uint id, SubscriptionQuery query, SubscriptionsOptions limits, PolicySet? policies, PolicyContext? context) =>
+        ServerSubscription.Compile(sink, id, query, _engine.Schema, limits, policies, context);
+
+    /// <summary>
+    /// Registers a compiled subscription for the live fan-out: it sees every commit after this
+    /// point. Runs under the engine's write lock.
+    /// </summary>
+    public void Add(ServerSubscription subscription)
+    {
         if (!_byTable.TryGetValue(subscription.Schema.Id, out var list))
             _byTable[subscription.Schema.Id] = list = [];
 
@@ -68,7 +88,90 @@ internal sealed class SubscriptionEngine
         subscription.ShareWireColumns(list);
         list.Add(subscription);
         _activeByTable.AddOrUpdate(subscription.Schema.Name, 1, static (_, count) => count + 1);
-        return (subscription, initialSet);
+    }
+
+    /// <summary>
+    /// The commits that land while an initial set is read off the write lock. Begun under the same
+    /// lock hold that pins the read (see <c>MelangeEngine.ReadAtHead</c>), so it holds exactly the
+    /// records after the pinned LSN; see <see cref="CatchUpInitialSet"/>.
+    /// </summary>
+    internal sealed class CatchUp
+    {
+        public List<CommitRecord> Records { get; } = [];
+    }
+
+    /// <summary>Starts recording commits for an off-lock initial set. Runs under the engine's write lock.</summary>
+    public CatchUp BeginCatchUp()
+    {
+        var catchUp = new CatchUp();
+        _catchUps.Add(catchUp);
+        return catchUp;
+    }
+
+    /// <summary>Stops recording. Runs under the engine's write lock; idempotent.</summary>
+    public void EndCatchUp(CatchUp catchUp) => _catchUps.Remove(catchUp);
+
+    /// <summary>
+    /// Collects an initial set from <paramref name="source"/>, a view pinned at
+    /// <paramref name="anchorLsn"/>, with the cost ceilings enforced. Needs no lock: this is the
+    /// part of a subscribe that scans, and on a large paged table it used to hold every commit and
+    /// the node's heartbeat for its whole length (#213). Only for a subscription without row or
+    /// column policies, whose verdicts would otherwise read live state rather than the pin.
+    /// </summary>
+    public InitialSet CollectInitialSet(ServerSubscription subscription, SubscriptionsOptions limits, IHotStoreReader source, ulong anchorLsn) =>
+        CollectWithCeilings(subscription, limits, anchorLsn, source);
+
+    /// <summary>
+    /// Brings an initial set collected at its anchor up to <paramref name="head"/> by applying the
+    /// commits <paramref name="catchUp"/> recorded since, and re-checks the ceilings. Runs under
+    /// the engine's write lock, immediately before <see cref="Add"/>, so the returned set's anchor
+    /// is the registration's: the client sees exactly the commits after it, as if the whole set
+    /// had been read under the lock. Exact, not conservative: the set itself is in hand, so a row
+    /// that left scope is simply removed.
+    /// </summary>
+    public InitialSet CatchUpInitialSet(
+        ServerSubscription subscription, SubscriptionsOptions limits, InitialSet set, CatchUp catchUp, ulong head)
+    {
+        if (catchUp.Records.Count == 0)
+            return set with { AnchorLsn = head };
+
+        var rows = new Dictionary<RowKey, (ReadOnlyMemory<byte> Row, IReadOnlySet<string>? Columns)>(set.Rows.Count);
+        for (var i = 0; i < set.Rows.Count; i++)
+            rows[set.Rows[i].Key] = (set.Rows[i].Value, set.RowColumns?[i]);
+
+        var decoded = new DecodedRow();
+        foreach (var record in catchUp.Records)
+        {
+            foreach (var op in record.WriteSet)
+            {
+                if (op.Table != subscription.Schema.Id)
+                    continue;
+                if (op.Kind == RowOpKind.Delete)
+                {
+                    rows.Remove(op.Key);
+                    continue;
+                }
+
+                decoded.Reset(subscription.Schema, op.Row);
+                if (subscription.Matches(op.Key, decoded) && subscription.PolicyAdmits(decoded))
+                    rows[op.Key] = (op.Row, set.RowColumns is null ? null : subscription.VisibleColumns(decoded));
+                else
+                    rows.Remove(op.Key);
+            }
+        }
+
+        var list = new List<KeyValuePair<RowKey, ReadOnlyMemory<byte>>>(rows.Count);
+        var columns = set.RowColumns is null ? null : new List<IReadOnlySet<string>?>(rows.Count);
+        long bytes = 0;
+        foreach (var (key, (row, rowColumns)) in rows)
+        {
+            list.Add(new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, row));
+            columns?.Add(rowColumns);
+            bytes += row.Length;
+        }
+
+        EnforceCeilings(subscription, limits, list.Count, bytes);
+        return new InitialSet(head, list, bytes, columns);
     }
 
     /// <summary>Removes a subscription. Runs under the engine's write lock.</summary>
@@ -141,6 +244,9 @@ internal sealed class SubscriptionEngine
     /// </summary>
     public void Fanout(CommitRecord record)
     {
+        foreach (var catchUp in _catchUps)
+            catchUp.Records.Add(record);
+
         var perSink = default(Dictionary<IDeltaSink, Dictionary<ServerSubscription, List<WireRowOp>>>);
         var wire = default(WireRowMemo);
         var before = default(DecodedRow);
@@ -377,7 +483,7 @@ internal sealed class SubscriptionEngine
         return left.Count == right.Count && left.SetEquals(right);
     }
 
-    private InitialSet CollectWithCeilings(ServerSubscription subscription, SubscriptionsOptions limits, ulong anchorLsn)
+    private InitialSet CollectWithCeilings(ServerSubscription subscription, SubscriptionsOptions limits, ulong anchorLsn, IHotStoreReader source)
     {
         var rows = new List<KeyValuePair<RowKey, ReadOnlyMemory<byte>>>();
         var perRowColumns = subscription.Evaluator is { HasColumnPolicies: true } && subscription.Context is not null
@@ -386,7 +492,7 @@ internal sealed class SubscriptionEngine
         long bytes = 0;
         var filtered = 0;
         var decoded = new DecodedRow();
-        foreach (var pair in subscription.MatchingRows(_engine.HotStore))
+        foreach (var pair in subscription.MatchingRows(source))
         {
             decoded.Reset(subscription.Schema, pair.Value);
             if (!subscription.PolicyAdmits(decoded))

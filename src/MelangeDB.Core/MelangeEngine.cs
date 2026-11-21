@@ -547,12 +547,23 @@ public sealed partial class MelangeEngine : IDisposable
     /// commit and the node's heartbeat for its whole length, which on a paged store is minutes at
     /// a million rows (#208). A store without pinned reads falls back to exactly that.
     /// </para>
+    /// <para>
+    /// <paramref name="atPin"/>, when given, runs under the same lock hold as the pin, with the
+    /// head: the place to start recording the commits that will land after it (a subscription's
+    /// initial set catches up on exactly those before it registers).
+    /// </para>
     /// </summary>
-    internal T ReadAtHead<T>(Func<ulong, IHotStoreReader, T> read)
+    internal T ReadAtHead<T>(Func<ulong, IHotStoreReader, T> read, Action<ulong>? atPin = null)
     {
         ArgumentNullException.ThrowIfNull(read);
         if (_readViewSource is not { } source)
-            return ReadConsistent(head => read(head, HotStore));
+        {
+            return ReadConsistent(head =>
+            {
+                atPin?.Invoke(head);
+                return read(head, HotStore);
+            });
+        }
 
         ulong head;
         IHotStoreReadView view;
@@ -560,6 +571,15 @@ public sealed partial class MelangeEngine : IDisposable
         {
             head = _log.HeadLsn;
             view = source.OpenReadView();
+            try
+            {
+                atPin?.Invoke(head);
+            }
+            catch
+            {
+                view.Dispose();
+                throw;
+            }
         }
 
         using (view)

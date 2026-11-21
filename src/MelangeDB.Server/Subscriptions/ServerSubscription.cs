@@ -272,7 +272,7 @@ internal sealed class ServerSubscription
     }
 
     /// <summary>Enumerates the store rows this subscription currently matches, in a deterministic order.</summary>
-    public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MatchingRows(IHotStore store)
+    public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MatchingRows(IHotStoreReader store)
     {
         switch (Predicate)
         {
@@ -292,7 +292,7 @@ internal sealed class ServerSubscription
     }
 
     /// <summary>The single primary-key row this subscription matches, or empty — including when that one row is unreadable.</summary>
-    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MatchSingleKey(IHotStore store)
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MatchSingleKey(IHotStoreReader store)
     {
         ReadOnlyMemory<byte> row;
         try
@@ -328,7 +328,7 @@ internal sealed class ServerSubscription
     /// with it. <see cref="IHotStore.ScanKeyRange"/> asks the store to seek instead, so the cost is
     /// the size of the window rather than the distance to it.</para>
     /// </summary>
-    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanPrimaryKeyRange(IHotStore store)
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanPrimaryKeyRange(IHotStoreReader store)
     {
         foreach (var key in store.ScanKeyRange(Schema.Id, RangeLow, RangeHigh))
         {
