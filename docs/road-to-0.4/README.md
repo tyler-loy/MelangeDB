@@ -54,6 +54,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | Planned |
 | 30 | Shard HA | **Committed** 2026-11-20; [design record](../design/shard-ha.md) settled 2026-11-21: fence (step 0, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), then detection, then the warm replica |
+| 31 | Throughput: the capacity ceiling re-measured, then shared fan-out | Planned, **last in 0.4** (owner, 2026-11-21); ideas below |
 
 The plans for 20, 22, and 23 stay where they were written, in [road-to-0.3/](../road-to-0.3/).
 Moving them would break every link into them for no gain; the decision record is the same document
@@ -78,6 +79,29 @@ that was just pinned. Automatic reconnect is in the same phase because both are 
 client surviving events it did not cause.
 
 **Phases 22 and 29 are independent** of everything else and of each other.
+
+**Phase 31 comes last** (owner, 2026-11-21). Phase 30's liveness soak put the load tool's knee at
+about 200 players on four shards on one machine. That number is a stress shape: every player
+subscribes to everything on its shard, so delivered rows grow with the square of players per shard,
+and the machine delivers about 110–120k rows/s. Phase 20 located the wall: subscription evaluation
+inside the commit, about 5.5 µs per subscriber per commit under the write lock. The ideas, in the
+order to try them:
+
+1. **Re-measure in the shape a game runs** (hours). Server GC (the tool runs workstation GC on 32
+   threads); more, smaller shards (200 players on 16 shards is about 12 per shard, not 50); an
+   area-of-interest mode in the load tool (subscribe to chunks within a radius); the driver on a
+   second machine. This gives the honest ceiling before anything changes.
+2. **Shared fan-out, still under the lock** (days). Identical subscriptions (same SQL, same scope,
+   no row or column policies) are one query: evaluate the group once, encode its row ops once, and
+   give each client the shared bytes with its own subscription id. Today each subscriber gets its
+   own predicate checks, allocations and `TransactionUpdateFrame`, a `Measure` under the lock, and a
+   second serialization on its send loop. This keeps the consistency guarantee.
+3. **Conflation for position-like tables** (days, a protocol choice). One frame per client per send
+   window, and optionally only the latest value of a row within it.
+4. **[Read-side fan-out](../idea-bin/read-side-fanout.md)** (weeks), only if 2 is not enough: it
+   trades away the guarantee 2 keeps.
+5. **Binary node-link frames** (days). Hub-node traffic, border batches included, is JSON; clients
+   already use MessagePack. Matters more with many shards.
 
 **Phase 30 was planned as gated on phase 20's reassignment-window measurement, and is now
 committed instead.** On 2026-11-20 the project owner settled the question the gate left open:
