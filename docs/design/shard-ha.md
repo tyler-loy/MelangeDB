@@ -4,12 +4,12 @@
 12–19 s. No acknowledged write is lost, and at no instant can two nodes both make a write to the
 same shard durable and acknowledge it.
 
-**Status:** **proposed** (2026-11-21). [Road-to-0.4](../road-to-0.4/README.md) commits phase 30.
+**Status:** **design settled, not built** (2026-11-21). [Road-to-0.4](../road-to-0.4/README.md) commits phase 30.
 The project owner set the bar on 2026-11-20: production systems get HA, and the bar for *not*
 building it is high. [Phase 20](../road-to-0.3/plan-phase-20.md) measured the window this record
 starts from ([idea-bin entry](../idea-bin/shard-ha-warm-replica.md), the proposal this replaces).
-Nothing here is built. The decisions at the end are open until the owner settles them; then they
-are answered in place, as with every other record.
+Nothing here is built. The owner settled the decisions at the end on 2026-11-21; they are answered
+in place. The next step is a phase plan for step 0.
 
 **Depends on:** [plan-phase-09](../road-to-0.1/plan-phase-09.md) (membership, fencing tokens,
 per-shard logs on shared storage), [elastic-rebalancing.md](elastic-rebalancing.md) (the drain,
@@ -61,7 +61,7 @@ Surveyed 2026-11-21. Phase 09's docs describe the intent; these are the mechanic
 These are bugs in shipped code, independent of HA. Today they are masked, because the adopting node
 needs another heartbeat and a full recovery before it can write, and that usually outlasts them.
 HA's whole purpose is to remove that delay, so **these are fixed first, as step 0 of the phase.**
-They are **not yet filed as issues**; see *Decisions to settle*.
+Each is filed as an issue.
 
 1. **The node's lease can outlive the hub's death declaration.** The node starts its lease when the
    heartbeat *reply arrives*. The hub may declare death `FailureTimeoutMs` after it *received* that
@@ -69,17 +69,19 @@ They are **not yet filed as issues**; see *Decisions to settle*.
    time (a Postgres round-trip with the Postgres membership store) plus return latency. Clock drift
    isn't budgeted, and both sides use wall-clock time. The node also never reads the hub's
    `AuthReply.FailureTimeoutMs`, so a node configured with a longer timeout keeps its lease well past
-   the hub's declaration.
+   the hub's declaration ([#214](https://github.com/tyler-loy/MelangeDB/issues/214)).
 2. **Internal commits skip the lease check.** The guard returns early for `CommitOrigin.Internal`.
    Replica batches, border applies, and handoff markers (freeze, import, settle, release, abort)
-   all still append to the shard's log after the lease has lapsed.
+   all still append to the shard's log after the lease has lapsed ([#215](https://github.com/tyler-loy/MelangeDB/issues/215)).
 3. **An expired lease closes nothing.** The node keeps its engines open and holds `melange.lock`, so
    on lock-honouring storage a live but partitioned owner blocks the new owner's open indefinitely.
-   On storage that doesn't honour the lock, nothing stops two nodes appending to one `melange.log`.
+   On storage that doesn't honour the lock, nothing stops two nodes appending to one `melange.log`
+   ([#216](https://github.com/tyler-loy/MelangeDB/issues/216)).
 4. **The hub routes border batches, border resets, and forwarded events without checking that the
-   sender owns the source shard.** A fenced owner's border publisher keeps feeding neighbours.
+   sender owns the source shard.** A fenced owner's border publisher keeps feeding neighbours
+   ([#218](https://github.com/tyler-loy/MelangeDB/issues/218)).
 5. **An exception in the dead-node sweep crashes the hub.** It runs on a bare timer callback, so a
-   Postgres error there is an unhandled exception on a thread-pool thread.
+   Postgres error there is an unhandled exception on a thread-pool thread ([#217](https://github.com/tyler-loy/MelangeDB/issues/217)).
 6. Smaller: a node marked dead revives silently on its next heartbeat, with no rejoin epoch; and
    the drain discards the origin's reported head LSN rather than checking the destination recovered
    to it.
@@ -229,23 +231,24 @@ risking two writers; the cost of a false positive becomes a needless promotion, 
 
 ## Decisions to settle
 
-Each has a recommendation; none is settled until the owner says so.
+Settled by the owner on 2026-11-21; each answer is recorded first, with the question kept below it
+for the reasoning.
 
-1. **The storage fence: term segments, or the lock?** *Recommended: term segments.* The cheaper
+1. **The storage fence: term segments, or the lock?** **Settled: term segments.** The cheaper
    alternative keeps the single log file and makes `melange.lock` the fence. That requires shared
    storage that honours cross-host exclusive locks: a documented deployment requirement plus a
    startup probe where the hub has one node hold a lock and another try to take it. It saves the
    log-format change. It gives up storage-agnostic safety: the paused writer is only as fenced as
    the filesystem's lock is honest. On NFS it also inherits the up-to-90 s wait after machine death.
-2. **Which shards get a replica?** *Recommended: on by default (`Cluster:ShardReplicas = 1`) whenever
-   the cluster has two or more shard nodes*, consistent with HA being the default, with `0` to opt
+2. **Which shards get a replica?** **Settled: on by default** (`Cluster:ShardReplicas = 1`) whenever
+   the cluster has two or more shard nodes, consistent with HA being the default, with `0` to opt
    out per deployment. The alternative is opt-in per strategy, so only the shards that need it pay
    for it.
-3. **Default timing once HA is on.** *Recommended: decide from a measurement* (heartbeat 250 ms with
+3. **Default timing once HA is on.** **Settled: decided from a measurement** (heartbeat 250 ms with
    a 2–3 s timeout as the starting hypothesis, plus a false-positive soak under load) rather than
    picking numbers now. This includes whether the heartbeat loop gets a dedicated thread.
-4. **Ordering.** *Recommended:* step 0 (the fence fixes found above) ships first as its own change,
+4. **Ordering.** **Settled:** step 0 (the fence fixes found above) ships first as its own change,
    then detection (#201 plus the fast path), then the replica. Each step stands alone, and steps 0–1
    alone cut the window to a few seconds with no memory cost.
-5. **The step 0 findings: file them as issues** so they are tracked like phase 20's, or keep them
-   here until step 0 is planned.
+5. **The step 0 findings.** **Settled: filed as issues**, the way phase 20's were:
+   [#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218).
