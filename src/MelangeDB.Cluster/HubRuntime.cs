@@ -124,6 +124,18 @@ internal sealed partial class HubRuntime : IDisposable
     private TcpListener? _listener;
     private Task? _acceptLoop;
     private ITimer? _sweepTimer;
+
+    /// <summary>The fine-grained deadline check; see <see cref="CheckDeadlines"/>.</summary>
+    private ITimer? _deadlineTimer;
+
+    /// <summary>Serializes death decisions between the deadline check and the slow sweep.</summary>
+    private readonly Lock _deathLock = new();
+
+    /// <summary>
+    /// When each node's link closed, on the monotonic clock, while it has not re-registered:
+    /// what <see cref="Cluster"/>'s <c>FastFailoverOnLinkLoss</c> reads.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> _linkLostTimestamps = new(StringComparer.Ordinal);
     private ITimer? _rebalanceTimer;
     private int _rebalanceMoveInFlight;
     private readonly ConcurrentDictionary<ShardKey, long> _lastShardMoveTicks = new();
@@ -293,8 +305,14 @@ internal sealed partial class HubRuntime : IDisposable
         NodeListenPort = ((IPEndPoint)_listener.LocalEndpoint).Port;
         _acceptLoop = Task.Run(AcceptLoopAsync);
 
+        // The slow sweep reads membership, so it stays coarse; it exists for nodes this hub has
+        // not heard from since it started. The deadline check reads only memory, so it runs fine
+        // enough that a death is declared within a twentieth of the timeout of its deadline,
+        // rather than anywhere up to half a timeout late (#201).
         var sweep = TimeSpan.FromMilliseconds(Math.Max(250, cluster.FailureTimeoutMs / 2));
         _sweepTimer = _time.CreateTimer(_ => SweepDeadNodes(), null, sweep, sweep);
+        var deadlines = TimeSpan.FromMilliseconds(Math.Clamp(cluster.FailureTimeoutMs / 20, 25, 250));
+        _deadlineTimer = _time.CreateTimer(_ => CheckDeadlines(), null, deadlines, deadlines);
 
         // Always armed, gated per tick on the live Cluster:RebalanceEnabled — hysteresis lives in
         // the window, the per-shard floor, and the decision rule, not in the tick rate.
@@ -1426,8 +1444,11 @@ internal sealed partial class HubRuntime : IDisposable
 
     private void OnLinkClosed(NodeLink link)
     {
-        if (link.Tag is NodeSession { NodeName: { } name })
-            _linksByNode.TryRemove(new KeyValuePair<string, NodeLink>(name, link));
+        if (link.Tag is NodeSession { NodeName: { } name }
+            && _linksByNode.TryRemove(new KeyValuePair<string, NodeLink>(name, link)))
+        {
+            _linkLostTimestamps[name] = _time.GetTimestamp();
+        }
     }
 
     private async Task<object?> HandleAsync(NodeLink link, NodeSession session, string type, JsonElement? body)
@@ -1543,6 +1564,7 @@ internal sealed partial class HubRuntime : IDisposable
 
         session.NodeName = request.NodeName;
         _heardTimestamps[request.NodeName] = _time.GetTimestamp();
+        _linkLostTimestamps.TryRemove(request.NodeName, out _);
         _linksByNode[request.NodeName] = link;
         _membership.RegisterNode(request.NodeName, request.PublicAddress, _time.GetUtcNow());
         _membership.AssignUnowned(_time.GetUtcNow());
@@ -1800,15 +1822,17 @@ internal sealed partial class HubRuntime : IDisposable
     {
         var now = _time.GetUtcNow();
         var timeout = TimeSpan.FromMilliseconds(Cluster.FailureTimeoutMs);
-        foreach (var node in _membership.Nodes())
+        lock (_deathLock)
         {
-            if (!node.Alive)
-                continue;
-            var silence = _time.GetElapsedTime(_heardTimestamps.GetValueOrDefault(node.NodeName, _startedTimestamp));
-            if (silence <= timeout)
-                continue;
-            var moved = _membership.MarkDead(node.NodeName, now);
-            LogNodeSuspectedDead(_logger, node.NodeName, silence.TotalMilliseconds, moved.Count);
+            foreach (var node in _membership.Nodes())
+            {
+                if (!node.Alive)
+                    continue;
+                var silence = _time.GetElapsedTime(_heardTimestamps.GetValueOrDefault(node.NodeName, _startedTimestamp));
+                if (silence <= timeout)
+                    continue;
+                DeclareDeadLocked(node.NodeName, silence, now, linkLost: false);
+            }
         }
 
         // The rate-limit memory is bounded: entries older than any conceivable window are noise.
@@ -1820,9 +1844,68 @@ internal sealed partial class HubRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// The failure detector's fine-grained half: every node this hub has heard from, checked
+    /// against its exact deadline from memory alone, touching membership only to declare a death
+    /// (#201). With <c>Cluster:FastFailoverOnLinkLoss</c> on, a node whose link closed and stayed
+    /// closed for a heartbeat interval is declared too; see that option for the storage it needs.
+    /// </summary>
+    private void CheckDeadlines()
+    {
+        try
+        {
+            var cluster = Cluster;
+            var timeout = TimeSpan.FromMilliseconds(cluster.FailureTimeoutMs);
+            var grace = TimeSpan.FromMilliseconds(cluster.HeartbeatIntervalMs);
+            var now = _time.GetUtcNow();
+            foreach (var (name, heard) in _heardTimestamps)
+            {
+                var silence = _time.GetElapsedTime(heard);
+                var linkLost = cluster.FastFailoverOnLinkLoss
+                    && _linkLostTimestamps.TryGetValue(name, out var lost)
+                    && _time.GetElapsedTime(lost) > grace
+                    && !_linksByNode.ContainsKey(name);
+                if (silence <= timeout && !linkLost)
+                    continue;
+                lock (_deathLock)
+                {
+                    // Re-read under the lock: a heartbeat or a re-registration may have landed.
+                    if (!_heardTimestamps.TryGetValue(name, out var heardNow))
+                        continue;
+                    silence = _time.GetElapsedTime(heardNow);
+                    linkLost = linkLost && _linkLostTimestamps.ContainsKey(name) && !_linksByNode.ContainsKey(name);
+                    if (silence <= timeout && !linkLost)
+                        continue;
+                    DeclareDeadLocked(name, silence, now, linkLost && silence <= timeout);
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            LogDeadNodeSweepFailed(_logger, exception.Message, exception);
+        }
+    }
+
+    /// <summary>
+    /// Marks a node dead and reassigns its shards under bumped fencing tokens. Under
+    /// <see cref="_deathLock"/>. The node leaves the in-memory deadline table, so neither check
+    /// declares it twice; its next heartbeat or registration puts it back.
+    /// </summary>
+    private void DeclareDeadLocked(string nodeName, TimeSpan silence, DateTimeOffset now, bool linkLost)
+    {
+        var moved = _membership.MarkDead(nodeName, now);
+        _heardTimestamps.TryRemove(nodeName, out _);
+        _linkLostTimestamps.TryRemove(nodeName, out _);
+        if (linkLost)
+            LogNodeLinkLostDeclaredDead(_logger, nodeName, silence.TotalMilliseconds, moved.Count);
+        else
+            LogNodeSuspectedDead(_logger, nodeName, silence.TotalMilliseconds, moved.Count);
+    }
+
     public void Dispose()
     {
         _stopped.Cancel();
+        _deadlineTimer?.Dispose();
         _sweepTimer?.Dispose();
         _rebalanceTimer?.Dispose();
         _listener?.Stop();
@@ -2000,6 +2083,10 @@ internal sealed partial class HubRuntime : IDisposable
         Message = "Reap of shard {Shard} refused by its owner '{Owner}': {Reason}. The hub asks from a sampled view and " +
             "the owner settles it under the shard's own lock, so a refusal is the check working rather than a failure.")]
     private static partial void LogShardReapRefused(ILogger logger, ulong shard, string owner, string reason);
+
+    [LoggerMessage(EventId = 1759, EventName = "NodeLinkLostDeclaredDead", Level = LogLevel.Warning,
+        Message = "Shard node '{NodeName}' lost its node link and did not reconnect within a heartbeat interval; declared dead {SilenceMs:F0}ms after its last heartbeat (Cluster:FastFailoverOnLinkLoss), and {Moved} shard(s) reassigned with bumped fencing tokens.")]
+    private static partial void LogNodeLinkLostDeclaredDead(ILogger logger, string nodeName, double silenceMs, int moved);
 
     [LoggerMessage(EventId = 1755, EventName = "DeadNodeSweepFailed", Level = LogLevel.Error,
         Message = "The dead-node sweep failed ({Reason}); no node was declared dead this tick, and the next tick tries again.")]
