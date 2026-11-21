@@ -53,7 +53,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | **Built**; fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | Planned |
-| 30 | Shard HA | **Committed** 2026-11-20; gets a design record before a plan, as [phase 24](../design/scheduler-lanes.md) did |
+| 30 | Shard HA | **Committed** 2026-11-20; [design record](../design/shard-ha.md) proposed 2026-11-21, decisions open |
 
 The plans for 20, 22, and 23 stay where they were written, in [road-to-0.3/](../road-to-0.3/).
 Moving them would break every link into them for no gain; the decision record is the same document
