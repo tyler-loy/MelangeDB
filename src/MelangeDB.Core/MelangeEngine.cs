@@ -536,6 +536,48 @@ public sealed partial class MelangeEngine : IDisposable
     }
 
     /// <summary>
+    /// Runs a raw read of committed state at one known LSN — the head, as
+    /// <see cref="ReadConsistent{T}"/> hands it — with the read itself <b>off</b> the write lock
+    /// when the store can pin a view. The head and the pin are taken together under the lock, and
+    /// every commit applies to the store before releasing it, so the view is exactly the state at
+    /// that LSN: a caller that resumes a log stream from it neither skips nor repeats a record.
+    /// <para>
+    /// For whole-table scans whose result is shipped somewhere else (a border reset, a Replicated
+    /// bootstrap). Run under <see cref="ReadConsistent{T}"/> instead, such a scan holds every
+    /// commit and the node's heartbeat for its whole length, which on a paged store is minutes at
+    /// a million rows (#208). A store without pinned reads falls back to exactly that.
+    /// </para>
+    /// </summary>
+    internal T ReadAtHead<T>(Func<ulong, IHotStoreReader, T> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        if (_readViewSource is not { } source)
+            return ReadConsistent(head => read(head, HotStore));
+
+        ulong head;
+        IHotStoreReadView view;
+        lock (_writeLock)
+        {
+            head = _log.HeadLsn;
+            view = source.OpenReadView();
+        }
+
+        using (view)
+            return read(head, view);
+    }
+
+    /// <summary>Runs an action at the head off the write lock; see <see cref="ReadAtHead{T}"/>.</summary>
+    internal void ReadAtHead(Action<ulong, IHotStoreReader> read)
+    {
+        ArgumentNullException.ThrowIfNull(read);
+        ReadAtHead<bool>((head, store) =>
+        {
+            read(head, store);
+            return true;
+        });
+    }
+
+    /// <summary>
     /// Opens the store's pinned view under the write lock, as <see cref="IReadViewSource"/>
     /// requires: no apply can run while the store captures its tables, so the view is one LSN across
     /// every table rather than one table after a multi-table commit and another before it. Cheap —
