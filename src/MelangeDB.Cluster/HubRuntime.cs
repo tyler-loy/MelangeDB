@@ -22,7 +22,9 @@ internal sealed partial class HubRuntime : IDisposable
 {
     private sealed class NodeSession
     {
+        private readonly Lock _replicaGate = new();
         private long _replicaCursor = -1;
+        private ulong _replicaPrev;
 
         public required string ServerNonce { get; init; }
 
@@ -32,21 +34,51 @@ internal sealed partial class HubRuntime : IDisposable
 
         public Task? ReplicaPump { get; set; }
 
-        /// <summary>The pump's cursor; -1 means not subscribed. A re-subscribe may move it back.</summary>
-        public long ReplicaCursor
+        /// <summary>
+        /// Where the pump will scan from next, and the last Replicated LSN at or before that point
+        /// — the <see cref="ReplicaBatch.PrevLsn"/> of the next slice. Null when not subscribed.
+        /// The two move together under one lock: a slice that claimed a predecessor its scan did
+        /// not start from would let a shard apply it over a hole (too low), or skip it forever
+        /// (too high, since a shard's cursor only ever reaches Replicated LSNs).
+        /// </summary>
+        public (ulong Cursor, ulong Prev)? ReplicaPosition()
         {
-            get => Interlocked.Read(ref _replicaCursor);
-            set => Interlocked.Exchange(ref _replicaCursor, value);
+            lock (_replicaGate)
+            {
+                return _replicaCursor < 0 ? null : ((ulong)_replicaCursor, _replicaPrev);
+            }
         }
 
-        /// <summary>Moves the cursor backwards only — a re-subscribe for a shard that needs older records.</summary>
-        public void LowerReplicaCursor(long cursor)
+        /// <summary>
+        /// Moves the scan back for a re-subscribe that needs older records; forward requests are
+        /// ignored. The subscriber's own cursor is a Replicated LSN (or a reset point, or zero), so
+        /// it is the predecessor too.
+        /// </summary>
+        public void LowerReplicaCursor(ulong cursor)
         {
-            long current;
-            while ((current = Interlocked.Read(ref _replicaCursor)) < 0 || cursor < current)
+            lock (_replicaGate)
             {
-                if (Interlocked.CompareExchange(ref _replicaCursor, cursor, current) == current)
+                if (_replicaCursor >= 0 && (long)cursor >= _replicaCursor)
                     return;
+                _replicaCursor = (long)cursor;
+                _replicaPrev = cursor;
+            }
+        }
+
+        /// <summary>
+        /// Advances past a scanned range, unless a re-subscribe moved the scan meanwhile (its
+        /// lower position stands). <paramref name="lastReplicated"/> is the range's last Replicated
+        /// LSN, or null when the range had none and the predecessor is unchanged.
+        /// </summary>
+        public void AdvanceReplica(ulong from, ulong to, ulong? lastReplicated)
+        {
+            lock (_replicaGate)
+            {
+                if (_replicaCursor != (long)from)
+                    return;
+                _replicaCursor = (long)to;
+                if (lastReplicated is { } lsn)
+                    _replicaPrev = lsn;
             }
         }
     }
@@ -1528,7 +1560,7 @@ internal sealed partial class HubRuntime : IDisposable
     /// </summary>
     private void StartReplicaPump(NodeLink link, NodeSession session, ulong fromLsn)
     {
-        session.LowerReplicaCursor((long)fromLsn);
+        session.LowerReplicaCursor(fromLsn);
         session.ReplicaPump ??= Task.Run(async () =>
         {
             var ct = _stopped.Token;
@@ -1536,7 +1568,8 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 try
                 {
-                    var cursor = (ulong)Math.Max(0, session.ReplicaCursor);
+                    if (session.ReplicaPosition() is not var (cursor, prev))
+                        return; // Unreachable: the pump starts only after a subscribe positioned it.
 
                     // A cursor below the truncation base cannot be served from the log — the
                     // gap's records are gone, and streaming from BaseLsn+1 would silently lose
@@ -1578,13 +1611,12 @@ internal sealed partial class HubRuntime : IDisposable
 
                         if (records.Count > 0)
                         {
-                            await link.RequestAsync("replica-batch", new ReplicaBatch([.. lsns], [.. records]), ct)
+                            await link.RequestAsync("replica-batch", new ReplicaBatch([.. lsns], [.. records], PrevLsn: prev), ct)
                                 .ConfigureAwait(false);
                         }
 
                         // Advance only if no re-subscribe moved the cursor back meanwhile.
-                        if (session.ReplicaCursor == (long)cursor)
-                            session.ReplicaCursor = (long)scanned;
+                        session.AdvanceReplica(cursor, scanned, records.Count > 0 ? lsns[^1] : null);
                         continue;
                     }
 
@@ -1647,8 +1679,8 @@ internal sealed partial class HubRuntime : IDisposable
             _engine.Log.BaseLsn,
             resetLsn,
             tables.Sum(static t => t.Rows.Length));
-        if (session.ReplicaCursor == (long)staleCursor)
-            session.ReplicaCursor = (long)resetLsn;
+        // Every shard that took the reset sits at resetLsn, which is therefore the predecessor.
+        session.AdvanceReplica(staleCursor, resetLsn, resetLsn);
     }
 
     private WireOp[] ReplicatedOps(CommitRecord record)

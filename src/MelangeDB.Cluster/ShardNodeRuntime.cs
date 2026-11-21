@@ -29,6 +29,19 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private readonly Dictionary<ShardKey, ShardRuntime> _shards = [];
 
     /// <summary>
+    /// Shards being opened, off the heartbeat path. Recovery is a full replay of the shard's
+    /// snapshot and log tail, which for a crowded shard takes seconds, and it used to run inline in
+    /// the heartbeat loop: the adopting node stopped heartbeating and renewing its lease for the
+    /// whole recovery, so a recovery longer than Cluster:FailureTimeoutMs got the healthy adopter
+    /// declared dead and self-fenced on every shard it owned (#198). An open now runs as its own
+    /// task; this map is what keeps a second heartbeat from starting the same open twice.
+    /// </summary>
+    private readonly Dictionary<ShardKey, Task> _opening = [];
+
+    /// <summary>The hub's latest assignment list as this node last received it, for opens that complete after it changed.</summary>
+    private Dictionary<ShardKey, ShardAssignment> _assigned = [];
+
+    /// <summary>
     /// Shards this node quiesced for a planned drain, with when. While marked, an assignment
     /// still naming this node does not reopen the shard — the hub is between quiesce and
     /// reassign, and reopening would race the destination onto one log. The mark clears when the
@@ -81,6 +94,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
     /// <summary>Test hook: while true, heartbeats stop — a partition, as the hub sees it.</summary>
     internal bool SuspendHeartbeats { get; set; }
+
+    /// <summary>
+    /// Test hook: runs at the start of every shard open, on the open's own task — a slow (or
+    /// failing) recovery without having to build a shard big enough to be one.
+    /// </summary>
+    internal Action<ShardKey>? BeforeOpen { get; set; }
 
     private ClusterOptions Cluster => _options.CurrentValue.Cluster;
 
@@ -321,9 +340,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             foreach (var reaping in _reaping.Keys.ToList())
                 IsReapingLocked(reaping);
 
+            _assigned = assigned;
             foreach (var assignment in assigned.Values)
             {
-                if (_shards.ContainsKey(assignment.Shard))
+                if (_shards.ContainsKey(assignment.Shard) || _opening.ContainsKey(assignment.Shard))
                     continue;
                 if (IsDrainingLocked(assignment.Shard))
                     continue;
@@ -333,55 +353,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 // and this is a stale assignment list — mint ids under a retired originator.
                 if (IsReapingLocked(assignment.Shard))
                     continue;
-                var directory = Path.Combine(Cluster.ShardDataPath, $"shard-{assignment.Shard.Value}");
-                Directory.CreateDirectory(directory);
-                var runtime = new ShardRuntime(
-                    assignment.Shard,
-                    assignment.FencingToken,
-                    assignment.Originator,
-                    directory,
-                    NodeName,
-                    _services.GetRequiredService<SchemaRegistry>(),
-                    _services.GetRequiredService<ReducerRegistry>(),
-                    _services,
-                    _options,
-                    LeaseValid,
-                    _loggerFactory,
-                    _time,
-                    _authenticator,
-                    _sessions);
-                _shards[assignment.Shard] = runtime;
-                var forwarder = new EventForwarder(
-                    runtime.Engine,
-                    assignment.Shard.Value,
-                    Path.Combine(directory, "events.cursor"),
-                    () => _link,
-                    _logger);
-                _forwarders[assignment.Shard] = forwarder;
-                forwarder.Start();
-                if (_strategy is { } strategy)
-                {
-                    var publisher = new BorderPublisher(
-                        runtime.Engine, assignment.Shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger);
-                    _borderPublishers[assignment.Shard] = publisher;
-                    publisher.Start();
-
-                    // Seamless (walking-triggered) handoff needs a strategy that can judge
-                    // boundaries and an application that names its migratable entities; with
-                    // both, the origin decides — its committed rows are the only trusted position.
-                    if (strategy is IBoundaryStrategy && _services.GetService<IMigrationAnchors>() is { } anchors)
-                    {
-                        var monitor = new BoundaryMonitor(
-                            runtime.Engine, assignment.Shard, strategy, anchors,
-                            () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, runtime.IsFrozen,
-                            _options, _time);
-                        _boundaryMonitors[assignment.Shard] = monitor;
-                        monitor.Start();
-                    }
-                }
-
-                shardSetChanged = true;
-                LogShardOpened(_logger, assignment.Shard.Value, NodeName, runtime.Engine.Log.HeadLsn);
+                var shard = assignment.Shard;
+                _opening[shard] = Task.Run(() => OpenShard(shard));
             }
 
             // A shard-set change moves the replication low-water mark; force a re-subscribe.
@@ -391,6 +364,137 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
         foreach (var runtime in closed)
             runtime.Dispose();
+    }
+
+    /// <summary>
+    /// Opens one assigned shard: recovery runs here, outside every lock and off the heartbeat
+    /// path, and only the finished runtime is published into the shard set — under the same checks
+    /// <see cref="ApplyAssignments"/> applies, re-read now, because the hub may have moved the
+    /// shard, a drain or reap may have started, or this node may be stopping while recovery ran.
+    /// A failed open (the previous owner still holding the log, a damaged directory) is logged and
+    /// left for the next heartbeat to retry; it no longer takes the hub link, and with it the
+    /// lease of every other shard on this node, down with it.
+    /// </summary>
+    private void OpenShard(ShardKey shard)
+    {
+        ShardRuntime? runtime = null;
+        try
+        {
+            ShardAssignment assignment;
+            lock (_shardsLock)
+            {
+                if (_stopped.IsCancellationRequested || !_assigned.TryGetValue(shard, out assignment!))
+                    return;
+            }
+
+            BeforeOpen?.Invoke(shard);
+            var started = _time.GetTimestamp();
+            var directory = Path.Combine(Cluster.ShardDataPath, $"shard-{shard.Value}");
+            Directory.CreateDirectory(directory);
+            runtime = new ShardRuntime(
+                shard,
+                assignment.FencingToken,
+                assignment.Originator,
+                directory,
+                NodeName,
+                _services.GetRequiredService<SchemaRegistry>(),
+                _services.GetRequiredService<ReducerRegistry>(),
+                _services,
+                _options,
+                LeaseValid,
+                _loggerFactory,
+                _time,
+                _authenticator,
+                _sessions);
+            var openMs = _time.GetElapsedTime(started).TotalMilliseconds;
+
+            lock (_shardsLock)
+            {
+                if (_stopped.IsCancellationRequested
+                    || !_assigned.TryGetValue(shard, out var current)
+                    || IsDrainingLocked(shard)
+                    || IsReapingLocked(shard))
+                {
+                    LogShardOpenAbandoned(_logger, shard.Value, NodeName);
+                    return; // runtime disposed in finally
+                }
+
+                // The token the hub holds now, not the one recovery started under: a heartbeat
+                // that bumped it while recovery ran must not be lost.
+                runtime.FencingToken = current.FencingToken;
+                PublishLocked(shard, runtime);
+                LogShardOpened(_logger, shard.Value, NodeName, openMs, runtime.Engine.Log.HeadLsn);
+                runtime = null; // Published: the shard set owns it now.
+            }
+
+            KickForwarders();
+        }
+        catch (Exception exception)
+        {
+            LogShardOpenFailed(_logger, shard.Value, NodeName, exception.Message);
+        }
+        finally
+        {
+            runtime?.Dispose();
+            lock (_shardsLock)
+            {
+                _opening.Remove(shard);
+            }
+        }
+    }
+
+    /// <summary>Applies an assignment list and completes when every shard it put into opening has finished (opened, failed, or abandoned).</summary>
+    private async Task<object?> ApplyAndAwaitOpensAsync(ShardAssignmentDto[] assignments)
+    {
+        ApplyAssignments(assignments);
+        Task[] opening;
+        lock (_shardsLock)
+        {
+            opening = [.. assignments
+                .Select(static a => new ShardKey(a.Shard))
+                .Select(shard => _opening.GetValueOrDefault(shard))
+                .OfType<Task>()];
+        }
+
+        await Task.WhenAll(opening).ConfigureAwait(false);
+        return null;
+    }
+
+    /// <summary>Puts an opened runtime into service: the shard set, its forwarder, border publisher, and boundary monitor. Caller holds <see cref="_shardsLock"/>.</summary>
+    private void PublishLocked(ShardKey shard, ShardRuntime runtime)
+    {
+        _shards[shard] = runtime;
+        var forwarder = new EventForwarder(
+            runtime.Engine,
+            shard.Value,
+            Path.Combine(runtime.Directory, "events.cursor"),
+            () => _link,
+            _logger);
+        _forwarders[shard] = forwarder;
+        forwarder.Start();
+        if (_strategy is { } strategy)
+        {
+            var publisher = new BorderPublisher(
+                runtime.Engine, shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger);
+            _borderPublishers[shard] = publisher;
+            publisher.Start();
+
+            // Seamless (walking-triggered) handoff needs a strategy that can judge
+            // boundaries and an application that names its migratable entities; with
+            // both, the origin decides — its committed rows are the only trusted position.
+            if (strategy is IBoundaryStrategy && _services.GetService<IMigrationAnchors>() is { } anchors)
+            {
+                var monitor = new BoundaryMonitor(
+                    runtime.Engine, shard, strategy, anchors,
+                    () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, runtime.IsFrozen,
+                    _options, _time);
+                _boundaryMonitors[shard] = monitor;
+                monitor.Start();
+            }
+        }
+
+        // A shard-set change moves the replication low-water mark; the next heartbeat re-subscribes.
+        _replicaSubscribedFrom = ulong.MaxValue;
     }
 
     /// <summary>Whether the shard is drain-quiesced, clearing an expired mark on the way past. Caller holds <see cref="_shardsLock"/>.</summary>
@@ -840,10 +944,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "assignments-apply":
                 // The drain's fast path: the hub pushes the destination's assignments instead of
-                // waiting out the heartbeat clock, and the reply doubles as "the shard is open"
-                // because ApplyAssignments recovers synchronously.
-                ApplyAssignments(body!.Value.Deserialize<AssignmentsApply>()!.Assignments);
-                return Task.FromResult<object?>(null);
+                // waiting out the heartbeat clock, and the reply doubles as "the shard is open".
+                // Opens run off the heartbeat path now (#198), so the reply waits for the ones this
+                // push started — on this request's own task, which the link dispatches apart from
+                // its read loop, so heartbeat replies keep flowing while it waits. The hub bounds
+                // the wait with its step timeout and falls back to the heartbeat clock past it.
+                return ApplyAndAwaitOpensAsync(body!.Value.Deserialize<AssignmentsApply>()!.Assignments);
             case "shard-execute":
             {
                 var execute = body!.Value.Deserialize<ShardExecute>()!;
@@ -981,6 +1087,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
         foreach (var (runtime, cursor) in shards)
         {
+            // A shard that has not applied everything up to the slice's predecessor would take
+            // the slice and advance its cursor over records it never saw. A shard published while
+            // a stream from a higher low-water mark was in flight did exactly that, and kept a
+            // permanent hole in its Replicated tables. Skipping is safe: publishing the shard reset
+            // the subscription mark, so the next heartbeat re-subscribes from this shard's own
+            // cursor and the stream comes back for it.
+            if (cursor < batch.PrevLsn)
+                continue;
             var applied = cursor;
             for (var i = 0; i < batch.Lsns.Length; i++)
             {
@@ -1207,6 +1321,19 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     {
         _stopped.Cancel();
         _link?.Dispose();
+
+        // An open in flight holds the shard's log and store; let it finish and close itself (it
+        // sees the stop and abandons) rather than leave those handles to a node that no longer
+        // exists. Bounded, because a recovery has no cancellation point — past the bound the
+        // handles are released when the task ends.
+        Task[] opening;
+        lock (_shardsLock)
+        {
+            opening = [.. _opening.Values];
+        }
+
+        if (opening.Length > 0)
+            Task.WaitAll(opening, TimeSpan.FromSeconds(30));
         lock (_shardsLock)
         {
             foreach (var forwarder in _forwarders.Values)
@@ -1225,8 +1352,16 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     }
 
     [LoggerMessage(EventId = 1707, EventName = "ShardOpened", Level = LogLevel.Information,
-        Message = "Shard {Shard} opened on node '{NodeName}', recovered to LSN {HeadLsn} from its own log.")]
-    private static partial void LogShardOpened(ILogger logger, ulong shard, string nodeName, ulong headLsn);
+        Message = "Shard {Shard} opened on node '{NodeName}' in {OpenMs:F0}ms, recovered to LSN {HeadLsn} from its own log.")]
+    private static partial void LogShardOpened(ILogger logger, ulong shard, string nodeName, double openMs, ulong headLsn);
+
+    [LoggerMessage(EventId = 1753, EventName = "ShardOpenFailed", Level = LogLevel.Warning,
+        Message = "Shard {Shard} could not be opened on node '{NodeName}' ({Reason}); the next heartbeat retries. The hub link and this node's other shards are unaffected.")]
+    private static partial void LogShardOpenFailed(ILogger logger, ulong shard, string nodeName, string reason);
+
+    [LoggerMessage(EventId = 1754, EventName = "ShardOpenAbandoned", Level = LogLevel.Information,
+        Message = "Shard {Shard} finished recovering on node '{NodeName}' after the hub had moved it (or a drain, reap, or shutdown began); the recovered runtime was closed unused.")]
+    private static partial void LogShardOpenAbandoned(ILogger logger, ulong shard, string nodeName);
 
     [LoggerMessage(EventId = 1708, EventName = "ShardReleased", Level = LogLevel.Information,
         Message = "Shard {Shard} released by node '{NodeName}': the hub reassigned it.")]

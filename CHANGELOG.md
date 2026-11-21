@@ -43,6 +43,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A node that takes over a dead node's shard no longer stops heartbeating while it recovers it**
+  ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). The open, a full replay of the
+  shard's snapshot and log tail, ran inside the heartbeat loop. So a recovery longer than
+  `Cluster:FailureTimeoutMs`, measured at 3–6 s for a 1M-row shard, got the *adopting* node
+  declared dead and self-fenced on every shard it owned, turning one node death into a cascade.
+  Opens now run on their own task, and the node keeps its heartbeat and lease through them. A failed
+  open is retried on the next heartbeat and no longer drops the hub link. `1707 ShardOpened` now
+  carries the recovery time; `1753 ShardOpenFailed` and `1754 ShardOpenAbandoned` are new.
 - **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
   fsynced while holding the log's append lock, so every commit that landed during a flush waited
   for it under the engine's write lock. A consumer game saw one-row commits of 63–206 ms with a

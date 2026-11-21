@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Xunit;
@@ -102,5 +103,85 @@ public class FailoverTests
 
         var afterHeal = await health.CheckHealthAsync(new HealthCheckContext(), TestContext.Current.CancellationToken);
         Assert.Equal(HealthStatus.Healthy, afterHeal.Status);
+    }
+
+    /// <summary>
+    /// #198: the node that adopts a dead node's shard recovers it off its heartbeat path. A
+    /// recovery that outlasts Cluster:FailureTimeoutMs used to run inside the heartbeat loop, so the
+    /// healthy adopter went silent, the hub declared it dead too, and its lease lapsed on every shard
+    /// it owned. Here the recovery is made to take three failure timeouts, and the adopter stays
+    /// alive, keeps its lease, and keeps serving the shard it already had the whole time.
+    /// </summary>
+    [Fact]
+    public async Task A_recovery_longer_than_the_failure_timeout_does_not_fence_the_node_doing_it()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(shardNodes: 2, heartbeatMs: 150, failureTimeoutMs: 1_500);
+        var owner = await cluster.EnsureShardOwnedAsync(1);
+        var adopter = await cluster.EnsureShardOwnedAsync(2);
+        Assert.NotEqual(owner.Name, adopter.Name); // Least-loaded placement puts them apart.
+        owner.Runtime.TryGetShard(new ShardKey(1))!.ReducerHost.Call("SpawnMob", ClusterFixture.Caller, 1u, 77);
+
+        var slowOpen = TestTime.Dilated(TimeSpan.FromMilliseconds(4_500));
+        var recovering = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        adopter.Runtime.BeforeOpen = shard =>
+        {
+            if (shard.Value != 1)
+                return;
+            recovering.TrySetResult();
+            Thread.Sleep(slowOpen);
+        };
+
+        await cluster.StopNodeAsync(owner.Name);
+        await recovering.Task.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(30)), TestContext.Current.CancellationToken);
+
+        // Throughout the recovery: the hub still counts the adopter alive, its lease holds, and
+        // the shard it already owned takes writes.
+        var clock = Stopwatch.StartNew();
+        var writes = 0;
+        while (adopter.Runtime.TryGetShard(new ShardKey(1)) is null)
+        {
+            Assert.True(clock.Elapsed < slowOpen + TestTime.Dilated(TimeSpan.FromSeconds(10)), "the slow open never finished");
+            Assert.True(
+                cluster.Hub.Membership.Nodes().Single(n => n.NodeName == adopter.Name).Alive,
+                $"the hub declared the adopter dead {clock.Elapsed.TotalMilliseconds:F0} ms into its recovery");
+            Assert.True(adopter.Runtime.LeaseValid(), "the adopter's lease lapsed while it recovered");
+            adopter.Runtime.TryGetShard(new ShardKey(2))!.ReducerHost.Call("SpawnMob", ClusterFixture.Caller, 2u, writes++);
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+        }
+
+        // The test only means something if the recovery outlasted the failure timeout it is about.
+        Assert.True(clock.Elapsed > TimeSpan.FromMilliseconds(TestTime.Scale * 1_500), $"recovery took only {clock.Elapsed}");
+        Assert.True(writes > 0);
+        var recovered = adopter.Runtime.TryGetShard(new ShardKey(1))!;
+        Assert.Equal(77, recovered.Engine.CommittedView.Scan<Mob>().Single().Hp);
+        Assert.Equal(adopter.Name, cluster.Hub.Membership.GetAssignment(new ShardKey(1))!.NodeName);
+    }
+
+    /// <summary>
+    /// A failed open (the previous owner still holding the log, a damaged directory) is retried on
+    /// the next heartbeat and costs the node nothing else. It used to throw out of the heartbeat
+    /// loop and drop the hub link, which is every other shard's lease too.
+    /// </summary>
+    [Fact]
+    public async Task A_failed_open_is_retried_without_dropping_the_hub_link()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(shardNodes: 1, heartbeatMs: 150, failureTimeoutMs: 3_000);
+        var node = cluster.Nodes.Single();
+        var failures = 0;
+        node.Runtime.BeforeOpen = shard =>
+        {
+            if (shard.Value == 3 && Interlocked.Increment(ref failures) <= 3)
+                throw new IOException("simulated: the log is still held by the previous owner");
+        };
+        var authsBefore = node.Runtime.Metrics.SentByType.GetValueOrDefault("auth");
+
+        await cluster.EnsureShardOwnedAsync(3);
+
+        Assert.True(Volatile.Read(ref failures) > 3, "the open was retried past its failures");
+
+        // Every reconnect authenticates afresh; one link throughout means no new auth.
+        Assert.Equal(authsBefore, node.Runtime.Metrics.SentByType.GetValueOrDefault("auth"));
+        Assert.True(node.Runtime.LeaseValid());
+        Assert.True(cluster.Hub.Membership.Nodes().Single().Alive);
     }
 }

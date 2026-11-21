@@ -452,7 +452,8 @@ loud: how long the silence was and how many shards moved under bumped fencing to
 misconfigured node, either way worth an alert), `1704 ForeignEventHandlerFailed` — a hub handler exhausted
 its retries for a shard-forwarded event; foreign events have no dead-letter file, and the log says so
 plainly — `1705 HandoffCompleted` and `1706 HandoffAborted` (the two ends every transfer saga reaches),
-`1707 ShardOpened` (which node, recovered to which LSN — reassignment is recovery, and this is its receipt),
+`1707 ShardOpened` (which node, how long recovery took, recovered to which LSN — reassignment is recovery, and this is its receipt; the duration is the part of a failover window that grows with the shard),
+`1753 ShardOpenFailed` (an open that threw — the previous owner still holding the log, a damaged directory — retried on the next heartbeat; since #198 it no longer drops the hub link, so a recurring one is a stuck shard, not a flapping node), `1754 ShardOpenAbandoned` (a recovery that finished after the hub had moved the shard, or a drain, reap, or shutdown began — closed unused, expected under reassignment churn),
 `1708 ShardReleased`, `1709 HubLinkLost` — the node's own view of a partition, ending in self-fencing if
 `Cluster:FailureTimeoutMs` passes first — `1710 HandoffUnresolved` — an import request that timed out or lost
 its link: the destination may or may not hold the import, so the player deliberately stays frozen until the
