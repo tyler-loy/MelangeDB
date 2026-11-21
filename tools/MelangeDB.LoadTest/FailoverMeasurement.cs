@@ -78,6 +78,7 @@ internal static class FailoverMeasurement
         var shardDirectory = Path.Combine(root, "shards", $"shard-{shard.Value}");
         var runs = new List<FailoverRun>();
         ushort originator;
+        ServerStats liveness;
         try
         {
             await using (var server = await LoadTestServer.StartAsync(options, output, ct, tuning).ConfigureAwait(false))
@@ -117,6 +118,7 @@ internal static class FailoverMeasurement
                 }
 
                 originator = server.Hub.Membership.GetAssignment(shard)!.Originator;
+                liveness = server.Stats();
             }
 
             // Recovery alone, with no cluster running: the heat-dependent part of the window.
@@ -125,6 +127,10 @@ internal static class FailoverMeasurement
                 isolated.Add(OpenIsolated(options, shardDirectory, originator));
             var footprint = DirectoryBytes(shardDirectory);
             var restores = runs.SelectMany(static r => r.ClientRestoreMs).ToList();
+
+            // Every kill is one death; any beyond that is a healthy node (the adopter, mid-recovery,
+            // most likely) declared dead. Lapses are counted on the nodes still running.
+            var falseDeaths = liveness.NodesDeclaredDead - runs.Count;
             var windows = runs.Select(static r => r.ServerWindowMs).ToList();
             var line =
                 FormattableString.Invariant($"FAILOVER rows={rows} row_bytes={options.RowBytes} tail={options.TailRecords} hot_store={options.HotStore} ") +
@@ -136,9 +142,11 @@ internal static class FailoverMeasurement
                 FormattableString.Invariant($"client_restore_p50_ms={Percentile(restores, 0.50):F0} client_restore_p99_ms={Percentile(restores, 0.99):F0} ") +
                 FormattableString.Invariant($"client_restore_max_ms={(restores.Count == 0 ? 0 : restores.Max()):F0} ") +
                 FormattableString.Invariant($"clients_unrestored={runs.Sum(static r => r.ClientsUnrestored)} ") +
-                FormattableString.Invariant($"resync_errors={runs.Sum(static r => r.ResyncErrors)} failed_calls={runs.Sum(static r => r.FailedCalls)}");
+                FormattableString.Invariant($"resync_errors={runs.Sum(static r => r.ResyncErrors)} failed_calls={runs.Sum(static r => r.FailedCalls)} ") +
+                FormattableString.Invariant($"false_deaths={falseDeaths} lease_lapses={liveness.LeaseLapses} ") +
+                FormattableString.Invariant($"hb_gap_max_ms={liveness.HeartbeatGapMaxMs:F0} lease_gap_max_ms={liveness.LeaseRenewalGapMaxMs:F0}");
             output.WriteLine(line);
-            return runs.All(static r => r.ClientsUnrestored == 0);
+            return runs.All(static r => r.ClientsUnrestored == 0) && falseDeaths == 0 && liveness.LeaseLapses == 0;
         }
         finally
         {

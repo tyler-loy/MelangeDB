@@ -134,10 +134,15 @@ noted.
   serve process via `/loadtest/stats` every sample interval. Hub and shard nodes share the serve
   process, so these numbers describe the whole server side of the run. On a soak run the time
   series (`--out`) is the leak watch: a healthy run's working set flattens; a leak trends.
+- **Liveness** — the longest heartbeat gap the hub saw, the longest lease-renewal gap any shard
+  node saw, how many gaps exceeded 0.5/1/2/3/5 s, and the nodes declared dead and leases lapsed.
+  Whole-run counters (`ClusterMetrics`, see OBSERVABILITY.md). A drive run kills nothing, so any
+  death or lapse is a false one. Run at a long `--failure-timeout-ms`, the gap counts say how many
+  false deaths each shorter timeout would have caused, from one run.
 - **`LOADTEST RESULT=PASS|FAIL ...`** — one machine-parseable line of key=value pairs. FAIL means:
   zero acked calls, any client disconnect, any resync error, or seam walkers configured on a
-  multi-shard world with zero completed handoffs (only checked when the stats endpoint is
-  reachable). Latency and throughput are **reported, never asserted** — thresholds belong to your
+  multi-shard world with zero completed handoffs, or any node declared dead or lease lapsed (these
+  two only checked when the stats endpoint is reachable). Latency and throughput are **reported, never asserted** — thresholds belong to your
   hardware, per the repo's measurement discipline (`HotspotMeasurementTests`).
 
 ## Methodology and caveats
@@ -332,6 +337,9 @@ After the kills, the shard directory is opened by a bare engine three times ("is
 heat-dependent part can be read without the heartbeat wait in it. The run also records, before each
 kill, how stale the owner's heartbeat already was. A live owner that has gone quiet shortens
 *detect* below the timeout, and the line says so with a WARNING rather than report it as speed.
+The summary line also counts **false deaths** (declarations beyond the one each kill causes) and
+lease lapses on the nodes still running, with the longest heartbeat and lease-renewal gaps: an
+adopter whose recovery stalls its heartbeat shows up there, and either one fails the run.
 
 **Synthetic by construction.** The reference workload has no cluster deployment, so this cannot come
 from it. One process hosts hub, both nodes, and the clients, so GC and thread-pool load are shared;

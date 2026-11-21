@@ -309,8 +309,33 @@ Meter name: `MelangeDB`.
 | `melange.cluster.provision.outstanding` | gauge | `{ticket}` | — | 14 |
 | `melange.cluster.provision.latency` | histogram | `ms` | — | 14 |
 | `melange.cluster.decommissions` | counter | `{node}` | — | 14 |
+| `melange.cluster.heartbeat.gap` | histogram | `ms` | `node` | 30 |
+| `melange.cluster.nodes.declared_dead` | counter | `{node}` | `reason` | 30 |
+| `melange.cluster.lease.renewal_gap` | histogram | `ms` | `node` | 30 |
+| `melange.cluster.lease.lapses` | counter | `{lapse}` | `node` | 30 |
 | `melange.backup.bytes` | counter | `By` | `outcome` | 15 |
 | `melange.backup.duration` | histogram | `ms` | `outcome` | 15 |
+
+### Reading the liveness instruments
+
+These four are what `Cluster:HeartbeatIntervalMs` and `Cluster:FailureTimeoutMs` should be chosen
+from, on the deployment's own hardware and load.
+
+- `melange.cluster.heartbeat.gap` (hub) is the time between consecutive heartbeats from one node,
+  as the hub received them. The hub declares a node dead when this exceeds the failure timeout, so
+  its tail is the margin a healthy cluster keeps. A gap is a pause on either end or on the network
+  between them: a thread-pool starvation on the node, a GC pause on either, a stalled hub.
+- `melange.cluster.lease.renewal_gap` (shard node) is the time from sending one acknowledged
+  heartbeat to the reply to the next: how long the lease had to last. The lease lapses when it
+  exceeds nine tenths of the hub's failure timeout, so this one runs out first. It reads a little
+  longer than the hub's gap, by one round trip.
+- `melange.cluster.nodes.declared_dead` (hub, `reason` = `timeout` or `link_lost`) and
+  `melange.cluster.lease.lapses` (node) count the outcomes. Outside a real failure both stay at
+  zero; a lapse with no matching death is a node that fenced itself on a gap the hub tolerated.
+
+`ClusterMetrics` carries the same four for tests and tools: `HeartbeatGaps` and `LeaseRenewalGaps`
+(`LivenessGaps`: count, maximum, and how many exceeded each of a fixed set of thresholds from
+500 ms to 10 s), `NodesDeclaredDead`, and `LeaseLapses`.
 
 ### Reading the two shard row gauges
 

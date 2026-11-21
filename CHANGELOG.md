@@ -12,6 +12,11 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Liveness instruments** (road-to-0.4 phase 30): `melange.cluster.heartbeat.gap` on the hub and
+  `melange.cluster.lease.renewal_gap` on shard nodes time how close a healthy cluster comes to its
+  failure timeout, and `melange.cluster.nodes.declared_dead` and `melange.cluster.lease.lapses`
+  count the outcomes. `ClusterMetrics` carries the same, and the load tool reports them. They are
+  what the heartbeat and failure-timeout settings should be chosen from; see OBSERVABILITY.md.
 - **`Cluster:FastFailoverOnLinkLoss`** (off by default; road-to-0.4 phase 30, step 1). The hub
   declares a node dead as soon as its node link closes and stays closed for a heartbeat interval
   (EventId 1759), instead of at the failure timeout. A killed process is detected in 1.0–1.2 s, and

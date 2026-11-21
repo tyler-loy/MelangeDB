@@ -205,6 +205,13 @@ internal static class LoadTestDriver
 
         output.WriteLine($"Client health:   {metrics.Disconnects} disconnects, {metrics.ResyncErrors} resync errors, " +
             $"{metrics.InconsistencyCount} cache inconsistencies");
+        if (finalStats is not null)
+        {
+            output.WriteLine(Invariant(
+                $"Liveness:        hub heartbeat gaps max {finalStats.HeartbeatGapMaxMs:F0} ms over {finalStats.HeartbeatGapCount} ({GapsOver(finalStats.HeartbeatGapsOverMs)}); ") +
+                Invariant($"lease renewal gaps max {finalStats.LeaseRenewalGapMaxMs:F0} ms over {finalStats.LeaseRenewalGapCount} ({GapsOver(finalStats.LeaseRenewalGapsOverMs)}); ") +
+                Invariant($"{finalStats.NodesDeclaredDead} node(s) declared dead, {finalStats.LeaseLapses} lease lapse(s) (whole run)"));
+        }
 
         var failures = new List<string>();
         if (metrics.Acked == 0)
@@ -215,6 +222,12 @@ internal static class LoadTestDriver
             failures.Add($"{metrics.ResyncErrors} resync errors");
         if (handoffs == 0 && options.SeamFraction > 0 && (options.WorldBlocksX > 1 || options.WorldBlocksY > 1))
             failures.Add("no completed handoffs despite seam walkers");
+
+        // Nothing is killed in a drive run, so any death is a false one.
+        if (finalStats is { NodesDeclaredDead: > 0 })
+            failures.Add($"{finalStats.NodesDeclaredDead} healthy node(s) declared dead");
+        if (finalStats is { LeaseLapses: > 0 })
+            failures.Add($"{finalStats.LeaseLapses} lease lapse(s) on healthy nodes");
         var pass = failures.Count == 0;
 
         var summary =
@@ -227,6 +240,12 @@ internal static class LoadTestDriver
             Invariant($"handoffs_aborted={handoffsAborted?.ToString(CultureInfo.InvariantCulture) ?? "unavailable"} ") +
             Invariant($"delta_rows_per_s={metrics.DeltaRows / seconds:F0} delta_bytes_per_s={bytes / seconds:F0} ") +
             Invariant($"disconnects={metrics.Disconnects} inconsistencies={metrics.InconsistencyCount}") +
+            (finalStats is { } live
+                ? Invariant($" hb_gap_max_ms={live.HeartbeatGapMaxMs:F0} hb_gaps_over_1000={live.HeartbeatGapsOverMs.GetValueOrDefault(1_000)} ") +
+                  Invariant($"hb_gaps_over_2000={live.HeartbeatGapsOverMs.GetValueOrDefault(2_000)} hb_gaps_over_3000={live.HeartbeatGapsOverMs.GetValueOrDefault(3_000)} ") +
+                  Invariant($"lease_gap_max_ms={live.LeaseRenewalGapMaxMs:F0} lease_gaps_over_1000={live.LeaseRenewalGapsOverMs.GetValueOrDefault(1_000)} ") +
+                  Invariant($"lease_gaps_over_2000={live.LeaseRenewalGapsOverMs.GetValueOrDefault(2_000)} nodes_declared_dead={live.NodesDeclaredDead} lease_lapses={live.LeaseLapses}")
+                : string.Empty) +
             (lockSplit is { } s ? Invariant($" post_commit_share={s.Share:F4} lock_split_transactions={s.Transactions} mean_locked_us={s.MeanLockedMs * 1000:F0}") : string.Empty) +
             (pass ? string.Empty : $" failures=[{string.Join("; ", failures)}]");
         output.WriteLine();
@@ -240,6 +259,10 @@ internal static class LoadTestDriver
             HandoffsCompleted = handoffs,
         };
     }
+
+    /// <summary>"&gt;1 s: n, &gt;2 s: n, ..." over the thresholds a timeout choice is made among.</summary>
+    private static string GapsOver(Dictionary<int, long> over) =>
+        string.Join(", ", new[] { 500, 1_000, 2_000, 3_000, 5_000 }.Select(t => Invariant($">{t} ms: {over.GetValueOrDefault(t)}")));
 
     /// <summary>The measured window's post-commit share of locked time, from the serve side's running sums; null when not traced.</summary>
     private static (long Transactions, double Share, double MeanLockedMs)? LockSplitShare(ServerStats? start, ServerStats? end)

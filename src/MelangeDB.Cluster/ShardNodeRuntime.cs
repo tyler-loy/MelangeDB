@@ -82,6 +82,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private bool _timeoutMismatchLogged;
 
     private ITimer? _leaseWatchdog;
+    private long _lastRenewalSentTimestamp;
+    private readonly System.Diagnostics.Metrics.Meter _livenessMeter = new("MelangeDB");
+    private readonly System.Diagnostics.Metrics.Histogram<double> _renewalGap;
+    private readonly System.Diagnostics.Metrics.Counter<long> _leaseLapses;
     private Task? _connectLoop;
     private Task? _reconcileLoop;
     private Task? _borderLoop;
@@ -102,6 +106,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             () => _options.CurrentValue.Bulk,
             () => _options.CurrentValue.Cluster,
             _time);
+        _renewalGap = _livenessMeter.CreateHistogram<double>(
+            "melange.cluster.lease.renewal_gap",
+            unit: "ms",
+            description: "Time from sending an acknowledged heartbeat to the reply to the next one: how long the node's lease had to last. It lapses past nine tenths of the hub's Cluster:FailureTimeoutMs.");
+        _leaseLapses = _livenessMeter.CreateCounter<long>(
+            "melange.cluster.lease.lapses",
+            unit: "{lapse}",
+            description: "Times a shard node's lease lapsed and it parked its shards.");
     }
 
     public ClusterMetrics Metrics { get; } = new();
@@ -287,6 +299,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// </summary>
     private void RenewLease(long sentTimestamp)
     {
+        var previous = Interlocked.Exchange(ref _lastRenewalSentTimestamp, sentTimestamp);
+        if (previous != 0)
+        {
+            var gap = _time.GetElapsedTime(previous);
+            Metrics.LeaseRenewalGaps.Record(gap);
+            _renewalGap.Record(gap.TotalMilliseconds, new KeyValuePair<string, object?>("node", NodeName));
+        }
+
         var timeoutMs = Volatile.Read(ref _leaseTimeoutMs);
         var lengthMs = timeoutMs - timeoutMs / 10;
         var until = sentTimestamp + (long)(lengthMs * (double)_time.TimestampFrequency / 1000d);
@@ -363,6 +383,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             _replicaSubscribedFrom = ulong.MaxValue;
         }
 
+        Metrics.LeaseLapsed();
+        _leaseLapses.Add(1, new KeyValuePair<string, object?>("node", NodeName));
         foreach (var runtime in parked)
             runtime.Dispose();
         if (parked.Count > 0)
@@ -1437,6 +1459,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         _stopped.Cancel();
         _leaseWatchdog?.Dispose();
         _link?.Dispose();
+        _livenessMeter.Dispose();
 
         // An open in flight holds the shard's log and store; let it finish and close itself (it
         // sees the stop and abandons) rather than leave those handles to a node that no longer

@@ -23,11 +23,19 @@ public class FailoverTests
             () => shard.Engine.CommittedView.Find<TickCount>(1L) is not null,
             "the timer fired at least once on the original owner");
 
+        // Liveness is measured on both ends while the cluster is healthy: the hub times the gaps
+        // between a node's heartbeats, the node times how long each lease had to last.
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.Hub.Metrics.HeartbeatGaps.Count > 0 && owner.Runtime.Metrics.LeaseRenewalGaps.Count > 0,
+            "both ends recorded liveness gaps");
+        var deathsBefore = cluster.Hub.Metrics.NodesDeclaredDead;
+
         await cluster.StopNodeAsync(owner.Name);
         var survivor = cluster.Nodes.Single(n => n.Name != owner.Name);
         await ClusterFixture.WaitUntilAsync(
             () => survivor.Runtime.TryGetShard(new ShardKey(1)) is not null,
             "the hub reassigned the dead node's shard to the survivor");
+        Assert.True(cluster.Hub.Metrics.NodesDeclaredDead > deathsBefore, "the death was counted");
 
         var recovered = survivor.Runtime.TryGetShard(new ShardKey(1))!;
         Assert.True(recovered.FencingToken > tokenBefore); // A new ownership term.
@@ -81,6 +89,7 @@ public class FailoverTests
         // #216: the lapsed lease parks the shard, which releases its log for whichever node the
         // hub names next, instead of a partitioned owner holding it open indefinitely.
         await ClusterFixture.WaitUntilAsync(() => owner.Runtime.TryGetShard(new ShardKey(1)) is null, "the shard was parked");
+        Assert.True(owner.Runtime.Metrics.LeaseLapses >= 1, "the lapse was counted");
 
         // The engine closes just after the shard leaves the shard set, so the lock frees a moment
         // later. A new owner's open retries the same way.

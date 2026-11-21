@@ -164,6 +164,84 @@ public sealed class ClusterMetrics
     internal void ProvisionExpired() => Interlocked.Increment(ref _provisionsExpired);
 
     internal void DecommissionRequested() => Interlocked.Increment(ref _decommissionsRequested);
+
+    private long _nodesDeclaredDead;
+    private long _leaseLapses;
+
+    /// <summary>
+    /// Hub: the gap between consecutive heartbeats from one node, as the hub received them — the
+    /// quantity <c>Cluster:FailureTimeoutMs</c> is compared against. A gap longer than the timeout
+    /// is a death declaration; the distribution says how close a healthy cluster comes to one.
+    /// </summary>
+    public LivenessGaps HeartbeatGaps { get; } = new();
+
+    /// <summary>
+    /// Shard node: the time from sending one acknowledged heartbeat to the reply to the next,
+    /// which is how long the node's lease had to outlast. The lease lapses when this exceeds nine
+    /// tenths of the hub's failure timeout.
+    /// </summary>
+    public LivenessGaps LeaseRenewalGaps { get; } = new();
+
+    /// <summary>Hub: nodes this hub declared dead, by timeout or (with fast failover) by link loss.</summary>
+    public long NodesDeclaredDead => Interlocked.Read(ref _nodesDeclaredDead);
+
+    /// <summary>Shard node: times this node's lease lapsed and it parked its shards.</summary>
+    public long LeaseLapses => Interlocked.Read(ref _leaseLapses);
+
+    internal void NodeDeclaredDead() => Interlocked.Increment(ref _nodesDeclaredDead);
+
+    internal void LeaseLapsed() => Interlocked.Increment(ref _leaseLapses);
+}
+
+/// <summary>
+/// A running record of liveness gaps (heartbeat intervals as observed): how many, the longest, and
+/// how many exceeded each of a fixed set of thresholds. The thresholds bracket the failure timeouts
+/// worth considering, so one run at a long timeout answers "how many false deaths would a shorter
+/// one have caused?" for all of them at once.
+/// </summary>
+public sealed class LivenessGaps
+{
+    /// <summary>The thresholds <see cref="Over"/> counts against, in milliseconds.</summary>
+    public static IReadOnlyList<int> ThresholdsMs { get; } = [500, 750, 1_000, 1_500, 2_000, 2_500, 3_000, 5_000, 10_000];
+
+    private readonly long[] _over = new long[ThresholdsMs.Count];
+    private long _count;
+    private long _maxMicros;
+
+    /// <summary>Gaps recorded.</summary>
+    public long Count => Interlocked.Read(ref _count);
+
+    /// <summary>The longest gap recorded, in milliseconds.</summary>
+    public double MaxMs => Interlocked.Read(ref _maxMicros) / 1000d;
+
+    /// <summary>Gaps longer than <paramref name="thresholdMs"/>, which must be one of <see cref="ThresholdsMs"/>.</summary>
+    public long Over(int thresholdMs)
+    {
+        for (var i = 0; i < ThresholdsMs.Count; i++)
+        {
+            if (ThresholdsMs[i] == thresholdMs)
+                return Interlocked.Read(ref _over[i]);
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(thresholdMs), thresholdMs, "Not one of LivenessGaps.ThresholdsMs.");
+    }
+
+    internal void Record(TimeSpan gap)
+    {
+        Interlocked.Increment(ref _count);
+        var micros = (long)(gap.TotalMilliseconds * 1000);
+        long current;
+        do
+        {
+            current = Interlocked.Read(ref _maxMicros);
+            if (micros <= current)
+                break;
+        }
+        while (Interlocked.CompareExchange(ref _maxMicros, micros, current) != current);
+
+        for (var i = 0; i < ThresholdsMs.Count && gap.TotalMilliseconds > ThresholdsMs[i]; i++)
+            Interlocked.Increment(ref _over[i]);
+    }
 }
 
 /// <summary>

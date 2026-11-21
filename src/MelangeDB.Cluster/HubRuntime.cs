@@ -158,6 +158,8 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly System.Diagnostics.Metrics.Meter _capacityMeter = new("MelangeDB");
     private readonly System.Diagnostics.Metrics.Histogram<double> _provisionLatency;
     private readonly System.Diagnostics.Metrics.Counter<long> _decommissions;
+    private readonly System.Diagnostics.Metrics.Histogram<double> _heartbeatGap;
+    private readonly System.Diagnostics.Metrics.Counter<long> _nodesDeclaredDead;
 
     public HubRuntime(IServiceProvider services)
     {
@@ -199,6 +201,14 @@ internal sealed partial class HubRuntime : IDisposable
             },
             unit: "{ticket}",
             description: "Provision tickets outstanding — 0 or 1 by construction.");
+        _heartbeatGap = _capacityMeter.CreateHistogram<double>(
+            "melange.cluster.heartbeat.gap",
+            unit: "ms",
+            description: "Time between consecutive heartbeats from one shard node, as the hub received them; Cluster:FailureTimeoutMs is compared against it.");
+        _nodesDeclaredDead = _capacityMeter.CreateCounter<long>(
+            "melange.cluster.nodes.declared_dead",
+            unit: "{node}",
+            description: "Shard nodes the hub declared dead, by reason: timeout, or link_lost under Cluster:FastFailoverOnLinkLoss.");
     }
 
     public ClusterMetrics Metrics { get; } = new();
@@ -1462,7 +1472,7 @@ internal sealed partial class HubRuntime : IDisposable
         switch (type)
         {
             case "heartbeat":
-                _heardTimestamps[session.NodeName] = _time.GetTimestamp();
+                RecordHeartbeat(session.NodeName);
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
                 if (body?.Deserialize<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
                     Load.Record(session.NodeName, heartbeat.Loads, _time.GetUtcNow());
@@ -1887,6 +1897,25 @@ internal sealed partial class HubRuntime : IDisposable
     }
 
     /// <summary>
+    /// Takes a heartbeat's arrival into the deadline table, recording the gap since the node's
+    /// previous one: the margin a healthy node keeps below <c>Cluster:FailureTimeoutMs</c>, which
+    /// is what a shorter timeout has to be chosen against. The first heartbeat after registration
+    /// measures from the registration.
+    /// </summary>
+    private void RecordHeartbeat(string nodeName)
+    {
+        var now = _time.GetTimestamp();
+        if (_heardTimestamps.TryGetValue(nodeName, out var previous))
+        {
+            var gap = _time.GetElapsedTime(previous, now);
+            Metrics.HeartbeatGaps.Record(gap);
+            _heartbeatGap.Record(gap.TotalMilliseconds, new KeyValuePair<string, object?>("node", nodeName));
+        }
+
+        _heardTimestamps[nodeName] = now;
+    }
+
+    /// <summary>
     /// Marks a node dead and reassigns its shards under bumped fencing tokens. Under
     /// <see cref="_deathLock"/>. The node leaves the in-memory deadline table, so neither check
     /// declares it twice; its next heartbeat or registration puts it back.
@@ -1896,6 +1925,8 @@ internal sealed partial class HubRuntime : IDisposable
         var moved = _membership.MarkDead(nodeName, now);
         _heardTimestamps.TryRemove(nodeName, out _);
         _linkLostTimestamps.TryRemove(nodeName, out _);
+        Metrics.NodeDeclaredDead();
+        _nodesDeclaredDead.Add(1, new KeyValuePair<string, object?>("reason", linkLost ? "link_lost" : "timeout"));
         if (linkLost)
             LogNodeLinkLostDeclaredDead(_logger, nodeName, silence.TotalMilliseconds, moved.Count);
         else
