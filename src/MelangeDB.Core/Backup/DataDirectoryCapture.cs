@@ -19,16 +19,17 @@ internal static class DataDirectoryCapture
     public static BackupEngineSummary Capture(string dataDirectory, string engineKey, ArchiveFrameWriter writer)
     {
         var directory = Path.GetFullPath(dataDirectory);
-        var logPath = Path.Combine(directory, "melange.log");
-        if (!File.Exists(logPath))
+        if (!LogSegments.IsLogDirectory(directory))
         {
             throw new InvalidOperationException(
                 $"'{directory}' does not contain melange.log — it is not a MelangeDB data directory. " +
                 "Point the backup at the directory CommitLog:Path names (or the shard's log directory).");
         }
 
+        var logPath = Path.Combine(directory, LogSegments.Load(directory).ActiveSegment.File);
         using var liveGuard = ExcludeLiveWriters(directory, logPath);
-        using var log = OpenLogForRead(logPath);
+        using var writerProbe = File.Exists(logPath) ? OpenLogForRead(logPath) : null;
+        using var log = new LogSegments.Reader(directory);
 
         var epoch = ReadEpoch(Path.Combine(directory, "melange.epoch"));
         var baseLsn = ReadBaseLsn(Path.Combine(directory, "melange.base"));
@@ -68,7 +69,7 @@ internal static class DataDirectoryCapture
                     "This directory would not boot, so it cannot be backed up as-is; restore from an earlier backup.");
             }
 
-            return CaptureCore(engineKey, writer, log, logPath, directory, snapshot, epoch, baseLsn, extraSidecars: null);
+            return CaptureCore(engineKey, writer, log, directory, directory, snapshot, epoch, baseLsn, extraSidecars: null);
         }
         finally
         {
@@ -77,9 +78,9 @@ internal static class DataDirectoryCapture
     }
 
     /// <summary>
-    /// Streams one engine section from an already-opened log handle: the identity frame (whose
+    /// Streams one engine section from already-opened log segments: the identity frame (whose
     /// head LSN the first pass computes), the snapshot rows, the log tail, the sidecars, the
-    /// counted end frame. Both passes walk the same handle, so the view cannot change between the
+    /// counted end frame. Both passes walk the same handles, so the view cannot change between the
     /// count and the stream — for the offline capture because the handle excludes writers, for
     /// the shared-storage capture because an appended-to file only grows and a compaction swap
     /// leaves the old content under the old handle. The tail is checked dense from the snapshot
@@ -89,8 +90,8 @@ internal static class DataDirectoryCapture
     internal static BackupEngineSummary CaptureCore(
         string engineKey,
         ArchiveFrameWriter writer,
-        Stream log,
-        string logPath,
+        LogSegments.Reader log,
+        string logDirectory,
         string engineDirectory,
         SnapshotReader? snapshot,
         Guid epoch,
@@ -103,7 +104,7 @@ internal static class DataDirectoryCapture
         var headLsn = Math.Max(baseLsn, snapshotLsn);
         long tailRecords = 0;
         var expected = snapshotLsn;
-        foreach (var record in LogFileFormat.WalkRecords(log, logPath))
+        foreach (var record in log.Walk())
         {
             headLsn = Math.Max(headLsn, record.Lsn);
             if (record.Lsn <= snapshotLsn)
@@ -130,7 +131,7 @@ internal static class DataDirectoryCapture
             Sequences = snapshot is null
                 ? []
                 : [.. snapshot.Header.Sequences.Select(pair => new ArchiveSequence { Table = pair.Key.Value, Next = pair.Value })],
-            Lineage = EpochLineage.Load(Path.GetDirectoryName(logPath)!).Ancestors is { Count: > 0 } ancestors ? ancestors : null,
+            Lineage = EpochLineage.Load(logDirectory).Ancestors is { Count: > 0 } ancestors ? ancestors : null,
         };
         writer.WriteFrame(ArchiveFrameType.EngineBegin, JsonSerializer.SerializeToUtf8Bytes(identity));
 
@@ -145,7 +146,7 @@ internal static class DataDirectoryCapture
         }
 
         long streamed = 0;
-        foreach (var record in LogFileFormat.WalkRecords(log, logPath))
+        foreach (var record in log.Walk())
         {
             if (record.Lsn <= snapshotLsn || record.Lsn > headLsn)
                 continue;
@@ -156,10 +157,10 @@ internal static class DataDirectoryCapture
         if (streamed != tailRecords)
             throw new InvalidOperationException($"'{engineDirectory}': the log changed during the backup ({tailRecords} tail records counted, {streamed} streamed).");
 
-        var eventsPath = Path.Combine(Path.GetDirectoryName(logPath)!, "melange.events.json");
+        var eventsPath = Path.Combine(logDirectory, "melange.events.json");
         if (File.Exists(eventsPath))
             WriteSidecarFrame(writer, "melange.events.json", File.ReadAllBytes(eventsPath));
-        var shapePath = Path.Combine(Path.GetDirectoryName(logPath)!, ShapeHistory.FileName);
+        var shapePath = Path.Combine(logDirectory, ShapeHistory.FileName);
         if (File.Exists(shapePath))
             WriteSidecarFrame(writer, ShapeHistory.FileName, File.ReadAllBytes(shapePath));
         foreach (var (name, content) in extraSidecars?.Invoke(headLsn) ?? [])

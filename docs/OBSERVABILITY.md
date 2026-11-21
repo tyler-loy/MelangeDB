@@ -428,6 +428,10 @@ tiers were recorded, taking it from the running code; Information, and once per 
 of a shape sidecar written before uniqueness was recorded against its existing rows, found no
 duplicates, and recorded the columns in place; Information, and once per data directory
 (road-to-0.4 phase 27; a boot that finds duplicates refuses instead, and logs nothing under this id)
+— `1011 LogSegmentSealed` — a cluster shard's log opened under a higher ownership term than the
+directory was at, so the previous owner's segment was sealed at its last valid record and the new
+term appends to its own; Information, once per change of owner (road-to-0.4 phase 30, the storage
+fence; anything written to the old segment after this line is not history)
 — `1008 ShapeAdopted` — a boot that *adopted*
 the running code's schema as the meaning of records already on disk, because no shape sidecar
 existed: the only possible reading of those bytes, correct only if the upgrade rule was followed,

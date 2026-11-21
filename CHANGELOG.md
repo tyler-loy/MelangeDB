@@ -12,6 +12,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **A log segment per ownership term: the storage fence** (road-to-0.4 phase 30, step 2b). A
+  cluster shard's log now opens under the shard's fencing token. Opening under a higher term seals
+  the previous owner's segment at its last valid record (EventId 1011) and appends to a new file,
+  `melange.log.{term}`; opening under a lower one is refused (`StaleTermException`). Nothing past a
+  seal is read again, so a previous owner that was only paused can no longer write into the new
+  owner's log, whether or not the shared filesystem honours `melange.lock`. A manifest,
+  `melange.segments`, lists the segments. Existing logs migrate in place on the first change of
+  owner, with no rename; non-cluster engines keep their single `melange.log`. Truncation deletes
+  sealed segments whole; backup capture and the restore check read across segments, and archives
+  are unchanged.
 - **`outcome_unknown`**, a new call error code (road-to-0.4 phase 30, step 2a). A cluster shard
   node now re-checks its lease after a commit is durable and before acknowledging it. If the lease
   ended in between, the shard may already have a new owner that cut the log before the record, so

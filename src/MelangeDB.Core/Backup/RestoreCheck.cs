@@ -121,14 +121,14 @@ internal static class RestoreCheck
     /// </summary>
     private static IEnumerable<(string Key, string Directory, string Reported)> DiscoverEngines(string root, string reportedRoot)
     {
-        if (File.Exists(Path.Combine(root, "melange.log")))
+        if (LogSegments.IsLogDirectory(root))
         {
             yield return (ArchiveFormat.SingleNodeEngineKey, root, reportedRoot);
             yield break;
         }
 
         var hub = Path.Combine(root, "hub");
-        if (File.Exists(Path.Combine(hub, "melange.log")))
+        if (LogSegments.IsLogDirectory(hub))
             yield return (ArchiveFormat.HubEngineKey, hub, Path.Combine(reportedRoot, "hub"));
 
         var shards = Path.Combine(root, "shards");
@@ -138,7 +138,7 @@ internal static class RestoreCheck
                      .OrderBy(static dir => Path.GetFileName(dir), StringComparer.Ordinal))
         {
             var log = Path.Combine(shard, "log");
-            if (File.Exists(Path.Combine(log, "melange.log")))
+            if (LogSegments.IsLogDirectory(log))
                 yield return (Path.GetFileName(shard)!, log, Path.Combine(reportedRoot, "shards", Path.GetFileName(shard)!, "log"));
         }
     }

@@ -171,3 +171,20 @@ fault its working set in from disk, which is the reopen cost again in another fo
   locally.
 - **Memory doubles** for replicated shards, which works against the elastic layer consolidating
   onto fewer nodes. The design record accepts this; the residency setting is the release valve.
+
+## As built
+
+- **2a** (PR #232): `ICommitGuard.ValidateAcknowledgement`, called after durability on every
+  commit path; the shard guard reports `outcome_unknown` once the lease has lapsed. Bulk keeps its
+  retryable error.
+- **2b**: `LogSegments` (manifest `melange.segments`, sealing at the cut, a read-only
+  multi-segment reader) and `FileCommitLog` opened under `CommitLogOptions.Term`, which the shard
+  runtime sets to the fencing token. A null term adopts the directory's, so non-cluster engines and
+  offline tools are unchanged. Truncation drops sealed segments whole; backup capture, discovery
+  and the restore check read the manifest; archives and restore are unchanged.
+  **One deviation: no `IShardStorage` interface yet.** With only the filesystem behind it, the
+  interface would have been a second name for the same file calls, and the part an object store
+  would actually replace (the live segment's append and fsync path) is not something a thin
+  interface can hide. `LogSegments` is where the manifest and the sealed segments live, and it is
+  the seam a driver would start from. The interface is left to the object-storage idea, which
+  would have to design it against a real second implementation.

@@ -101,6 +101,14 @@ public sealed class FileCommitLog : ICommitLog
     // header — never an offset into a file that has since been compacted.
     private readonly OffsetIndex _index = new();
 
+    // The segments behind the live one (phase 30 step 2b). Replaced, never mutated, under _lock.
+    private LogSegments.Manifest _manifest;
+    private readonly string _directory;
+
+    // Sealed segments' offset indexes, built on a segment's first read. Nothing at or below a cut
+    // ever changes, so an index once built stays true for the segment's life.
+    private readonly Dictionary<string, OffsetIndex> _sealedIndexes = new(StringComparer.Ordinal);
+
     // Serializes truncations against each other without blocking appends: the bulk of a
     // compaction's copy runs outside _lock, and two of them interleaving would each swap the
     // other's work away.
@@ -120,7 +128,7 @@ public sealed class FileCommitLog : ICommitLog
         _telemetry = telemetry;
         _durableFloor = durableFloor;
         Directory.CreateDirectory(options.Path);
-        FilePath = System.IO.Path.Combine(options.Path, "melange.log");
+        _directory = options.Path;
         EpochFilePath = System.IO.Path.Combine(options.Path, EpochFileName);
         BaseFilePath = System.IO.Path.Combine(options.Path, "melange.base");
         try
@@ -137,6 +145,19 @@ public sealed class FileCommitLog : ICommitLog
                 exception);
         }
 
+        try
+        {
+            // The term fence, before the live segment is touched: a higher term seals the previous
+            // owner's segment at its cut, a lower one is refused. See LogSegments.
+            _manifest = LogSegments.OpenForTerm(options.Path, options.Term, durableFloor, ReadBaseLsn(), _logger);
+        }
+        catch
+        {
+            _lockFile.Dispose();
+            throw;
+        }
+
+        FilePath = System.IO.Path.Combine(options.Path, _manifest.ActiveSegment.File);
         try
         {
             // FileShare.Delete throughout: log compaction atomically replaces the file, and every
@@ -165,8 +186,23 @@ public sealed class FileCommitLog : ICommitLog
     private SafeFileHandle OpenFlushHandle() =>
         File.OpenHandle(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
 
-    /// <summary>The full path of the log file.</summary>
+    /// <summary>The full path of the live segment: the file appends go to.</summary>
     public string FilePath { get; }
+
+    /// <summary>The ownership term the log is open under: the live segment's.</summary>
+    internal long Term => Segments.ActiveSegment.Term;
+
+    /// <summary>The segment manifest as it stands: sealed segments, then the live one.</summary>
+    internal LogSegments.Manifest Segments
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _manifest;
+            }
+        }
+    }
 
     /// <summary>
     /// The full path of the epoch sidecar. The epoch lives beside the log rather than in its
@@ -704,9 +740,22 @@ public sealed class FileCommitLog : ICommitLog
 
     private IEnumerable<CommitRecord> Read(ulong firstLsn, bool capAtDurable)
     {
+        LogSegments.Manifest manifest;
         lock (_lock)
         {
             _stream.Flush(); // Make buffered appends visible to the read handle.
+            manifest = _manifest;
+        }
+
+        // The sealed segments first, each up to its cut. Every record in them is at or below the
+        // head the log recovered with, so the durability cap never binds there.
+        foreach (var segment in manifest.SealedSegments)
+        {
+            if (segment.Cut < firstLsn)
+                continue;
+            foreach (var record in ReadSealed(segment, firstLsn))
+                yield return record;
+            firstLsn = segment.Cut + 1;
         }
 
         using var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -760,22 +809,37 @@ public sealed class FileCommitLog : ICommitLog
     {
         if (fromLsn == 0 || fromLsn > toLsn)
             return null;
+        LogSegments.Manifest manifest;
         lock (_lock)
         {
             if (_disposed)
                 return null;
             _stream.Flush();
+            manifest = _manifest;
         }
 
         using var reader = new FileStream(FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var frame = new byte[FrameSize];
+        var sealedReaders = new Dictionary<string, FileStream>(StringComparer.Ordinal);
+        try
+        {
+            return BinarySearchTimestamp(unixTimeMicros, fromLsn, toLsn, lsn => SegmentTimestamp(manifest, reader, sealedReaders, lsn));
+        }
+        finally
+        {
+            foreach (var sealedReader in sealedReaders.Values)
+                sealedReader.Dispose();
+        }
+    }
+
+    private static ulong? BinarySearchTimestamp(long unixTimeMicros, ulong fromLsn, ulong toLsn, Func<ulong, long?> timestampOf)
+    {
         ulong? answer = null;
         var low = fromLsn;
         var high = toLsn;
         while (low <= high)
         {
             var mid = low + (high - low) / 2;
-            var timestamp = ReadTimestampAt(reader, mid, frame);
+            var timestamp = timestampOf(mid);
             if (timestamp is { } micros && micros >= unixTimeMicros)
             {
                 answer = mid;
@@ -801,6 +865,35 @@ public sealed class FileCommitLog : ICommitLog
         return answer;
     }
 
+    /// <summary>The commit timestamp at <paramref name="lsn"/>, read from whichever segment holds it.</summary>
+    private long? SegmentTimestamp(
+        LogSegments.Manifest manifest, FileStream activeReader, Dictionary<string, FileStream> sealedReaders, ulong lsn)
+    {
+        var frame = new byte[FrameSize];
+        foreach (var segment in manifest.SealedSegments)
+        {
+            if (segment.Cut < lsn)
+                continue;
+            if (!sealedReaders.TryGetValue(segment.File, out var sealedReader))
+            {
+                try
+                {
+                    sealedReader = new FileStream(System.IO.Path.Combine(_directory, segment.File), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                }
+                catch (FileNotFoundException)
+                {
+                    return null;
+                }
+
+                sealedReaders[segment.File] = sealedReader;
+            }
+
+            return ReadTimestampAt(sealedReader, LocateSealed(sealedReader, segment, lsn, frame), lsn, frame);
+        }
+
+        return ReadTimestampAt(activeReader, Locate(activeReader, lsn, frame), lsn, frame);
+    }
+
     /// <summary>
     /// The file offset of the first record whose LSN is at or after <paramref name="lsn"/> — or
     /// the end of the readable records when there is none. Consults the index for a verified
@@ -820,6 +913,93 @@ public sealed class FileCommitLog : ICommitLog
 
         var start = indexed && VerifyRecordAt(reader, entryOffset, entryLsn, frame) ? entryOffset : HeaderSize;
         return SkipBelow(reader, start, lsn, frame);
+    }
+
+    /// <summary><see cref="Locate"/> in a sealed segment, through that segment's own index.</summary>
+    private long LocateSealed(FileStream reader, LogSegments.Sealed segment, ulong lsn, byte[] frame)
+    {
+        var index = SealedIndex(reader, segment, frame);
+        var start = index.TryFloor(lsn, out var entryLsn, out var entryOffset) && VerifyRecordAt(reader, entryOffset, entryLsn, frame)
+            ? entryOffset
+            : HeaderSize;
+        return SkipBelow(reader, start, lsn, frame);
+    }
+
+    /// <summary>
+    /// A sealed segment's index, built by hopping its frame headers up to the cut on first use.
+    /// Entries are verified on use (<see cref="VerifyRecordAt"/>), so the hop needs no CRC.
+    /// </summary>
+    private OffsetIndex SealedIndex(FileStream reader, LogSegments.Sealed segment, byte[] frame)
+    {
+        lock (_sealedIndexes)
+        {
+            if (_sealedIndexes.TryGetValue(segment.File, out var built))
+                return built;
+            var index = new OffsetIndex();
+            Span<byte> head = stackalloc byte[LsnOffsetInPayload + sizeof(ulong)];
+            var position = (long)HeaderSize;
+            var length = reader.Length;
+            while (position + FrameSize + head.Length <= length)
+            {
+                reader.Seek(position, SeekOrigin.Begin);
+                reader.ReadExactly(frame);
+                var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+                if (payloadLength < (uint)head.Length || payloadLength > MaxRecordBytes || position + FrameSize + payloadLength > length)
+                    break;
+                reader.ReadExactly(head);
+                var lsn = BinaryPrimitives.ReadUInt64LittleEndian(head[LsnOffsetInPayload..]);
+                if (lsn > segment.Cut)
+                    break;
+                index.Observe(lsn, position);
+                position += FrameSize + payloadLength;
+            }
+
+            _sealedIndexes[segment.File] = index;
+            return index;
+        }
+    }
+
+    /// <summary>
+    /// A sealed segment's records from <paramref name="firstLsn"/> up to its cut. A segment that a
+    /// truncation deleted meanwhile reads as nothing: every record in it was at or below the new
+    /// base, which no reader may ask for.
+    /// </summary>
+    private IEnumerable<CommitRecord> ReadSealed(LogSegments.Sealed segment, ulong firstLsn)
+    {
+        FileStream reader;
+        try
+        {
+            reader = new FileStream(System.IO.Path.Combine(_directory, segment.File), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        }
+        catch (FileNotFoundException)
+        {
+            yield break;
+        }
+
+        using (reader)
+        {
+            var frame = new byte[FrameSize];
+            reader.Seek(LocateSealed(reader, segment, firstLsn, frame), SeekOrigin.Begin);
+            while (reader.Position + FrameSize <= reader.Length)
+            {
+                reader.ReadExactly(frame);
+                var length = BinaryPrimitives.ReadUInt32LittleEndian(frame);
+                var expectedCrc = BinaryPrimitives.ReadUInt32LittleEndian(frame.AsSpan(4));
+                if (length == 0 || length > MaxRecordBytes || reader.Position + length > reader.Length)
+                    yield break;
+                var payload = new byte[length];
+                reader.ReadExactly(payload);
+                if (Crc32.Compute(payload) != expectedCrc)
+                    yield break;
+                var record = LogRecordCodec.ReadPayload(payload, (int)(FrameSize + length));
+                if (record.Lsn > segment.Cut)
+                    yield break; // Past the cut: a previous owner's unacknowledged writes, if anything.
+                if (record.Lsn >= firstLsn)
+                    yield return record;
+                else
+                    Interlocked.Increment(ref _skippedFrames);
+            }
+        }
     }
 
     /// <summary>
@@ -879,9 +1059,8 @@ public sealed class FileCommitLog : ICommitLog
     /// The commit timestamp of the record at <paramref name="lsn"/>, or null when no intact record
     /// with that LSN is readable. One seek and one record.
     /// </summary>
-    private long? ReadTimestampAt(FileStream reader, ulong lsn, byte[] frame)
+    private static long? ReadTimestampAt(FileStream reader, long offset, ulong lsn, byte[] frame)
     {
-        var offset = Locate(reader, lsn, frame);
         if (offset + FrameSize > reader.Length)
             return null;
         reader.Seek(offset, SeekOrigin.Begin);
@@ -1058,6 +1237,16 @@ public sealed class FileCommitLog : ICommitLog
             _stream.Write(header);
             _stream.Flush(flushToDisk: true);
 
+            // A new term's first segment continues the log behind it: same epoch, same base, and
+            // LSNs carry on from the last cut.
+            if (_manifest.SealedSegments.Count > 0)
+            {
+                EpochId = ReadOrMintEpoch();
+                _baseLsn = ReadBaseLsn();
+                _headLsn = Math.Max(_baseLsn, _manifest.LastCut);
+                return;
+            }
+
             // A fresh log file is a fresh incarnation: any epoch or truncation base left behind by
             // a deleted log must not survive it, or an old resume cursor would count against the
             // wrong history.
@@ -1072,7 +1261,7 @@ public sealed class FileCommitLog : ICommitLog
 
         EpochId = ReadOrMintEpoch();
         _baseLsn = ReadBaseLsn();
-        _headLsn = _baseLsn;
+        _headLsn = Math.Max(_baseLsn, _manifest.LastCut);
 
         Span<byte> fileHeader = stackalloc byte[HeaderSize];
         _stream.Seek(0, SeekOrigin.Begin);
@@ -1178,6 +1367,12 @@ public sealed class FileCommitLog : ICommitLog
     {
         lock (_truncateLock)
         {
+            // Sealed segments go whole: below the cut they never change, so there is nothing to
+            // copy, only files to forget. A truncation that ends inside them moves the base and
+            // stops; the live segment is rewritten only when the truncation reaches into it.
+            if (!DropSealedSegments(ref upToLsn))
+                return;
+
             // Phase one, under the append lock only long enough to read the decision's inputs:
             // what to remove, and how much of the file is already there to be copied.
             long copiedThrough;
@@ -1276,6 +1471,66 @@ public sealed class FileCommitLog : ICommitLog
 
             AdvanceDurable(head, newLength);
         }
+    }
+
+    /// <summary>
+    /// The sealed half of <see cref="TruncateBefore"/>: moves the base up to the truncation point
+    /// or the last cut, whichever is lower, then drops every sealed segment wholly at or below the
+    /// truncation point. The base is written first, so a crash between the steps leaves a manifest
+    /// naming segments whose records all sit below the base, which reads skip and the next
+    /// truncation removes. Returns whether the truncation still reaches into the live segment.
+    /// </summary>
+    private bool DropSealedSegments(ref ulong upToLsn)
+    {
+        LogSegments.Manifest manifest;
+        lock (_lock)
+        {
+            if (_disposed || _failure is not null)
+                return false;
+            upToLsn = Math.Min(upToLsn, _headLsn);
+            if (upToLsn <= _baseLsn)
+                return false;
+            manifest = _manifest;
+            if (manifest.SealedSegments.Count == 0)
+                return true;
+            var sealedBase = Math.Min(upToLsn, manifest.LastCut);
+            if (sealedBase > _baseLsn)
+            {
+                WriteBaseLsn(sealedBase);
+                _baseLsn = sealedBase;
+            }
+        }
+
+        var limit = upToLsn;
+        var dropped = manifest.SealedSegments.Where(segment => segment.Cut <= limit).ToList();
+        if (dropped.Count > 0)
+        {
+            var kept = new LogSegments.Manifest([.. manifest.SealedSegments.Where(segment => segment.Cut > limit)], manifest.ActiveSegment);
+            LogSegments.Save(_directory, kept);
+            lock (_lock)
+            {
+                _manifest = kept;
+            }
+
+            foreach (var segment in dropped)
+            {
+                lock (_sealedIndexes)
+                {
+                    _sealedIndexes.Remove(segment.File);
+                }
+
+                try
+                {
+                    File.Delete(System.IO.Path.Combine(_directory, segment.File));
+                }
+                catch (IOException)
+                {
+                    // Out of the manifest is out of the log; the file is litter, not history.
+                }
+            }
+        }
+
+        return upToLsn > manifest.LastCut;
     }
 
     /// <summary>Copies <c>[start, end)</c> of <paramref name="from"/> onto the end of <paramref name="to"/>, as bytes.</summary>
