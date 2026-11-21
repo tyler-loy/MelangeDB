@@ -171,3 +171,47 @@ fault its working set in from disk, which is the reopen cost again in another fo
   locally.
 - **Memory doubles** for replicated shards, which works against the elastic layer consolidating
   onto fewer nodes. The design record accepts this; the residency setting is the release valve.
+
+## As built
+
+- **2a** (PR #232): `ICommitGuard.ValidateAcknowledgement`, called after durability on every
+  commit path; the shard guard reports `outcome_unknown` once the lease has lapsed. Bulk keeps its
+  retryable error.
+- **2b**: `LogSegments` (manifest `melange.segments`, sealing at the cut, a read-only
+  multi-segment reader) and `FileCommitLog` opened under `CommitLogOptions.Term`, which the shard
+  runtime sets to the fencing token. A null term adopts the directory's, so non-cluster engines and
+  offline tools are unchanged. Truncation drops sealed segments whole; backup capture, discovery
+  and the restore check read the manifest; archives and restore are unchanged.
+  **One deviation: no `IShardStorage` interface yet.** With only the filesystem behind it, the
+  interface would have been a second name for the same file calls, and the part an object store
+  would actually replace (the live segment's append and fsync path) is not something a thin
+  interface can hide. `LogSegments` is where the manifest and the sealed segments live, and it is
+  the seam a driver would start from. The interface is left to the object-storage idea, which
+  would have to design it against a real second implementation.
+- **2c**: `LogFollower` (Core, internal) and `LogSegments.Tail`. The follower bootstraps read-only
+  (no lock, no truncation, no epoch, no shape writes: `ShapeGuard.Resolve(readOnly: true)`), then
+  polls the segments, applying only up to its `Ceiling`. It starts over from the snapshot when a
+  truncation passes its cursor, the epoch changes, or the shape sidecar changes. The tail reopens
+  files per call and verifies its remembered offset, so a compaction of the live segment is
+  re-located rather than misread. Not wired into the cluster yet; that is 2d.
+- **2d**: `ShardAssignment.ReplicaNode` and `IMembershipStore.SetReplica` (Postgres: a
+  `replica_node` column added in place). The hub places replicas on its rebalance tick, before
+  the rebalance gate (availability, not balance), keeping a cached plan so heartbeat replies cost
+  no membership read; stores clear a replica whose node died or became the owner. Owners report
+  `DurableLsn` in the load sample; the hub relays it as the ceiling only from the plan's owner.
+  Nodes run one follower thread (50 ms polls) and the `melange.cluster.replica.lag` gauge. Shard
+  hot stores moved to node-local scratch (`Cluster:LocalScratchPath`).
+- **2e**: `MarkDead` (both stores) gives a dead owner's shard to its replica's node when that node
+  is alive, under the bumped token, and to the least-loaded node otherwise. On that node the open
+  takes the follower out of the poll loop (`LogFollower.Release`, which hands over nothing if a
+  poll would have started over) and passes its store, sequences, cursor and epoch to the engine's
+  second constructor (`WarmStart`). The engine opens the log under the new term, which seals the
+  dead owner's segment, checks the projection belongs to it (epoch, originator, a cursor between
+  the base and the head), and replays only the records after the cursor; anything else is refused
+  (EventId 1015) and recovers cold. The rest of the open is unchanged. `Cluster:ReplicaResidency`
+  (`Owner` or `Paged`) is in. Measured (LOAD-TESTING, "After phase 30 step 2e"): at 100k
+  rows with fast failover, 10 of 10 kills promoted, the reopen fell from 0.7–1.4 s to 0.3–0.85 s,
+  and the server window to 0.72–1.14 s; at 1M rows, 6 of 6 promoted in 1.6–4.7 s against a
+  4.6–6.1 s cold reopen. The 1M runs found that a border reset larger than the node link's 64 MiB
+  frame cap dropped the link, which predates this phase; resets now travel in parts (fixed on
+  the same stack).

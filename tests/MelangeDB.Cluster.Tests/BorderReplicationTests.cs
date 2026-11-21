@@ -282,7 +282,7 @@ public class BorderReplicationTests
                 && reopened.Engine.CommittedView.Find<Critter>(SpatialReducers.CritterId(1)) is null,
             "the reset observer converged, deletion included");
         Assert.True(
-            cluster.Node(ownerA.Name).Metrics.ReceivedByType.GetValueOrDefault("border-reset-apply") >= 1,
+            cluster.Node(ownerA.Name).Metrics.ReceivedByType.GetValueOrDefault("border-reset-part-apply") >= 1,
             "the stream must have been reset, not silently resumed past the gap");
     }
 
@@ -301,7 +301,7 @@ public class BorderReplicationTests
             "the border copy arrived");
 
         var applied = observer.Metrics.ReceivedBytesByType.GetValueOrDefault("border-apply")
-            + observer.Metrics.ReceivedBytesByType.GetValueOrDefault("border-reset-apply");
+            + observer.Metrics.ReceivedBytesByType.GetValueOrDefault("border-reset-part-apply");
         Assert.True(applied > 0, "border-band bandwidth must be observable as received bytes by type");
     }
 }

@@ -52,6 +52,7 @@ internal static class FailoverMeasurement
                 // replays is the --tail it asked for and never an automatic snapshot's leftovers.
                 ["MelangeDb:Snapshots:IntervalTransactions"] = "1000000000000",
                 ["MelangeDb:Cluster:FastFailoverOnLinkLoss"] = options.FastFailover ? "true" : "false",
+                ["MelangeDb:Cluster:ShardReplicas"] = options.Replicas.ToString(CultureInfo.InvariantCulture),
             });
         var heartbeat = options.HeartbeatMs ?? tuning.HeartbeatMs;
         var failureTimeout = options.FailureTimeoutMs ?? tuning.FailureTimeoutMs;
@@ -59,7 +60,7 @@ internal static class FailoverMeasurement
             $"Failover: rows [{string.Join(", ", options.FailoverRows)}] x {options.RowBytes} B, tail {options.TailRecords} records, " +
             $"{options.Repeat} kill(s) each, {options.Clients} client(s) at {options.TickHz} Hz, hot store {options.HotStore}, " +
             $"heartbeat {heartbeat} ms, failure timeout {failureTimeout} ms (deadline check every {Math.Clamp(failureTimeout / 20, 25, 250)} ms), " +
-            $"fast failover {(options.FastFailover ? "on" : "off")}.");
+            $"fast failover {(options.FastFailover ? "on" : "off")}, replicas {options.Replicas}.");
         output.WriteLine(
             $"Machine: {Environment.ProcessorCount} logical cores, Server GC {System.Runtime.GCSettings.IsServerGC}, " +
             $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription}, .NET {Environment.Version}.");
@@ -136,7 +137,8 @@ internal static class FailoverMeasurement
             var falseDeaths = liveness.NodesDeclaredDead - runs.Count;
             var windows = runs.Select(static r => r.ServerWindowMs).ToList();
             var line =
-                FormattableString.Invariant($"FAILOVER rows={rows} row_bytes={options.RowBytes} tail={options.TailRecords} hot_store={options.HotStore} ") +
+                FormattableString.Invariant($"FAILOVER rows={rows} row_bytes={options.RowBytes} tail={options.TailRecords} hot_store={options.HotStore} replicas={options.Replicas} ") +
+                FormattableString.Invariant($"promoted={runs.Count(static r => r.Promoted)}/{runs.Count} replica_behind_records={Range(runs.Select(static r => (double)r.ReplicaBehind))} ") +
                 FormattableString.Invariant($"kills={runs.Count} shard_dir_mib={footprint / (1024.0 * 1024):F1} ") +
                 FormattableString.Invariant($"detect_ms={Range(runs.Select(static r => r.DetectMs))} ") +
                 FormattableString.Invariant($"reopen_ms={Range(runs.Select(static r => r.ReopenMs))} ") +
@@ -179,6 +181,20 @@ internal static class FailoverMeasurement
         // own (it is one stall from being fenced while healthy), and it also shortens "detect"
         // below the timeout, so the run must say when it happened rather than report the
         // shorter window as if the hub had been faster.
+        // Steady state first: with replicas on, the survivor's follower is placed and caught up (the
+        // restarted node from the previous kill has to bootstrap its replica from the snapshot).
+        // The tail below is then written with no wait, so the kill finds the replica as far behind
+        // as live traffic leaves it.
+        if (options.Replicas > 0)
+        {
+            // Up to where the owner stood when the wait began: the clients keep writing, so the
+            // replica is always a heartbeat or so behind the live head.
+            var target = owner.Engine.Log.DurableLsn;
+            await WaitUntilAsync(
+                () => server.Node(survivorName)?.ReplicaAppliedLsn(shard) is { } applied && applied >= target,
+                "the survivor's replica caught up before the kill", ct).ConfigureAwait(false);
+        }
+
         using var watch = new HeartbeatWatch(hub, ownerName);
         var pauseBefore = GC.GetTotalPauseDuration();
         var phase = Stopwatch.StartNew();
@@ -207,6 +223,9 @@ internal static class FailoverMeasurement
         // of a small shard's whole reopen.
         long assignedAt = 0, openedAt = 0, writtenAt = 0;
         var probeIdentity = DevTokens.IdentityOf("failover-probe");
+        var replicaBehind = server.Node(survivorName)?.ReplicaAppliedLsn(shard) is { } kept
+            ? (long)(owner.Engine.Log.DurableLsn - Math.Min(kept, owner.Engine.Log.DurableLsn))
+            : -1;
         var killedAt = Stopwatch.GetTimestamp();
         var poll = Task.Factory.StartNew(
             () =>
@@ -272,6 +291,8 @@ internal static class FailoverMeasurement
             FailedCalls: probes.Sum(static p => p.FailedSinceArm),
             preKill)
         {
+            Promoted = server.Node(survivorName)?.TryGetShard(shard)?.WarmStartedFrom is not null,
+            ReplicaBehind = replicaBehind,
             FailureReasons = probes
                 .SelectMany(static p => p.FailureReasonsSinceArm)
                 .GroupBy(static pair => pair.Key, StringComparer.Ordinal)
@@ -365,6 +386,12 @@ internal static class FailoverMeasurement
         int FailedCalls,
         PreKill PreKill)
     {
+        /// <summary>Whether the survivor started from its replica (step 2e) rather than recovering cold.</summary>
+        public bool Promoted { get; init; }
+
+        /// <summary>Records the replica had not applied at the kill; -1 when the survivor had no replica.</summary>
+        public long ReplicaBehind { get; init; }
+
         /// <summary>Why the failed calls failed: exception type and message head, with counts.</summary>
         public IReadOnlyDictionary<string, int> FailureReasons { get; init; } = new Dictionary<string, int>();
 
@@ -375,7 +402,8 @@ internal static class FailoverMeasurement
 
         private string Body() => string.Create(
             CultureInfo.InvariantCulture,
-            $"[rows {Rows} kill {Run}] detect {DetectMs:F0} ms, reopen {ReopenMs:F0} ms, first write {FirstWriteMs:F0} ms " +
+            $"[rows {Rows} kill {Run}] detect {DetectMs:F0} ms, {(Promoted ? "promote" : "reopen")} {ReopenMs:F0} ms" +
+            $"{(ReplicaBehind >= 0 ? $" (replica {ReplicaBehind} behind)" : string.Empty)}, first write {FirstWriteMs:F0} ms " +
             $"=> server window {ServerWindowMs:F0} ms; clients restored p50 {Percentile(ClientRestoreMs, 0.5):F0} / " +
             $"max {(ClientRestoreMs.Count == 0 ? 0 : ClientRestoreMs.Max()):F0} ms, {ClientsUnrestored} unrestored, " +
             $"{ResyncErrors} resync error(s), {FailedCalls} failed call(s). Pre-kill: snapshot {PreKill.SnapshotMs:F0} ms, " +

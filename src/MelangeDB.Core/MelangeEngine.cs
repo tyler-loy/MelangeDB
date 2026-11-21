@@ -76,7 +76,33 @@ public sealed partial class MelangeEngine : IDisposable
         IHotStoreProvider? hotStoreProvider = null,
         ushort originator = 0,
         IReducerRandomProvider? randomProvider = null)
+        : this(options, schema, loggerFactory, timeProvider, hotStoreProvider, originator, randomProvider, warmStartSource: null)
     {
+    }
+
+    /// <summary>
+    /// The second recovery entry point (road-to-0.4 phase 30, step 2e): a new owner starting from a
+    /// replica's warm projection. <paramref name="warmStartSource"/> is called once the log is
+    /// open, so a log that cannot be opened yet (the previous owner's handle not yet released)
+    /// fails the open without consuming the replica, and the retry can still promote it. When
+    /// the projection belongs to this log (same epoch, same originator, a cursor the log still
+    /// holds), the engine adopts its store and sequences and replays only the records after its
+    /// cursor; otherwise it disposes the store and recovers cold. Everything after recovery is the
+    /// ordinary path.
+    /// </summary>
+    internal MelangeEngine(
+        MelangeDbOptions options,
+        SchemaRegistry schema,
+        ILoggerFactory? loggerFactory,
+        TimeProvider? timeProvider,
+        IHotStoreProvider? hotStoreProvider,
+        ushort originator,
+        IReducerRandomProvider? randomProvider,
+        Func<WarmStart?>? warmStartSource)
+    {
+        // Owned once taken: the engine disposes the warm store on every path that does not adopt it.
+        WarmStart? warmStart = null;
+        IDisposable? unadoptedWarmStore = null;
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(schema);
         _options = options;
@@ -108,8 +134,9 @@ public sealed partial class MelangeEngine : IDisposable
                 loggers.CreateLogger<FileCommitLog>(),
                 _telemetry,
                 SnapshotFile.DurableFloor(options.CommitLog.Path));
-            _sequencer = new AutoIncSequencer(originator);
             Lineage = EpochLineage.Load(options.CommitLog.Path);
+            warmStart = warmStartSource?.Invoke();
+            unadoptedWarmStore = warmStart?.Store as IDisposable;
 
             // Shape governance before any row byte is interpreted: load (or adopt) the shape
             // sidecar, refuse a destructive schema change, and hold the additive transform that
@@ -122,28 +149,42 @@ public sealed partial class MelangeEngine : IDisposable
                 options.Schema.AllowAdoption,
                 lsn => LogMessages.ShapeAdopted(_logger, options.CommitLog.Path, lsn),
                 count => LogMessages.ShapeTiersRecorded(_logger, count, options.CommitLog.Path));
-            var store = CreateStore(options, schema, hotStoreProvider, loggers);
-            _storeLifetime = store as IDisposable;
-
-            // Recovery: the snapshot (when one exists) bootstraps the projection and the AutoInc
-            // sequences at its LSN, then one pass over the log tail rebuilds the rest — replaying
-            // re-observes every durably allocated AutoInc id, so replay never reassigns different
-            // ids. The tail record's timestamp is kept as the scheduler's downtime anchor — when
-            // the world last moved. A store that can take the whole replay through builders does
-            // (no read view can exist yet, so a version per row would be built for nobody); the
-            // in-memory store's LoadSnapshot has its own bulk path either way.
-            var bulk = store as IBulkRecovery;
-            bulk?.BeginRecovery();
-            var replayFrom = RecoverSnapshot(store);
-            foreach (var record in _log.ReadFrom(replayFrom))
+            var warm = warmStart is not null && WarmStartRefusal(warmStart, originator) is { } refusal
+                ? Refuse(warmStart, refusal)
+                : warmStart;
+            if (warm is null)
             {
-                var replay = _shapes.TransformRecord(record);
-                store.Apply(WithoutArchiveOps(replay));
-                _sequencer.Observe(replay, schema);
-                RecoveredTailTimestamp = replay.Timestamp;
+                unadoptedWarmStore?.Dispose();
+                unadoptedWarmStore = null;
             }
 
-            bulk?.CompleteRecovery();
+            _sequencer = warm?.Sequencer ?? new AutoIncSequencer(originator);
+            var store = warm?.Store ?? CreateStore(options, schema, hotStoreProvider, loggers);
+            _storeLifetime = store as IDisposable;
+            unadoptedWarmStore = null;
+            if (warm is not null)
+            {
+                // Warm: the store already holds everything up to the cursor, published, so only
+                // the tail applies (the cursor to the previous owner's cut, plus anything this
+                // term already wrote), record by record, as the appliers would.
+                RecoveredTailTimestamp = warm.TailTimestamp;
+                var replayed = 0;
+                foreach (var record in _log.ReadFrom(warm.AppliedLsn + 1))
+                {
+                    var replay = _shapes.TransformRecord(record);
+                    store.Apply(WithoutArchiveOps(replay));
+                    _sequencer.Observe(replay, schema);
+                    RecoveredTailTimestamp = replay.Timestamp;
+                    replayed++;
+                }
+
+                WarmStartedFrom = warm.AppliedLsn;
+                LogMessages.WarmStarted(_logger, options.CommitLog.Path, warm.AppliedLsn, replayed);
+            }
+            else
+            {
+                RecoverCold(store, schema);
+            }
 
             _tailTimestamp = RecoveredTailTimestamp;
             HotStore = store;
@@ -164,11 +205,56 @@ public sealed partial class MelangeEngine : IDisposable
         }
         catch
         {
+            unadoptedWarmStore?.Dispose();
             _storeLifetime?.Dispose();
             _log?.Dispose();
             _telemetry?.Dispose();
             throw;
         }
+    }
+
+    /// <summary>The cold path: the snapshot, then the whole log after it.</summary>
+    private void RecoverCold(IHotStore store, SchemaRegistry schema)
+    {
+        // Recovery: the snapshot (when one exists) bootstraps the projection and the AutoInc
+        // sequences at its LSN, then one pass over the log tail rebuilds the rest — replaying
+        // re-observes every durably allocated AutoInc id, so replay never reassigns different
+        // ids. The tail record's timestamp is kept as the scheduler's downtime anchor — when
+        // the world last moved. A store that can take the whole replay through builders does
+        // (no read view can exist yet, so a version per row would be built for nobody); the
+        // in-memory store's LoadSnapshot has its own bulk path either way.
+        var bulk = store as IBulkRecovery;
+        bulk?.BeginRecovery();
+        var replayFrom = RecoverSnapshot(store);
+        foreach (var record in _log.ReadFrom(replayFrom))
+        {
+            var replay = _shapes.TransformRecord(record);
+            store.Apply(WithoutArchiveOps(replay));
+            _sequencer.Observe(replay, schema);
+            RecoveredTailTimestamp = replay.Timestamp;
+        }
+
+        bulk?.CompleteRecovery();
+    }
+
+    /// <summary>Why <paramref name="warm"/> cannot stand for this log's history; null when it can.</summary>
+    private string? WarmStartRefusal(WarmStart warm, ushort originator)
+    {
+        if (warm.Epoch != _log.EpochId)
+            return $"it was built from log epoch {warm.Epoch}, and this log is epoch {_log.EpochId}";
+        if (warm.Sequencer.Originator != originator)
+            return $"its sequences are originator {warm.Sequencer.Originator}'s, and this engine mints as {originator}";
+        if (warm.AppliedLsn < _log.BaseLsn)
+            return $"its cursor (LSN {warm.AppliedLsn}) is below the log's base (LSN {_log.BaseLsn})";
+        if (warm.AppliedLsn > _log.HeadLsn)
+            return $"its cursor (LSN {warm.AppliedLsn}) is past the log's head (LSN {_log.HeadLsn}), so it applied records the log does not hold";
+        return null;
+    }
+
+    private WarmStart? Refuse(WarmStart warm, string reason)
+    {
+        LogMessages.WarmStartRefused(_logger, _options.CommitLog.Path, warm.AppliedLsn, reason);
+        return null;
     }
 
     /// <summary>
@@ -177,7 +263,7 @@ public sealed partial class MelangeEngine : IDisposable
     /// asking for an engine whose package is not registered fails loudly rather than silently
     /// substituting.
     /// </summary>
-    private IHotStore CreateStore(
+    internal static IHotStore CreateStore(
         MelangeDbOptions options,
         SchemaRegistry schema,
         IHotStoreProvider? provider,
@@ -221,16 +307,19 @@ public sealed partial class MelangeEngine : IDisposable
     /// <see cref="IHotStore"/>, including one this assembly never saw, holds nothing of an archive
     /// table but its keys. The AutoInc sequencer and every decoupled applier still see the whole record.
     /// </summary>
-    private CommitRecord WithoutArchiveOps(CommitRecord record)
+    private CommitRecord WithoutArchiveOps(CommitRecord record) => WithoutArchiveOps(record, Schema, _archiveTables);
+
+    /// <summary>The archive filter for any projection of a log, the follower's included (phase 30 step 2c).</summary>
+    internal static CommitRecord WithoutArchiveOps(CommitRecord record, SchemaRegistry schema, IReadOnlySet<TableId> archiveTables)
     {
-        if (_archiveTables.Count == 0)
+        if (archiveTables.Count == 0)
             return record;
 
         List<RowOp>? kept = null;
         for (var i = 0; i < record.WriteSet.Count; i++)
         {
             var op = record.WriteSet[i];
-            if (_archiveTables.Contains(op.Table))
+            if (archiveTables.Contains(op.Table))
             {
                 if (kept is null)
                 {
@@ -239,7 +328,7 @@ public sealed partial class MelangeEngine : IDisposable
                         kept.Add(record.WriteSet[j]);
                 }
 
-                if (Schema.KeySetFor(op.Table) is { } keySet)
+                if (schema.KeySetFor(op.Table) is { } keySet)
                     kept.Add(KeySetOp(keySet, op));
                 continue;
             }
@@ -466,6 +555,9 @@ public sealed partial class MelangeEngine : IDisposable
     /// scheduler's approximation of when the process went down.
     /// </summary>
     internal Timestamp? RecoveredTailTimestamp { get; private set; }
+
+    /// <summary>The replica cursor this engine started from (step 2e); null after a cold recovery.</summary>
+    internal ulong? WarmStartedFrom { get; }
 
     public IHotStore HotStore { get; }
 
@@ -2250,6 +2342,24 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void ShapeUniqueRecorded(ILogger logger, int tables, int columns, string directory) =>
             ShapeUniqueRecordedMessage(logger, tables, directory, columns, null);
+
+        private static readonly Action<ILogger, string, ulong, int, Exception?> WarmStartedMessage =
+            LoggerMessage.Define<string, ulong, int>(
+                LogLevel.Information,
+                new EventId(1014, "EngineWarmStarted"),
+                "Took over '{LogDirectory}' from a replica's projection at LSN {AppliedLsn}, replaying {Replayed} record(s) instead of recovering from the snapshot.");
+
+        public static void WarmStarted(ILogger logger, string directory, ulong applied, int replayed) =>
+            WarmStartedMessage(logger, directory, applied, replayed, null);
+
+        private static readonly Action<ILogger, string, ulong, string, Exception?> WarmStartRefusedMessage =
+            LoggerMessage.Define<string, ulong, string>(
+                LogLevel.Warning,
+                new EventId(1015, "EngineWarmStartRefused"),
+                "A replica's projection of '{LogDirectory}' at LSN {AppliedLsn} was not used because {Reason}; recovering from the snapshot instead.");
+
+        public static void WarmStartRefused(ILogger logger, string directory, ulong applied, string reason) =>
+            WarmStartRefusedMessage(logger, directory, applied, reason, null);
 
         private static readonly Action<ILogger, Guid, ulong, string, DateTimeOffset, DateTimeOffset, Exception?> CloneProvenanceMessage =
             LoggerMessage.Define<Guid, ulong, string, DateTimeOffset, DateTimeOffset>(

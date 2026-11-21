@@ -78,11 +78,15 @@ internal sealed partial class ShardRuntime : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(TableId Table, RowKey Key), ulong> _borrowedRows = new();
     private readonly ILogger _logger;
 
+    /// <summary>The replica cursor this shard was promoted from (phase 30 step 2e); null after a cold open.</summary>
+    internal ulong? WarmStartedFrom => Engine.WarmStartedFrom;
+
     public ShardRuntime(
         ShardKey shard,
         long fencingToken,
         ushort originator,
         string shardDirectory,
+        string scratchDirectory,
         string nodeName,
         SchemaRegistry schema,
         ReducerRegistry reducers,
@@ -92,7 +96,8 @@ internal sealed partial class ShardRuntime : IDisposable
         ILoggerFactory loggerFactory,
         TimeProvider time,
         MelangeAuthenticator authenticator,
-        MelangeSessions sessions)
+        MelangeSessions sessions,
+        Func<WarmStart?>? warmStart = null)
     {
         Shard = shard;
         FencingToken = fencingToken;
@@ -103,8 +108,13 @@ internal sealed partial class ShardRuntime : IDisposable
         _strategy = strategy;
         var current = options.CurrentValue;
         Options = MelangeOptionsClone.DeepClone(current);
-        Options.HotStore.Path = Path.Combine(shardDirectory, "hot");
+        Options.HotStore.Path = scratchDirectory;
         Options.CommitLog.Path = Path.Combine(shardDirectory, "log");
+
+        // The storage fence (phase 30 step 2b): the log opens under this ownership's term, which
+        // seals the previous owner's segment at its cut, and refuses a term older than the one
+        // the directory is already at.
+        Options.CommitLog.Term = fencingToken;
         Options.Events.DeadLetterPath = Path.Combine(shardDirectory, "deadletter");
 
         Engine = new MelangeEngine(
@@ -114,7 +124,8 @@ internal sealed partial class ShardRuntime : IDisposable
             time,
             services.GetService<IHotStoreProvider>(),
             originator,
-            services.GetService<IReducerRandomProvider>());
+            services.GetService<IReducerRandomProvider>(),
+            warmStart);
         Engine.SetTableAccessGuard(PlacementGuards.ShardAccess(shard, nodeName));
         Engine.AddCommitGuard(new ShardCommitGuard(
             schema,
@@ -333,7 +344,8 @@ internal sealed partial class ShardRuntime : IDisposable
         // the last pass still reads as empty here. The reap re-decides it under the engine write
         // lock, in the same hold that stops further writes — see SealIfEmpty.
         return new ShardLoadDto(
-            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount, _authoritativeRows);
+            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount, _authoritativeRows,
+            DurableLsn: Engine.Log.DurableLsn);
     }
 
     /// <summary>
@@ -533,6 +545,52 @@ internal sealed partial class ShardRuntime : IDisposable
 
             WriteBorderCursor(reset.OwnerShard, reset.Epoch, reset.Lsn);
         }
+    }
+
+    /// <summary>A border reset arriving in parts, per owner shard: what has been staged so far.</summary>
+    private sealed class StagedReset(string id)
+    {
+        public string Id { get; } = id;
+
+        public int NextPart { get; set; }
+
+        public List<ReplicaTableSnapshot> Tables { get; } = [];
+    }
+
+    private readonly Dictionary<ulong, StagedReset> _stagedResets = [];
+
+    /// <summary>
+    /// Stages one part of a border reset and, on the final part, applies the whole reset as
+    /// <see cref="ApplyBorderReset"/> does. Nothing is applied before the final part: a reset's
+    /// deletions are "every row borrowed from this owner that the band lacks", which a partial
+    /// band would get wrong. Part 0 starts a new staging, replacing any abandoned one; a part out
+    /// of sequence (a lost or repeated part, an observer restart in between) discards the staging
+    /// and fails, and the owner starts over.
+    /// </summary>
+    public void ApplyBorderResetPart(BorderResetPart part)
+    {
+        var owner = part.Reset.OwnerShard;
+        List<ReplicaTableSnapshot> tables;
+        lock (_stagedResets)
+        {
+            if (part.Part == 0)
+                _stagedResets[owner] = new StagedReset(part.ResetId);
+            if (!_stagedResets.TryGetValue(owner, out var staged) || staged.Id != part.ResetId || staged.NextPart != part.Part)
+            {
+                _stagedResets.Remove(owner);
+                throw new InvalidOperationException(
+                    $"Border reset part {part.Part} of '{part.ResetId}' from shard {owner} arrived out of sequence; the owner starts the reset over.");
+            }
+
+            staged.Tables.AddRange(part.Reset.Tables);
+            staged.NextPart++;
+            if (!part.Final)
+                return;
+            _stagedResets.Remove(owner);
+            tables = staged.Tables;
+        }
+
+        ApplyBorderReset(part.Reset with { Tables = [.. tables] });
     }
 
     /// <summary>The observer's durable cursor into one owner's log: epoch, LSN, and the band depth it was taken at.</summary>

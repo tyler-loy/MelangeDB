@@ -75,10 +75,9 @@ internal static class OnlineEngineCapture
             }
 
             long tailRecords = 0;
-            using (var log = new FileStream(
-                engine.LogFile.FilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            using (var log = new LogSegments.Reader(Path.GetDirectoryName(engine.LogFile.FilePath)!))
             {
-                foreach (var record in LogFileFormat.WalkRecords(log, engine.LogFile.FilePath))
+                foreach (var record in log.Walk())
                 {
                     if (record.Lsn <= snapshotLsn || record.Lsn > fence)
                         continue;

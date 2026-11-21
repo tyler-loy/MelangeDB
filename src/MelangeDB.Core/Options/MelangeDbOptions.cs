@@ -783,6 +783,15 @@ public sealed class CommitLogOptions
     /// distrust, and the fault-injection suite is the answer to that.
     /// </summary>
     public bool GroupCommit { get; set; } = true;
+
+    /// <summary>
+    /// The ownership term the log is opened under: set by a cluster shard node to the shard's
+    /// fencing token, never by configuration (phase 30 step 2b). An owner under term <c>t</c>
+    /// appends only to its own segment; opening under a higher term seals the previous owner's
+    /// segment at its last valid record, and opening under a lower one is refused. Null (every
+    /// non-cluster engine, and offline tools) adopts whichever term the directory is already at.
+    /// </summary>
+    internal long? Term { get; set; }
 }
 
 /// <summary>Options for what MelangeDB emits (<c>MelangeDb:Telemetry:*</c>). Exporters are the host's business.</summary>

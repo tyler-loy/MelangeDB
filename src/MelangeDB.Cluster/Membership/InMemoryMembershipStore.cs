@@ -87,14 +87,19 @@ public sealed class InMemoryMembershipStore : IMembershipStore
             if (_nodes.TryGetValue(nodeName, out var record))
                 _nodes[nodeName] = record with { Alive = false, LastSeen = now };
 
+            // A dead node keeps no replicas; the hub places new ones.
+            foreach (var replicated in _shards.Values.Where(a => a.ReplicaNode == nodeName).ToList())
+                _shards[replicated.Shard] = replicated with { ReplicaNode = null };
+
+            // A shard with a live replica goes to the replica's node, which promotes its warm
+            // projection; the rest take the cold path on the least-loaded node.
             var changed = new List<ShardAssignment>();
             foreach (var assignment in _shards.Values.Where(a => a.NodeName == nodeName).ToList())
             {
-                var next = assignment with
-                {
-                    NodeName = LeastLoadedNode(except: nodeName),
-                    FencingToken = assignment.FencingToken + 1,
-                };
+                var replica = assignment.ReplicaNode is { } candidate && _nodes.TryGetValue(candidate, out var node) && node.Alive
+                    ? candidate
+                    : null;
+                var next = WithOwner(assignment, replica ?? LeastLoadedNode(except: nodeName));
                 _shards[assignment.Shard] = next;
                 changed.Add(next);
             }
@@ -112,7 +117,7 @@ public sealed class InMemoryMembershipStore : IMembershipStore
             {
                 if (LeastLoadedNode() is not { } owner)
                     break;
-                var next = assignment with { NodeName = owner, FencingToken = assignment.FencingToken + 1 };
+                var next = WithOwner(assignment, owner);
                 _shards[assignment.Shard] = next;
                 changed.Add(next);
             }
@@ -130,11 +135,39 @@ public sealed class InMemoryMembershipStore : IMembershipStore
                 throw new InvalidOperationException($"{shard} was never created; nothing to reassign.");
             if (!_nodes.TryGetValue(toNode, out var node) || !node.Alive)
                 throw new InvalidOperationException($"Node '{toNode}' is not registered and alive; a drain must never assign to a corpse.");
-            var next = assignment with { NodeName = toNode, FencingToken = assignment.FencingToken + 1 };
+            var next = WithOwner(assignment, toNode);
             _shards[shard] = next;
             return next;
         }
     }
+
+    public ShardAssignment SetReplica(ShardKey shard, string? replicaNode)
+    {
+        lock (_lock)
+        {
+            if (!_shards.TryGetValue(shard, out var assignment))
+                throw new InvalidOperationException($"{shard} was never created; it has no replica to place.");
+            if (replicaNode is not null)
+            {
+                if (replicaNode == assignment.NodeName)
+                    throw new InvalidOperationException($"'{replicaNode}' owns {shard}; a shard's replica must be on another node.");
+                if (!_nodes.TryGetValue(replicaNode, out var node) || !node.Alive)
+                    throw new InvalidOperationException($"Node '{replicaNode}' is not registered and alive; it cannot keep a replica.");
+            }
+
+            var next = assignment with { ReplicaNode = replicaNode };
+            _shards[shard] = next;
+            return next;
+        }
+    }
+
+    /// <summary>A change of owner: a new term, and no replica on the new owner's own node.</summary>
+    private static ShardAssignment WithOwner(ShardAssignment assignment, string? owner) => assignment with
+    {
+        NodeName = owner,
+        FencingToken = assignment.FencingToken + 1,
+        ReplicaNode = assignment.ReplicaNode == owner ? null : assignment.ReplicaNode,
+    };
 
     private string? LeastLoadedNode(string? except = null)
     {

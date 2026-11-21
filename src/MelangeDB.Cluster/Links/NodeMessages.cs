@@ -35,7 +35,13 @@ internal sealed record AuthRequest(string NodeName, string PublicAddress, string
 
 internal sealed record AuthReply(string Proof, ShardAssignmentDto[] Assignments, int FailureTimeoutMs);
 
-internal sealed record HeartbeatReply(ShardAssignmentDto[] Assignments);
+/// <summary>
+/// A shard this node keeps a warm replica of (phase 30): the originator its sequences continue
+/// under, and the ceiling, the owner's last reported durable LSN (0 until the owner has reported).
+/// </summary>
+internal sealed record ReplicaDto(ulong Shard, ushort Originator, ulong Ceiling);
+
+internal sealed record HeartbeatReply(ShardAssignmentDto[] Assignments, ReplicaDto[]? Replicas = null);
 
 /// <summary>
 /// One owned shard's load sample, riding the heartbeat — no new clock, no new message. The
@@ -50,7 +56,8 @@ internal sealed record ShardLoadDto(
     long ResidentBytes,
     int BorrowedRows,
     long AuthoritativeRows,
-    bool Draining = false);
+    bool Draining = false,
+    ulong DurableLsn = 0);
 
 /// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
 internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);
@@ -158,6 +165,19 @@ internal sealed record BorderBatch(ulong OwnerShard, ulong ObserverShard, string
 /// rows previously borrowed from this owner that the snapshot lacks</em>.
 /// </summary>
 internal sealed record BorderReset(ulong OwnerShard, ulong ObserverShard, string Epoch, ulong Lsn, ReplicaTableSnapshot[] Tables);
+
+/// <summary>
+/// One part of a <see cref="BorderReset"/> too large for one node-link frame (a million-row shard's
+/// band runs to hundreds of MiB). Sent owner node → hub as <c>border-reset-part</c> and routed hub →
+/// observer node as <c>border-reset-part-apply</c>, in order, each acked before the next. The
+/// observer stages the parts and applies the reset, deletions and cursor included, only on the
+/// <see cref="Final"/> one: a partial reset would delete every borrowed row a later part carries.
+/// A part out of sequence discards the staging and fails, and the owner starts the reset over
+/// under a new <see cref="ResetId"/>. A separate type rather than fields on
+/// <see cref="BorderReset"/>, so a node that predates parts refuses them rather than applying
+/// each one as a whole reset.
+/// </summary>
+internal sealed record BorderResetPart(string ResetId, int Part, bool Final, BorderReset Reset);
 
 /// <summary>The log-arguments payload of a <c>melange/border</c> record: which shard owns the copied rows.</summary>
 internal sealed record BorderMarker(ulong Owner);

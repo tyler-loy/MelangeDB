@@ -96,6 +96,13 @@ public sealed class LoadTestOptions
     /// <summary>Payload bytes per ballast row.</summary>
     public int RowBytes { get; set; } = 256;
 
+    /// <summary>
+    /// <c>--replicas 0|1</c>: <c>Cluster:ShardReplicas</c> for the failover measurement. With 1 (the
+    /// library default) the survivor keeps a warm replica and promotes it; 0 measures the cold
+    /// reopen the replica replaces.
+    /// </summary>
+    public int Replicas { get; set; } = 1;
+
     /// <summary>Records committed after the snapshot and before the kill: the log tail recovery replays.</summary>
     public int TailRecords { get; set; } = 10_000;
 
@@ -259,6 +266,7 @@ public sealed class LoadTestOptions
                         break;
                     case "--row-bytes": options.RowBytes = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--tail": options.TailRecords = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--replicas": options.Replicas = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--repeat": options.Repeat = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--clients": options.Clients = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--address": options.Address = new Uri(value); break;

@@ -12,6 +12,28 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Warm replicas** (road-to-0.4 phase 30, steps 2c to 2e). With two or more shard nodes, the hub
+  places each shard's replica on a node other than its owner (`Cluster:ShardReplicas`, default 1;
+  0 opts out). The replica's node follows the shard's log read-only and keeps its hot store current
+  up to the owner's durable LSN, which the owner reports in its heartbeat and the hub relays.
+  `melange.cluster.replica.lag` shows how far behind each one is. When an owner dies, the hub
+  hands its shard to the replica's node, which **promotes** the replica: the new owner's engine
+  starts from the replica's store and replays only the records it had not applied (EventIds 1014,
+  1762), where it used to recover the whole snapshot. A replica that cannot stand for the log is
+  refused (1015) and the shard recovers cold. `Cluster:ReplicaResidency` (`Owner` by default,
+  or `Paged`) sets how a replica holds its tables. Shard hot stores now live in node-local scratch
+  (`Cluster:LocalScratchPath`), no longer under the shared shard directory. `IMembershipStore`
+  gains `SetReplica`, and the Postgres store a `replica_node` column, added in place.
+- **A log segment per ownership term: the storage fence** (road-to-0.4 phase 30, step 2b). A
+  cluster shard's log now opens under the shard's fencing token. Opening under a higher term seals
+  the previous owner's segment at its last valid record (EventId 1011) and appends to a new file,
+  `melange.log.{term}`; opening under a lower one is refused (`StaleTermException`). Nothing past a
+  seal is read again, so a previous owner that was only paused can no longer write into the new
+  owner's log, whether or not the shared filesystem honours `melange.lock`. A manifest,
+  `melange.segments`, lists the segments. Existing logs migrate in place on the first change of
+  owner, with no rename; non-cluster engines keep their single `melange.log`. Truncation deletes
+  sealed segments whole; backup capture and the restore check read across segments, and archives
+  are unchanged.
 - **`outcome_unknown`**, a new call error code (road-to-0.4 phase 30, step 2a). A cluster shard
   node now re-checks its lease after a commit is durable and before acknowledging it. If the lease
   ended in between, the shard may already have a new owner that cut the log before the record, so
@@ -101,6 +123,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A large border reset took down the node link, and with it a healthy node.** A band reset was
+  sent as one node-link frame, and a link drops any frame over 64 MiB. A million-row shard's band
+  against a side neighbour came to 152-170 MiB, so the hub's reader closed the owner's link; the
+  node's lease lapsed, and with `Cluster:FastFailoverOnLinkLoss` on the hub declared it dead at
+  once and moved its shards. Resets now travel in parts of about 16 MiB (`border-reset-part`),
+  which the observer stages and applies whole on the last one, so its deletions and cursor move
+  only with a complete band. A link also refuses to send a frame over the limit, failing that one
+  request rather than writing what its peer would drop the link for. Found by the phase 30
+  failover runs at 1M rows.
 - **Shards for blocks with a negative x coordinate could not be reached.** Their keys have the top
   bit set, and the shard node's websocket route only matched keys that fit in a signed 64-bit
   integer, so every connection to them got a 404: no player could be served west of x = 0. Under

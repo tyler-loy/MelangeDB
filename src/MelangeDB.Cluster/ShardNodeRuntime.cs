@@ -110,6 +110,19 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             "melange.cluster.lease.renewal_gap",
             unit: "ms",
             description: "Time from sending an acknowledged heartbeat to the reply to the next one: how long the node's lease had to last. It lapses past nine tenths of the hub's Cluster:FailureTimeoutMs.");
+        _livenessMeter.CreateObservableGauge(
+            "melange.cluster.replica.lag",
+            () =>
+            {
+                lock (_followersLock)
+                {
+                    return _followers.Select(pair => new System.Diagnostics.Metrics.Measurement<long>(
+                        (long)(pair.Value.Ceiling > pair.Value.AppliedLsn ? pair.Value.Ceiling - pair.Value.AppliedLsn : 0),
+                        new KeyValuePair<string, object?>("shard", pair.Key))).ToList();
+                }
+            },
+            unit: "{record}",
+            description: "Records a shard replica's follower is behind its owner's durable LSN, as last relayed by the hub.");
         _leaseLapses = _livenessMeter.CreateCounter<long>(
             "melange.cluster.lease.lapses",
             unit: "{lapse}",
@@ -133,7 +146,181 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// </summary>
     internal Action<ShardKey>? BeforeOpen { get; set; }
 
+    /// <summary>Test hook: the estimated bytes per border-reset part this node's publishers send, so a test band splits.</summary>
+    internal int BorderResetPartBytes { get; set; } = BorderPublisher.DefaultResetPartBytes;
+
     private ClusterOptions Cluster => _options.CurrentValue.Cluster;
+
+    /// <summary>This node's own scratch (Cluster:LocalScratchPath): shard hot stores, owned and replica.</summary>
+    private string LocalScratch => string.IsNullOrEmpty(Cluster.LocalScratchPath)
+        ? Path.Combine(_options.CurrentValue.HotStore.Path, "cluster")
+        : Cluster.LocalScratchPath;
+
+    private readonly Lock _followersLock = new();
+    private readonly Dictionary<ulong, LogFollower> _followers = [];
+    private Thread? _followerThread;
+
+    /// <summary>Test hook: the follower keeping this node's replica of <paramref name="shard"/>, if any.</summary>
+    internal LogFollower? TryGetFollower(ShardKey shard)
+    {
+        lock (_followersLock)
+        {
+            return _followers.GetValueOrDefault(shard.Value);
+        }
+    }
+
+    /// <summary>For the failover tool: how far this node's replica of <paramref name="shard"/> has applied; null without one.</summary>
+    internal ulong? ReplicaAppliedLsn(ShardKey shard) => TryGetFollower(shard)?.AppliedLsn;
+
+    /// <summary>
+    /// Diffs the hub's replica list against the running followers (phase 30 step 2d): new ones
+    /// start, dropped ones stop, and each ceiling rises to the owner's latest durable LSN. A shard
+    /// this node owns is never followed here, whatever a stale plan says.
+    /// </summary>
+    private void ApplyReplicas(ReplicaDto[] replicas)
+    {
+        HashSet<ShardKey> owned;
+        HashSet<ShardKey> promoting;
+        lock (_shardsLock)
+        {
+            owned = [.. _assigned.Keys];
+
+            // Assigned here but not open yet: the open promotes the follower (step 2e), so it is
+            // left for the open to take rather than stopped under it.
+            promoting = [.. _assigned.Keys.Where(shard => !_shards.ContainsKey(shard))];
+        }
+
+        var wanted = replicas.Where(r => !owned.Contains(new ShardKey(r.Shard))).ToDictionary(static r => r.Shard);
+        List<LogFollower> stopped = [];
+        lock (_followersLock)
+        {
+            foreach (var (shard, follower) in _followers.ToList())
+            {
+                if (wanted.ContainsKey(shard) || promoting.Contains(new ShardKey(shard)))
+                    continue;
+                _followers.Remove(shard);
+                stopped.Add(follower);
+            }
+
+            foreach (var replica in wanted.Values)
+            {
+                if (!_followers.TryGetValue(replica.Shard, out var follower))
+                {
+                    follower = CreateFollower(replica);
+                    _followers[replica.Shard] = follower;
+                }
+
+                follower.Ceiling = Math.Max(follower.Ceiling, replica.Ceiling);
+            }
+
+            if (_followers.Count > 0 && _followerThread is null)
+            {
+                _followerThread = new Thread(FollowReplicas) { IsBackground = true, Name = "MelangeDB replica follower" };
+                _followerThread.Start();
+            }
+        }
+
+        foreach (var follower in stopped)
+        {
+            lock (follower)
+                follower.Dispose();
+        }
+    }
+
+    private LogFollower CreateFollower(ReplicaDto replica)
+    {
+        var options = MelangeOptionsClone.DeepClone(_options.CurrentValue);
+        options.CommitLog.Path = Path.Combine(Cluster.ShardDataPath, $"shard-{replica.Shard}", "log");
+        options.HotStore.Path = Path.Combine(LocalScratch, $"replica-{replica.Shard}");
+        var schema = _services.GetRequiredService<SchemaRegistry>();
+        ApplyReplicaResidency(options, schema, Cluster.ReplicaResidency);
+        return new LogFollower(
+            options,
+            schema,
+            replica.Originator,
+            _loggerFactory,
+            _services.GetService<IHotStoreProvider>());
+    }
+
+    /// <summary>
+    /// Promotion's first half (phase 30 step 2e): stops this node's follower of
+    /// <paramref name="shard"/>, if it has one, and hands over its projection for the owner's engine
+    /// to start from. Null when there is none to hand over (no follower, not bootstrapped yet, or a
+    /// place in the log that can no longer be trusted); the open then recovers cold.
+    /// </summary>
+    private WarmStart? TakeReplica(ShardKey shard)
+    {
+        LogFollower? follower;
+        lock (_followersLock)
+        {
+            if (_followers.Remove(shard.Value, out follower) is false)
+                return null;
+        }
+
+        // The poll loop may hold it mid-poll; the lock waits that out, and the loop skips a
+        // disposed follower afterwards.
+        lock (follower)
+        {
+            try
+            {
+                return follower.Release();
+            }
+            catch (Exception exception)
+            {
+                LogReplicaFollowFailed(_logger, shard.Value, exception.Message);
+                follower.Dispose();
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// <c>Cluster:ReplicaResidency</c> on a replica's options: <see cref="ReplicaResidency.Paged"/>
+    /// pins every table to paged, overriding attributes and <c>Residency:*</c> alike. A promoted
+    /// replica keeps the residency it was built with until the shard next opens cold.
+    /// </summary>
+    internal static void ApplyReplicaResidency(MelangeDbOptions options, SchemaRegistry schema, ReplicaResidency residency)
+    {
+        if (residency != ReplicaResidency.Paged)
+            return;
+        options.Residency.Default = Residency.Paged;
+        foreach (var table in schema.Tables)
+            options.Residency.PerTable[table.Name] = Residency.Paged;
+    }
+
+    /// <summary>The followers' poll loop: one thread for all of this node's replicas.</summary>
+    private void FollowReplicas()
+    {
+        while (!_stopped.IsCancellationRequested)
+        {
+            List<(ulong Shard, LogFollower Follower)> followers;
+            lock (_followersLock)
+            {
+                followers = [.. _followers.Select(static pair => (pair.Key, pair.Value))];
+            }
+
+            foreach (var (shard, follower) in followers)
+            {
+                lock (follower)
+                {
+                    try
+                    {
+                        follower.Poll();
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Stopped since the list was read.
+                    }
+                    catch (Exception exception)
+                    {
+                        LogReplicaFollowFailed(_logger, shard, exception.Message);
+                    }
+                }
+            }
+
+            _stopped.Token.WaitHandle.WaitOne(50);
+        }
+    }
 
     private string NodeName => Cluster.NodeName;
 
@@ -279,8 +466,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 var sent = _time.GetTimestamp();
                 var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(loads), ct).ConfigureAwait(false);
                 RenewLease(sent);
-                var assignments = beat!.Value.Deserialize<HeartbeatReply>()!.Assignments;
-                ApplyAssignments(assignments);
+                var beatReply = beat!.Value.Deserialize<HeartbeatReply>()!;
+                ApplyAssignments(beatReply.Assignments);
+                ApplyReplicas(beatReply.Replicas ?? []);
                 await SubscribeReplicationAsync(link, ct).ConfigureAwait(false);
             }
 
@@ -587,6 +775,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 assignment.FencingToken,
                 assignment.Originator,
                 directory,
+                Path.Combine(LocalScratch, $"shard-{shard.Value}"),
                 NodeName,
                 _services.GetRequiredService<SchemaRegistry>(),
                 _services.GetRequiredService<ReducerRegistry>(),
@@ -596,7 +785,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 _loggerFactory,
                 _time,
                 _authenticator,
-                _sessions);
+                _sessions,
+                () => TakeReplica(shard));
             var openMs = _time.GetElapsedTime(started).TotalMilliseconds;
 
             lock (_shardsLock)
@@ -614,7 +804,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 // that bumped it while recovery ran must not be lost.
                 runtime.FencingToken = current.FencingToken;
                 PublishLocked(shard, runtime);
-                LogShardOpened(_logger, shard.Value, NodeName, openMs, runtime.Engine.Log.HeadLsn);
+                if (runtime.Engine.WarmStartedFrom is { } from)
+                    LogShardPromoted(_logger, shard.Value, NodeName, openMs, from, runtime.Engine.Log.HeadLsn);
+                else
+                    LogShardOpened(_logger, shard.Value, NodeName, openMs, runtime.Engine.Log.HeadLsn);
                 runtime = null; // Published: the shard set owns it now.
             }
 
@@ -666,7 +859,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         if (_strategy is { } strategy)
         {
             var publisher = new BorderPublisher(
-                runtime.Engine, shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger);
+                runtime.Engine, shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger, BorderResetPartBytes);
             _borderPublishers[shard] = publisher;
             publisher.Start();
 
@@ -1115,6 +1308,15 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 return Task.FromResult<object?>(null);
             }
 
+            case "border-reset-part-apply":
+            {
+                var part = body!.Value.Deserialize<BorderResetPart>()!;
+                var observer = TryGetShard(new ShardKey(part.Reset.ObserverShard))
+                    ?? throw new InvalidOperationException($"This node does not own shard {part.Reset.ObserverShard}.");
+                observer.ApplyBorderResetPart(part);
+                return Task.FromResult<object?>(null);
+            }
+
             case "shard-drain":
                 return Task.FromResult<object?>(QuiesceShard(body!.Value.Deserialize<ShardDrain>()!));
             case "shard-reap":
@@ -1514,6 +1716,16 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         _leaseWatchdog?.Dispose();
         _link?.Dispose();
         _livenessMeter.Dispose();
+        lock (_followersLock)
+        {
+            foreach (var follower in _followers.Values)
+            {
+                lock (follower)
+                    follower.Dispose();
+            }
+
+            _followers.Clear();
+        }
 
         // An open in flight holds the shard's log and store; let it finish and close itself (it
         // sees the stop and abandons) rather than leave those handles to a node that no longer
@@ -1547,6 +1759,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     [LoggerMessage(EventId = 1707, EventName = "ShardOpened", Level = LogLevel.Information,
         Message = "Shard {Shard} opened on node '{NodeName}' in {OpenMs:F0}ms, recovered to LSN {HeadLsn} from its own log.")]
     private static partial void LogShardOpened(ILogger logger, ulong shard, string nodeName, double openMs, ulong headLsn);
+
+    [LoggerMessage(EventId = 1762, EventName = "ShardPromoted", Level = LogLevel.Information,
+        Message = "Shard {Shard} promoted from its replica on node '{NodeName}' in {OpenMs:F0}ms: the replica stood at LSN {FromLsn}, and the shard is at LSN {HeadLsn}.")]
+    private static partial void LogShardPromoted(ILogger logger, ulong shard, string nodeName, double openMs, ulong fromLsn, ulong headLsn);
+
+    [LoggerMessage(EventId = 1761, EventName = "ReplicaFollowFailed", Level = LogLevel.Warning,
+        Message = "Following shard {Shard}'s log for its replica failed ({Reason}); the next poll tries again.")]
+    private static partial void LogReplicaFollowFailed(ILogger logger, ulong shard, string reason);
 
     [LoggerMessage(EventId = 1756, EventName = "ShardsParkedOnLeaseExpiry", Level = LogLevel.Warning,
         Message = "Node '{NodeName}' parked {Count} shard(s): its lease lapsed without a hub heartbeat, so it may already have been declared dead. Their engines are closed and their logs released for whichever node the hub names; registering again reopens any still assigned here.")]

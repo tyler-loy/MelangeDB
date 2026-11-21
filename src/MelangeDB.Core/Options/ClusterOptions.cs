@@ -1,5 +1,15 @@
 namespace MelangeDB.Core;
 
+/// <summary>How a shard's warm replica holds its tables (<c>Cluster:ReplicaResidency</c>).</summary>
+public enum ReplicaResidency
+{
+    /// <summary>As the owner does: the same <c>Residency:*</c> resolution, the same memory cost.</summary>
+    Owner,
+
+    /// <summary>Every table paged, whatever its attribute or <c>Residency:*</c> says.</summary>
+    Paged,
+}
+
 /// <summary>The role a node plays in a cluster (<c>Cluster:Role</c>).</summary>
 public enum ClusterRole
 {
@@ -136,6 +146,32 @@ public sealed class ClusterOptions
     /// assumes shared or re-attachable volumes; log shipping is a later phase).
     /// </summary>
     public string ShardDataPath { get; set; } = "./data/shards";
+
+    /// <summary>
+    /// Warm replicas per shard (road-to-0.4 phase 30): a second node keeps each shard's hot store
+    /// current by following its log, so promoting it costs the unapplied tail instead of a full
+    /// recovery. 1 (the default) places one whenever a second live shard node exists; 0 opts out.
+    /// More than one is refused at startup. A replica costs its shard's resident memory again, on
+    /// another node.
+    /// </summary>
+    public int ShardReplicas { get; set; } = 1;
+
+    /// <summary>
+    /// How a warm replica holds its shard's tables. <see cref="ReplicaResidency.Owner"/> (the
+    /// default) resolves residency exactly as the owner does, so a promoted replica serves at the
+    /// owner's speed from its first call. <see cref="ReplicaResidency.Paged"/> pages every table,
+    /// for deployments short of memory: the replica costs disk rather than RAM, and a promoted one
+    /// faults its working set in from disk as it is used.
+    /// </summary>
+    public ReplicaResidency ReplicaResidency { get; set; } = ReplicaResidency.Owner;
+
+    /// <summary>
+    /// Where a shard node keeps the scratch that is its own: shard hot stores (owned and replica
+    /// alike), which are rebuilt on every open and never read by another node. Empty means a
+    /// <c>cluster</c> folder under <c>HotStore:Path</c>. Node-local storage, never the shared
+    /// <see cref="ShardDataPath"/>.
+    /// </summary>
+    public string LocalScratchPath { get; set; } = "";
 
     /// <summary>
     /// Spatial strategy only: how deep (in chunks) each shard's read-only border band reaches into

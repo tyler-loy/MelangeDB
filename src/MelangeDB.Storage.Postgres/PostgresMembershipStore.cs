@@ -58,6 +58,7 @@ public sealed class PostgresMembershipStore : IMembershipStore
                     fencing_token bigint NOT NULL,
                     originator int NOT NULL
                 );
+                ALTER TABLE {Schema}.melange_cluster_shards ADD COLUMN IF NOT EXISTS replica_node text NULL;
                 CREATE TABLE IF NOT EXISTS {Schema}.melange_cluster_originator (
                     lock_row boolean PRIMARY KEY,
                     next_originator int NOT NULL
@@ -189,7 +190,7 @@ public sealed class PostgresMembershipStore : IMembershipStore
         using var connection = Open();
         using var command = connection.CreateCommand();
         command.CommandText = $"""
-            SELECT shard, node_name, fencing_token, originator
+            SELECT shard, node_name, fencing_token, originator, replica_node
             FROM {Schema}.melange_cluster_shards WHERE node_name = @name ORDER BY shard
             """;
         command.Parameters.AddWithValue("name", nodeName);
@@ -201,7 +202,7 @@ public sealed class PostgresMembershipStore : IMembershipStore
         using var connection = Open();
         using var command = connection.CreateCommand();
         command.CommandText = $"""
-            SELECT shard, node_name, fencing_token, originator
+            SELECT shard, node_name, fencing_token, originator, replica_node
             FROM {Schema}.melange_cluster_shards ORDER BY shard
             """;
         return ReadAssignments(command);
@@ -224,14 +225,24 @@ public sealed class PostgresMembershipStore : IMembershipStore
             dead.ExecuteNonQuery();
         }
 
+        // A dead node keeps no replicas; the hub places new ones.
+        using (var replicas = connection.CreateCommand())
+        {
+            replicas.Transaction = transaction;
+            replicas.CommandText = $"UPDATE {Schema}.melange_cluster_shards SET replica_node = NULL WHERE replica_node = @name";
+            replicas.Parameters.AddWithValue("name", nodeName);
+            replicas.ExecuteNonQuery();
+        }
+
+        // A shard with a live replica goes to the replica's node, which promotes its warm
+        // projection; the rest take the cold path on the least-loaded node. Replicas on the dead
+        // node were cleared above, so a replica read here is on another node; IsAlive covers one
+        // that died too but has not been swept yet.
         var changed = new List<ShardAssignment>();
         foreach (var assignment in AssignmentsOf(connection, transaction, nodeName))
         {
-            var next = assignment with
-            {
-                NodeName = LeastLoadedNode(connection, transaction, except: nodeName),
-                FencingToken = assignment.FencingToken + 1,
-            };
+            var replica = assignment.ReplicaNode is { } candidate && IsAlive(connection, transaction, candidate) ? candidate : null;
+            var next = WithOwner(assignment, replica ?? LeastLoadedNode(connection, transaction, except: nodeName));
             WriteAssignment(connection, transaction, next);
             changed.Add(next);
         }
@@ -250,7 +261,7 @@ public sealed class PostgresMembershipStore : IMembershipStore
         {
             if (LeastLoadedNode(connection, transaction, except: null) is not { } owner)
                 break;
-            var next = assignment with { NodeName = owner, FencingToken = assignment.FencingToken + 1 };
+            var next = WithOwner(assignment, owner);
             WriteAssignment(connection, transaction, next);
             changed.Add(next);
         }
@@ -276,11 +287,44 @@ public sealed class PostgresMembershipStore : IMembershipStore
                 throw new InvalidOperationException($"Node '{toNode}' is not registered and alive; a drain must never assign to a corpse.");
         }
 
-        var next = assignment with { NodeName = toNode, FencingToken = assignment.FencingToken + 1 };
+        var next = WithOwner(assignment, toNode);
         WriteAssignment(connection, transaction, next);
         transaction.Commit();
         return next;
     }
+
+    public ShardAssignment SetReplica(ShardKey shard, string? replicaNode)
+    {
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+        LockShards(connection, transaction);
+        var assignment = ReadAssignment(connection, transaction, shard)
+            ?? throw new InvalidOperationException($"{shard} was never created; it has no replica to place.");
+        if (replicaNode is not null)
+        {
+            if (replicaNode == assignment.NodeName)
+                throw new InvalidOperationException($"'{replicaNode}' owns {shard}; a shard's replica must be on another node.");
+            using var alive = connection.CreateCommand();
+            alive.Transaction = transaction;
+            alive.CommandText = $"SELECT alive FROM {Schema}.melange_cluster_nodes WHERE node_name = @name";
+            alive.Parameters.AddWithValue("name", replicaNode);
+            if (alive.ExecuteScalar() is not true)
+                throw new InvalidOperationException($"Node '{replicaNode}' is not registered and alive; it cannot keep a replica.");
+        }
+
+        var next = assignment with { ReplicaNode = replicaNode };
+        WriteAssignment(connection, transaction, next);
+        transaction.Commit();
+        return next;
+    }
+
+    /// <summary>A change of owner: a new term, and no replica on the new owner's own node.</summary>
+    private static ShardAssignment WithOwner(ShardAssignment assignment, string? owner) => assignment with
+    {
+        NodeName = owner,
+        FencingToken = assignment.FencingToken + 1,
+        ReplicaNode = assignment.ReplicaNode == owner ? null : assignment.ReplicaNode,
+    };
 
     public bool RemoveShard(ShardKey shard)
     {
@@ -313,7 +357,7 @@ public sealed class PostgresMembershipStore : IMembershipStore
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"""
-            SELECT shard, node_name, fencing_token, originator
+            SELECT shard, node_name, fencing_token, originator, replica_node
             FROM {Schema}.melange_cluster_shards WHERE shard = @shard
             """;
         command.Parameters.AddWithValue("shard", unchecked((long)shard.Value));
@@ -326,8 +370,8 @@ public sealed class PostgresMembershipStore : IMembershipStore
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = nodeName is null
-            ? $"SELECT shard, node_name, fencing_token, originator FROM {Schema}.melange_cluster_shards WHERE node_name IS NULL ORDER BY shard"
-            : $"SELECT shard, node_name, fencing_token, originator FROM {Schema}.melange_cluster_shards WHERE node_name = @name ORDER BY shard";
+            ? $"SELECT shard, node_name, fencing_token, originator, replica_node FROM {Schema}.melange_cluster_shards WHERE node_name IS NULL ORDER BY shard"
+            : $"SELECT shard, node_name, fencing_token, originator, replica_node FROM {Schema}.melange_cluster_shards WHERE node_name = @name ORDER BY shard";
         if (nodeName is not null)
             command.Parameters.AddWithValue("name", nodeName);
         return ReadAssignments(command);
@@ -339,12 +383,22 @@ public sealed class PostgresMembershipStore : IMembershipStore
         command.Transaction = transaction;
         command.CommandText = $"""
             UPDATE {Schema}.melange_cluster_shards
-            SET node_name = @node, fencing_token = @token WHERE shard = @shard
+            SET node_name = @node, fencing_token = @token, replica_node = @replica WHERE shard = @shard
             """;
         command.Parameters.AddWithValue("node", (object?)assignment.NodeName ?? DBNull.Value);
+        command.Parameters.Add("replica", NpgsqlTypes.NpgsqlDbType.Text).Value = (object?)assignment.ReplicaNode ?? DBNull.Value;
         command.Parameters.AddWithValue("token", assignment.FencingToken);
         command.Parameters.AddWithValue("shard", unchecked((long)assignment.Shard.Value));
         command.ExecuteNonQuery();
+    }
+
+    private bool IsAlive(NpgsqlConnection connection, NpgsqlTransaction transaction, string nodeName)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"SELECT alive FROM {Schema}.melange_cluster_nodes WHERE node_name = @name";
+        command.Parameters.AddWithValue("name", nodeName);
+        return command.ExecuteScalar() is true;
     }
 
     private string? LeastLoadedNode(NpgsqlConnection connection, NpgsqlTransaction transaction, string? except)
@@ -375,7 +429,8 @@ public sealed class PostgresMembershipStore : IMembershipStore
                 new ShardKey(unchecked((ulong)reader.GetInt64(0))),
                 reader.IsDBNull(1) ? null : reader.GetString(1),
                 reader.GetInt64(2),
-                (ushort)reader.GetInt32(3)));
+                (ushort)reader.GetInt32(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4)));
         }
 
         return assignments;

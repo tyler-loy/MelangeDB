@@ -313,6 +313,7 @@ Meter name: `MelangeDB`.
 | `melange.cluster.nodes.declared_dead` | counter | `{node}` | `reason` | 30 |
 | `melange.cluster.lease.renewal_gap` | histogram | `ms` | `node` | 30 |
 | `melange.cluster.lease.lapses` | counter | `{lapse}` | `node` | 30 |
+| `melange.cluster.replica.lag` | gauge | `{record}` | `shard` | 30 |
 | `melange.backup.bytes` | counter | `By` | `outcome` | 15 |
 | `melange.backup.duration` | histogram | `ms` | `outcome` | 15 |
 
@@ -428,6 +429,21 @@ tiers were recorded, taking it from the running code; Information, and once per 
 of a shape sidecar written before uniqueness was recorded against its existing rows, found no
 duplicates, and recorded the columns in place; Information, and once per data directory
 (road-to-0.4 phase 27; a boot that finds duplicates refuses instead, and logs nothing under this id)
+— `1011 LogSegmentSealed` — a cluster shard's log opened under a higher ownership term than the
+directory was at, so the previous owner's segment was sealed at its last valid record and the new
+term appends to its own; Information, once per change of owner (road-to-0.4 phase 30, the storage
+fence; anything written to the old segment after this line is not history)
+— `1012 LogFollowerBootstrapped` — a shard replica's follower loaded the snapshot and began
+following the owner's log from the LSN named; Information, once at start and again after each
+`1013` — `1013 LogFollowerStartingOver` — the follower lost its place (a truncation passed its
+cursor, or the record it expected was not where the log said) and starts again from the snapshot;
+Warning, because a replica doing this repeatedly is a replica that is rarely warm (phase 30)
+— `1014 EngineWarmStarted` — an engine took over a log from a replica's projection instead of
+recovering from the snapshot, naming the replica's LSN and how many records it replayed past it;
+Information, once per promotion (phase 30 step 2e)
+— `1015 EngineWarmStartRefused` — a replica's projection was handed over but did not belong to the
+log (another epoch or originator, a cursor below the log's base or past its head), so the engine
+recovered cold; Warning, because the failover took the slow path it was meant to avoid
 — `1008 ShapeAdopted` — a boot that *adopted*
 the running code's schema as the meaning of records already on disk, because no shape sidecar
 existed: the only possible reading of those bytes, correct only if the upgrade rule was followed,
@@ -488,7 +504,7 @@ its retries for a shard-forwarded event; foreign events have no dead-letter file
 plainly — `1705 HandoffCompleted` and `1706 HandoffAborted` (the two ends every transfer saga reaches),
 `1707 ShardOpened` (which node, how long recovery took, recovered to which LSN — reassignment is recovery, and this is its receipt; the duration is the part of a failover window that grows with the shard),
 `1753 ShardOpenFailed` (an open that threw — the previous owner still holding the log, a damaged directory — retried on the next heartbeat; since #198 it no longer drops the hub link, so a recurring one is a stuck shard, not a flapping node), `1754 ShardOpenAbandoned` (a recovery that finished after the hub had moved the shard, or a drain, reap, or shutdown began — closed unused, expected under reassignment churn),
-`1755 DeadNodeSweepFailed` (the failure detector's tick threw, usually a membership-store outage; no node was declared dead that tick and the next one retries, where it used to take the hub process down, [#217](https://github.com/tyler-loy/MelangeDB/issues/217)), `1756 ShardsParkedOnLeaseExpiry` (a node's lease lapsed without a hub heartbeat, so it closed its shard engines and released their logs for whichever node the hub names; registering again reopens any still assigned, [#216](https://github.com/tyler-loy/MelangeDB/issues/216)), `1757 FailureTimeoutMismatch` (a node configured with a different `Cluster:FailureTimeoutMs` from its hub; the lease follows the hub's, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)), `1759 NodeLinkLostDeclaredDead` (with `Cluster:FastFailoverOnLinkLoss` on, a node whose link closed and stayed closed for a heartbeat interval was declared dead before its failure timeout, naming how long since its last heartbeat and how many shards moved; 1702 is the timeout path), `1758 UnownedSourceRefused` (the hub refused a border batch, border reset, or forwarded event from a node that no longer owns the source shard: a fenced node still publishing, [#218](https://github.com/tyler-loy/MelangeDB/issues/218)),
+`1755 DeadNodeSweepFailed` (the failure detector's tick threw, usually a membership-store outage; no node was declared dead that tick and the next one retries, where it used to take the hub process down, [#217](https://github.com/tyler-loy/MelangeDB/issues/217)), `1756 ShardsParkedOnLeaseExpiry` (a node's lease lapsed without a hub heartbeat, so it closed its shard engines and released their logs for whichever node the hub names; registering again reopens any still assigned, [#216](https://github.com/tyler-loy/MelangeDB/issues/216)), `1757 FailureTimeoutMismatch` (a node configured with a different `Cluster:FailureTimeoutMs` from its hub; the lease follows the hub's, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)), `1759 NodeLinkLostDeclaredDead` (with `Cluster:FastFailoverOnLinkLoss` on, a node whose link closed and stayed closed for a heartbeat interval was declared dead before its failure timeout, naming how long since its last heartbeat and how many shards moved; 1702 is the timeout path), `1761 ReplicaFollowFailed` (a replica's follower threw reading its shard's log; the next poll, 50 ms later, retries, and `melange.cluster.replica.lag` shows whether it is falling behind), `1762 ShardPromoted` (a shard opened on its replica's node from the replica's projection rather than by recovery: 1707's counterpart on the fast path, naming the open time, the replica's LSN and the head it reached), `1758 UnownedSourceRefused` (the hub refused a border batch, border reset, or forwarded event from a node that no longer owns the source shard: a fenced node still publishing, [#218](https://github.com/tyler-loy/MelangeDB/issues/218)),
 `1708 ShardReleased`, `1709 HubLinkLost` — the node's own view of a partition, ending in self-fencing if
 `Cluster:FailureTimeoutMs` passes first — `1710 HandoffUnresolved` — an import request that timed out or lost
 its link: the destination may or may not hold the import, so the player deliberately stays frozen until the
@@ -610,8 +626,8 @@ gauge. Handoff *rate* is the first counter over time; a growing `HandoffsUnresol
 
 Cluster link traffic is additionally counted per message type in `ClusterMetrics`, as messages **and payload
 bytes** in each direction (phase 10 added the bytes). Border-band bandwidth is read straight off it: sum the
-`border-apply` / `border-reset-apply` types received on a node to see what holding its neighbours' edges
-costs, and the `border-batch` / `border-reset` types sent to see what serving its own edges costs.
+`border-apply` / `border-reset-part-apply` types received on a node to see what holding its neighbours' edges
+costs, and the `border-batch` / `border-reset-part` types sent (a band reset travels in parts of at most about 16 MiB, so a large one is many frames; `border-reset` and `border-reset-apply` are the single-frame form, which only a node from before parts still sends) to see what serving its own edges costs.
 
 The **shard ownership map** is a first-class query: `MelangeClusterCoordinator.OwnershipMap()` returns every
 shard, its owning node, and its fencing term, straight from the membership store — the same truth the hub

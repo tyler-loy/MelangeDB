@@ -157,4 +157,64 @@ public class PostgresMembershipTests
         Assert.True(store.Heartbeat("a", T0.AddSeconds(3)));
         Assert.Equal(T0.AddSeconds(3), store.Nodes().Single().LastSeen);
     }
+
+    /// <summary>
+    /// Phase 30 step 2d: the replica column round-trips, a replica never sits on its owner, and the
+    /// store clears it where a death or a change of owner would leave it pointing wrong, without
+    /// touching the fencing token.
+    /// </summary>
+    [Fact]
+    public void A_replica_is_recorded_and_cleared_where_a_death_or_a_move_would_leave_it_wrong()
+    {
+        var (store, _) = CreateStore();
+        store.RegisterNode("a", "http://a", T0);
+        store.RegisterNode("b", "http://b", T0);
+        store.RegisterNode("c", "http://c", T0);
+        var shard = new ShardKey(77);
+        var owner = store.EnsureShard(shard, T0).NodeName!;
+        var other = new[] { "a", "b", "c" }.First(n => n != owner);
+
+        Assert.Throws<InvalidOperationException>(() => store.SetReplica(shard, owner));
+        var placed = store.SetReplica(shard, other);
+        Assert.Equal(other, placed.ReplicaNode);
+        Assert.Equal(1, placed.FencingToken); // A replica owns nothing: no new term.
+        Assert.Equal(other, store.GetAssignment(shard)!.ReplicaNode);
+
+        // The owner moves onto the replica's node: no replica on the owner.
+        var moved = store.Reassign(shard, other, T0);
+        Assert.Null(moved.ReplicaNode);
+
+        // A replica's node dies: the replica goes with it.
+        var third = new[] { "a", "b", "c" }.First(n => n != other && n != owner);
+        store.SetReplica(shard, third);
+        store.MarkDead(third, T0);
+        Assert.Null(store.GetAssignment(shard)!.ReplicaNode);
+        Assert.Throws<InvalidOperationException>(() => store.SetReplica(shard, third));
+    }
+
+    /// <summary>
+    /// Phase 30 step 2e: a dead owner's shard goes to its replica's node, which holds the warm
+    /// projection, even when another node is the least loaded. The token is bumped as for any
+    /// death, and the shard has no replica until the hub places a new one.
+    /// </summary>
+    [Fact]
+    public void A_dead_owners_shard_goes_to_its_replica_rather_than_the_least_loaded_node()
+    {
+        var (store, _) = CreateStore();
+        store.RegisterNode("a", "http://a", T0);
+        store.RegisterNode("b", "http://b", T0);
+        store.RegisterNode("c", "http://c", T0);
+        var shard = new ShardKey(78);
+        var before = store.EnsureShard(shard, T0);
+
+        // The non-owner the least-loaded rule would not pick: the later name on a tie.
+        var replica = new[] { "a", "b", "c" }.Where(n => n != before.NodeName).Max(StringComparer.Ordinal)!;
+        store.SetReplica(shard, replica);
+
+        var promoted = Assert.Single(store.MarkDead(before.NodeName!, T0));
+        Assert.Equal(replica, promoted.NodeName);
+        Assert.Equal(before.FencingToken + 1, promoted.FencingToken);
+        Assert.Null(promoted.ReplicaNode);
+        Assert.Equal(promoted, store.GetAssignment(shard));
+    }
 }

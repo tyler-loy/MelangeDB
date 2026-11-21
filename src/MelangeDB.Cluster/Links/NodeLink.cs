@@ -22,7 +22,7 @@ public sealed class NodeLinkException(string message, bool isPeerError = false) 
 /// "zero cross-node traffic" acceptance test counts these — network calls, not code inspection —
 /// so every frame that crosses a link increments here, heartbeats included (tests exclude them by
 /// type name). The byte counters are the border-band bandwidth measure: sum the
-/// <c>border-apply</c>/<c>border-reset-apply</c> types on a node to see what its neighbours'
+/// <c>border-apply</c>/<c>border-reset-part-apply</c> types on a node to see what its neighbours'
 /// edges cost it.
 /// </summary>
 public sealed class ClusterMetrics
@@ -377,9 +377,23 @@ internal sealed class NodeLink : IDisposable
     private static JsonElement? ToElement(object? body) =>
         body is null ? null : JsonSerializer.SerializeToElement(body, body.GetType());
 
+    /// <summary>
+    /// The largest frame payload a link accepts. A reader that receives a larger one cannot trust
+    /// the stream and drops the link, so a sender refuses to write one: the request fails on its
+    /// own, and the link, with every other shard's traffic and the node's lease, survives. A
+    /// message that can grow with a shard's data (a border reset) is sent in parts instead.
+    /// </summary>
+    internal const int MaxFramePayloadBytes = 64 * 1024 * 1024;
+
     private static (byte[] Buffer, int PayloadLength) Encode(WireFrame frame)
     {
         var payload = JsonSerializer.SerializeToUtf8Bytes(frame);
+        if (payload.Length > MaxFramePayloadBytes)
+        {
+            throw new NodeLinkException(
+                $"A '{frame.Type}' frame of {payload.Length} bytes exceeds the node link's {MaxFramePayloadBytes}-byte limit; it was not sent.");
+        }
+
         var buffer = new byte[4 + payload.Length];
         BinaryPrimitives.WriteInt32LittleEndian(buffer, payload.Length);
         payload.CopyTo(buffer, 4);
@@ -437,7 +451,7 @@ internal sealed class NodeLink : IDisposable
             {
                 _stream.ReadExactly(header);
                 var length = BinaryPrimitives.ReadInt32LittleEndian(header);
-                if (length is <= 0 or > 64 * 1024 * 1024)
+                if (length is <= 0 or > MaxFramePayloadBytes)
                     throw new InvalidDataException($"Node-link frame length {length} is out of range.");
                 var payload = new byte[length];
                 _stream.ReadExactly(payload);
