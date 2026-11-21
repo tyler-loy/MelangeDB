@@ -91,10 +91,15 @@ public sealed class InMemoryMembershipStore : IMembershipStore
             foreach (var replicated in _shards.Values.Where(a => a.ReplicaNode == nodeName).ToList())
                 _shards[replicated.Shard] = replicated with { ReplicaNode = null };
 
+            // A shard with a live replica goes to the replica's node, which promotes its warm
+            // projection; the rest take the cold path on the least-loaded node.
             var changed = new List<ShardAssignment>();
             foreach (var assignment in _shards.Values.Where(a => a.NodeName == nodeName).ToList())
             {
-                var next = WithOwner(assignment, LeastLoadedNode(except: nodeName));
+                var replica = assignment.ReplicaNode is { } candidate && _nodes.TryGetValue(candidate, out var node) && node.Alive
+                    ? candidate
+                    : null;
+                var next = WithOwner(assignment, replica ?? LeastLoadedNode(except: nodeName));
                 _shards[assignment.Shard] = next;
                 changed.Add(next);
             }

@@ -166,6 +166,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         }
     }
 
+    /// <summary>For the failover tool: how far this node's replica of <paramref name="shard"/> has applied; null without one.</summary>
+    internal ulong? ReplicaAppliedLsn(ShardKey shard) => TryGetFollower(shard)?.AppliedLsn;
+
     /// <summary>
     /// Diffs the hub's replica list against the running followers (phase 30 step 2d): new ones
     /// start, dropped ones stop, and each ceiling rises to the owner's latest durable LSN. A shard
@@ -174,9 +177,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private void ApplyReplicas(ReplicaDto[] replicas)
     {
         HashSet<ShardKey> owned;
+        HashSet<ShardKey> promoting;
         lock (_shardsLock)
         {
             owned = [.. _assigned.Keys];
+
+            // Assigned here but not open yet: the open promotes the follower (step 2e), so it is
+            // left for the open to take rather than stopped under it.
+            promoting = [.. _assigned.Keys.Where(shard => !_shards.ContainsKey(shard))];
         }
 
         var wanted = replicas.Where(r => !owned.Contains(new ShardKey(r.Shard))).ToDictionary(static r => r.Shard);
@@ -185,7 +193,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         {
             foreach (var (shard, follower) in _followers.ToList())
             {
-                if (wanted.ContainsKey(shard))
+                if (wanted.ContainsKey(shard) || promoting.Contains(new ShardKey(shard)))
                     continue;
                 _followers.Remove(shard);
                 stopped.Add(follower);
@@ -221,12 +229,60 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         var options = MelangeOptionsClone.DeepClone(_options.CurrentValue);
         options.CommitLog.Path = Path.Combine(Cluster.ShardDataPath, $"shard-{replica.Shard}", "log");
         options.HotStore.Path = Path.Combine(LocalScratch, $"replica-{replica.Shard}");
+        var schema = _services.GetRequiredService<SchemaRegistry>();
+        ApplyReplicaResidency(options, schema, Cluster.ReplicaResidency);
         return new LogFollower(
             options,
-            _services.GetRequiredService<SchemaRegistry>(),
+            schema,
             replica.Originator,
             _loggerFactory,
             _services.GetService<IHotStoreProvider>());
+    }
+
+    /// <summary>
+    /// Promotion's first half (phase 30 step 2e): stops this node's follower of
+    /// <paramref name="shard"/>, if it has one, and hands over its projection for the owner's engine
+    /// to start from. Null when there is none to hand over (no follower, not bootstrapped yet, or a
+    /// place in the log that can no longer be trusted); the open then recovers cold.
+    /// </summary>
+    private WarmStart? TakeReplica(ShardKey shard)
+    {
+        LogFollower? follower;
+        lock (_followersLock)
+        {
+            if (_followers.Remove(shard.Value, out follower) is false)
+                return null;
+        }
+
+        // The poll loop may hold it mid-poll; the lock waits that out, and the loop skips a
+        // disposed follower afterwards.
+        lock (follower)
+        {
+            try
+            {
+                return follower.Release();
+            }
+            catch (Exception exception)
+            {
+                LogReplicaFollowFailed(_logger, shard.Value, exception.Message);
+                follower.Dispose();
+                return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// <c>Cluster:ReplicaResidency</c> on a replica's options: <see cref="ReplicaResidency.Paged"/>
+    /// pins every table to paged, overriding attributes and <c>Residency:*</c> alike. A promoted
+    /// replica keeps the residency it was built with until the shard next opens cold.
+    /// </summary>
+    internal static void ApplyReplicaResidency(MelangeDbOptions options, SchemaRegistry schema, ReplicaResidency residency)
+    {
+        if (residency != ReplicaResidency.Paged)
+            return;
+        options.Residency.Default = Residency.Paged;
+        foreach (var table in schema.Tables)
+            options.Residency.PerTable[table.Name] = Residency.Paged;
     }
 
     /// <summary>The followers' poll loop: one thread for all of this node's replicas.</summary>
@@ -726,7 +782,8 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 _loggerFactory,
                 _time,
                 _authenticator,
-                _sessions);
+                _sessions,
+                () => TakeReplica(shard));
             var openMs = _time.GetElapsedTime(started).TotalMilliseconds;
 
             lock (_shardsLock)
@@ -744,7 +801,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 // that bumped it while recovery ran must not be lost.
                 runtime.FencingToken = current.FencingToken;
                 PublishLocked(shard, runtime);
-                LogShardOpened(_logger, shard.Value, NodeName, openMs, runtime.Engine.Log.HeadLsn);
+                if (runtime.Engine.WarmStartedFrom is { } from)
+                    LogShardPromoted(_logger, shard.Value, NodeName, openMs, from, runtime.Engine.Log.HeadLsn);
+                else
+                    LogShardOpened(_logger, shard.Value, NodeName, openMs, runtime.Engine.Log.HeadLsn);
                 runtime = null; // Published: the shard set owns it now.
             }
 
@@ -1687,6 +1747,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     [LoggerMessage(EventId = 1707, EventName = "ShardOpened", Level = LogLevel.Information,
         Message = "Shard {Shard} opened on node '{NodeName}' in {OpenMs:F0}ms, recovered to LSN {HeadLsn} from its own log.")]
     private static partial void LogShardOpened(ILogger logger, ulong shard, string nodeName, double openMs, ulong headLsn);
+
+    [LoggerMessage(EventId = 1762, EventName = "ShardPromoted", Level = LogLevel.Information,
+        Message = "Shard {Shard} promoted from its replica on node '{NodeName}' in {OpenMs:F0}ms: the replica stood at LSN {FromLsn}, and the shard is at LSN {HeadLsn}.")]
+    private static partial void LogShardPromoted(ILogger logger, ulong shard, string nodeName, double openMs, ulong fromLsn, ulong headLsn);
 
     [LoggerMessage(EventId = 1761, EventName = "ReplicaFollowFailed", Level = LogLevel.Warning,
         Message = "Following shard {Shard}'s log for its replica failed ({Reason}); the next poll tries again.")]

@@ -67,4 +67,30 @@ public class MembershipStoreTests
         Assert.True(store.Heartbeat("a", T0.AddSeconds(1)));
         Assert.Equal(T0.AddSeconds(1), store.Nodes().Single().LastSeen);
     }
+
+    /// <summary>
+    /// Phase 30 step 2e: a dead owner's shard goes to its replica's node, which holds the warm
+    /// projection, even when another node is the least loaded. The token is bumped as for any
+    /// death, and the shard has no replica until the hub places a new one.
+    /// </summary>
+    [Fact]
+    public void A_dead_owners_shard_goes_to_its_replica_rather_than_the_least_loaded_node()
+    {
+        var store = new InMemoryMembershipStore();
+        store.RegisterNode("a", "http://a", T0);
+        store.RegisterNode("b", "http://b", T0);
+        store.RegisterNode("c", "http://c", T0);
+        var shard = new ShardKey(1);
+        var before = store.EnsureShard(shard, T0);
+
+        // The non-owner the least-loaded rule would not pick: the later name on a tie.
+        var replica = new[] { "a", "b", "c" }.Where(n => n != before.NodeName).Max(StringComparer.Ordinal)!;
+        store.SetReplica(shard, replica);
+
+        var promoted = Assert.Single(store.MarkDead(before.NodeName!, T0));
+        Assert.Equal(replica, promoted.NodeName);
+        Assert.Equal(before.FencingToken + 1, promoted.FencingToken);
+        Assert.Null(promoted.ReplicaNode);
+        Assert.Equal(promoted, store.GetAssignment(shard));
+    }
 }

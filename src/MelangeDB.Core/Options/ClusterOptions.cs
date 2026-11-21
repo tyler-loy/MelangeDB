@@ -1,5 +1,15 @@
 namespace MelangeDB.Core;
 
+/// <summary>How a shard's warm replica holds its tables (<c>Cluster:ReplicaResidency</c>).</summary>
+public enum ReplicaResidency
+{
+    /// <summary>As the owner does: the same <c>Residency:*</c> resolution, the same memory cost.</summary>
+    Owner,
+
+    /// <summary>Every table paged, whatever its attribute or <c>Residency:*</c> says.</summary>
+    Paged,
+}
+
 /// <summary>The role a node plays in a cluster (<c>Cluster:Role</c>).</summary>
 public enum ClusterRole
 {
@@ -145,6 +155,15 @@ public sealed class ClusterOptions
     /// another node.
     /// </summary>
     public int ShardReplicas { get; set; } = 1;
+
+    /// <summary>
+    /// How a warm replica holds its shard's tables. <see cref="ReplicaResidency.Owner"/> (the
+    /// default) resolves residency exactly as the owner does, so a promoted replica serves at the
+    /// owner's speed from its first call. <see cref="ReplicaResidency.Paged"/> pages every table,
+    /// for deployments short of memory: the replica costs disk rather than RAM, and a promoted one
+    /// faults its working set in from disk as it is used.
+    /// </summary>
+    public ReplicaResidency ReplicaResidency { get; set; } = ReplicaResidency.Owner;
 
     /// <summary>
     /// Where a shard node keeps the scratch that is its own: shard hot stores (owned and replica
