@@ -482,9 +482,11 @@ shard directory — `1717 TransferListenerFailed`, an `IShardTransferListener` t
 durable regardless, but the application's session map may lag until the idempotent listener runs again —
 `1718 GatewaySwapCompleted` (Debug: a client's shard attachment swapped seamlessly — how many subscriptions
 re-scoped and held calls flushed; the client observed nothing), `1719 GatewaySwapFailed` (the swap could not
-complete; the client converges through the ordinary resync path), `1720 GatewayHandoffQueueOverflow` (a
-client queued more than the cap during one transfer; further calls get a retryable error),
-`1721 GatewayPreopened` (Debug: a destination session opened on approach, so the swap is instant), and
+complete; its held calls go to the shard's current owner and the client gets an `overflow_resync` error to
+re-establish subscriptions), `1720 GatewayHandoffQueueOverflow` (a client queued more than the cap during
+one transfer; further calls get a retryable error — sustained, it means a transfer is not ending),
+`1721 GatewayPreopened` (Debug: a destination session opened on approach, so the swap is instant),
+`1760 GatewayPreopenFailed` (Debug: that pre-open had failed, so the swap connected afresh), and
 `1722 HandoffRequestStale` (Debug: a transfer request dropped because the sender is not the entity's current
 owner — the fencing rule applied to triggers, and the guard that stops a stale origin from re-importing the
 past over the present) (10).
