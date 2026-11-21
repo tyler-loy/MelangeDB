@@ -228,6 +228,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             () => OnUpstreamClosed(self),
             _gateway.CountUpstreamSent,
             _gateway.CountUpstreamReceived,
+            _gateway.UpstreamConnectTimeout,
             ct).ConfigureAwait(false);
         self = connected;
         return connected;
@@ -427,11 +428,17 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
 
     /// <summary>
     /// A freshly created (or freshly reassigned) shard is opened by its owner on the owner's
-    /// next heartbeat; retry across that window rather than surfacing a transient 404.
+    /// next heartbeat, and a dead owner is replaced only once the hub declares it dead; retry
+    /// across that window rather than surfacing a transient failure. Each attempt re-resolves the
+    /// owner and is bounded by <see cref="GatewayRuntime.UpstreamConnectTimeout"/>, and the whole
+    /// retry by <see cref="GatewayRuntime.ShardAttachBudget"/>, sized from the failure timeout so
+    /// that it outlasts a reassignment instead of expiring inside one.
     /// </summary>
     private async Task<UpstreamSession> ConnectShardAsync(ShardKey shard, CancellationToken ct)
     {
-        for (var attempt = 1; ; attempt++)
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var budget = _gateway.ShardAttachBudget;
+        while (true)
         {
             try
             {
@@ -439,7 +446,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 return await ConnectUpstreamAsync(_gateway.ShardSocketUri(publicAddress, shard), firesLifecycle: false, ct)
                     .ConfigureAwait(false);
             }
-            catch (Exception) when (attempt < 20)
+            catch (Exception) when (!ct.IsCancellationRequested && System.Diagnostics.Stopwatch.GetElapsedTime(started) < budget)
             {
                 await Task.Delay(250, ct).ConfigureAwait(false);
             }

@@ -43,6 +43,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A client on a shard whose machine died no longer hangs**
+  ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). The gateway's upstream connect had
+  no timeout. A dead process refuses connections, but a dead machine answers nothing, so the
+  connect waited out the OS TCP timeout (about 21 s on Windows, about two minutes on stock Linux)
+  while holding the client's attachment lock, and every shard call that client made waited
+  behind it. Each upstream handshake is now bounded (`Cluster:FailureTimeoutMs / 4`, 1–5 s). The
+  shard attachment's retry, previously a fixed 20 × 250 ms that on a fast-refusing OS ran out
+  before the hub had even declared the node dead, now lasts `2 × Cluster:FailureTimeoutMs`, so a
+  call waits out a reassignment instead of failing inside it. Failed handshakes also dispose
+  their socket now.
 - **A node that takes over a dead node's shard no longer stops heartbeating while it recovers it**
   ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). The open, a full replay of the
   shard's snapshot and log tail, ran inside the heartbeat loop. So a recovery longer than
