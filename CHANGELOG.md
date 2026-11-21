@@ -37,6 +37,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **Paged FASTER scans read a block of rows at a time, about 8× faster on a large shard**
+  ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)). A paged scan used to read one row
+  at a time, each row a synchronous random read of its main record and then its out-of-line
+  payloads. Scans now issue the reads for 128 rows, wait once, then do the same for their
+  payloads. A snapshot of a 1M-row shard (256 B rows) went from 4–5.5 min to 29–41 s, and a
+  300k-row one from 19.4 s to 4.5 s. This covers snapshots, border resets, subscription initial
+  sets, and index scans: everything that materializes paged rows. Row order, the directory as the
+  source of truth, unreadable-row skipping (EventId 1511), and a read view's pinned values are
+  unchanged. Each block holds the store lock for about 2 ms, where a single row used to hold it for
+  about 250 µs. A scan whose store is disposed mid-scan can still return the rest of the block it
+  had already read before it reports `ObjectDisposedException`.
 - **A reducer call with the wrong number of arguments names the problem.** Instead of
   `Expected 3 argument(s); the call carries 2.`, a short call is told which parameters it is
   missing and that only a defaulted parameter can be left off, and a long one is told the

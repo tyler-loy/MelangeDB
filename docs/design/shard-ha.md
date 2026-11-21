@@ -165,10 +165,9 @@ alternative and what it gives up.
   left. Shared filesystems can be slow to show appends to an open handle (NFS caches attributes),
   so the tailer reopens per poll. The lag has to be measured, not assumed.
 - **Bootstrap is ordinary recovery, read-only:** the snapshot file plus the tail. A replica whose
-  cursor falls behind the log's base after a truncation re-bootstraps the same way. That path
-  reads through the paged scan in [#212](https://github.com/tyler-loy/MelangeDB/issues/212), so a
-  FASTER replica of a large shard takes minutes to come up warm. That is acceptable for standing up
-  a replica and is one more reason to fix #212.
+  cursor falls behind the log's base after a truncation re-bootstraps the same way. The snapshot
+  it bootstraps from is written through the paged scan, which reads a block of rows at a time since
+  [#212](https://github.com/tyler-loy/MelangeDB/issues/212): about 30–40 s for a 1M-row FASTER shard, down from 4–5.5 min.
 - **Promotion:** the hub assigns the shard to the replica's node under term *t+1*. The replica cuts
   segment *t*, replays from its cursor to the cut, opens segment *t+1*, and publishes the shard.
   The expected cost is the unapplied tail: milliseconds when the replica was current.

@@ -91,10 +91,9 @@ What it says about the design:
    outliving its disposed store, now a clean `ObjectDisposedException`. Underneath it, a border
    reset scanned the whole paged shard under the engine lock, silencing the heartbeat until the hub
    fenced the live node ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)); it now scans a
-   pinned view off the lock. The 1M-row window is about 19 s, the same shape as the rest. What
-   remains is that paged scans are slow, not blocking
-   ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)): a replica bootstrap reads through
-   that path, so phase 30 inherits it.
+   pinned view off the lock. The 1M-row window is about 19 s, the same shape as the rest. Paged
+   scans were also slow, at 4–5.5 min for a 1M-row snapshot; reading a block of rows at a time cut
+   that to 29–41 s ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)).
 
 ## Reopening trigger (fired)
 
