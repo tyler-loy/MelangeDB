@@ -15,6 +15,14 @@ namespace MelangeDB.Server;
 /// </summary>
 internal sealed class MelangeTransport : ICommitObserver, IDisposable
 {
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IServiceProvider, MelangeTransport> ByHost = new();
+
+    /// <summary>Records the transport <c>MapMelangeSocket</c> built for this host, so other surfaces (the MCP endpoint) share it.</summary>
+    internal static void Register(IServiceProvider services, MelangeTransport transport) => ByHost.AddOrUpdate(services, transport);
+
+    /// <summary>The transport <c>MapMelangeSocket</c> built for this host, or null if it has not been mapped.</summary>
+    internal static MelangeTransport? For(IServiceProvider services) => ByHost.TryGetValue(services, out var transport) ? transport : null;
+
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
     private readonly ConcurrentDictionary<ConnectionId, MelangeSocketConnection> _connections = new();
     private readonly ConcurrentDictionary<Identity, int> _connectionsPerIdentity = new();

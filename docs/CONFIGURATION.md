@@ -287,6 +287,19 @@ to its admin console without also serving unauthenticated-in-effect bulk writes 
 | `Backup:OwnerRole` | string | `melange-backup-owner` | live | 15 | The role claim that authorizes a caller on `/melange/backup`, per the `Sql:OwnerRole` precedent (the IdP is the gate). Deliberately its own key — read-everything-as-archive, read-everything-as-queries, and write-anything are three capabilities; an operator who wants one god-role sets the keys to one value. A caller without it is refused (`403 owner_required`), never silently downgraded. Empty makes the endpoint unusable by everyone. |
 | `Backup:StreamStallTimeoutMs` | int | `60000` | live | 15 | How long the backup stream tolerates a stalled client before aborting and releasing the truncation pin. The pin is what makes an online backup consistent, and like every truncation pin (saga markers, subscriber checkpoints) it must be bounded — a wedged backup client must not become a full disk. |
 
+## Agent endpoint (MCP)
+
+**Shipped as of road-to-0.4 phase 29** (defaults verified against `McpOptions`): the gate for
+`MelangeDB.Mcp`'s endpoint. The reducer allowlist is deliberately not configuration: it is named
+in code (`AddMelangeMcp(mcp => mcp.AllowReducers(...))`), so a grant is visible in review and
+cannot be widened by an environment variable. See [MCP.md](MCP.md).
+
+| Key | Type | Default | Reload | Phase | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `Mcp:Enabled` | bool | `false` | live | 29 | Gates the MCP endpoint (`{Transport:Path}/mcp`); off answers `403 mcp_disabled`. Off by default per the `Sql:*` posture: an endpoint that answers SQL is a production surface the moment it is on. |
+| `Mcp:OwnerRole` | string | `melange-agent` | live | 29 | The role claim that authorizes a caller on the MCP endpoint, its own key per the `Bulk:OwnerRole`/`Backup:OwnerRole` precedent: "an agent may look" is a different capability from "a person may query". A caller without it is refused (`403 owner_required`). It grants the endpoint only; `query` still runs under `Sql:*`, so owner SQL still needs `Sql:OwnerRole`. Empty makes the endpoint unusable by everyone. |
+| `Mcp:AllowReducersInProduction` | bool | `false` | live | 29 | Whether the reducers named with `AllowReducers` may be called outside the Development environment. Off, `call_reducer` refuses everywhere but Development; reads are unaffected. The failure it prevents is a write-capable agent endpoint nobody remembers is live. |
+
 ## Transport and subscriptions
 
 | Key | Type | Default | Reload | Phase | Notes |

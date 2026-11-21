@@ -105,6 +105,7 @@ Source name: `MelangeDB`.
 | `melange.event.handle` | 06 | `melange.event.type`, `melange.handler` | **Linked, not parented** — see below. |
 | `melange.scheduler.tick` | 05 | `melange.reducer.name`, `melange.shard` (attribute from 09) | A tick has no client parent, so it starts a new trace. |
 | `melange.producer` | 26 | `melange.producer.name`, `melange.producer.outcome` (`ok`/`invalid_args`/`rate_limited`/`denied`/`rejected`/`timeout`/`too_many_bytes`/`error`); `melange.caller` unless `Telemetry:IncludeCallerIdentity` is off | Parented to the client's `traceparent` when one was sent, as `melange.reducer` is. Producers write nothing, so no `melange.commit` span ever sits under one. |
+| `melange.mcp.tool` | 29 | `melange.mcp.tool` (the tool's name), `melange.mcp.outcome` (`ok`/`refused`/`error`), `melange.error.code` on a refusal (the wire code: `sql_disabled`, `reducer_not_allowed`, `rejected`, ...), `melange.reducer` for `call_reducer` | One per agent tool call on the MCP endpoint. A `call_reducer` span parents the call's `melange.reducer` span, which records the caller under `Telemetry:IncludeCallerIdentity` as always. |
 | `melange.handoff` | 09 | `melange.shard.from`, `melange.shard.to` | Spans two processes. This is where distributed tracing earns its keep. |
 
 A `melange.reducer` span that exceeds `Telemetry:SlowReducerMs` additionally carries a

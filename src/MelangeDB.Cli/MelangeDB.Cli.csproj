@@ -5,7 +5,7 @@
     <OutputType>Exe</OutputType>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>melange</ToolCommandName>
-    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md).</Description>
+    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md). `melange mcp` bridges a local agent's stdio to a running host's MCP endpoint (docs/MCP.md).</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,6 +17,12 @@
          the machinery that writes them — the CLI must never grow a second implementation of a
          format the engine owns. `schema` still depends on nothing but the BCL. -->
     <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- `melange mcp`, the stdio bridge to a host's agent endpoint: the official SDK's client
+         toward the host and its stdio server toward the agent. -->
+    <PackageReference Include="ModelContextProtocol" Version="2.4.0" />
   </ItemGroup>
 
 </Project>

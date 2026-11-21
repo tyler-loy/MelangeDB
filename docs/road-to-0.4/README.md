@@ -33,7 +33,7 @@ seventh:
 | A constraint added by migration is checked against existing rows | 2.7 | Built in phase 27 | [Phase 27](plan-phase-27.md) |
 | Old clients survive added columns | 2.16.1 | A stale client is refused at subscribe | [Phase 28](plan-phase-28.md) |
 | Automatic reconnect with backoff and token refresh | 2.12 | Manual `ReconnectAsync` | [Phase 28](plan-phase-28.md) |
-| An agent (MCP) endpoint over schema, SQL, and reducer calls | 2.7–2.10 | Nothing | [Phase 29](plan-phase-29.md) |
+| An agent (MCP) endpoint over schema, SQL, and reducer calls | 2.7–2.10 | **Built**: `MelangeDB.Mcp` (single node) | [Phase 29](plan-phase-29.md) |
 | HA replication of a single database | 2.10 (Maincloud) | Recovery by reassignment only | Phase 30, committed; designed from [phase 20](../road-to-0.3/plan-phase-20.md)'s window |
 
 **Catching up does not mean copying.** Each row is answered in this project's own terms, and two of
@@ -52,7 +52,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | [23](../road-to-0.3/plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate`. **Carried from 0.3** | Planned |
 | [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | **Built**; fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |
-| [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | Planned |
+| [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | **Built** for a single node 2026-11-21 ([MCP.md](../MCP.md)); cluster routing of reducer calls left |
 | 30 | Shard HA ([step 2 plan](plan-phase-30.md)) | **Built** 2026-11-21: the fence (step 0, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), detection, then the warm replica and promotion ([design record](../design/shard-ha.md)). Fast failover stays opt-in |
 | 31 | Throughput: the capacity ceiling re-measured, then shared fan-out | Planned, **last in 0.4** (owner, 2026-11-21); ideas below |
 

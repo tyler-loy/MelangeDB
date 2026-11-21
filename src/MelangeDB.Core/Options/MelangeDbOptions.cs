@@ -34,6 +34,8 @@ public sealed class MelangeDbOptions
 
     public BackupOptions Backup { get; set; } = new();
 
+    public McpOptions Mcp { get; set; } = new();
+
     public SchedulerOptions Scheduler { get; set; } = new();
 
     public EventsOptions Events { get; set; } = new();
@@ -532,6 +534,33 @@ public sealed class BulkOptions
     /// </para>
     /// </summary>
     public bool CreateShards { get; set; }
+}
+
+/// <summary>The agent endpoint's options (<c>MelangeDb:Mcp:*</c>), read by the <c>MelangeDB.Mcp</c> package.</summary>
+public sealed class McpOptions
+{
+    /// <summary>
+    /// Whether the MCP endpoint answers at all. Off by default per the <c>Sql:*</c> posture: an
+    /// endpoint that answers SQL is a production surface the moment it is on. While off it
+    /// answers <c>403 mcp_disabled</c>. Live: read per request.
+    /// </summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// The role claim that authorizes a caller on the MCP endpoint, its own key per the
+    /// <c>Bulk:OwnerRole</c>/<c>Backup:OwnerRole</c> precedent: "an agent may look" is a different
+    /// capability from "a person may query". A caller without it is refused outright. Empty makes
+    /// the endpoint unusable by everyone. Holding it grants the endpoint, not owner SQL: the
+    /// <c>query</c> tool still runs under <c>Sql:*</c> exactly as <c>{path}/sql</c> does.
+    /// </summary>
+    public string OwnerRole { get; set; } = "melange-agent";
+
+    /// <summary>
+    /// Whether the reducers named with <c>AllowReducers</c> may be called outside the Development
+    /// environment. Off by default: the failure it prevents is a write-capable agent endpoint
+    /// nobody remembers is live. Reads are not affected. Live: read per call.
+    /// </summary>
+    public bool AllowReducersInProduction { get; set; }
 }
 
 /// <summary>Online backup options (<c>MelangeDb:Backup:*</c>).</summary>

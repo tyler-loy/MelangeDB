@@ -1,6 +1,6 @@
 # Phase 29 — The agent surface
 
-**Status: Planned.**
+**Status: Built for a single node** (2026-11-21); cluster routing of reducer calls is the one deliverable left. See [MCP.md](../MCP.md) and the as-built notes at the end.
 
 **Goal:** an opt-in package, `MelangeDB.Mcp`, that exposes a [Model Context
 Protocol](https://modelcontextprotocol.io) endpoint from the developer's own host. A coding agent
@@ -85,10 +85,14 @@ opinionated agent prompt pack. Those stay out (see [Out of scope](#out-of-scope)
 
 ## Decisions to settle
 
+All three settled by the owner on 2026-11-21, each as leaned. The reasoning is kept below. The SDK,
+checked at phase start: `ModelContextProtocol.AspNetCore` 2.4.0 (published 2026-11-07), the
+official C# SDK, with its streamable HTTP transport hosted in the developer's pipeline.
+
 ### Whether reducer calls ship in the first release at all
 
 They are what makes the endpoint useful for testing gameplay from an agent, and also the only part
-that can change the world. **Leaning:** ship them, but only by name and only with an explicit
+that can change the world. **Settled: ship them** (owner, 2026-11-21), but only by name and only with an explicit
 identity per reducer, so the default install is read-only and the grant is visible in code review.
 The alternative, read-only in v1 with writes later, is defensible if the threat-model section
 cannot bound prompt-injected calls to something the allowlist makes acceptable.
@@ -98,12 +102,40 @@ cannot bound prompt-injected calls to something the allowlist makes acceptable.
 An endpoint that answers SQL is a production surface the moment it is enabled. `Mcp:Enabled`
 defaulting to off covers a deployment that never opted in. **Open:** whether that is enough, or
 whether reducer calls additionally refuse outside the Development environment unless an explicit
-`Mcp:AllowReducersInProduction` is set. **Leaning:** the extra flag for reducers only. Reads follow
+`Mcp:AllowReducersInProduction` is set. **Settled: the extra flag, for reducers only** (owner,
+2026-11-21). Reads follow
 the `/melange/sql` precedent exactly, and the failure the flag prevents is a write-capable agent
 endpoint nobody remembers is live.
 
 ### Transport
 
 MCP's HTTP transport, hosted in the developer's ASP.NET pipeline, is the natural fit for a library.
-The stdio bridge covers agents that only speak stdio. **Leaning:** HTTP in the package, stdio only
-in the CLI bridge, and nothing else.
+The stdio bridge covers agents that only speak stdio. **Settled: HTTP in the package, stdio only in
+the CLI bridge, and nothing else** (owner, 2026-11-21).
+
+## As built
+
+- **`MelangeDB.Mcp`** over `ModelContextProtocol.AspNetCore` 2.4.0: `AddMelangeMcp(mcp => ...)`
+  registers a stateless streamable-HTTP server and its tools; `MapMelangeMcp()` maps it at
+  `{Transport:Path}/mcp`. Every mapped endpoint is wrapped by a gate (through an endpoint
+  convention, since `MapMcp` endpoints take no endpoint filters): `Mcp:Enabled`, then the host's
+  own token validation (the transport's authenticator, shared with `MapMelangeSocket`), then
+  `Mcp:OwnerRole`.
+- **One SQL implementation.** `/melange/sql`'s body moved into `AdHocSql` (gates, the row path,
+  the aggregate path), which the HTTP endpoint and the `query` tool both call, so an agent gets the
+  endpoint's exact answer and exact refusal. The HTTP behaviour is unchanged.
+- **`call_reducer`** is one tool rather than one per reducer: the allowlist is in its description
+  and its refusal, and `describe_schema` carries the parameters. It is registered only when the
+  allowlist is non-empty. Unknown or non-standard names fail at map time.
+- **`signals`** is a `MeterListener` over the `MelangeDB` meters, bounded at 1,000 series: gauges at
+  their latest value, counters summed and histograms as count/sum/max since the endpoint started.
+- **The stdio bridge** is `melange mcp <url>`: the SDK's client toward the host and its stdio server
+  toward the agent, forwarding tool listings and calls and deciding nothing.
+- **Not built: cluster routing for reducer calls.** Every tool answers for the node it reached, as
+  the HTTP surfaces do. Routing a call to the owning shard needs the hub's shard-execute path to
+  carry the caller's claims and client-call source, which it does not today (it passes neither,
+  so a routed call would skip the reducer's policy). That change is the follow-up.
+- **Tests** (in the transport suite, over the real HTTP transport with the SDK's own client): the
+  three gates, every read tool, the SQL refusal, the allowlist, the production flag, a bad
+  allowlist failing at startup, and the stdio bridge end to end over in-memory pipes.
+

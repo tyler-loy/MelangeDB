@@ -112,7 +112,7 @@ jobs:
       FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
       PACKABLE: >-
         Abstractions Core Protocol Client Server CodeGen
-        Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli
+        Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli Mcp
     steps:
       - uses: actions/checkout@v7
 
@@ -174,7 +174,7 @@ jobs:
       FEED: https://api.nuget.org/v3/index.json
       PACKABLE: >-
         Abstractions Core Protocol Client Server CodeGen
-        Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli
+        Storage.Faster Storage.Postgres Cluster OpenTelemetry Cli Mcp
     steps:
       - uses: actions/checkout@v7
 
