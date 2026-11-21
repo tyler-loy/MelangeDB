@@ -415,6 +415,38 @@ calls by reason.
   a send to a node dying under it was mistaken for the client leaving. Fixed separately; with the
   fix, 30 of 30 kills restored every client.
 
+#### Liveness soak (phase 30), 2026-11-21
+
+How close a healthy cluster comes to its failure timeout: `all --nodes 4 --soak` with heartbeat
+250 ms and a 15 s timeout, long enough that no death disturbs the run. Every gap the hub saw
+between two heartbeats from one node is counted against each candidate timeout at once. The hub
+and all four nodes share one process, so a pause stalls both ends of every link together; a real
+deployment's hub does not share its node's thread pool, so treat these as pessimistic.
+
+| Players (capacity ladder) | Hot store | Longest gap | > 1 s | > 2 s | > 3 s | > 5 s | Deaths / lapses |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 (comfortable) | in-memory | 432 ms | 0 | 0 | 0 | 0 | 0 / 0 |
+| 100 | FASTER | 428 ms | 0 | 0 | 0 | 0 | 0 / 0 |
+| 200 (past the knee) | in-memory | 4.2 s | 428 | 35 | 2 | 0 | 0 / 0 |
+| 200 | FASTER | 4.3 s | 425 | 43 | 9 | 0 | 0 / 0 |
+| 300 (collapse) | FASTER | 10.0 s | 378 | 238 | 120 | 24 | 0 / 0 |
+
+About 4,800 heartbeats per run at 100 players, 2,750 at 200, 1,400 at 300: overloaded, the
+heartbeats themselves slow down. (The in-memory 300-player run lost its stats endpoint in the
+collapse and has no row.) The lease-renewal gaps the nodes measured track the hub's within a few
+milliseconds.
+
+- **At sustainable load there is room for a 2 s timeout:** the longest gap was under half a second.
+- **Past the knee, heartbeats stall with everything else.** At 200 players a 2 s timeout would have
+  declared a healthy node dead 35–43 times in five minutes, and 3 s 2–9 times. Each one moves a
+  shard onto nodes that are just as overloaded.
+- **Recovering a big shard does not stall the adopter.** `failover --rows 1000000 --hot-store
+  faster --heartbeat-ms 250 --failure-timeout-ms 15000 --fast-failover`: the longest gap across two
+  7 s recoveries was 335 ms, with no false death or lapse (#198's fix holding).
+- **The first pass found two gateway bugs** that refused 11% of calls at 100 players: shards for
+  negative-x blocks were unreachable, and the retries exhausted the port range; and a failed swap
+  wedged its client. Fixed in #228 before these numbers were taken.
+
 ### Soak — memory over five minutes
 
 `all --players 100 --nodes 4 --soak`: 300 s measured after 15 s warm-up, the stable point from the
