@@ -138,6 +138,14 @@ long body is precisely what that isolation level exists to allow; a 500 ms snaps
 all, since it froze nothing, and an alert built to catch write stalls should not fire on a reducer that
 caused none.
 
+**So counting long `melange.reducer` spans does not count missing `1003`s.** A snapshot span can run
+far past the threshold, in its body or in its durability wait, both outside the lock, and correctly
+produce no warning. That is the whole population of slow spans in a workload whose sweeps declare
+`Isolation.Snapshot`. [#203](https://github.com/tyler-loy/MelangeDB/issues/203) was opened on exactly this
+comparison: 139 production spans over 50 ms in nine days and a handful of `1003`s, every one of the 139 a
+snapshot reducer. To find snapshot transactions that are slow *for their caller*, query the span
+duration filtered on `melange.isolation = snapshot`; the `1003` stream is for write stalls.
+
 Both numbers are always printed, and `FiredMeasure` names the one that crossed. That field exists because
 the message previously asserted the locked portion had crossed the threshold on both paths, which was false
 on the serialized one whenever an fsync wait sat between the two numbers — a line reading "held the write
