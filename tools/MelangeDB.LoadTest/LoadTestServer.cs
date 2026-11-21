@@ -33,6 +33,13 @@ internal sealed class LoadTestServer : IAsyncDisposable
     private readonly string _root;
     private readonly bool _ownsRoot;
     private readonly List<(string Name, WebApplication? App)> _nodeApps = [];
+    private readonly Lock _lagLock = new();
+    private readonly List<long> _lagRecords = [];
+    private readonly List<double> _stalenessMs = [];
+
+    // Per owner shard: when each durable LSN was first seen, oldest first, trimmed to two minutes.
+    private readonly Dictionary<ulong, Queue<(long At, ulong Durable)>> _durableHistory = [];
+    private Timer? _lagSampler;
     private LockSplitListener? _lockSplit;
     private WebApplication _hubApp = null!;
     private int _hubHttpPort;
@@ -122,6 +129,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
             }
         }
 
+        _lagSampler = new Timer(_ => SampleReplicaLag(), null, 100, 100);
         output.WriteLine($"GATEWAY {GatewayUri}");
         output.WriteLine($"STATS http://{ReachableHost()}:{_hubHttpPort}/loadtest/stats");
         output.WriteLine("READY");
@@ -181,6 +189,14 @@ internal sealed class LoadTestServer : IAsyncDisposable
             .Where(static n => n.App is not null)
             .Select(static n => n.App!.Services.GetRequiredService<ShardNodeRuntime>().Metrics)
             .ToList();
+        List<long> lag;
+        List<double> staleness;
+        lock (_lagLock)
+        {
+            lag = [.. _lagRecords.Order()];
+            staleness = [.. _stalenessMs.Order()];
+        }
+
         return new ServerStats
         {
             TimestampUtc = DateTimeOffset.UtcNow,
@@ -209,6 +225,12 @@ internal sealed class LoadTestServer : IAsyncDisposable
             LeaseRenewalGapMaxMs = nodes.Count == 0 ? 0 : nodes.Max(static n => n.LeaseRenewalGaps.MaxMs),
             LeaseRenewalGapsOverMs = LivenessGaps.ThresholdsMs.ToDictionary(static t => t, t => nodes.Sum(n => n.LeaseRenewalGaps.Over(t))),
             NodesDeclaredDead = metrics.NodesDeclaredDead,
+            ReplicaLagSamples = lag.Count,
+            ReplicaLagP50Records = Quantile(lag, 0.50),
+            ReplicaLagP99Records = Quantile(lag, 0.99),
+            ReplicaLagMaxRecords = lag.Count == 0 ? 0 : lag[^1],
+            ReplicaStalenessMaxMs = staleness.Count == 0 ? 0 : staleness[^1],
+            ReplicaStalenessP99Ms = Quantile(staleness, 0.99),
             LeaseLapses = nodes.Sum(static n => n.LeaseLapses),
         };
     }
@@ -385,8 +407,61 @@ internal sealed class LoadTestServer : IAsyncDisposable
         return port;
     }
 
+    /// <summary>
+    /// One tick of the replica lag sampler: for every replica on every live node, the owner's
+    /// durable LSN (read from the owner's engine in this same process) minus what the replica has
+    /// applied. Read without the hub's relay, so the ceiling's own delay counts as lag. Staleness
+    /// is how long the oldest record the replica has not applied has been durable, from a history
+    /// of the owner's durable LSN at this sampler's 100 ms resolution.
+    /// </summary>
+    private void SampleReplicaLag()
+    {
+        try
+        {
+            var now = System.Diagnostics.Stopwatch.GetTimestamp();
+            foreach (var (_, app) in _nodeApps.ToArray())
+            {
+                if (app is null)
+                    continue;
+                foreach (var (shard, applied, _) in app.Services.GetRequiredService<ShardNodeRuntime>().ReplicaProgress())
+                {
+                    if (TryGetShard(shard) is not { } owner || applied == 0)
+                        continue; // No owner up, or the replica has not bootstrapped yet.
+                    var durable = owner.Engine.Log.DurableLsn;
+                    var behind = durable > applied ? (long)(durable - applied) : 0;
+                    lock (_lagLock)
+                    {
+                        if (!_durableHistory.TryGetValue(shard.Value, out var history))
+                            _durableHistory[shard.Value] = history = new Queue<(long, ulong)>();
+                        if (history.Count == 0 || history.Last().Durable < durable)
+                            history.Enqueue((now, durable));
+                        while (history.Count > 1 && System.Diagnostics.Stopwatch.GetElapsedTime(history.Peek().At, now) > TimeSpan.FromMinutes(2))
+                            history.Dequeue();
+
+                        _lagRecords.Add(behind);
+                        if (behind > 0)
+                        {
+                            // The first moment the owner was seen durable past what the replica holds.
+                            var since = history.FirstOrDefault(entry => entry.Durable > applied).At;
+                            _stalenessMs.Add(since == 0 ? 0 : System.Diagnostics.Stopwatch.GetElapsedTime(since, now).TotalMilliseconds);
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception exception) when (exception is ObjectDisposedException or InvalidOperationException)
+        {
+            // A node stopping under the sampler; the next tick reads the survivors.
+        }
+    }
+
+    private static T Quantile<T>(List<T> sorted, double q) =>
+        sorted.Count == 0 ? default! : sorted[Math.Min(sorted.Count - 1, (int)(q * sorted.Count))];
+
     public async ValueTask DisposeAsync()
     {
+        if (_lagSampler is not null)
+            await _lagSampler.DisposeAsync().ConfigureAwait(false);
         foreach (var (_, app) in _nodeApps)
         {
             if (app is not null)
