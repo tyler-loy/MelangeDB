@@ -53,6 +53,20 @@ All packages ship together at one version; there is no per-package versioning. S
   before the hub had even declared the node dead, now lasts `2 × Cluster:FailureTimeoutMs`, so a
   call waits out a reassignment instead of failing inside it. Failed handshakes also dispose
   their socket now.
+- **A node that takes over a dead node's shard no longer stops heartbeating while it recovers it**
+  ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). The open, a full replay of the
+  shard's snapshot and log tail, ran inside the heartbeat loop. So a recovery longer than
+  `Cluster:FailureTimeoutMs`, measured at 3–6 s for a 1M-row shard, got the *adopting* node
+  declared dead and self-fenced on every shard it owned, turning one node death into a cascade.
+  Opens now run on their own task, and the node keeps its heartbeat and lease through them. A failed
+  open is retried on the next heartbeat and no longer drops the hub link. `1707 ShardOpened` now
+  carries the recovery time; `1753 ShardOpenFailed` and `1754 ShardOpenAbandoned` are new.
+- **A shard opened while its node's Replicated stream was running could permanently miss
+  Replicated rows.** The stream runs from the node's low-water mark, so a slice in flight when a
+  new shard was published started past that shard's cursor. The shard applied it anyway and moved
+  its cursor over every earlier record. Each slice now carries the last Replicated LSN before it,
+  and a shard that's behind skips the slice until the re-subscribe its own publication triggers.
+  (The window existed before; asynchronous opens widened it enough for a test to catch.)
 - **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
   fsynced while holding the log's append lock, so every commit that landed during a flush waited
   for it under the engine's write lock. A consumer game saw one-row commits of 63–206 ms with a
