@@ -135,7 +135,7 @@ project's own terms, and not by copying.
 | [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) | **Built** |
 | [28](road-to-0.4/plan-phase-28.md) | Clients that outlive a deploy: old bindings survive added columns at any position, and reconnect is automatic with backoff and token refresh. Lands before 23 | **Built** |
 | [29](road-to-0.4/plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, SQL, and published signals; reducer calls by name only. A protocol, not the refused admin console | Planned |
-| 30 | Shard HA — [idea-bin](idea-bin/shard-ha-warm-replica.md) | **Committed** (2026-11-20: production systems get HA). Design record before a plan, starting from phase 20's window, where detection, not rebuild, dominates |
+| 30 | Shard HA — [design record](design/shard-ha.md) | **Committed** (2026-11-20: production systems get HA). Design settled 2026-11-21: fence fixes first ([#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), then detection, then a warm replica over the shared log |
 
 ## What's left
 

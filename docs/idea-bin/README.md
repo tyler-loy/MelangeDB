@@ -52,6 +52,7 @@ links the entry, and neither restates the other's argument.
 | [dev-host-hot-migration.md](dev-host-hot-migration.md) | `dotnet watch` migrates in place instead of dropping clients | The reconnect loop costs more than the fix |
 | [engine-sagas.md](engine-sagas.md) | Declared cross-node sagas: engine-owned outbox, retry, receipts, parking | Every listed consumer flow fits with less code than today |
 | [identity-sharded-hub.md](identity-sharded-hub.md) | Hub `Global` tables partitioned by identity into fixed buckets | Load test or telemetry projects hub saturation before the target population |
+| [object-storage-driver.md](object-storage-driver.md) | Shard logs as write-once chunk objects on S3 or Azure Blob, with conditional writes as the fence | A deployment without shared filesystem storage, plus a measured PUT latency and request bill |
 | [distributed-reducers.md](distributed-reducers.md) | A reducer spanning declared participants, optimistic body, short prepare, presumed abort | A named flow a saga cannot make correct, after engine sagas ship |
 
 Six of these came from an outside review of the project, each claim checked against the code before
