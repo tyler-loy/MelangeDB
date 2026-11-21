@@ -12,6 +12,11 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`Cluster:FastFailoverOnLinkLoss`** (off by default; road-to-0.4 phase 30, step 1). The hub
+  declares a node dead as soon as its node link closes and stays closed for a heartbeat interval
+  (EventId 1759), instead of at the failure timeout. A killed process is detected in 1.0–1.2 s, and
+  its shards are writable again in 1.9–3.2 s at 100k rows, down from 10–12 s. **Requires shared
+  storage that enforces exclusive file locks across hosts**; see CONFIGURATION.md.
 - **Clients built against an older schema survive additive server changes** (road-to-0.4 phase 28).
   A typed subscription used to refuse any descriptor that was not identical to its bindings, so
   every added column broke every client not yet rebuilt, which a shipped game client cannot avoid.
@@ -71,6 +76,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A node is declared dead at its deadline, not up to half a timeout later**
+  ([#201](https://github.com/tyler-loy/MelangeDB/issues/201)). The hub checked every `FailureTimeoutMs/2`. It now checks each node's deadline every
+  `FailureTimeoutMs/20` (25–250 ms), from memory, and reads the membership store only to record a
+  death. Measured at defaults: detection 9.0–9.9 s after a kill, from 10.6–13.4 s.
 - **The shard fence holds without timing luck** (road-to-0.4 phase 30, step 0;
   [design/shard-ha.md](docs/design/shard-ha.md)). Five gaps, each masked today by how slow a
   reassignment is, and each one a warm replica's fast promotion would have exposed:
