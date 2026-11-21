@@ -292,7 +292,11 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
         ulong resetLsn = 0;
         var tables = new List<ReplicaTableSnapshot>();
         var sent = new HashSet<(uint, RowKey)>();
-        _engine.ReadConsistent(head =>
+
+        // Every row of the shard is read to find the band's, so this runs off the write lock
+        // against a view pinned at the reset LSN. Under the lock it held every commit, and the
+        // node's heartbeat, for the whole scan: minutes on a paged million-row shard (#208).
+        _engine.ReadAtHead((head, store) =>
         {
             resetLsn = head;
             foreach (var table in _engine.Schema.Tables)
@@ -300,7 +304,7 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
                 if (table.Placement != Placement.Partitioned)
                     continue;
                 var slice = new List<WireOp>();
-                foreach (var (key, bytes) in _engine.HotStore.Scan(table.Id))
+                foreach (var (key, bytes) in store.Scan(table.Id))
                 {
                     // Borrowed rows are the true owner's to publish; see CollectBorderOps.
                     if (_borrowedOwner(table.Id, key) is not null)

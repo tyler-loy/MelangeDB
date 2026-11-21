@@ -1654,14 +1654,17 @@ internal sealed partial class HubRuntime : IDisposable
     {
         ulong resetLsn = 0;
         var tables = new List<ReplicaTableSnapshot>();
-        _engine.ReadConsistent(head =>
+        // Off the write lock, against a view pinned at the reset LSN: a whole-table scan under it
+        // stalls every hub commit for its length (#208, where the same scan on a shard's border
+        // reset got a live node fenced).
+        _engine.ReadAtHead((head, store) =>
         {
             resetLsn = head;
             foreach (var table in _engine.Schema.Tables)
             {
                 if (table.Placement != Placement.Replicated)
                     continue;
-                var rows = _engine.HotStore.Scan(table.Id)
+                var rows = store.Scan(table.Id)
                     .Select(pair => new WireOp((byte)RowOpKind.Insert, table.Id.Value, pair.Key.ToArray(), pair.Value.ToArray()))
                     .ToArray();
                 tables.Add(new ReplicaTableSnapshot(table.Id.Value, rows));

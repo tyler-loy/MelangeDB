@@ -349,7 +349,13 @@ clients at 15 Hz, 3 kills per size. Ranges are over the kills.
 | in-memory | 1M (565 MiB) | see below | 4.9–6.1 s | 3.2–4.5 s | 11.3–18.5 s | 12.0 / 19.1 s |
 | FASTER | 10k (12 MiB) | 11.2–11.5 s | 0.6–1.3 s | 97–121 ms | 11.9–12.8 s | 12.6 / 13.0 s |
 | FASTER | 100k (62 MiB) | 10.6–11.1 s | 0.7–2.8 s | 415–703 ms | 11.7–13.4 s | 12.6 / 14.1 s |
-| FASTER | 1M | **not measured: issue [#199](https://github.com/tyler-loy/MelangeDB/issues/199)** | | | | |
+| FASTER | 1M (284 MiB) | 12.1–13.2 s | 6.0–7.0 s | 3.2–4.0 s | 19.1–19.2 s | 20.2 / 24.7 s¹ |
+
+¹ Measured later, after the [#208](https://github.com/tyler-loy/MelangeDB/issues/208) fix, with 2
+clients and 2 kills rather than 20 and 3. Before it, this row could not be measured: a border reset
+scanned the paged shard under the engine lock and the hub fenced the live owner before the kill.
+Each pre-kill snapshot of this shard took 4–5.5 min (random-order paged reads); through them the
+owner's heartbeat staleness peaked at 1.0–1.35 s.
 
 The reading:
 

@@ -48,6 +48,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A border reset no longer freezes its shard, or gets a live node fenced**
+  ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)). To rebuild a neighbour's border
+  copy (EventId 1715), the owner read every row of the shard under the engine write lock and kept
+  the band's. On a paged FASTER shard that is random disk reads per row: about 250 µs a row, so
+  minutes at a million rows, with every commit and the node's heartbeat load sample queued behind
+  it until the hub declared the node dead. The scan now runs against a read view pinned at the
+  reset LSN, with the lock held only to take the pin. The hub's Replicated bootstrap, the same
+  whole-table scan under the lock, moved the same way.
 - **The load-test tool's call-to-delta latency collected no samples** from protocol v2 (0.2.0) on,
   because the driver matched its own row's `Identity` column as `byte[]`. The smoke test now
   asserts the metric has samples. Results recorded before 2026-08-06 are unaffected.
