@@ -50,7 +50,9 @@ public interface IMembershipStore
 
     /// <summary>
     /// Marks a node dead and reassigns each of its shards to a surviving live node, bumping every
-    /// moved shard's fencing token — the old owner's token is now stale everywhere. Shards with
+    /// moved shard's fencing token — the old owner's token is now stale everywhere. A shard whose
+    /// replica is on a live node goes to that node, which promotes its warm projection; the rest go
+    /// to the least-loaded live node. Replicas on the dead node are cleared. Shards with
     /// no surviving candidate become unowned (null node) with a bumped token, and are assigned on
     /// the next registration. Returns the assignments that changed.
     /// </summary>

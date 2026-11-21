@@ -78,6 +78,9 @@ internal sealed partial class ShardRuntime : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(TableId Table, RowKey Key), ulong> _borrowedRows = new();
     private readonly ILogger _logger;
 
+    /// <summary>The replica cursor this shard was promoted from (phase 30 step 2e); null after a cold open.</summary>
+    internal ulong? WarmStartedFrom => Engine.WarmStartedFrom;
+
     public ShardRuntime(
         ShardKey shard,
         long fencingToken,
@@ -93,7 +96,8 @@ internal sealed partial class ShardRuntime : IDisposable
         ILoggerFactory loggerFactory,
         TimeProvider time,
         MelangeAuthenticator authenticator,
-        MelangeSessions sessions)
+        MelangeSessions sessions,
+        Func<WarmStart?>? warmStart = null)
     {
         Shard = shard;
         FencingToken = fencingToken;
@@ -120,7 +124,8 @@ internal sealed partial class ShardRuntime : IDisposable
             time,
             services.GetService<IHotStoreProvider>(),
             originator,
-            services.GetService<IReducerRandomProvider>());
+            services.GetService<IReducerRandomProvider>(),
+            warmStart);
         Engine.SetTableAccessGuard(PlacementGuards.ShardAccess(shard, nodeName));
         Engine.AddCommitGuard(new ShardCommitGuard(
             schema,

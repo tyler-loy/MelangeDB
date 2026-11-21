@@ -101,6 +101,7 @@ noted.
 | `--rows` | 10000,100000,1000000 | `failover`: ballast rows on the measured shard, one sweep entry each. |
 | `--row-bytes` | 256 | `failover`: payload bytes per ballast row (minimum 8). |
 | `--tail` | 10000 | `failover`: records committed after the pre-kill snapshot, which recovery replays. |
+| `--replicas` | 1 | `failover`: `Cluster:ShardReplicas`. With 1 the survivor promotes its warm replica, and the run reports how many kills promoted and how far behind the replica was; 0 measures the cold reopen. |
 | `--repeat` | 3 | `failover`: kills per sweep entry. |
 | `--clients` | 20 | `failover`: gateway clients on the measured shard, each calling Move at `--tick-hz`. |
 
@@ -422,6 +423,49 @@ calls by reason.
 - **These runs found a gateway bug.** About one kill in twelve tore down a client's connection:
   a send to a node dying under it was mistaken for the client leaving. Fixed separately; with the
   fix, 30 of 30 kills restored every client.
+
+#### After phase 30 step 2e (promotion), 2026-11-21
+
+Same machine, defaults (heartbeat 250 ms, timeout 5 s), `--fast-failover`, 4 clients. `--replicas 1`
+is the library default: the survivor keeps a warm replica and the hub hands it the shard.
+`--replicas 0` is the cold reopen it replaces. Before each kill the run waits until the replica
+has caught up to where the owner stood, then writes the 10,000-record tail at full speed and kills
+at once, so the replica is a few thousand records behind when the owner dies, as live traffic
+would leave it.
+
+| Store | Rows | Replicas | Kills promoted | Replica behind at kill | Promote / reopen | Server window |
+| --- | --- | --- | --- | --- | --- | --- |
+| in-memory | 100k | 0 | — | — | 0.74–1.12 s | 1.20–1.51 s |
+| in-memory | 100k | 1 | 5 / 5 | 5.1–9.9k records | 0.49–0.54 s | 0.74–1.05 s |
+| FASTER | 100k | 0 | — | — | 0.94–1.40 s | 1.40–1.69 s |
+| FASTER | 100k | 1 | 5 / 5 | 1.9–10.1k records | 0.31–0.85 s | 0.72–1.14 s |
+| in-memory | 1M | 0 | — | — | 3.84–4.96 s | 3.84–4.96 s |
+| in-memory | 1M | 1 | 1 (see below) | 4.5k records | 1.41 s | 1.69 s |
+| FASTER | 1M | 0 | — | — | 4.18–5.26 s | 4.18–5.26 s |
+| FASTER | 1M | 1 | 1 (see below) | 4.0k records | 2.21 s | 2.66 s |
+
+At the default deadline detection, 100k in-memory with replicas: detect 4.8–5.1 s, promote
+0.42–0.49 s, server window 5.2–5.5 s (from 5.9–6.2 s). No false death or lease lapse in any
+100k run; the longest heartbeat gap was 320 ms.
+
+- **Promotion takes the reopen out of the window.** What remains is the heartbeat that carries the
+  assignment and the replay of what the replica had not applied. At 100k rows a promoted shard was
+  writable half a second after the hub named it.
+- **At 1M rows promotion costs 1.4–2.2 s,** well under the 4–5 s cold reopen but above what a
+  4,000-record replay explains. Where the rest goes is not measured yet.
+- **The 1M rows are one kill each, because the runs found a border bug.** A border reset is sent
+  as one node-link frame, and the link refuses frames over 64 MiB. Against a side neighbour, a
+  million-row shard's band is about 375k rows, a 152–170 MiB frame. The hub's reader drops the
+  link, and with fast failover on, the hub declares a healthy node dead. The replica-off rows hit
+  it too: their "detect 0 ms" is the shard already moving before the kill. This predates phase 30.
+- **The first runs found a promotion bug, fixed before these numbers.** The survivor's first open
+  often fails because the dying owner has not released the log yet, and the next heartbeat
+  retries. The open took the replica before trying the log, so the failed attempt threw the
+  replica away and the retry went cold. The replica is now taken only once the log is open.
+- **Clients come back about 1.5 s after the kill however fast the server is.** This is the test
+  machine: on Windows a refused loopback connect takes about 2 s to fail (measured), and the
+  gateway's first reattach attempt goes to the dead node's port. On Linux a refused connect fails
+  at once.
 
 #### Liveness soak (phase 30), 2026-11-21
 

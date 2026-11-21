@@ -234,10 +234,15 @@ public sealed class PostgresMembershipStore : IMembershipStore
             replicas.ExecuteNonQuery();
         }
 
+        // A shard with a live replica goes to the replica's node, which promotes its warm
+        // projection; the rest take the cold path on the least-loaded node. Replicas on the dead
+        // node were cleared above, so a replica read here is on another node; IsAlive covers one
+        // that died too but has not been swept yet.
         var changed = new List<ShardAssignment>();
         foreach (var assignment in AssignmentsOf(connection, transaction, nodeName))
         {
-            var next = WithOwner(assignment, LeastLoadedNode(connection, transaction, except: nodeName));
+            var replica = assignment.ReplicaNode is { } candidate && IsAlive(connection, transaction, candidate) ? candidate : null;
+            var next = WithOwner(assignment, replica ?? LeastLoadedNode(connection, transaction, except: nodeName));
             WriteAssignment(connection, transaction, next);
             changed.Add(next);
         }
@@ -385,6 +390,15 @@ public sealed class PostgresMembershipStore : IMembershipStore
         command.Parameters.AddWithValue("token", assignment.FencingToken);
         command.Parameters.AddWithValue("shard", unchecked((long)assignment.Shard.Value));
         command.ExecuteNonQuery();
+    }
+
+    private bool IsAlive(NpgsqlConnection connection, NpgsqlTransaction transaction, string nodeName)
+    {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"SELECT alive FROM {Schema}.melange_cluster_nodes WHERE node_name = @name";
+        command.Parameters.AddWithValue("name", nodeName);
+        return command.ExecuteScalar() is true;
     }
 
     private string? LeastLoadedNode(NpgsqlConnection connection, NpgsqlTransaction transaction, string? except)

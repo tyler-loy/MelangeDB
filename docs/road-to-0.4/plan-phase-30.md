@@ -201,3 +201,16 @@ fault its working set in from disk, which is the reopen cost again in another fo
   `DurableLsn` in the load sample; the hub relays it as the ceiling only from the plan's owner.
   Nodes run one follower thread (50 ms polls) and the `melange.cluster.replica.lag` gauge. Shard
   hot stores moved to node-local scratch (`Cluster:LocalScratchPath`).
+- **2e**: `MarkDead` (both stores) gives a dead owner's shard to its replica's node when that node
+  is alive, under the bumped token, and to the least-loaded node otherwise. On that node the open
+  takes the follower out of the poll loop (`LogFollower.Release`, which hands over nothing if a
+  poll would have started over) and passes its store, sequences, cursor and epoch to the engine's
+  second constructor (`WarmStart`). The engine opens the log under the new term, which seals the
+  dead owner's segment, checks the projection belongs to it (epoch, originator, a cursor between
+  the base and the head), and replays only the records after the cursor; anything else is refused
+  (EventId 1015) and recovers cold. The rest of the open is unchanged. `Cluster:ReplicaResidency`
+  (`Owner` or `Paged`) is in. Measured (LOAD-TESTING, "After phase 30 step 2e"): at 100k
+  rows with fast failover, 10 of 10 kills promoted, the reopen fell from 0.7–1.4 s to 0.3–0.85 s,
+  and the server window to 0.72–1.14 s; at 1M rows a promotion took 1.4–2.2 s against a 4–5 s cold
+  reopen. The 1M runs found that a border reset larger than the node link's 64 MiB frame cap
+  drops the link, which predates this phase.

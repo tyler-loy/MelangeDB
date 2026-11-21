@@ -207,6 +207,37 @@ internal sealed class LogFollower : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Ends the follower and hands its projection to the engine that is about to own the log
+    /// (step 2e). Null when there is nothing worth handing over: no bootstrap yet, or a place in
+    /// the log that can no longer be trusted (the same checks that would make a poll start
+    /// over), in which case the new owner recovers cold. The follower is disposed either way, and
+    /// the caller must not be polling it concurrently.
+    /// </summary>
+    public WarmStart? Release()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        try
+        {
+            if (_store is null || MustStartOver())
+                return null;
+            var warm = new WarmStart
+            {
+                Store = _store,
+                Sequencer = Sequencer,
+                AppliedLsn = AppliedLsn,
+                Epoch = _epoch,
+                TailTimestamp = TailTimestamp,
+            };
+            _store = null; // The engine owns it now.
+            return warm;
+        }
+        finally
+        {
+            Dispose();
+        }
+    }
+
     private Guid? ReadEpoch()
     {
         var path = Path.Combine(_directory, FileCommitLog.EpochFileName);
