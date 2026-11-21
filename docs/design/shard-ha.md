@@ -138,6 +138,12 @@ This works on any shared filesystem, whatever its lock semantics. `melange.lock`
 same-host guard and a fast-path signal (below), not as the fence. Compaction and backup already
 treat the log as files to copy; they learn the manifest.
 
+The segments, the manifest, and the snapshot sit behind a **shard storage interface** from the
+start, with the local or shared filesystem as its first driver. The interface costs little now,
+and it is where an object-store driver would plug in later
+([idea-bin](../idea-bin/object-storage-driver.md)). On S3 or Azure Blob, conditional writes would
+make the fence storage-enforced.
+
 The cost is a log-format change in `FileCommitLog`: a manifest, multiple segments, and recovery
 across them. It is the largest single piece of the phase. *Decisions to settle* has the cheaper
 alternative and what it gives up.
@@ -221,7 +227,9 @@ risking two writers; the cost of a false positive becomes a needless promotion, 
 ## What this deliberately does not fix
 
 - **Shared storage stays a single point of failure.** If the volume goes, every shard goes. HA of
-  the storage is the platform's job: replicated volumes, cloud file services.
+  the storage is the platform's job: replicated volumes, cloud file services. An object-store
+  driver would largely retire this ([idea-bin](../idea-bin/object-storage-driver.md)), and the
+  storage interface above is what leaves room for it.
 - **The hub stays a single point of failure.** Shard HA keeps shards writable while the hub is up.
   When the hub dies, membership freezes: no failover, no rebalance, and once nodes' leases lapse,
   every shard is fenced. Hub HA (a standby hub over the same Postgres) is a separate question, and a
