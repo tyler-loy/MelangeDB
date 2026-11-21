@@ -273,6 +273,8 @@ internal sealed partial class HubRuntime : IDisposable
         var cluster = Cluster;
         if (string.IsNullOrEmpty(cluster.Secret))
             throw new InvalidOperationException("Cluster:Role is Hub but Cluster:Secret is empty; nodes cannot authenticate.");
+        if (Cluster.ShardReplicas is < 0 or > 1)
+            throw new InvalidOperationException($"Cluster:ShardReplicas is {Cluster.ShardReplicas}; this release keeps 0 or 1 warm replica per shard.");
         if (_provisioner is not null && cluster.MaxNodes < 1)
         {
             // Startup-fatal on purpose: a deployment that registered a provisioner meant to use
@@ -882,6 +884,9 @@ internal sealed partial class HubRuntime : IDisposable
             // flight or the loop has been toggled off mid-episode.
             SweepProvisionTicket(cluster, now);
 
+            // Nor does replica placement: it is availability, not balance.
+            PlaceReplicas(cluster);
+
             if (!cluster.RebalanceEnabled
                 || Interlocked.CompareExchange(ref _rebalanceMoveInFlight, 0, 0) != 0
                 || Interlocked.CompareExchange(ref _scaleInInFlight, 0, 0) != 0
@@ -1477,12 +1482,19 @@ internal sealed partial class HubRuntime : IDisposable
                 RecordHeartbeat(session.NodeName);
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
                 if (body?.Deserialize<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
+                {
                     Load.Record(session.NodeName, heartbeat.Loads, _time.GetUtcNow());
+                    foreach (var load in heartbeat.Loads)
+                    {
+                        if (!load.Draining)
+                            _ceilings[load.Shard] = (load.DurableLsn, session.NodeName);
+                    }
+                }
 
                 // A node returning from a partition is alive again; shards orphaned while it was
                 // suspected dead get owners before the reply reports this node's assignments.
                 _membership.AssignUnowned(_time.GetUtcNow());
-                return new HeartbeatReply(AssignmentsDto(session.NodeName));
+                return new HeartbeatReply(AssignmentsDto(session.NodeName), ReplicasDto(session.NodeName));
             case "replica-subscribe":
                 var subscribe = body!.Value.Deserialize<ReplicaSubscribe>()!;
                 StartReplicaPump(link, session, subscribe.FromLsn);
@@ -1623,6 +1635,82 @@ internal sealed partial class HubRuntime : IDisposable
 
     private ShardAssignmentDto[] AssignmentsDto(string nodeName) =>
         [.. _membership.AssignmentsFor(nodeName).Select(ShardAssignmentDto.From)];
+
+    private sealed record ReplicaPlanEntry(ulong Shard, ushort Originator, string Owner);
+
+    // The replica placement as the last rebalance tick left it, by replica node, so a heartbeat
+    // reply costs no membership read. Replaced whole, never mutated.
+    private Dictionary<string, ReplicaPlanEntry[]> _replicaPlan = new(StringComparer.Ordinal);
+
+    // Each shard's durable LSN as its reporting node last said, and who said it: relayed as the
+    // replica's ceiling only when that node is the shard's owner in the plan.
+    private readonly ConcurrentDictionary<ulong, (ulong Durable, string Reporter)> _ceilings = new();
+
+    private ReplicaDto[] ReplicasDto(string nodeName) =>
+        Volatile.Read(ref _replicaPlan).TryGetValue(nodeName, out var plan)
+            ? [.. plan.Select(entry => new ReplicaDto(
+                entry.Shard,
+                entry.Originator,
+                _ceilings.TryGetValue(entry.Shard, out var ceiling) && ceiling.Reporter == entry.Owner ? ceiling.Durable : 0))]
+            : [];
+
+    /// <summary>
+    /// Keeps <c>Cluster:ShardReplicas</c> warm replicas placed (phase 30 step 2d): every owned shard
+    /// gets one on a live node other than its owner, fewest-replicas-first, kept where it is while
+    /// that node lives; none at all when the setting is 0 or no second node exists. The membership
+    /// store clears a replica whose node died or became the owner, so this only fills gaps.
+    /// </summary>
+    private void PlaceReplicas(ClusterOptions cluster)
+    {
+        var live = _membership.Nodes().Where(static n => n.Alive).Select(static n => n.NodeName).ToList();
+        var assignments = _membership.AllAssignments().ToList();
+        var replicaCounts = live.ToDictionary(
+            node => node,
+            node => assignments.Count(a => a.ReplicaNode == node),
+            StringComparer.Ordinal);
+        for (var i = 0; i < assignments.Count; i++)
+        {
+            var assignment = assignments[i];
+            var wanted = assignment.ReplicaNode;
+            if (cluster.ShardReplicas <= 0 || assignment.NodeName is null)
+            {
+                wanted = null;
+            }
+            else if (wanted is null || wanted == assignment.NodeName || !replicaCounts.ContainsKey(wanted))
+            {
+                wanted = replicaCounts
+                    .Where(pair => pair.Key != assignment.NodeName)
+                    .OrderBy(static pair => pair.Value)
+                    .ThenBy(static pair => pair.Key, StringComparer.Ordinal)
+                    .Select(static pair => pair.Key)
+                    .FirstOrDefault();
+            }
+
+            if (wanted == assignment.ReplicaNode)
+                continue;
+            try
+            {
+                assignments[i] = _membership.SetReplica(assignment.Shard, wanted);
+            }
+            catch (InvalidOperationException)
+            {
+                continue; // Raced a death, a move, or a reap; the next tick decides again.
+            }
+
+            if (assignment.ReplicaNode is { } previous && replicaCounts.ContainsKey(previous))
+                replicaCounts[previous]--;
+            if (wanted is not null)
+                replicaCounts[wanted]++;
+        }
+
+        Volatile.Write(ref _replicaPlan, assignments
+            .Where(static a => a.ReplicaNode is not null && a.NodeName is not null)
+            .GroupBy(static a => a.ReplicaNode!, StringComparer.Ordinal)
+            .ToDictionary(
+                static group => group.Key,
+                static group => group.Select(static a => new ReplicaPlanEntry(a.Shard.Value, a.Originator, a.NodeName!)).ToArray(),
+                StringComparer.Ordinal));
+    }
 
     /// <summary>
     /// One pump per subscribed link: reads the hub log from the node's cursor, filters Replicated

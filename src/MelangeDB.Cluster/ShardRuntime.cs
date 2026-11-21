@@ -83,6 +83,7 @@ internal sealed partial class ShardRuntime : IDisposable
         long fencingToken,
         ushort originator,
         string shardDirectory,
+        string scratchDirectory,
         string nodeName,
         SchemaRegistry schema,
         ReducerRegistry reducers,
@@ -103,7 +104,7 @@ internal sealed partial class ShardRuntime : IDisposable
         _strategy = strategy;
         var current = options.CurrentValue;
         Options = MelangeOptionsClone.DeepClone(current);
-        Options.HotStore.Path = Path.Combine(shardDirectory, "hot");
+        Options.HotStore.Path = scratchDirectory;
         Options.CommitLog.Path = Path.Combine(shardDirectory, "log");
 
         // The storage fence (phase 30 step 2b): the log opens under this ownership's term, which
@@ -338,7 +339,8 @@ internal sealed partial class ShardRuntime : IDisposable
         // the last pass still reads as empty here. The reap re-decides it under the engine write
         // lock, in the same hold that stops further writes — see SealIfEmpty.
         return new ShardLoadDto(
-            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount, _authoritativeRows);
+            Shard.Value, utilization, Engine.Log.HeadLsn, _residentBytes, BorrowedRowCount, _authoritativeRows,
+            DurableLsn: Engine.Log.DurableLsn);
     }
 
     /// <summary>

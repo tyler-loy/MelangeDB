@@ -12,6 +12,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **Warm replicas** (road-to-0.4 phase 30, steps 2c and 2d). With two or more shard nodes, the hub
+  places each shard's replica on a node other than its owner (`Cluster:ShardReplicas`, default 1;
+  0 opts out). The replica's node follows the shard's log read-only and keeps its hot store current
+  up to the owner's durable LSN, which the owner reports in its heartbeat and the hub relays.
+  `melange.cluster.replica.lag` shows how far behind each one is. Promotion, which turns this into
+  a faster failover, is the next step. Shard hot stores now live in node-local scratch
+  (`Cluster:LocalScratchPath`), no longer under the shared shard directory. `IMembershipStore`
+  gains `SetReplica`, and the Postgres store a `replica_node` column, added in place.
 - **A log segment per ownership term: the storage fence** (road-to-0.4 phase 30, step 2b). A
   cluster shard's log now opens under the shard's fencing token. Opening under a higher term seals
   the previous owner's segment at its last valid record (EventId 1011) and appends to a new file,

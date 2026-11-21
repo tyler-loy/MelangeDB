@@ -138,6 +138,23 @@ public sealed class ClusterOptions
     public string ShardDataPath { get; set; } = "./data/shards";
 
     /// <summary>
+    /// Warm replicas per shard (road-to-0.4 phase 30): a second node keeps each shard's hot store
+    /// current by following its log, so promoting it costs the unapplied tail instead of a full
+    /// recovery. 1 (the default) places one whenever a second live shard node exists; 0 opts out.
+    /// More than one is refused at startup. A replica costs its shard's resident memory again, on
+    /// another node.
+    /// </summary>
+    public int ShardReplicas { get; set; } = 1;
+
+    /// <summary>
+    /// Where a shard node keeps the scratch that is its own: shard hot stores (owned and replica
+    /// alike), which are rebuilt on every open and never read by another node. Empty means a
+    /// <c>cluster</c> folder under <c>HotStore:Path</c>. Node-local storage, never the shared
+    /// <see cref="ShardDataPath"/>.
+    /// </summary>
+    public string LocalScratchPath { get; set; } = "";
+
+    /// <summary>
     /// Spatial strategy only: how deep (in chunks) each shard's read-only border band reaches into
     /// its neighbours. Deeper is smoother and costs bandwidth plus memory on every node. The
     /// default is derived, not guessed: the band must cover
