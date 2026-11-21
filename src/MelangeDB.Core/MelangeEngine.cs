@@ -613,7 +613,7 @@ public sealed partial class MelangeEngine : IDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(reducerName);
         ArgumentNullException.ThrowIfNull(body);
-        if (_inReducer.Value)
+        if (InReducer(reducerName))
         {
             throw new InvalidOperationException(
                 "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
@@ -667,7 +667,7 @@ public sealed partial class MelangeEngine : IDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(reducerName);
         ArgumentNullException.ThrowIfNull(body);
-        if (_inReducer.Value)
+        if (InReducer(reducerName))
         {
             throw new InvalidOperationException(
                 "Nested reducer calls are forbidden: a reducer must not invoke another reducer. " +
@@ -797,7 +797,7 @@ public sealed partial class MelangeEngine : IDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(reducerName);
         ArgumentNullException.ThrowIfNull(ops);
-        if (_inReducer.Value)
+        if (InReducer(reducerName))
             throw new InvalidOperationException("ApplyInternal cannot run inside a reducer.");
 
         CommitRecord record;
@@ -958,7 +958,7 @@ public sealed partial class MelangeEngine : IDisposable
         ArgumentNullException.ThrowIfNull(rows);
         if (rows.Count == 0)
             return null;
-        if (_inReducer.Value)
+        if (InReducer(BulkReducerName))
             throw new InvalidOperationException("Bulk ingestion cannot run inside a reducer.");
 
         CommitRecord bulkRecord;
@@ -1422,11 +1422,43 @@ public sealed partial class MelangeEngine : IDisposable
     /// </summary>
     private void ThrowIfClosed(string reducerName)
     {
-        if (!_closed)
+        if (!Volatile.Read(ref _closed))
             return;
-        throw new TransientRejectionException(
-            $"This database has been drained for shutdown and accepts no further writes; " +
-            $"'{reducerName}' arrived after the drain. Retry against the next process.");
+        throw ClosedRejection(reducerName, innerException: null);
+    }
+
+    private TransientRejectionException ClosedRejection(string reducerName, Exception? innerException)
+    {
+        var message = Volatile.Read(ref _disposed)
+            ? $"This engine has been disposed (its shard was released, or its node is stopping); '{reducerName}' " +
+              "was not committed. Retry: the call is routed to wherever the shard is now."
+            : $"This database has been drained for shutdown and accepts no further writes; " +
+              $"'{reducerName}' arrived after the drain. Retry against the next process.";
+        return innerException is null
+            ? new TransientRejectionException(message)
+            : new TransientRejectionException(message, innerException);
+    }
+
+    /// <summary>
+    /// Every write entry point's first check, and the first thing it touches on the engine: a call
+    /// arriving at a closed or disposed engine is refused here as retryable, before the nested-call
+    /// flag (a <see cref="ThreadLocal{T}"/> that <see cref="Dispose"/> releases) is read. A shard
+    /// released under live traffic used to answer each such call with an
+    /// <see cref="ObjectDisposedException"/>, reported to the client as an internal error and
+    /// logged as one (#202). Nothing has been staged at this point, so retrying is always safe.
+    /// </summary>
+    private bool InReducer(string reducerName)
+    {
+        ThrowIfClosed(reducerName);
+        try
+        {
+            return _inReducer.Value;
+        }
+        catch (ObjectDisposedException disposed)
+        {
+            // Disposed between the check above and the read; still nothing staged.
+            throw ClosedRejection(reducerName, disposed);
+        }
     }
 
     /// <summary>
@@ -1444,6 +1476,12 @@ public sealed partial class MelangeEngine : IDisposable
         if (_disposed)
             return;
         _disposed = true;
+
+        // Closed before anything is released: a call that reaches the write lock after this point
+        // is refused by ThrowIfClosed as retryable, rather than finding a disposed log or store.
+        // Not under the lock: a caller can dispose while another thread holds it, and waiting
+        // here would turn a release into a possible deadlock.
+        Volatile.Write(ref _closed, true);
         _log.Dispose();
         _storeLifetime?.Dispose();
         _telemetry?.Dispose();
