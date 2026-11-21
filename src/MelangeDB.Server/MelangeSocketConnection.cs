@@ -642,6 +642,9 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                     $"This connection already holds Subscriptions:MaxPerConnection ({limits.MaxPerConnection}) subscriptions.");
             }
 
+            if (TrySubscribeOffLock(subscribe.SubscriptionId, query, limits))
+                return;
+
             using var activity = _transport.Telemetry?.StartInitialSet(query.Table);
             var initialSet = _transport.Engine.ReadConsistent(head =>
             {
@@ -677,6 +680,81 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _transport.Telemetry?.RecordRejected(rejected.Code);
             EnqueuePriority(new ErrorFrame(rejected.Code, rejected.Message, SubscriptionId: subscribe.SubscriptionId));
         }
+    }
+
+    /// <summary>
+    /// Subscribes with the initial set read off the engine's write lock (#213). The set is
+    /// collected from a view pinned at head <c>h1</c>, while the subscription engine records every
+    /// commit after it. Then, under one short lock hold at head <c>h2</c>, those commits are
+    /// applied to the set, the subscription registers, and its bulk stream is listed. The set the
+    /// client receives is anchored at <c>h2</c>, the same LSN the live fan-out starts after, so it
+    /// is exactly what the locked path would have produced, and the data channel stays in LSN
+    /// order (a client's resume cursor is the highest LSN it has seen, so a gap frame below it
+    /// would be lost on reconnect).
+    /// <para>
+    /// Returns false, having registered nothing, when the locked path must run instead: the store
+    /// cannot pin a view, the table has row or column policies (they may read other tables, which
+    /// off the lock would be live state rather than the pin), or a reauthentication swapped the
+    /// connection's policy context meanwhile. A ceiling breach throws, as on the locked path.
+    /// </para>
+    /// </summary>
+    private bool TrySubscribeOffLock(uint subscriptionId, SubscriptionQuery query, SubscriptionsOptions limits)
+    {
+        var engine = _transport.Engine;
+        var subscriptions = _transport.Subscriptions;
+        if (!engine.SupportsReadViews)
+            return false;
+
+        var context = _policyContext;
+        var subscription = subscriptions.Compile(this, subscriptionId, query, limits, _transport.Policies, context);
+        if (subscription.Evaluator is not null)
+            return false;
+
+        using var activity = _transport.Telemetry?.StartInitialSet(query.Table);
+        SubscriptionEngine.CatchUp? catchUp = null;
+        InitialSet? registered;
+        try
+        {
+            var collected = engine.ReadAtHead(
+                (head, store) => subscriptions.CollectInitialSet(subscription, limits, store, head),
+                atPin: _ => catchUp = subscriptions.BeginCatchUp());
+
+            registered = engine.ReadConsistent(head =>
+            {
+                var recorded = catchUp!;
+                subscriptions.EndCatchUp(recorded);
+                catchUp = null;
+                if (!ReferenceEquals(context, _policyContext))
+                    return null;
+
+                var current = subscriptions.CatchUpInitialSet(subscription, limits, collected, recorded, head);
+                subscriptions.Add(subscription);
+                _subscriptions[subscriptionId] = subscription;
+
+                // Listed under the registration's lock hold, as on the locked path: the sender's
+                // first-chunk rule depends on it (see TryDequeueNext).
+                lock (_bulk)
+                {
+                    _bulk.Add(new BulkStream(subscription, current));
+                }
+
+                return current;
+            });
+        }
+        finally
+        {
+            if (catchUp is { } abandoned)
+                engine.ReadConsistent(_ => subscriptions.EndCatchUp(abandoned));
+        }
+
+        if (registered is null)
+            return false;
+
+        // The anchor must be durable before the first chunk leaves; see HandleSubscribe.
+        engine.Log.WaitDurable(registered.AnchorLsn);
+        ServerTelemetry.CompleteInitialSet(activity, registered.Rows.Count, registered.Bytes);
+        _sendSignal.Release();
+        return true;
     }
 
     private void HandleUnsubscribe(UnsubscribeFrame unsubscribe)

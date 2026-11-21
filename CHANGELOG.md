@@ -37,6 +37,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **A subscription's initial set is collected off the engine's write lock**
+  ([#213](https://github.com/tyler-loy/MelangeDB/issues/213)), for tables without row or column
+  policies on a store that can pin a read view (both shipped stores can). The row and byte
+  ceilings bound what a subscription returns, not what it reads, so a filtered subscription over a
+  large paged table used to hold every commit and the node's heartbeat for its whole scan.
+  - The set is now read from a view pinned at head *h1*, while the subscription engine records the
+    commits that land after it.
+  - Under one short lock hold at head *h2*, those commits are folded into the set, the ceilings are
+    re-checked, and the subscription registers.
+  - The client receives a set anchored at *h2*, exactly what the locked path would have sent.
+  - Tables with policies keep the locked path, because a policy may read other tables, which off
+    the lock would be live state rather than the pin.
 - **Paged FASTER scans read a block of rows at a time, about 8× faster on a large shard**
   ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)). A paged scan used to read one row
   at a time, each row a synchronous random read of its main record and then its out-of-line
