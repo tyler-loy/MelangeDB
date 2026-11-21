@@ -146,6 +146,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// </summary>
     internal Action<ShardKey>? BeforeOpen { get; set; }
 
+    /// <summary>Test hook: the estimated bytes per border-reset part this node's publishers send, so a test band splits.</summary>
+    internal int BorderResetPartBytes { get; set; } = BorderPublisher.DefaultResetPartBytes;
+
     private ClusterOptions Cluster => _options.CurrentValue.Cluster;
 
     /// <summary>This node's own scratch (Cluster:LocalScratchPath): shard hot stores, owned and replica.</summary>
@@ -856,7 +859,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         if (_strategy is { } strategy)
         {
             var publisher = new BorderPublisher(
-                runtime.Engine, shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger);
+                runtime.Engine, shard, strategy, runtime.BorrowedOwnerOf, () => _link, _logger, BorderResetPartBytes);
             _borderPublishers[shard] = publisher;
             publisher.Start();
 
@@ -1302,6 +1305,15 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 var observer = TryGetShard(new ShardKey(reset.ObserverShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {reset.ObserverShard}.");
                 observer.ApplyBorderReset(reset);
+                return Task.FromResult<object?>(null);
+            }
+
+            case "border-reset-part-apply":
+            {
+                var part = body!.Value.Deserialize<BorderResetPart>()!;
+                var observer = TryGetShard(new ShardKey(part.Reset.ObserverShard))
+                    ?? throw new InvalidOperationException($"This node does not own shard {part.Reset.ObserverShard}.");
+                observer.ApplyBorderResetPart(part);
                 return Task.FromResult<object?>(null);
             }
 

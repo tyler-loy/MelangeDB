@@ -123,6 +123,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A large border reset took down the node link, and with it a healthy node.** A band reset was
+  sent as one node-link frame, and a link drops any frame over 64 MiB. A million-row shard's band
+  against a side neighbour came to 152-170 MiB, so the hub's reader closed the owner's link; the
+  node's lease lapsed, and with `Cluster:FastFailoverOnLinkLoss` on the hub declared it dead at
+  once and moved its shards. Resets now travel in parts of about 16 MiB (`border-reset-part`),
+  which the observer stages and applies whole on the last one, so its deletions and cursor move
+  only with a complete band. A link also refuses to send a frame over the limit, failing that one
+  request rather than writing what its peer would drop the link for. Found by the phase 30
+  failover runs at 1M rows.
 - **Shards for blocks with a negative x coordinate could not be reached.** Their keys have the top
   bit set, and the shard node's websocket route only matched keys that fit in a signed 64-bit
   integer, so every connection to them got a 404: no player could be served west of x = 0. Under

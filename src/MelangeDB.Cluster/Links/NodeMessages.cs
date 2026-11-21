@@ -166,6 +166,19 @@ internal sealed record BorderBatch(ulong OwnerShard, ulong ObserverShard, string
 /// </summary>
 internal sealed record BorderReset(ulong OwnerShard, ulong ObserverShard, string Epoch, ulong Lsn, ReplicaTableSnapshot[] Tables);
 
+/// <summary>
+/// One part of a <see cref="BorderReset"/> too large for one node-link frame (a million-row shard's
+/// band runs to hundreds of MiB). Sent owner node → hub as <c>border-reset-part</c> and routed hub →
+/// observer node as <c>border-reset-part-apply</c>, in order, each acked before the next. The
+/// observer stages the parts and applies the reset, deletions and cursor included, only on the
+/// <see cref="Final"/> one: a partial reset would delete every borrowed row a later part carries.
+/// A part out of sequence discards the staging and fails, and the owner starts the reset over
+/// under a new <see cref="ResetId"/>. A separate type rather than fields on
+/// <see cref="BorderReset"/>, so a node that predates parts refuses them rather than applying
+/// each one as a whole reset.
+/// </summary>
+internal sealed record BorderResetPart(string ResetId, int Part, bool Final, BorderReset Reset);
+
 /// <summary>The log-arguments payload of a <c>melange/border</c> record: which shard owns the copied rows.</summary>
 internal sealed record BorderMarker(ulong Owner);
 

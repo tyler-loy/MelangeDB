@@ -439,25 +439,27 @@ would leave it.
 | in-memory | 100k | 1 | 5 / 5 | 5.1–9.9k records | 0.49–0.54 s | 0.74–1.05 s |
 | FASTER | 100k | 0 | — | — | 0.94–1.40 s | 1.40–1.69 s |
 | FASTER | 100k | 1 | 5 / 5 | 1.9–10.1k records | 0.31–0.85 s | 0.72–1.14 s |
-| in-memory | 1M | 0 | — | — | 3.84–4.96 s | 3.84–4.96 s |
-| in-memory | 1M | 1 | 1 (see below) | 4.5k records | 1.41 s | 1.69 s |
-| FASTER | 1M | 0 | — | — | 4.18–5.26 s | 4.18–5.26 s |
-| FASTER | 1M | 1 | 1 (see below) | 4.0k records | 2.21 s | 2.66 s |
+| in-memory | 1M | 0 | — | — | 4.62–6.05 s | 5.08–6.48 s |
+| in-memory | 1M | 1 | 3 / 3 | 6.7–10.3k records | 1.63–3.00 s | 1.96–3.44 s |
+| FASTER | 1M | 0 | — | — | 4.97–6.06 s | 5.30–6.51 s |
+| FASTER | 1M | 1 | 3 / 3 | 2.1–10.1k records | 2.38–4.74 s | 2.68–5.08 s |
 
-At the default deadline detection, 100k in-memory with replicas: detect 4.8–5.1 s, promote
-0.42–0.49 s, server window 5.2–5.5 s (from 5.9–6.2 s). No false death or lease lapse in any
-100k run; the longest heartbeat gap was 320 ms.
+The 1M rows were measured after the border-reset fix below; before it, a 1M run could not get
+past its first kill. At the default deadline detection, 100k in-memory with replicas: detect
+4.8–5.1 s, promote 0.42–0.49 s, server window 5.2–5.5 s (from 5.9–6.2 s). No false death or lease
+lapse in any run; the longest heartbeat gap was 320 ms.
 
 - **Promotion takes the reopen out of the window.** What remains is the heartbeat that carries the
   assignment and the replay of what the replica had not applied. At 100k rows a promoted shard was
   writable half a second after the hub named it.
-- **At 1M rows promotion costs 1.4–2.2 s,** well under the 4–5 s cold reopen but above what a
-  4,000-record replay explains. Where the rest goes is not measured yet.
-- **The 1M rows are one kill each, because the runs found a border bug.** A border reset is sent
-  as one node-link frame, and the link refuses frames over 64 MiB. Against a side neighbour, a
-  million-row shard's band is about 375k rows, a 152–170 MiB frame. The hub's reader drops the
-  link, and with fast failover on, the hub declares a healthy node dead. The replica-off rows hit
-  it too: their "detect 0 ms" is the shard already moving before the kill. This predates phase 30.
+- **At 1M rows promotion costs 1.6–4.7 s,** about half the cold reopen, but more than the
+  replay alone explains at 100k. Where the rest goes is not measured yet.
+- **The 1M runs found a border bug, since fixed.** A border reset was sent as one node-link frame,
+  and the link drops frames over 64 MiB. Against a side neighbour, a million-row shard's band is
+  about 375k rows, a 152–170 MiB frame. The hub's reader dropped the link, and with fast failover
+  on, the hub declared a healthy node dead and moved its shards, again after each reopen. It
+  predates phase 30: the first replica-off runs showed it as "detect 0 ms", the shard already
+  moving before the kill. Resets now travel in parts of about 16 MiB.
 - **The first runs found a promotion bug, fixed before these numbers.** The survivor's first open
   often fails because the dying owner has not released the log yet, and the next heartbeat
   retries. The open took the replica before trying the log, so the failed attempt threw the

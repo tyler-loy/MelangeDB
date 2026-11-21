@@ -16,6 +16,12 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
 {
     private const int MaxRecordsPerBatch = 256;
 
+    /// <summary>
+    /// Estimated frame bytes per border-reset part: a quarter of the node link's frame limit, so
+    /// the estimate (base64 rows plus per-row JSON) has room to be wrong.
+    /// </summary>
+    internal const int DefaultResetPartBytes = NodeLink.MaxFramePayloadBytes / 4;
+
     private sealed class Stream
     {
         public ulong Cursor;
@@ -41,6 +47,7 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
     private readonly Func<TableId, RowKey, ulong?> _borrowedOwner;
     private readonly Func<NodeLink?> _link;
     private readonly ILogger _logger;
+    private readonly int _resetPartBytes;
     private readonly ConcurrentDictionary<ulong, Stream> _streams = new();
     private readonly SemaphoreSlim _signal = new(0, 1);
     private readonly CancellationTokenSource _stopped = new();
@@ -52,8 +59,10 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
         IShardStrategy strategy,
         Func<TableId, RowKey, ulong?> borrowedOwner,
         Func<NodeLink?> link,
-        ILogger logger)
+        ILogger logger,
+        int resetPartBytes = DefaultResetPartBytes)
     {
+        _resetPartBytes = resetPartBytes;
         _engine = engine;
         _shard = shard;
         _strategy = strategy;
@@ -320,11 +329,19 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
             }
         });
 
-        await link.RequestAsync(
-            "border-reset",
-            new BorderReset(_shard.Value, observer, _engine.Log.EpochId.ToString(), resetLsn, [.. tables]),
-            ct).ConfigureAwait(false);
-        LogBorderReset(_logger, _shard.Value, observer, sent.Count, resetLsn);
+        // In parts, each acked before the next: the observer applies nothing until the last.
+        var epoch = _engine.Log.EpochId.ToString();
+        var resetId = Guid.NewGuid().ToString("N");
+        var parts = SplitReset(tables, _resetPartBytes);
+        for (var i = 0; i < parts.Count; i++)
+        {
+            await link.RequestAsync(
+                "border-reset-part",
+                new BorderResetPart(resetId, i, i == parts.Count - 1, new BorderReset(_shard.Value, observer, epoch, resetLsn, parts[i])),
+                ct).ConfigureAwait(false);
+        }
+
+        LogBorderReset(_logger, _shard.Value, observer, sent.Count, resetLsn, parts.Count);
         lock (stream)
         {
             stream.NeedsReset = false;
@@ -348,7 +365,53 @@ internal sealed partial class BorderPublisher : ICommitObserver, IDisposable
 
     [LoggerMessage(EventId = 1715, EventName = "BorderStreamReset", Level = LogLevel.Information,
         Message = "Shard {OwnerShard}'s border stream to observer shard {ObserverShard} could not resume from the observer's cursor " +
-            "(truncated past, another log epoch, or a widened band); the full band ({Rows} row(s) at LSN {ResetLsn}) was sent as a reset " +
-            "instead of silently skipping the gap.")]
-    private static partial void LogBorderReset(ILogger logger, ulong ownerShard, ulong observerShard, int rows, ulong resetLsn);
+            "(truncated past, another log epoch, or a widened band); the full band ({Rows} row(s) at LSN {ResetLsn}, in {Parts} part(s)) was sent " +
+            "as a reset instead of silently skipping the gap.")]
+    private static partial void LogBorderReset(ILogger logger, ulong ownerShard, ulong observerShard, int rows, ulong resetLsn, int parts);
+
+    /// <summary>
+    /// Splits a reset's tables into parts of at most <paramref name="partBytes"/> estimated frame
+    /// bytes each (a row is never split; a single row larger than the budget gets a part of its
+    /// own). Always at least one part, so an empty band still delivers its deletions and cursor.
+    /// </summary>
+    internal static List<ReplicaTableSnapshot[]> SplitReset(IReadOnlyList<ReplicaTableSnapshot> tables, int partBytes)
+    {
+        var parts = new List<ReplicaTableSnapshot[]>();
+        var current = new List<ReplicaTableSnapshot>();
+        var rows = new List<WireOp>();
+        long bytes = 0;
+
+        void CloseTable(uint table)
+        {
+            if (rows.Count > 0)
+                current.Add(new ReplicaTableSnapshot(table, [.. rows]));
+            rows.Clear();
+        }
+
+        foreach (var table in tables)
+        {
+            foreach (var row in table.Rows)
+            {
+                var estimate = EstimatedBytes(row);
+                if (bytes > 0 && bytes + estimate > partBytes)
+                {
+                    CloseTable(table.Table);
+                    parts.Add([.. current]);
+                    current.Clear();
+                    bytes = 0;
+                }
+
+                rows.Add(row);
+                bytes += estimate;
+            }
+
+            CloseTable(table.Table);
+        }
+
+        parts.Add([.. current]);
+        return parts;
+    }
+
+    /// <summary>A row op's JSON size: base64 key and row, plus the field names and numbers around them.</summary>
+    private static long EstimatedBytes(WireOp op) => ((op.Key.Length + (op.Row?.Length ?? 0)) * 4L / 3) + 64;
 }

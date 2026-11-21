@@ -626,8 +626,8 @@ gauge. Handoff *rate* is the first counter over time; a growing `HandoffsUnresol
 
 Cluster link traffic is additionally counted per message type in `ClusterMetrics`, as messages **and payload
 bytes** in each direction (phase 10 added the bytes). Border-band bandwidth is read straight off it: sum the
-`border-apply` / `border-reset-apply` types received on a node to see what holding its neighbours' edges
-costs, and the `border-batch` / `border-reset` types sent to see what serving its own edges costs.
+`border-apply` / `border-reset-part-apply` types received on a node to see what holding its neighbours' edges
+costs, and the `border-batch` / `border-reset-part` types sent (a band reset travels in parts of at most about 16 MiB, so a large one is many frames; `border-reset` and `border-reset-apply` are the single-frame form, which only a node from before parts still sends) to see what serving its own edges costs.
 
 The **shard ownership map** is a first-class query: `MelangeClusterCoordinator.OwnershipMap()` returns every
 shard, its owning node, and its fencing term, straight from the membership store — the same truth the hub

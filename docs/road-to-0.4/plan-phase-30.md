@@ -211,6 +211,7 @@ fault its working set in from disk, which is the reopen cost again in another fo
   (EventId 1015) and recovers cold. The rest of the open is unchanged. `Cluster:ReplicaResidency`
   (`Owner` or `Paged`) is in. Measured (LOAD-TESTING, "After phase 30 step 2e"): at 100k
   rows with fast failover, 10 of 10 kills promoted, the reopen fell from 0.7–1.4 s to 0.3–0.85 s,
-  and the server window to 0.72–1.14 s; at 1M rows a promotion took 1.4–2.2 s against a 4–5 s cold
-  reopen. The 1M runs found that a border reset larger than the node link's 64 MiB frame cap
-  drops the link, which predates this phase.
+  and the server window to 0.72–1.14 s; at 1M rows, 6 of 6 promoted in 1.6–4.7 s against a
+  4.6–6.1 s cold reopen. The 1M runs found that a border reset larger than the node link's 64 MiB
+  frame cap dropped the link, which predates this phase; resets now travel in parts (fixed on
+  the same stack).

@@ -547,6 +547,52 @@ internal sealed partial class ShardRuntime : IDisposable
         }
     }
 
+    /// <summary>A border reset arriving in parts, per owner shard: what has been staged so far.</summary>
+    private sealed class StagedReset(string id)
+    {
+        public string Id { get; } = id;
+
+        public int NextPart { get; set; }
+
+        public List<ReplicaTableSnapshot> Tables { get; } = [];
+    }
+
+    private readonly Dictionary<ulong, StagedReset> _stagedResets = [];
+
+    /// <summary>
+    /// Stages one part of a border reset and, on the final part, applies the whole reset as
+    /// <see cref="ApplyBorderReset"/> does. Nothing is applied before the final part: a reset's
+    /// deletions are "every row borrowed from this owner that the band lacks", which a partial
+    /// band would get wrong. Part 0 starts a new staging, replacing any abandoned one; a part out
+    /// of sequence (a lost or repeated part, an observer restart in between) discards the staging
+    /// and fails, and the owner starts over.
+    /// </summary>
+    public void ApplyBorderResetPart(BorderResetPart part)
+    {
+        var owner = part.Reset.OwnerShard;
+        List<ReplicaTableSnapshot> tables;
+        lock (_stagedResets)
+        {
+            if (part.Part == 0)
+                _stagedResets[owner] = new StagedReset(part.ResetId);
+            if (!_stagedResets.TryGetValue(owner, out var staged) || staged.Id != part.ResetId || staged.NextPart != part.Part)
+            {
+                _stagedResets.Remove(owner);
+                throw new InvalidOperationException(
+                    $"Border reset part {part.Part} of '{part.ResetId}' from shard {owner} arrived out of sequence; the owner starts the reset over.");
+            }
+
+            staged.Tables.AddRange(part.Reset.Tables);
+            staged.NextPart++;
+            if (!part.Final)
+                return;
+            _stagedResets.Remove(owner);
+            tables = staged.Tables;
+        }
+
+        ApplyBorderReset(part.Reset with { Tables = [.. tables] });
+    }
+
     /// <summary>The observer's durable cursor into one owner's log: epoch, LSN, and the band depth it was taken at.</summary>
     public (string Epoch, ulong Lsn, int BandChunks) ReadBorderCursor(ulong ownerShard, int currentBand)
     {

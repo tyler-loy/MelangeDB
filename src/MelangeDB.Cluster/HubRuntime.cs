@@ -1538,6 +1538,19 @@ internal sealed partial class HubRuntime : IDisposable
                 return null;
             }
 
+            case "border-reset-part":
+            {
+                // Relayed part by part, unchanged: the hub holds no staging, and a part that
+                // cannot be delivered fails back to the owner, which starts the reset over.
+                var part = body!.Value.Deserialize<BorderResetPart>()!;
+                RequireOwnedBy(session, part.Reset.OwnerShard, type);
+                var observer = _membership.GetAssignment(new ShardKey(part.Reset.ObserverShard));
+                if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
+                    throw new InvalidOperationException($"Shard {part.Reset.ObserverShard}'s owner is unreachable; the owner retries.");
+                await observerLink.RequestAsync("border-reset-part-apply", part, _stopped.Token).ConfigureAwait(false);
+                return null;
+            }
+
             case "handoff-request":
                 HandleHandoffRequest(session, body!.Value.Deserialize<HandoffRequest>()!);
                 return null;
