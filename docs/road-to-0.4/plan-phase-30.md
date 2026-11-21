@@ -194,3 +194,10 @@ fault its working set in from disk, which is the reopen cost again in another fo
   truncation passes its cursor, the epoch changes, or the shape sidecar changes. The tail reopens
   files per call and verifies its remembered offset, so a compaction of the live segment is
   re-located rather than misread. Not wired into the cluster yet; that is 2d.
+- **2d**: `ShardAssignment.ReplicaNode` and `IMembershipStore.SetReplica` (Postgres: a
+  `replica_node` column added in place). The hub places replicas on its rebalance tick, before
+  the rebalance gate (availability, not balance), keeping a cached plan so heartbeat replies cost
+  no membership read; stores clear a replica whose node died or became the owner. Owners report
+  `DurableLsn` in the load sample; the hub relays it as the ceiling only from the plan's owner.
+  Nodes run one follower thread (50 ms polls) and the `melange.cluster.replica.lag` gauge. Shard
+  hot stores moved to node-local scratch (`Cluster:LocalScratchPath`).

@@ -157,5 +157,7 @@ public class FenceStepZeroTests
         public ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now) => _inner.Reassign(shard, toNode, now);
 
         public bool RemoveShard(ShardKey shard) => _inner.RemoveShard(shard);
+
+        public ShardAssignment SetReplica(ShardKey shard, string? replicaNode) => _inner.SetReplica(shard, replicaNode);
     }
 }

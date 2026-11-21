@@ -35,7 +35,13 @@ internal sealed record AuthRequest(string NodeName, string PublicAddress, string
 
 internal sealed record AuthReply(string Proof, ShardAssignmentDto[] Assignments, int FailureTimeoutMs);
 
-internal sealed record HeartbeatReply(ShardAssignmentDto[] Assignments);
+/// <summary>
+/// A shard this node keeps a warm replica of (phase 30): the originator its sequences continue
+/// under, and the ceiling, the owner's last reported durable LSN (0 until the owner has reported).
+/// </summary>
+internal sealed record ReplicaDto(ulong Shard, ushort Originator, ulong Ceiling);
+
+internal sealed record HeartbeatReply(ShardAssignmentDto[] Assignments, ReplicaDto[]? Replicas = null);
 
 /// <summary>
 /// One owned shard's load sample, riding the heartbeat — no new clock, no new message. The
@@ -50,7 +56,8 @@ internal sealed record ShardLoadDto(
     long ResidentBytes,
     int BorrowedRows,
     long AuthoritativeRows,
-    bool Draining = false);
+    bool Draining = false,
+    ulong DurableLsn = 0);
 
 /// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
 internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);

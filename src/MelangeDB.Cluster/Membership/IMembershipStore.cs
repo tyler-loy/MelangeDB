@@ -8,9 +8,10 @@ public sealed record NodeRecord(string NodeName, string PublicAddress, DateTimeO
 /// term, and the shard's originator id. The fencing token increases on every reassignment — a
 /// message carrying an older token is from a previous owner and is rejected. The originator is
 /// stable for the shard's lifetime: the AutoInc sequence continues from the shard's own log when
-/// ownership moves, so the same prefix keeps minting unique ids.
+/// ownership moves, so the same prefix keeps minting unique ids. <see cref="ReplicaNode"/> is the
+/// node keeping a warm replica (phase 30), never the owner; changing it does not change the term.
 /// </summary>
-public sealed record ShardAssignment(ShardKey Shard, string? NodeName, long FencingToken, ushort Originator);
+public sealed record ShardAssignment(ShardKey Shard, string? NodeName, long FencingToken, ushort Originator, string? ReplicaNode = null);
 
 /// <summary>
 /// The cluster's ownership registry: which nodes exist, which node owns each shard under which
@@ -68,6 +69,15 @@ public interface IMembershipStore
     /// a node that is not registered and alive — a drain must never assign to a corpse.
     /// </summary>
     ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now);
+
+    /// <summary>
+    /// Names the node that keeps <paramref name="shard"/>'s warm replica, or none. Placement is the
+    /// hub's decision; the store only records it, and clears it itself where a change of owner or
+    /// a death would otherwise leave it naming the owner or a dead node. Does not bump the fencing
+    /// token: a replica owns nothing. Throws for an unknown shard, a replica on the owner, or a
+    /// node that is not registered and alive.
+    /// </summary>
+    ShardAssignment SetReplica(ShardKey shard, string? replicaNode);
 
     /// <summary>
     /// Forgets a shard entirely — the counterpart <see cref="EnsureShard"/> never had. Returns
