@@ -43,6 +43,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A client on a shard whose machine died no longer hangs**
+  ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). The gateway's upstream connect had
+  no timeout. A dead process refuses connections, but a dead machine answers nothing, so the
+  connect waited out the OS TCP timeout (about 21 s on Windows, about two minutes on stock Linux)
+  while holding the client's attachment lock, and every shard call that client made waited
+  behind it. Each upstream handshake is now bounded (`Cluster:FailureTimeoutMs / 4`, 1–5 s). The
+  shard attachment's retry, previously a fixed 20 × 250 ms that on a fast-refusing OS ran out
+  before the hub had even declared the node dead, now lasts `2 × Cluster:FailureTimeoutMs`, so a
+  call waits out a reassignment instead of failing inside it. Failed handshakes also dispose
+  their socket now.
 - **`FsyncPolicy = Interval` no longer puts the disk on the commit path.** The interval flusher
   fsynced while holding the log's append lock, so every commit that landed during a flush waited
   for it under the engine's write lock. A consumer game saw one-row commits of 63–206 ms with a
