@@ -134,10 +134,15 @@ noted.
   serve process via `/loadtest/stats` every sample interval. Hub and shard nodes share the serve
   process, so these numbers describe the whole server side of the run. On a soak run the time
   series (`--out`) is the leak watch: a healthy run's working set flattens; a leak trends.
+- **Liveness** — the longest heartbeat gap the hub saw, the longest lease-renewal gap any shard
+  node saw, how many gaps exceeded 0.5/1/2/3/5 s, and the nodes declared dead and leases lapsed.
+  Whole-run counters (`ClusterMetrics`, see OBSERVABILITY.md). A drive run kills nothing, so any
+  death or lapse is a false one. Run at a long `--failure-timeout-ms`, the gap counts say how many
+  false deaths each shorter timeout would have caused, from one run.
 - **`LOADTEST RESULT=PASS|FAIL ...`** — one machine-parseable line of key=value pairs. FAIL means:
   zero acked calls, any client disconnect, any resync error, or seam walkers configured on a
-  multi-shard world with zero completed handoffs (only checked when the stats endpoint is
-  reachable). Latency and throughput are **reported, never asserted** — thresholds belong to your
+  multi-shard world with zero completed handoffs, or any node declared dead or lease lapsed (these
+  two only checked when the stats endpoint is reachable). Latency and throughput are **reported, never asserted** — thresholds belong to your
   hardware, per the repo's measurement discipline (`HotspotMeasurementTests`).
 
 ## Methodology and caveats
@@ -332,6 +337,9 @@ After the kills, the shard directory is opened by a bare engine three times ("is
 heat-dependent part can be read without the heartbeat wait in it. The run also records, before each
 kill, how stale the owner's heartbeat already was. A live owner that has gone quiet shortens
 *detect* below the timeout, and the line says so with a WARNING rather than report it as speed.
+The summary line also counts **false deaths** (declarations beyond the one each kill causes) and
+lease lapses on the nodes still running, with the longest heartbeat and lease-renewal gaps: an
+adopter whose recovery stalls its heartbeat shows up there, and either one fails the run.
 
 **Synthetic by construction.** The reference workload has no cluster deployment, so this cannot come
 from it. One process hosts hub, both nodes, and the clients, so GC and thread-pool load are shared;
@@ -403,9 +411,71 @@ calls by reason.
 - **Failed calls in these windows are the rate limiter, not the failover.** The probe fires 15
   calls/s without waiting. The gateway holds them through the window and they reach the shard in
   one burst, and `RateLimit:*` turns the excess away.
+- **At the phase 30 defaults (heartbeat 250 ms, timeout 5 s),** same runs:
+
+  | Detection | Detect | Reopen | Server window | Client restore p50 / max |
+  | --- | --- | --- | --- | --- |
+  | At the deadline | 4.9–5.1 s | 0.8–1.3 s | 5.9–6.2 s | 6.1 / 6.4 s |
+  | `--fast-failover` | 0.36–0.39 s | 1.2–1.3 s | 1.5–1.6 s | 1.8 / 1.8 s |
+
+  No false death or lease lapse in either; the longest heartbeat gap was 305 ms.
 - **These runs found a gateway bug.** About one kill in twelve tore down a client's connection:
   a send to a node dying under it was mistaken for the client leaving. Fixed separately; with the
   fix, 30 of 30 kills restored every client.
+
+#### Liveness soak (phase 30), 2026-11-21
+
+How close a healthy cluster comes to its failure timeout: `all --nodes 4 --soak` with heartbeat
+250 ms and a 15 s timeout, long enough that no death disturbs the run. Every gap the hub saw
+between two heartbeats from one node is counted against each candidate timeout at once. The hub
+and all four nodes share one process, so a pause stalls both ends of every link together; a real
+deployment's hub does not share its node's thread pool, so treat these as pessimistic.
+
+| Players (capacity ladder) | Hot store | Longest gap | > 1 s | > 2 s | > 3 s | > 5 s | Deaths / lapses |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 (comfortable) | in-memory | 432 ms | 0 | 0 | 0 | 0 | 0 / 0 |
+| 100 | FASTER | 428 ms | 0 | 0 | 0 | 0 | 0 / 0 |
+| 200 (past the knee) | in-memory | 4.2 s | 428 | 35 | 2 | 0 | 0 / 0 |
+| 200 | FASTER | 4.3 s | 425 | 43 | 9 | 0 | 0 / 0 |
+| 300 (collapse) | FASTER | 10.0 s | 378 | 238 | 120 | 24 | 0 / 0 |
+
+About 4,800 heartbeats per run at 100 players, 2,750 at 200, 1,400 at 300: overloaded, the
+heartbeats themselves slow down. (The in-memory 300-player run lost its stats endpoint in the
+collapse and has no row.) The lease-renewal gaps the nodes measured track the hub's within a few
+milliseconds.
+
+- **At sustainable load there is room for a 2 s timeout:** the longest gap was under half a second.
+- **Past the knee, heartbeats stalled with everything else.** At 200 players a 2 s timeout would
+  have declared a healthy node dead 35–43 times in five minutes, and 3 s 2–9 times. Each one moves
+  a shard onto nodes that are just as overloaded. Timing each hop showed almost all of it was
+  waiting for thread-pool threads: the heartbeat loop's 250 ms delay fired up to 2.4 s late, and
+  the hub waited up to 1.3 s for a thread to handle the beat.
+
+**With the liveness ping** (a dedicated pinger thread on the node, answered on the hub's link
+reader thread) and synchronous link sends under a plain lock, the same sweep:
+
+| Players | Hot store | Longest gap | > 1 s | > 2 s | > 3 s | > 5 s | Deaths / lapses |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 | in-memory | 272 ms | 0 | 0 | 0 | 0 | 0 / 0 |
+| 200 | in-memory | 1.1 s | 2 | 0 | 0 | 0 | 0 / 0 |
+| 200 | FASTER | 1.8 s | 5 | 0 | 0 | 0 | 0 / 0 |
+| 300 | FASTER | 3.2 s | 4 | 4 | 4 | 0 | 0 / 0 |
+
+- **The ping alone was half the fix.** Its first version still waited up to 1.5 s for the link's
+  send lock, a `SemaphoreSlim` that handed itself on release to queued async waiters whose
+  continuations needed pool threads; no write held it longer than 23 ms. Sends are now synchronous
+  writes under a plain lock, so the waiters are threads already running.
+- **What remains is a few discrete multi-second pauses at collapse,** four in five minutes at 300
+  players, likely full collections of a 3 GiB heap. A dedicated thread sleeping 10 ms never woke
+  more than 54 ms late at 200 players.
+- **Throughput rose too:** 200 players acked ~770–800k calls in five minutes, from ~690k, now that
+  the pool no longer cycles through send-lock handoffs.
+- **Recovering a big shard does not stall the adopter.** `failover --rows 1000000 --hot-store
+  faster --heartbeat-ms 250 --failure-timeout-ms 15000 --fast-failover`: the longest gap across two
+  7 s recoveries was 335 ms, with no false death or lapse (#198's fix holding).
+- **The first pass found two gateway bugs** that refused 11% of calls at 100 players: shards for
+  negative-x blocks were unreachable, and the retries exhausted the port range; and a failed swap
+  wedged its client. Fixed in #228 before these numbers were taken.
 
 ### Soak — memory over five minutes
 

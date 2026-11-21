@@ -12,6 +12,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **A liveness ping that a starved thread pool cannot delay** (road-to-0.4 phase 30). Shard nodes
+  ping the hub every `Cluster:HeartbeatIntervalMs` from a dedicated thread, and the hub answers on
+  the node link's reader thread, which is now a dedicated thread too; each acknowledged ping renews
+  the node's lease and the hub's deadline for it. Under load the thread-pool heartbeat arrived up to
+  4 s late from healthy nodes, which ruled out short failure timeouts. A ping cannot revive a node
+  the hub has declared dead; its heartbeat still does.
+- **Liveness instruments** (road-to-0.4 phase 30): `melange.cluster.heartbeat.gap` on the hub and
+  `melange.cluster.lease.renewal_gap` on shard nodes time how close a healthy cluster comes to its
+  failure timeout, and `melange.cluster.nodes.declared_dead` and `melange.cluster.lease.lapses`
+  count the outcomes. `ClusterMetrics` carries the same, and the load tool reports them. They are
+  what the heartbeat and failure-timeout settings should be chosen from; see OBSERVABILITY.md.
 - **`Cluster:FastFailoverOnLinkLoss`** (off by default; road-to-0.4 phase 30, step 1). The hub
   declares a node dead as soon as its node link closes and stays closed for a heartbeat interval
   (EventId 1759), instead of at the failure timeout. A killed process is detected in 1.0–1.2 s, and
@@ -42,6 +53,13 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **Cluster defaults: `Cluster:HeartbeatIntervalMs` 250 (was 1000), `Cluster:FailureTimeoutMs`
+  5000 (was 10000)** (road-to-0.4 phase 30). Chosen from a soak under load: with the liveness ping,
+  no healthy node went silent longer than 3.2 s even with the cluster collapsing. A killed shard
+  owner's shards are writable again in 5.9–6.2 s (were 10.1–11.8 s), and 1.5–1.6 s with
+  `Cluster:FastFailoverOnLinkLoss`. Deployments whose nodes see longer pauses (multi-second
+  collections of very large heaps) should set a longer timeout; `melange.cluster.heartbeat.gap`
+  shows how close they come.
 - **A subscription's initial set is collected off the engine's write lock**
   ([#213](https://github.com/tyler-loy/MelangeDB/issues/213)), for tables without row or column
   policies on a store that can pin a read view (both shipped stores can). The row and byte

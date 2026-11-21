@@ -50,4 +50,23 @@ public sealed record ServerStats
     public double LockedMsSum { get; init; }
 
     public double PostCommitMsSum { get; init; }
+
+    // Liveness, whole-run (phase 30's timing soak): heartbeat gaps as the hub received them, the
+    // shard nodes' lease-renewal gaps (all nodes together), and the false deaths they caused. The
+    // "over" maps are keyed by threshold in ms (ClusterMetrics' LivenessGaps thresholds).
+    public long HeartbeatGapCount { get; init; }
+
+    public double HeartbeatGapMaxMs { get; init; }
+
+    public Dictionary<int, long> HeartbeatGapsOverMs { get; init; } = [];
+
+    public long LeaseRenewalGapCount { get; init; }
+
+    public double LeaseRenewalGapMaxMs { get; init; }
+
+    public Dictionary<int, long> LeaseRenewalGapsOverMs { get; init; } = [];
+
+    public long NodesDeclaredDead { get; init; }
+
+    public long LeaseLapses { get; init; }
 }

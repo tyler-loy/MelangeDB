@@ -177,6 +177,10 @@ internal sealed class LoadTestServer : IAsyncDisposable
     {
         using var process = Process.GetCurrentProcess();
         var metrics = Hub.Metrics;
+        var nodes = _nodeApps
+            .Where(static n => n.App is not null)
+            .Select(static n => n.App!.Services.GetRequiredService<ShardNodeRuntime>().Metrics)
+            .ToList();
         return new ServerStats
         {
             TimestampUtc = DateTimeOffset.UtcNow,
@@ -198,6 +202,14 @@ internal sealed class LoadTestServer : IAsyncDisposable
             LockSplitTransactions = _lockSplit?.Transactions ?? 0,
             LockedMsSum = _lockSplit?.LockedMs ?? 0,
             PostCommitMsSum = _lockSplit?.PostCommitMs ?? 0,
+            HeartbeatGapCount = metrics.HeartbeatGaps.Count,
+            HeartbeatGapMaxMs = metrics.HeartbeatGaps.MaxMs,
+            HeartbeatGapsOverMs = LivenessGaps.ThresholdsMs.ToDictionary(static t => t, metrics.HeartbeatGaps.Over),
+            LeaseRenewalGapCount = nodes.Sum(static n => n.LeaseRenewalGaps.Count),
+            LeaseRenewalGapMaxMs = nodes.Count == 0 ? 0 : nodes.Max(static n => n.LeaseRenewalGaps.MaxMs),
+            LeaseRenewalGapsOverMs = LivenessGaps.ThresholdsMs.ToDictionary(static t => t, t => nodes.Sum(n => n.LeaseRenewalGaps.Over(t))),
+            NodesDeclaredDead = metrics.NodesDeclaredDead,
+            LeaseLapses = nodes.Sum(static n => n.LeaseLapses),
         };
     }
 
