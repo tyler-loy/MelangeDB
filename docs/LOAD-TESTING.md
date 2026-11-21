@@ -349,7 +349,7 @@ clients at 15 Hz, 3 kills per size. Ranges are over the kills.
 | in-memory | 1M (565 MiB) | see below | 4.9–6.1 s | 3.2–4.5 s | 11.3–18.5 s | 12.0 / 19.1 s |
 | FASTER | 10k (12 MiB) | 11.2–11.5 s | 0.6–1.3 s | 97–121 ms | 11.9–12.8 s | 12.6 / 13.0 s |
 | FASTER | 100k (62 MiB) | 10.6–11.1 s | 0.7–2.8 s | 415–703 ms | 11.7–13.4 s | 12.6 / 14.1 s |
-| FASTER | 1M | **not measured: issue [#199](https://github.com/tyler-loy/MelangeDB/issues/199)** | | | | |
+| FASTER | 1M | **not measured: issue [#208](https://github.com/tyler-loy/MelangeDB/issues/208)** (first seen as [#199](https://github.com/tyler-loy/MelangeDB/issues/199)) | | | | |
 
 The reading:
 
@@ -368,12 +368,14 @@ The reading:
   port refuses connections at once. A dead *machine* doesn't refuse; the gateway's upstream connect
   has no timeout, so each client stalls for the OS TCP connect timeout. That's 21 s measured on this
   Windows machine, and about 127 s on stock Linux by its documented SYN retry schedule (#200).
+  **Since fixed:** the handshake and the attachment retry are bounded by the failure timeout; these
+  rows were measured before the fix.
 - **At 1M rows, detect is not a clean number.** Two of the three kills found the owner's heartbeat
   already 7.7–8.3 s stale before the kill. That owner had adopted the shard on the previous kill and
   went quiet for the whole recovery, because **a node opens an adopted shard inside its heartbeat
   loop** ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). With the failure timeout set
   below the recovery time (`--failure-timeout-ms 3000`), the hub declares the *adopting* node dead
-  mid-recovery, a cascade from a single kill.
+  mid-recovery, a cascade from a single kill. **Since fixed:** opens run off the heartbeat loop.
 
 ### Soak — memory over five minutes
 
