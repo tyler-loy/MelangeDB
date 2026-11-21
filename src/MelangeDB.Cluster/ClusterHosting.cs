@@ -243,7 +243,9 @@ public static class MelangeClusterEndpointRouteBuilderExtensions
         ArgumentNullException.ThrowIfNull(endpoints);
         var services = endpoints.ServiceProvider;
         var options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
-        var path = (basePath ?? options.CurrentValue.Transport.Path).TrimEnd('/') + "/shard/{shardKey:long}";
+        // Unconstrained, parsed as ulong below: a :long constraint refused every key with the top
+        // bit set, which SpatialShardStrategy gives every block with a negative x coordinate.
+        var path = (basePath ?? options.CurrentValue.Transport.Path).TrimEnd('/') + "/shard/{shardKey}";
         return endpoints.Map(path, context => HandleShardSocketAsync(context, services));
     }
 
@@ -270,9 +272,13 @@ public static class MelangeClusterEndpointRouteBuilderExtensions
         }
 
         var node = services.GetRequiredService<ShardNodeRuntime>();
-        var shardValue = ulong.Parse(
-            (string)context.Request.RouteValues["shardKey"]!, System.Globalization.CultureInfo.InvariantCulture);
-        var shard = node.TryGetShard(new ShardKey(shardValue));
+        var shard = ulong.TryParse(
+            (string)context.Request.RouteValues["shardKey"]!,
+            System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var shardValue)
+            ? node.TryGetShard(new ShardKey(shardValue))
+            : null;
         if (shard is null)
         {
             context.Response.StatusCode = StatusCodes.Status404NotFound;

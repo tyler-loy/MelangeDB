@@ -76,6 +76,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **Shards for blocks with a negative x coordinate could not be reached.** Their keys have the top
+  bit set, and the shard node's websocket route only matched keys that fit in a signed 64-bit
+  integer, so every connection to them got a 404: no player could be served west of x = 0. Under
+  load the gateway's pre-opens to such neighbours, retried every 250 ms, exhausted the ephemeral
+  port range, and ordinary handoffs then failed to connect.
+- **A handoff swap that failed left the client unable to call shard reducers.** The gateway kept
+  holding the client's calls for a transfer nothing would end, then refused them at the 256-call
+  cap for as long as it stayed connected. The held calls now go to the shard's current owner and
+  the client is told to re-establish its subscriptions. A swap whose pre-opened session had failed
+  now connects afresh instead of failing.
 - **A node is declared dead at its deadline, not up to half a timeout later**
   ([#201](https://github.com/tyler-loy/MelangeDB/issues/201)). The hub checked every `FailureTimeoutMs/2`. It now checks each node's deadline every
   `FailureTimeoutMs/20` (25–250 ms), from memory, and reads the membership store only to record a

@@ -650,6 +650,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         }
 
         UpstreamSession? retired = null;
+        var failed = false;
         try
         {
             // "Already there" short-circuits a duplicate handoff notification — but never a
@@ -664,9 +665,22 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 _preopened.Remove(to.Value, out preopened);
             }
 
-            var session = preopened is not null
-                ? await preopened.ConfigureAwait(false)
-                : await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
+            // A pre-open that failed (its node was not serving the shard yet, or not at all) is
+            // not the swap's failure: connect now, with the full retry budget.
+            UpstreamSession? session = null;
+            if (preopened is not null)
+            {
+                try
+                {
+                    session = await preopened.ConfigureAwait(false);
+                }
+                catch (Exception exception) when (!ClientGone(exception, _closed.Token))
+                {
+                    LogPreopenFailed(_gateway.Logger, to.Value, exception.Message);
+                }
+            }
+
+            session ??= await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
 
             byte[][] subscribes;
             List<(byte[] Bytes, uint RequestId, bool IsProducer)> held;
@@ -694,6 +708,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         catch (Exception exception) when (!ClientGone(exception, _closed.Token))
         {
             LogSwapFailed(_gateway.Logger, to.Value, exception.Message);
+            failed = true;
         }
         finally
         {
@@ -701,6 +716,19 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             _muted = null;
             if (retired is not null)
                 await retired.DisposeAsync().ConfigureAwait(false);
+        }
+
+        // A failed swap must not leave the connection holding calls: nothing else ends the
+        // transfer for it, so every later call was held, then refused at the cap, for as long as
+        // the client stayed connected. Release the held calls to whichever node owns the session's
+        // shard now (resolved per call), and tell the client its subscriptions need re-establishing,
+        // since they were never re-scoped onto that node.
+        if (failed)
+        {
+            ReleaseHeldCalls();
+            _ = SendToClientAsync(new ErrorFrame(
+                MelangeErrorCodes.OverflowResync,
+                "An attachment behind the gateway was re-established; re-establish subscriptions."), CancellationToken.None);
         }
     }
 
@@ -770,8 +798,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     private static partial void LogSwapCompleted(ILogger logger, ulong shard, int subscriptions, int heldCalls);
 
     [LoggerMessage(EventId = 1719, EventName = "GatewaySwapFailed", Level = LogLevel.Warning,
-        Message = "Gateway could not swap a client to shard {Shard} ({Reason}); the client converges through the ordinary resync path on its next call.")]
+        Message = "Gateway could not swap a client to shard {Shard} ({Reason}); its held calls go to the shard's current owner and the client is told to re-establish subscriptions.")]
     private static partial void LogSwapFailed(ILogger logger, ulong shard, string reason);
+
+    [LoggerMessage(EventId = 1760, EventName = "GatewayPreopenFailed", Level = LogLevel.Debug,
+        Message = "Gateway's pre-opened session to shard {Shard} had failed ({Reason}); the swap connects afresh.")]
+    private static partial void LogPreopenFailed(ILogger logger, ulong shard, string reason);
 
     [LoggerMessage(EventId = 1720, EventName = "GatewayHandoffQueueOverflow", Level = LogLevel.Warning,
         Message = "A client queued more than {Cap} reducer calls during one transfer; further calls are refused with a retryable error until the transfer resolves.")]
