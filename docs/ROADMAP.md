@@ -129,13 +129,13 @@ project's own terms, and not by copying.
 
 | Phase | Title | Status |
 | --- | --- | --- |
-| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, carried from 0.3 — here because phase 30's trigger is one of its numbers | Planned |
+| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, carried from 0.3 — the decision-gating half: scheduled-reducer cost, fan-out share, the reassignment window, the 20 km world | **Measured**; findings [#198](https://github.com/tyler-loy/MelangeDB/issues/198)–[#204](https://github.com/tyler-loy/MelangeDB/issues/204) |
 | [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`, carried from 0.3 — SpacetimeDB has had module unit testing since 2.12 | Planned |
 | [23](road-to-0.3/plan-phase-23.md) | The TypeScript client and client conformance, carried from 0.3 | Planned |
 | [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) | **Built** |
 | [28](road-to-0.4/plan-phase-28.md) | Clients that outlive a deploy: old bindings survive added columns at any position, and reconnect is automatic with backoff and token refresh. Lands before 23 | **Built** |
 | [29](road-to-0.4/plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, SQL, and published signals; reducer calls by name only. A protocol, not the refused admin console | Planned |
-| 30 | Shard HA as a warm replica — [idea-bin](idea-bin/shard-ha-warm-replica.md) | Conditional on phase 20's reassignment window; design record before a plan, and may close as a refusal |
+| 30 | Shard HA — [idea-bin](idea-bin/shard-ha-warm-replica.md) | **Committed** (2026-11-20: production systems get HA). Design record before a plan, starting from phase 20's window, where detection, not rebuild, dominates |
 
 ## What's left
 
@@ -150,9 +150,13 @@ every benchmark in these docs as a dev-machine measurement rather than a product
 characteristic** — that distinction is the whole reason the phase asked for numbers, and phase 11's
 own risk register is explicit that a port reporting only wins is not evidence.
 
-The measurements that *gate other work* are now [phase 20](road-to-0.3/plan-phase-20.md), including
-two phase 11 did not ask for: the reassignment window for a crowded shard, and what the scheduled
-reducers cost a player reducer on the same lock.
+The measurements that *gate other work* were [phase 20](road-to-0.3/plan-phase-20.md), recorded on
+2026-11-20: the reassignment window for a crowded shard, what the scheduled reducers cost on the
+same lock, the fan-out share of lock-held time, and the 20 km world's footprint. They are dated and
+machine-pinned in [LOAD-TESTING.md](LOAD-TESTING.md) and
+[REFERENCE-WORKLOAD.md](REFERENCE-WORKLOAD.md). They narrow the warning above without lifting it:
+they are dev-machine and production-telemetry measurements of named shapes, not a characterization
+of the reference workload under players, which its deployment has not had.
 
 **The head-to-head comparison against SpacetimeDB is split out of that phase and remains
 undecided.** Its baseline froze at the port and the game has kept shipping — including changes its
@@ -189,9 +193,7 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
 - **Dynamic *assignment* is no longer deferred** — it is M4 above, planned as phases 13–14.
   What stays deferred: dynamic boundary *splitting* (the quadtree; its narrowed customer and
   reopening trigger are recorded in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)),
-  [shard-level HA](idea-bin/shard-ha-warm-replica.md) (a warm-replica shape and its reopening
-  trigger are in the idea bin; this deferral stands until that trigger fires), and
-  [sharding the hub](idea-bin/identity-sharded-hub.md) (likewise: an identity-sharded shape and its
+  and [sharding the hub](idea-bin/identity-sharded-hub.md) (likewise: an identity-sharded shape and its
   trigger are in the idea bin, and this deferral stands until it fires).
 - **Shard-side interest-scoped event delivery.** Nothing in the shipped cross-shard ladder needs it.
 - **A complete read-modify-write detector for snapshot reducers.** The detectable common shape —
@@ -227,5 +229,6 @@ the measurement or named consumer that would turn it into a phase. An idea there
 and not a soft refusal — it is an argument left open on purpose.
 
 Where an idea proposes a shape for something the list above already refuses — currently
-[shard-level HA](idea-bin/shard-ha-warm-replica.md) and
 [sharding the hub](idea-bin/identity-sharded-hub.md) — the deferral stands until its trigger fires.
+([Shard-level HA](idea-bin/shard-ha-warm-replica.md) was the other one until 2026-11-20, when it was
+committed as 0.4's phase 30.)

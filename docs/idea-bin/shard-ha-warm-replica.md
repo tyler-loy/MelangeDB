@@ -3,9 +3,12 @@
 **Shape:** a second node per hot shard that is already applying that shard's log into its own
 projection, holds no write lock, and can take one on fence without rebuilding anything.
 
-**Status:** undecided, and **against a live deferral** — [ROADMAP.md](../ROADMAP.md) records
-shard-level HA as deferred, and that decision stands until the trigger below fires. This entry is
-the proposal, not a reversal. See [the bin's rule on overlap](README.md#what-this-directory-must-not-do).
+**Status:** **measured, and moving to a design record** (2026-11-20). [Phase 20](../road-to-0.3/plan-phase-20.md)
+timed the window this entry's trigger asked for (see *The measurement* below). And the project owner
+settled the framing the trigger left open: **production systems get HA, and the bar for not building
+it is high.** So the measurement shapes [phase 30](../road-to-0.4/README.md)'s design; it doesn't
+decide whether phase 30 happens. ROADMAP.md's shard-HA deferral is lifted by that decision, and this
+entry stays as the proposal the design record starts from.
 
 ## What exists today
 
@@ -33,11 +36,9 @@ the rebuild. Described that way it is a recombination of shipped parts rather th
 
 Three things, and the first is the one that matters.
 
-**Nobody has measured the window.** The entire case above is "the recovery window is too long," and
-that number does not exist in this repo. If reassignment on a realistic crowded shard completes
-inside a reconnect backoff, this feature buys a loading screen nobody sees, and it buys it at the
-price below. Arguing for it before measuring is exactly the move the project's phase-11 risk
-register warns about.
+**Nobody had measured the window.** When this entry was written, the case above was "the recovery
+window is too long" with no number behind it. Phase 20 supplied one; see *The measurement*. (Kept as
+written: the other two points below are still the design's real costs.)
 
 **It doubles the resident footprint of the shard you least want to double.** Residency is opt-in and
 computable on purpose (phase 07) — a warm replica makes the honest footprint of a hot shard two
@@ -55,7 +56,46 @@ Dynamic boundary splitting stays deferred, with its reasoning in
 [design/elastic-rebalancing.md](../design/elastic-rebalancing.md). Fixed grains plus reassignment
 remains the right elasticity story; this idea is orthogonal to it.
 
-## Reopening trigger
+## The measurement (phase 20)
+
+Process death of a shard's owner, default timing (heartbeat 1 s, failure timeout 10 s), 20 clients on
+the shard. Full method and table in [LOAD-TESTING.md](../LOAD-TESTING.md).
+
+| Rows on the shard | Detect | Reopen (in cluster) | Recovery alone | Clients back |
+| --- | --- | --- | --- | --- |
+| 10k | 10.8–11.7 s | 0.6–1.4 s | ~0.1 s | 12–14 s |
+| 100k | 10.6–12.2 s | 0.9–2.8 s | ~0.5 s | 12–14 s |
+| 1M | (contaminated, see below) | 4.9–6.1 s | 3.2–4.5 s | 12–19 s |
+
+What it says about the design:
+
+1. **The window is a loading screen at every size.** It's 12–19 s before any write lands. Phase 28's
+   automatic reconnect doesn't hide it, because the client never disconnects: the gateway holds or
+   fails its calls.
+2. **Detection, not rebuild, dominates.** That part is 10.6–13.4 s, and a warm replica doesn't
+   touch it. Fencing forbids promotion before the dead owner's lease expires, and the hub's sweep
+   adds up to half the timeout on top ([#201](https://github.com/tyler-loy/MelangeDB/issues/201)).
+   **A warm replica alone removes 1–6 s of a 12–19 s window.** Phase 30's design has to own
+   detection too: shorter leases, a faster sweep, or an explicit failure signal from the link. The
+   fencing third state below is where the shorter-lease risk lives.
+3. **The cold path can cascade.** A node opens an adopted shard inside its heartbeat loop, so a
+   recovery longer than the failure timeout gets the *adopting* node declared dead
+   ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). A warm replica sidesteps that for the
+   replicated shards. The cold path stays the fallback for everything else and must be fixed
+   regardless.
+4. **Machine death is worse than process death.** The gateway's upstream connect has no timeout, so
+   on a dead machine each client stalls for the OS TCP connect timeout: 21 s on Windows, about 127 s
+   on stock Linux ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). That would cap any
+   gain from a replica until it's fixed.
+5. **FASTER at 1M rows could not be measured.** It hit
+   [#199](https://github.com/tyler-loy/MelangeDB/issues/199), unreadable payloads after
+   reassignment churn. That has to be closed before a replica, which is a second projection of the
+   same shard, is built on the store.
+
+## Reopening trigger (fired)
+
+Kept as it was written, for the record. The measurement ran, and the decision it gated was then made on
+other grounds: HA by default.
 
 **The reassignment-window measurement, on a crowded shard, under realistic residency.** That number
 is a named deliverable of [phase 20](../road-to-0.3/plan-phase-20.md) — added to the outstanding

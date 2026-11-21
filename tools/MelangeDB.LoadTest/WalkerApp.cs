@@ -44,6 +44,23 @@ public partial struct PlayerPos
     public long Seq;
 }
 
+/// <summary>
+/// The failover measurement's shard heat: rows whose only job is to be recovered. A crowded
+/// shard's rebuild cost is its row count and bytes, whatever the rows mean, so the sweep varies
+/// these and holds everything else still. Paged by default, like the reference workload's world.
+/// </summary>
+[Table(Placement = Placement.Partitioned, ShardBy = nameof(ChunkId))]
+public partial struct Ballast
+{
+    [PrimaryKey]
+    public long Id;
+
+    [Index]
+    public uint ChunkId;
+
+    public byte[] Payload;
+}
+
 /// <summary>Which shard owns each player's rows — the session-to-shard mapping, on the hub.</summary>
 [Table(Public = true, Placement = Placement.Global)]
 public partial struct PlayerShardMap
@@ -71,6 +88,18 @@ public sealed class WalkerReducers
             ctx.Db.PlayerPos.Update(pos with { ChunkId = chunkId, Seq = seq });
         else
             ctx.Db.PlayerPos.Insert(new PlayerPos { PlayerId = ctx.Caller, ChunkId = chunkId, Seq = seq });
+    }
+
+    /// <summary>Failover seeding: one transaction inserting <paramref name="count"/> ballast rows in one chunk.</summary>
+    [Reducer]
+    public void SeedBallast(ReducerContext ctx, uint chunkId, long firstId, int count, int payloadBytes)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var payload = new byte[payloadBytes];
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(payload, firstId + i);
+            ctx.Db.Ballast.Insert(new Ballast { Id = firstId + i, ChunkId = chunkId, Payload = payload });
+        }
     }
 
     /// <summary>

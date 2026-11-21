@@ -24,6 +24,7 @@ internal sealed class PlayerDriver : IAsyncDisposable
     private readonly byte[] _identity;
     private readonly Random _random;
     private readonly bool _seamWalker;
+    private readonly bool _mover;
     private readonly ConcurrentDictionary<long, long> _pendingSentAt = new();
     private MelangeSubscription? _terrain;
     private MelangeSubscription? _positions;
@@ -65,6 +66,7 @@ internal sealed class PlayerDriver : IAsyncDisposable
                 _metrics.ResyncError();
         };
 
+        _mover = options.Movers is not { } movers || index < movers;
         _seamVertical = options.WorldBlocksX > 1;
         _seamWalker = index < options.Players * options.SeamFraction && (options.WorldBlocksX > 1 || options.WorldBlocksY > 1);
         if (_seamWalker)
@@ -113,6 +115,10 @@ internal sealed class PlayerDriver : IAsyncDisposable
     /// <summary>The tick loop: one Move per tick, one chunk step every ChunkEveryTicks ticks.</summary>
     public async Task RunAsync(CancellationToken ct)
     {
+        // A passive subscriber (beyond --movers) holds its subscriptions and receives every delta
+        // but commits nothing, so a sweep over subscriber count holds the commit rate still.
+        if (!_mover)
+            return;
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(1 / _options.TickHz));
         var tick = 0;
         try
@@ -175,7 +181,15 @@ internal sealed class PlayerDriver : IAsyncDisposable
     /// <summary>Runs on the client's receive loop for every PlayerPos delta; cheap by design.</summary>
     private void OnSelfCandidate(MelangeRow row)
     {
-        if (row.Columns["PlayerId"] is not byte[] id || !id.AsSpan().SequenceEqual(_identity))
+        // The wire decodes an Identity column to Identity; matching only byte[] (the pre-v2 shape)
+        // silently matched nothing, and the headline metric reported "no samples" for it.
+        var id = row.Columns["PlayerId"] switch
+        {
+            Identity identity => identity.ToByteArray(),
+            byte[] bytes => bytes,
+            _ => null,
+        };
+        if (id is null || !id.AsSpan().SequenceEqual(_identity))
             return;
         var seq = Convert.ToInt64(row.Columns["Seq"], System.Globalization.CultureInfo.InvariantCulture);
         var now = Stopwatch.GetTimestamp();

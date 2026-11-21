@@ -199,6 +199,101 @@ just `foreach (...) { exists = true; break; }` existence checks that want a `.An
 - **Multi-target codegen.** Three consumers (Godot C#, admin web, CLI) generate from one schema.
   `MelangeDB.CodeGen` should target multiple output trees from the start.
 
+## Measured in production (road-to-0.3 phase 20)
+
+Everything above is an audit of what the workload *uses*. This section is what it *costs*, read from
+the production deployment's own traces rather than from a bench. The read was queries only, over
+the deployment's existing OpenTelemetry data, with no load added and nothing changed.
+
+### Scheduled reducers hold the write lock 0.18% of the time
+
+The question [phase 24](design/scheduler-lanes.md) waits on is whether the fourteen scheduled
+reducers contend with players for the one write lock. Two six-hour windows a week apart
+(2026-11-13 12:00–18:00 and 2026-11-20 00:00–06:00 UTC), on the production world with its
+scheduled simulation running:
+
+| Reducer | Runs / 6 h | Lock hold p50 | p99 | max | Share of wall time |
+| --- | --- | --- | --- | --- | --- |
+| `SimulateCreaturePopulation` | 10,718 | 3.2 ms | 5.3 ms | 8.9 ms | 0.163% |
+| `TickCreatures` | 43,200 | 33 µs | 50 µs | 1.1 ms | 0.007% |
+| `GrowFlora` | 4,310 | 228 µs | 2.4 ms | 3.7 ms | 0.006% |
+| `SampleWorldStats` | 720 | 418 µs | 614 µs | 1.9 ms | 0.001% |
+| `TickBreath` | 21,600 | 8 µs | 19 µs | 1.5 ms | 0.001% |
+| everything else | < 11,000 each | ≤ 309 µs | | | < 0.001% |
+| **All scheduled work** | | | | | **0.180%** (0.178% in the earlier window) |
+
+How the hold was computed: a transaction's `melange.reducer` span start to its `melange.commit`
+span's start, plus the commit span. That is the body and the locked append, and it excludes the
+durability wait, which since phase 17 runs after the lock is released. A read-only tick has no commit,
+so its whole span is the hold. The span starts before the lock is taken, so any wait for the lock is
+counted too. That makes these upper bounds, and with no other writers in the windows the wait is
+close to nothing.
+
+**What a player would feel.** A player's call that arrives at a random instant finds the lock held
+by scheduled work 0.18% of the time, and the longest hold in twelve hours was 8.9 ms, under one
+60 Hz frame. On this world, scheduled work is not a source of player latency, and phase 24's
+question is answered for it.
+
+**What this does not measure, said plainly.** The production deployment had **no player traffic in
+the 30-day retention window**: the only client-initiated reducers in it are boot seeding and tool
+connections. So this is the cost side alone. The p99 of a player's `Move` on a busy shard, which is
+what the phase plan named, is a bound derived from the hold distribution, not an observed latency.
+Two things would change the conclusion. One is a world whose simulation grows with population:
+`SimulateCreaturePopulation` scans 64 chunks per tick and its cost follows creature count, not player
+count, so a re-read after a populated period is the check. The other is a scheduled reducer added
+later with a wide body. The query that produced the table is in the phase 20 plan's As built
+section, so the re-read costs a few seconds.
+
+### The long tail is the disk, after the lock
+
+The same windows' `melange.reducer` spans for `SimulateCreaturePopulation` reach 194 ms, which reads
+like a lock problem and is not one. The longest trace in the week breaks down as 2.6 ms of body,
+0.05 ms of commit, and **191 ms of fsync**, all of the fsync after the lock was released. Across the
+windows, fsync is p50 7.4 ms, p99 13.3 ms, max 125 ms on the production disk. Under group commit a
+player's call waits on that flush only for its own durability. It does not wait for another
+transaction's flush to finish before its body runs. A player's write in the same batch as a slow flush
+waits for that flush, which is disk latency and is the fsync policy's choice, not contention.
+
+**Open discrepancy, recorded and not explained here.** Spans like that one exceed
+`Telemetry:SlowReducerMs` (50 ms) on total time and should each have logged a `1003` warning. The
+week holds 124 scheduled-reducer spans over 50 ms, but the 30 days hold only five `1003` entries.
+The threshold code fires on total for a serialized transaction, and the deployment's logging
+configuration filters nothing. The cause is not established. It is filed as an issue rather than
+guessed at here, because the slow-reducer stream is the signal an operator would watch for exactly
+this.
+
+### The 20 km world on one node: 294 MiB working set
+
+Phase 11's capability claim was the 20 km world (314 × 314 = 98,596 chunks) on one node within a
+fixed budget. Measured 2026-11-20 on the same Windows machine as [LOAD-TESTING.md](LOAD-TESTING.md):
+
+- **Setup:** the reference workload at its current mainline, a Release build of its host, MelangeDB
+  `0.2.3-ci.231` (the version that mainline pins), the FASTER hot store at the default 128 MiB
+  buffer-pool budget, and no configuration changes.
+- **World:** baked with the workload's own generator, `--seed 42 --size 20096`, the same seed its
+  docs use, then published into an empty store.
+
+| | |
+| --- | --- |
+| Chunks | 98,596 marker rows, of which **23,020 carry terrain**; 75,576 are open ocean and store no blob |
+| Bake and publish | 18 s; commit log 119 MB on disk |
+| Restart to healthy | about 2 s, recovering that log |
+| Residency report at boot | 86 resident tables holding **97.6 KB**, plus 9.8 MB of paged-table bookkeeping, under the 128 MiB buffer-pool cap: **137.5 MiB declared footprint** |
+| Process after 90 s idle, scheduled simulation running | **working set 293.5 MiB**, private bytes 264.6 MiB, peak working set 302.1 MiB |
+| Settled managed heap | **not taken.** Attaching `dotnet-gcdump` to the host was not permitted in this session; the methodology's preferred number is still owed |
+
+**The claim holds, in a weaker form than it was made in.** The full 20 km world runs on one node in
+under 300 MiB. That memory is bounded by the configured buffer pool and doesn't track world size,
+which is the property complaint 2 asked for. But since the workload's archipelago work (its phase
+33), a 20 km bake from the CLI is **sparse**: one island, three-quarters open ocean storing
+nothing. So this demonstrates the row count and the chunk index, and not 4× the 10 km world's
+terrain bytes. A land-dense 20 km world needs a generator preset the workload doesn't have. Measuring
+that is a change to the workload, not to MelangeDB, and was deliberately not made here.
+
+The figure is MelangeDB's capability, not a statement about SpacetimeDB. Since 2.16.1 SpacetimeDB
+tables can opt into tiered storage, so whether it hosts this world is an open question this
+measurement doesn't answer.
+
 ## Verdict
 
 The core bets hold. Single-table subscriptions cover the real workload with no joins needed; the

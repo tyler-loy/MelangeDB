@@ -60,6 +60,44 @@ public sealed class LoadTestOptions
     /// <summary>serve only: exit after this many seconds. 0 means run until Ctrl+C.</summary>
     public int ServeSeconds { get; set; }
 
+    /// <summary>
+    /// Cluster:HeartbeatIntervalMs for every node. Null means the subcommand's own default: serve
+    /// keeps the 250 ms it has always run with; failover uses the library default, because the
+    /// window it measures is the one a deployment on defaults gets.
+    /// </summary>
+    public int? HeartbeatMs { get; set; }
+
+    /// <summary>Cluster:FailureTimeoutMs for every node. Null means the subcommand's default (see <see cref="HeartbeatMs"/>).</summary>
+    public int? FailureTimeoutMs { get; set; }
+
+    /// <summary>
+    /// serve: trace every reducer and sum its write-lock split — locked time and the post-commit
+    /// part of it, where subscription fan-out runs — into the stats endpoint. Sets
+    /// Telemetry:SlowReducerMs to 0, because the split rides the slow-reducer event; tracing every
+    /// transaction costs a little, so it is off unless a run asks for the split.
+    /// </summary>
+    public bool LockSplit { get; set; }
+
+    /// <summary>HotStore:Engine for every node: "inmemory" or "faster".</summary>
+    public string HotStore { get; set; } = "inmemory";
+
+    // ---- failover: the reassignment-window measurement ----
+
+    /// <summary>Ballast rows on the measured shard, one run per entry — the shard-heat sweep.</summary>
+    public IReadOnlyList<int> FailoverRows { get; set; } = [10_000, 100_000, 1_000_000];
+
+    /// <summary>Payload bytes per ballast row.</summary>
+    public int RowBytes { get; set; } = 256;
+
+    /// <summary>Records committed after the snapshot and before the kill: the log tail recovery replays.</summary>
+    public int TailRecords { get; set; } = 10_000;
+
+    /// <summary>Kills per sweep entry; the window is reported as a distribution over them.</summary>
+    public int Repeat { get; set; } = 3;
+
+    /// <summary>Gateway clients on the measured shard, each calling Move at <see cref="TickHz"/>.</summary>
+    public int Clients { get; set; } = 20;
+
     // ---- drive: workload ----
 
     /// <summary>The gateway address to drive, e.g. ws://127.0.0.1:5000/gateway.</summary>
@@ -67,6 +105,12 @@ public sealed class LoadTestOptions
 
     /// <summary>Concurrent simulated players, each a real websocket client.</summary>
     public int Players { get; set; } = 200;
+
+    /// <summary>
+    /// drive: only the first this-many players move; the rest connect, subscribe, and receive.
+    /// Null means everyone moves. Holds the commit rate fixed across a subscriber sweep.
+    /// </summary>
+    public int? Movers { get; set; }
 
     /// <summary>Movement reducer calls per player per second.</summary>
     public double TickHz { get; set; } = 15;
@@ -152,6 +196,9 @@ public sealed class LoadTestOptions
                 case "--in-process-server":
                     options.InProcessServer = true;
                     continue;
+                case "--lock-split":
+                    options.LockSplit = true;
+                    continue;
             }
 
             if (i + 1 >= args.Length)
@@ -185,8 +232,28 @@ public sealed class LoadTestOptions
                     case "--listen": options.Listen = value; break;
                     case "--data": options.DataPath = value; break;
                     case "--serve-seconds": options.ServeSeconds = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--heartbeat-ms": options.HeartbeatMs = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--failure-timeout-ms": options.FailureTimeoutMs = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--hot-store":
+                        if (value is not ("inmemory" or "faster"))
+                        {
+                            error.WriteLine($"--hot-store takes 'inmemory' or 'faster', not '{value}'.");
+                            return null;
+                        }
+
+                        options.HotStore = value;
+                        break;
+                    case "--rows":
+                        options.FailoverRows = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                            .Select(static v => int.Parse(v, CultureInfo.InvariantCulture)).ToArray();
+                        break;
+                    case "--row-bytes": options.RowBytes = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--tail": options.TailRecords = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--repeat": options.Repeat = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--clients": options.Clients = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--address": options.Address = new Uri(value); break;
                     case "--players": options.Players = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--movers": options.Movers = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--tick-hz": options.TickHz = double.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--chunk-every": options.ChunkEveryTicks = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--seam-fraction": options.SeamFraction = double.Parse(value, CultureInfo.InvariantCulture); break;

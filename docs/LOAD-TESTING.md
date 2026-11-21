@@ -30,14 +30,18 @@ before its first move), so the configured population loads every shard from the 
 ## Running it
 
 The tool is a console app; `dotnet run --project tools/MelangeDB.LoadTest -- <subcommand>` or run
-the built exe. Three subcommands, because **the measurement is contaminated if server nodes and the
-load driver share a thread pool**:
+the built exe (`all` re-launches its own executable as the serve child, so run the apphost
+`MelangeDB.LoadTest.exe`, not `dotnet MelangeDB.LoadTest.dll`). Three load subcommands, because
+**the measurement is contaminated if server nodes and the load driver share a thread pool**:
 
 | Subcommand | What it does |
 | --- | --- |
 | `serve` | Hosts the hub plus N shard nodes (real Kestrel hosts, real TCP node links) in this process, seeds the world's terrain, then prints `GATEWAY <uri>`, `STATS <uri>`, and `READY`. Runs until Ctrl+C (or `--serve-seconds`). |
 | `drive` | Connects `--players` clients to `--address` and generates the workload for `--warmup-seconds` + `--duration-seconds`, printing a sample every `--sample-seconds` and a final summary. |
 | `all` | Spawns `serve` as a **separate child process**, waits for `READY`, then drives against it. The one-command local run. |
+
+A fourth, `failover`, is a different measurement: it kills the node that owns a crowded shard and
+times the reassignment window. See [The reassignment window](#the-reassignment-window).
 
 ```
 # Small and fast (under 30 s, 2 nodes, 8 players):
@@ -80,6 +84,11 @@ noted.
 | `--handoff-min-ms` | 2000 | `Cluster:HandoffMinIntervalMs`. |
 | `--fsync` | interval | `CommitLog:FsyncPolicy`: `interval` or `commit`. Interval is the capacity default; per-commit measures the disk's fsync ceiling instead. |
 | `--fsync-interval-ms` | 50 | `CommitLog:FsyncIntervalMs` when interval. |
+| `--hot-store` | inmemory | `HotStore:Engine`: `inmemory` or `faster`. |
+| `--heartbeat-ms` | 250 (`failover`: 1000) | `Cluster:HeartbeatIntervalMs`. `failover` defaults to the library's value, because the window it measures is the one a deployment on defaults gets. |
+| `--failure-timeout-ms` | 15000 (`failover`: 10000) | `Cluster:FailureTimeoutMs`. Same reasoning. |
+| `--lock-split` | — | serve: trace every Move and sum its write-lock split, locked time and the post-commit part of it where subscription fan-out runs, into the stats endpoint; the driver reports the measured window's post-commit share. Sets `Telemetry:SlowReducerMs` to 0, because the split rides the slow-reducer event, and tracing every transaction costs a little. |
+| `--movers` | everyone | drive: only the first N players move; the rest connect, subscribe, and receive. Holds the commit rate fixed across a subscriber sweep. |
 | `--port` / `--listen` | 0 / 127.0.0.1 | Hub bind (gateway + stats). `--listen 0.0.0.0` accepts a remote driver. |
 | `--data` | temp dir | Data root for logs and hot stores; the temp default is deleted on exit. |
 | `--out` | — | Time-series file; `.json` writes JSON, anything else CSV. |
@@ -88,6 +97,11 @@ noted.
 | `--smoke` | — | Preset: 2 nodes, 2x1 world of 4x4 blocks, 8 players all seam walkers, 10 Hz, 12 s measured. |
 | `--soak` | — | Preset: 300 s measured, 15 s warm-up. Combine with `--players`. |
 | `--in-process-server` | — | `all` only: serve on a background task in the driver's process. For the smoke test and debugging; it contaminates the measurement and the tool says so. |
+| `--rows` | 10000,100000,1000000 | `failover`: ballast rows on the measured shard, one sweep entry each. |
+| `--row-bytes` | 256 | `failover`: payload bytes per ballast row (minimum 8). |
+| `--tail` | 10000 | `failover`: records committed after the pre-kill snapshot, which recovery replays. |
+| `--repeat` | 3 | `failover`: kills per sweep entry. |
+| `--clients` | 20 | `failover`: gateway clients on the measured shard, each calling Move at `--tick-hz`. |
 
 ## What each metric means
 
@@ -151,6 +165,11 @@ noted.
   range contained *no* change to the client assembly or its dependency closure at all, which a diff
   answered in a couple of minutes and no amount of bisecting would have. Declining to guess which
   change caused it is not the same as establishing that one did.
+- **Call-to-delta reported "no samples" from protocol v2 (2026-08-06, shipped in 0.2.0) until phase
+  20.** Protocol v2 decodes an `Identity` column as `Identity`, and the driver still matched its own
+  row as `byte[]`, so it never recognized one. Every other number in such a run is unaffected, and the
+  results below predate the break (2026-07-31). The smoke test now asserts the metric has samples,
+  which is the check that would have caught it.
 - **What the tool refuses to guess:** with the stats endpoint unreachable (or `--no-stats`),
   handoff counters and server memory are printed as *unavailable*, and the summary says
   `handoffs_completed=unavailable` rather than 0.
@@ -232,9 +251,129 @@ no seams, 60 s, ~758 calls/s — one commit per call):
 either way — but the *latency distribution* tells the story: under per-commit fsync every commit
 waits its turn behind the disk's fsync queue, and p90 goes from 20 ms to half a second at only
 ~70% of that ceiling. Choosing the fsync policy is choosing this distribution, exactly as
-CLUSTERING.md says at the strategy-choice point. (Measured before phase 17's group commit; the
-concurrent callers this tool generates are exactly the shape that now shares fsyncs, so a re-run
-should show the per-commit-fsync tail collapse toward the batched ceiling.)
+CLUSTERING.md says at the strategy-choice point.
+
+That table was measured before phase 17's group commit, with a prediction attached: the concurrent
+callers this tool generates are exactly the shape that shares fsyncs, so the per-commit-fsync tail
+should collapse toward the batched ceiling. **Re-run 2026-11-20** (road-to-0.3 phase 20), same
+machine and shape, arms interleaved interval → commit → commit → interval:
+
+| Fsync | Acked | p50 | p90 | p99 | max |
+| --- | --- | --- | --- | --- | --- |
+| `interval` (50 ms), two arms | 45,500 / 45,500 each | 10.7–10.8 ms | 17.6–18.1 ms | 35.0–35.8 ms | 143–253 ms |
+| `commit`, two arms | 45,499–45,500 / same | 12.8–13.0 ms | 18.9–19.4 ms | 166–172 ms | 251–291 ms |
+
+**The prediction held for the bulk of the distribution, and only partly for the tail.**
+- Per-commit fsync's p90 fell from 522 ms to 19 ms, and now sits level with interval fsync.
+- p99 fell 7.6×, from 1,294 ms to about 170 ms, but is still about 5× interval's.
+- The max fell an order of magnitude.
+
+So since phase 17, per-commit durability costs about 2 ms at the median and a fatter p99 tail, not
+a different latency class. The fsync-policy choice CLUSTERING.md describes is now mainly a choice
+about that tail.
+
+### Fan-out under the write lock — one shard, subscribers swept
+
+Measured 2026-11-20 for road-to-0.3 phase 20, as [read-side fan-out](idea-bin/read-side-fanout.md)'s
+reopening metric. One shard on one node, **50 movers at 15 Hz (a fixed ~750 commits/s)**, and the
+subscriber count swept by adding passive subscribers (`--movers 50 --players N --lock-split`). Every
+subscriber holds the same `PlayerPos` and `Terrain` subscriptions. Arms ran interleaved 50 → 100 →
+200 → 400 → 400 → 200 → 100 → 50, each 60 s measured after 10 s of warm-up.
+
+| Subscribers | Post-commit share of locked time | Mean lock hold per Move | Lock demand (750/s × hold; over 1 cannot be served) | Call-to-delta p50 / p99 | Delta rows/s |
+| --- | --- | --- | --- | --- | --- |
+| 50 | 66.1%, 67.2% | 339–342 µs | 0.26 | 11.1 / 35–37 ms | 37,900 |
+| 100 | 74.3%, 75.2% | 793–805 µs | 0.60 | 24–26 / 100–178 ms | 75,800 |
+| 200 | 86.2%, 87.7% | 1.20–1.36 ms | 0.90–1.02 | 9.8–10.8 s | 122,400 |
+| 400 | 90.5% | 2.46 ms | 1.85 | 20.7–21.6 s | 107,800–118,600 |
+
+(The second 400 arm's final stats read did not complete under the overload, so it has a latency but
+no split.)
+
+The reading:
+
+- **Fan-out is most of the lock already at 50 subscribers.** Phase 20 set the bar at 25% of locked
+  time at 200 subscribers. Measured, it's 86–88%, and two-thirds at a quarter of that population.
+- **It grows linearly in subscribers**, at about 5.5 µs per subscriber per commit of post-commit
+  time (225 µs → 600 µs → 1.1 ms → 2.2 ms). That cost is paid under the write lock, so every other
+  writer on the shard waits for it.
+- **The shard saturates at about 200 subscribers at this commit rate.** Lock-held time per second
+  reaches about 1.0 (750 × 1.3 ms), and call-to-delta goes from tens of milliseconds to ten seconds.
+  This is the same wall as the capacity ladder above (about 110–120k delivered rows/s), now located:
+  it's the subscription evaluation inside the commit, not the socket writes after it.
+- The share itself stays under 100%, because the body and append are a fixed cost. The absolute
+  post-commit time is what scales, and it does so linearly, not worse.
+
+`--lock-split` traces every Move (every transaction carries the slow-reducer split), which costs
+some throughput, so the absolute lock holds are a slight overstatement and the shares are not
+affected. One machine, driver and server in separate processes on the same 16 cores: past 200
+subscribers the driver is also saturated, which inflates latency but not the server-side split.
+
+### The reassignment window
+
+`failover` measures what node death costs a crowded shard. It runs a hub and two shard nodes in one
+process, fills the measured shard with `--rows` ballast rows, attaches `--clients` gateway clients
+that call Move at `--tick-hz`, and then for each of `--repeat` kills:
+
+1. Takes a snapshot on the owner and commits `--tail` records after it, the log tail recovery will
+   replay.
+2. **Kills the owner the way a crash would.** The node runtime is disposed at once, so heartbeats
+   and engines stop, and the host is then aborted with no grace, so its port refuses connections
+   immediately. The hub learns of the death only from heartbeat silence.
+3. Times each part on a spinning poll thread. **Detect** runs from the kill until the hub names a
+   new owner. **Reopen** runs until the shard is open on the survivor: the heartbeat that carries
+   the assignment, plus recovery. **First write** runs until a reducer commits there. **Client
+   restore** runs from the kill until each client's first acked call that it sent after the node
+   was dead.
+4. Restarts the killed node, so the next kill moves the shard back.
+
+After the kills, the shard directory is opened by a bare engine three times ("isolated open"), so the
+heat-dependent part can be read without the heartbeat wait in it. The run also records, before each
+kill, how stale the owner's heartbeat already was. A live owner that has gone quiet shortens
+*detect* below the timeout, and the line says so with a WARNING rather than report it as speed.
+
+**Synthetic by construction.** The reference workload has no cluster deployment, so this cannot come
+from it. One process hosts hub, both nodes, and the clients, so GC and thread-pool load are shared;
+treat sub-second differences as noise.
+
+#### Results, 2026-11-20
+
+Same machine as above. Release build, workstation GC, defaults `Cluster:HeartbeatIntervalMs` 1000
+and `Cluster:FailureTimeoutMs` 10000 (hub sweep every 5 s), 256 B rows, 10,000-record tail, 20
+clients at 15 Hz, 3 kills per size. Ranges are over the kills.
+
+| Store | Rows (shard dir) | Detect | Reopen | Isolated open | Server window | Client restore p50 / max |
+| --- | --- | --- | --- | --- | --- | --- |
+| in-memory | 10k (12 MiB) | 10.8–11.7 s | 0.6–1.4 s | 116–183 ms | 11.9–13.1 s | 12.1 / 14.0 s |
+| in-memory | 100k (62 MiB) | 10.6–12.2 s | 0.9–2.7 s | 392–753 ms | 12.0–13.9 s | 13.3 / 14.1 s |
+| in-memory | 1M (565 MiB) | see below | 4.9–6.1 s | 3.2–4.5 s | 11.3–18.5 s | 12.0 / 19.1 s |
+| FASTER | 10k (12 MiB) | 11.2–11.5 s | 0.6–1.3 s | 97–121 ms | 11.9–12.8 s | 12.6 / 13.0 s |
+| FASTER | 100k (62 MiB) | 10.6–11.1 s | 0.7–2.8 s | 415–703 ms | 11.7–13.4 s | 12.6 / 14.1 s |
+| FASTER | 1M | **not measured: issue [#199](https://github.com/tyler-loy/MelangeDB/issues/199)** | | | | |
+
+The reading:
+
+- **Detection is the window, at every size measured.** It took 10.6–13.4 s at defaults, because the
+  hub's death sweep runs every `FailureTimeoutMs/2`, so a node is declared dead 1.0–1.5× the timeout
+  after its last heartbeat ([#201](https://github.com/tyler-loy/MelangeDB/issues/201)). It doesn't
+  depend on shard heat. A warm replica can't shorten it either: fencing forbids reassigning before
+  the old owner's lease has expired.
+- **Reopen is the part that grows with heat:** about 0.1 s of recovery at 10k rows, 0.5 s at 100k,
+  and 3.5 s at 1M (isolated). In the cluster it costs more, because the assignment waits for a
+  heartbeat and the recovery competes with everything else in the process. At 1M rows it's 5–6 s on
+  top of detection.
+- **Clients come back with the server,** within about 0.1 s of the first write at most sizes. Calls in
+  the window fail or wait, depending on how the gateway's retry budget lines up with detection
+  ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)). This is process death, where the dead
+  port refuses connections at once. A dead *machine* doesn't refuse; the gateway's upstream connect
+  has no timeout, so each client stalls for the OS TCP connect timeout. That's 21 s measured on this
+  Windows machine, and about 127 s on stock Linux by its documented SYN retry schedule (#200).
+- **At 1M rows, detect is not a clean number.** Two of the three kills found the owner's heartbeat
+  already 7.7–8.3 s stale before the kill. That owner had adopted the shard on the previous kill and
+  went quiet for the whole recovery, because **a node opens an adopted shard inside its heartbeat
+  loop** ([#198](https://github.com/tyler-loy/MelangeDB/issues/198)). With the failure timeout set
+  below the recovery time (`--failure-timeout-ms 3000`), the hub declares the *adopting* node dead
+  mid-recovery, a cascade from a single kill.
 
 ### Soak — memory over five minutes
 
