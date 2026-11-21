@@ -86,14 +86,15 @@ What it says about the design:
    timeout, so on a dead machine each client stalled for the OS TCP connect timeout: 21 s on
    Windows, about 127 s on stock Linux ([#200](https://github.com/tyler-loy/MelangeDB/issues/200)).
    Handshakes and the attachment retry are now bounded by the failure timeout.
-5. **FASTER at 1M rows could not be measured, and one cause is still open.** The "missing payload"
+5. **FASTER at 1M rows could not be measured. Fixed, and now measured.** The "missing payload"
    errors ([#199](https://github.com/tyler-loy/MelangeDB/issues/199)) turned out to be a read view
-   outliving its disposed store, now a clean `ObjectDisposedException`. The root cause underneath is
-   not fixed: a snapshot of a FASTER shard larger than its buffer pool can hold a writer under the
-   engine lock for about two minutes, silencing the node's heartbeat
-   ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)). With HA on, that is a false
-   failover, and a replica reads through the same store, so it has to be closed before phase 30
-   builds on FASTER.
+   outliving its disposed store, now a clean `ObjectDisposedException`. Underneath it, a border
+   reset scanned the whole paged shard under the engine lock, silencing the heartbeat until the hub
+   fenced the live node ([#208](https://github.com/tyler-loy/MelangeDB/issues/208)); it now scans a
+   pinned view off the lock. The 1M-row window is about 19 s, the same shape as the rest. What
+   remains is that paged scans are slow, not blocking
+   ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)): a replica bootstrap reads through
+   that path, so phase 30 inherits it.
 
 ## Reopening trigger (fired)
 

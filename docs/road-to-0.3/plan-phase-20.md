@@ -428,6 +428,7 @@ where it's the first step of that repro.
 **Afterwards (still 2026-11-20).** The table records the findings as filed. Since then #198 and
 #200 are fixed, and #199 turned out to be a read view outliving its disposed store, also fixed. The
 13.7 s silence above was then narrowed to its own issue,
-[#208](https://github.com/tyler-loy/MelangeDB/issues/208): a FASTER snapshot larger than the buffer
-pool holds an ordinary writer under the engine lock for about two minutes. That is the one cold-path
-finding still open before phase 30.
+[#208](https://github.com/tyler-loy/MelangeDB/issues/208), and fixed: a border reset scanned the
+whole paged shard under the engine lock, and the commit the stall was first blamed on was only
+waiting behind it. With that fixed the FASTER 1M row was measured, and no cold-path finding from
+this phase is still open before phase 30.
