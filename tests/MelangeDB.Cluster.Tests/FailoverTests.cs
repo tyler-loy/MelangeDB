@@ -70,10 +70,35 @@ public class FailoverTests
         owner.Runtime.SuspendHeartbeats = true;
         await ClusterFixture.WaitUntilAsync(() => !owner.Runtime.LeaseValid(), "the lease expired");
 
-        var fenced = Assert.Throws<ShardFencedException>(
+        // Refused either way: fenced by the lapsed lease, or, once the watchdog has parked the
+        // shard, by the closed engine. Neither is a write.
+        var refused = Assert.ThrowsAny<Exception>(
             () => shard.ReducerHost.Call("SpawnMob", ClusterFixture.Caller, 1u, 6));
-        Assert.Contains("lease", fenced.Message);
-        Assert.Contains("fenc", fenced.Message);
+        Assert.True(
+            refused is ShardFencedException or TransientRejectionException,
+            $"a fenced node must refuse, not fail: {refused.GetType().Name}: {refused.Message}");
+
+        // #216: the lapsed lease parks the shard, which releases its log for whichever node the
+        // hub names next, instead of a partitioned owner holding it open indefinitely.
+        await ClusterFixture.WaitUntilAsync(() => owner.Runtime.TryGetShard(new ShardKey(1)) is null, "the shard was parked");
+
+        // The engine closes just after the shard leaves the shard set, so the lock frees a moment
+        // later. A new owner's open retries the same way.
+        var lockPath = Path.Combine(shard.Directory, "log", "melange.lock");
+        await ClusterFixture.WaitUntilAsync(
+            () =>
+            {
+                try
+                {
+                    using (File.Open(lockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                        return true;
+                }
+                catch (IOException)
+                {
+                    return false;
+                }
+            },
+            "the parked engine released the shard's log");
 
         // The melange-shard health check reports the contested ownership.
         var health = owner.App!.Services.GetRequiredService<MelangeShardHealthCheck>();

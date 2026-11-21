@@ -229,9 +229,9 @@ internal sealed class ShardCommitGuard : ICommitGuard
 
     public void Validate(string reducerName, IReadOnlyList<RowOp> writeSet, CommitOrigin origin)
     {
-        if (origin == CommitOrigin.Internal)
-            return;
-
+        // Every origin, internal ones included (#215): replica batches, border copies, and
+        // handoff markers append to this shard's log exactly as a reducer does, and a node whose
+        // lease lapsed may no longer own the log it would append them to.
         if (!_leaseValid())
         {
             throw new ShardFencedException(
@@ -239,6 +239,9 @@ internal sealed class ShardCommitGuard : ICommitGuard
                 "have reassigned the shard, so writes are fenced until the node re-registers and holds a current " +
                 "fencing token. '" + reducerName + "' was not committed.");
         }
+
+        if (origin == CommitOrigin.Internal)
+            return;
 
         var frozen = _frozenRows();
         if (frozen.Count > 0)

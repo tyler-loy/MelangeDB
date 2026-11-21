@@ -4,7 +4,7 @@
 12–19 s. No acknowledged write is lost, and at no instant can two nodes both make a write to the
 same shard durable and acknowledge it.
 
-**Status:** **design settled, not built** (2026-11-21). [Road-to-0.4](../road-to-0.4/README.md) commits phase 30.
+**Status:** **design settled; step 0 (the fence fixes, #214–#218) built** (2026-11-21). [Road-to-0.4](../road-to-0.4/README.md) commits phase 30.
 The project owner set the bar on 2026-11-20: production systems get HA, and the bar for *not*
 building it is high. [Phase 20](../road-to-0.3/plan-phase-20.md) measured the window this record
 starts from ([idea-bin entry](../idea-bin/shard-ha-warm-replica.md), the proposal this replaces).

@@ -71,6 +71,25 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The shard fence holds without timing luck** (road-to-0.4 phase 30, step 0;
+  [design/shard-ha.md](docs/design/shard-ha.md)). Five gaps, each masked today by how slow a
+  reassignment is, and each one a warm replica's fast promotion would have exposed:
+  - **A node's lease could outlive the hub's death declaration** ([#214](https://github.com/tyler-loy/MelangeDB/issues/214)). It ran from when the
+    heartbeat reply arrived, against the node's own timeout. It now runs from when the heartbeat
+    was sent, for 90% of the hub's timeout (taken from registration; a mismatch logs 1757), on a
+    monotonic clock. The hub measures silence on its own monotonic clock too, so a wall-clock jump
+    can't declare a node dead early.
+  - **Internal commits ignored the lease** ([#215](https://github.com/tyler-loy/MelangeDB/issues/215)). Replica batches, border copies, and handoff
+    markers appended to a shard's log after the lease lapsed. Every origin is fenced now.
+  - **An expired lease released nothing** ([#216](https://github.com/tyler-loy/MelangeDB/issues/216)). A partitioned but live owner kept its engines
+    open and their log locks held, which blocked the new owner indefinitely on storage that honours
+    the lock. The node now parks its shards when the lease lapses (1756), and reopens the ones still
+    assigned to it when it registers again.
+  - **A failure in the dead-node sweep crashed the hub** ([#217](https://github.com/tyler-loy/MelangeDB/issues/217)). An exception from the
+    membership store (a Postgres outage) was unhandled on a timer thread. It's logged (1755) and the
+    next tick retries.
+  - **The hub routed border batches, border resets, and forwarded events without checking the
+    sender** ([#218](https://github.com/tyler-loy/MelangeDB/issues/218)). It now refuses them from a node that doesn't own the source shard (1758).
 - **A call to a shard whose engine was just released is refused as retryable, not reported as an
   internal error** ([#202](https://github.com/tyler-loy/MelangeDB/issues/202)). A shard node
   disposes a shard's engine when the shard is released, drained, or the node stops, while client

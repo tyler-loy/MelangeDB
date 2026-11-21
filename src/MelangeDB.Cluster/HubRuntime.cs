@@ -95,6 +95,17 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly ILogger _logger;
     private readonly ForeignEventDispatcher _foreignEvents;
     private readonly ConcurrentDictionary<string, NodeLink> _linksByNode = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// When each node was last heard from, on the monotonic clock (<see cref="TimeProvider.GetTimestamp"/>).
+    /// The death decision reads this, never the wall clock: a node's lease runs on its own monotonic
+    /// clock from the moment it sent the heartbeat, so a forward jump of this hub's wall clock must
+    /// not let the hub declare a node dead while its lease still holds (#214). A node with no entry
+    /// (this hub restarted since it last heard) counts from <see cref="_startedTimestamp"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<string, long> _heardTimestamps = new(StringComparer.Ordinal);
+
+    private readonly long _startedTimestamp;
     private readonly ConcurrentDictionary<string, Saga> _sagas = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Identity, string> _sagasByPlayer = new();
     private readonly ConcurrentDictionary<Identity, long> _lastHandoffStartTicks = new();
@@ -143,6 +154,7 @@ internal sealed partial class HubRuntime : IDisposable
         _options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
         _membership = services.GetRequiredService<IMembershipStore>();
         _time = services.GetService<TimeProvider>() ?? TimeProvider.System;
+        _startedTimestamp = _time.GetTimestamp();
         _provisioner = services.GetService<INodeProvisioner>();
         var loggers = services.GetService<ILoggerFactory>() ?? Microsoft.Extensions.Logging.Abstractions.NullLoggerFactory.Instance;
         _logger = loggers.CreateLogger("MelangeDB.Cluster.Hub");
@@ -1429,6 +1441,7 @@ internal sealed partial class HubRuntime : IDisposable
         switch (type)
         {
             case "heartbeat":
+                _heardTimestamps[session.NodeName] = _time.GetTimestamp();
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
                 if (body?.Deserialize<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
                     Load.Record(session.NodeName, heartbeat.Loads, _time.GetUtcNow());
@@ -1443,6 +1456,7 @@ internal sealed partial class HubRuntime : IDisposable
                 return null;
             case "events-forward":
                 var forward = body!.Value.Deserialize<EventsForward>()!;
+                RequireOwnedBy(session, forward.ShardValue, type);
                 await _foreignEvents.DispatchAsync(session.NodeName, forward.ShardValue, forward, _stopped.Token).ConfigureAwait(false);
                 return null;
             case "border-subscribe":
@@ -1460,6 +1474,7 @@ internal sealed partial class HubRuntime : IDisposable
             case "border-batch":
             {
                 var batch = body!.Value.Deserialize<BorderBatch>()!;
+                RequireOwnedBy(session, batch.OwnerShard, type);
                 var observer = _membership.GetAssignment(new ShardKey(batch.ObserverShard));
                 if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
                     throw new InvalidOperationException($"Shard {batch.ObserverShard}'s owner is unreachable; the owner retries.");
@@ -1470,6 +1485,7 @@ internal sealed partial class HubRuntime : IDisposable
             case "border-reset":
             {
                 var reset = body!.Value.Deserialize<BorderReset>()!;
+                RequireOwnedBy(session, reset.OwnerShard, type);
                 var observer = _membership.GetAssignment(new ShardKey(reset.ObserverShard));
                 if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
                     throw new InvalidOperationException($"Shard {reset.ObserverShard}'s owner is unreachable; the owner retries.");
@@ -1526,6 +1542,7 @@ internal sealed partial class HubRuntime : IDisposable
         }
 
         session.NodeName = request.NodeName;
+        _heardTimestamps[request.NodeName] = _time.GetTimestamp();
         _linksByNode[request.NodeName] = link;
         _membership.RegisterNode(request.NodeName, request.PublicAddress, _time.GetUtcNow());
         _membership.AssignUnowned(_time.GetUtcNow());
@@ -1739,16 +1756,59 @@ internal sealed partial class HubRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// The failure detector's tick. Guarded: it runs on a bare timer callback, where an exception
+    /// (a membership-store outage, say) is unhandled and takes the hub process down (#217). A
+    /// failed tick logs and the next tick tries again.
+    /// </summary>
     private void SweepDeadNodes()
+    {
+        try
+        {
+            SweepDeadNodesCore();
+        }
+        catch (Exception exception)
+        {
+            LogDeadNodeSweepFailed(_logger, exception.Message, exception);
+        }
+    }
+
+    /// <summary>
+    /// Refuses a node-originated message about a shard the sending node does not currently own
+    /// (#218). Border batches, border resets, and forwarded events carry a source shard and no
+    /// fencing token; without this check, a node the hub has fenced and reassigned away from could
+    /// keep feeding its border copies to neighbours and its events to handlers. The refusal is an
+    /// error reply, which the sender's pump treats as a failed send and retries; a node that really
+    /// lost the shard closes it on its next heartbeat and stops.
+    /// </summary>
+    private void RequireOwnedBy(NodeSession session, ulong shardValue, string messageType)
+    {
+        if (IsCurrentOwner(session.NodeName, shardValue))
+            return;
+        var owner = _membership.GetAssignment(new ShardKey(shardValue))?.NodeName;
+        LogUnownedSourceRefused(_logger, messageType, shardValue, session.NodeName ?? "(unauthenticated)", owner ?? "(none)");
+        throw new InvalidOperationException(
+            $"'{messageType}' for shard {shardValue} refused: node '{session.NodeName}' does not own it (owner: {owner ?? "none"}).");
+    }
+
+    /// <summary>Whether <paramref name="nodeName"/> is the shard's current owner in membership; see <see cref="RequireOwnedBy"/>.</summary>
+    internal bool IsCurrentOwner(string? nodeName, ulong shardValue) =>
+        nodeName is not null
+        && string.Equals(_membership.GetAssignment(new ShardKey(shardValue))?.NodeName, nodeName, StringComparison.Ordinal);
+
+    private void SweepDeadNodesCore()
     {
         var now = _time.GetUtcNow();
         var timeout = TimeSpan.FromMilliseconds(Cluster.FailureTimeoutMs);
         foreach (var node in _membership.Nodes())
         {
-            if (!node.Alive || now - node.LastSeen <= timeout)
+            if (!node.Alive)
+                continue;
+            var silence = _time.GetElapsedTime(_heardTimestamps.GetValueOrDefault(node.NodeName, _startedTimestamp));
+            if (silence <= timeout)
                 continue;
             var moved = _membership.MarkDead(node.NodeName, now);
-            LogNodeSuspectedDead(_logger, node.NodeName, (now - node.LastSeen).TotalMilliseconds, moved.Count);
+            LogNodeSuspectedDead(_logger, node.NodeName, silence.TotalMilliseconds, moved.Count);
         }
 
         // The rate-limit memory is bounded: entries older than any conceivable window are noise.
@@ -1940,6 +2000,14 @@ internal sealed partial class HubRuntime : IDisposable
         Message = "Reap of shard {Shard} refused by its owner '{Owner}': {Reason}. The hub asks from a sampled view and " +
             "the owner settles it under the shard's own lock, so a refusal is the check working rather than a failure.")]
     private static partial void LogShardReapRefused(ILogger logger, ulong shard, string owner, string reason);
+
+    [LoggerMessage(EventId = 1755, EventName = "DeadNodeSweepFailed", Level = LogLevel.Error,
+        Message = "The dead-node sweep failed ({Reason}); no node was declared dead this tick, and the next tick tries again.")]
+    private static partial void LogDeadNodeSweepFailed(ILogger logger, string reason, Exception exception);
+
+    [LoggerMessage(EventId = 1758, EventName = "UnownedSourceRefused", Level = LogLevel.Warning,
+        Message = "Refused '{MessageType}' for shard {Shard} from node '{NodeName}', which does not own it (owner: {Owner}). A fenced node is still publishing; it stops once it learns it lost the shard.")]
+    private static partial void LogUnownedSourceRefused(ILogger logger, string messageType, ulong shard, string nodeName, string owner);
 
     [LoggerMessage(EventId = 1734, EventName = "RebalanceEvaluationFailed", Level = LogLevel.Warning,
         Message = "A rebalance tick failed to evaluate ({Reason}); the loop continues on its next tick.")]
