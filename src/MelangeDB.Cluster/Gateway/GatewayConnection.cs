@@ -298,6 +298,17 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     /// handoff and replayed on whichever side ends up authoritative, exactly as reducer calls always
     /// were: a producer pinned on a shard mid-transfer would read a world about to be released.
     /// </summary>
+    /// <summary>
+    /// Whether <paramref name="exception"/> means this client connection is ending, as opposed to
+    /// an upstream failing under it. A cancellation counts only when <paramref name="ct"/> (the
+    /// connection's own token) was cancelled: a websocket whose transport is aborted mid-send,
+    /// which is exactly what a node killed under a forwarded call does, reports
+    /// <see cref="OperationCanceledException"/> too. Treated as the client leaving, that tore down
+    /// the client's whole connection, and a client without automatic reconnect never came back.
+    /// </summary>
+    private static bool ClientGone(Exception exception, CancellationToken ct) =>
+        exception is OperationCanceledException && ct.IsCancellationRequested;
+
     private async Task RouteCallAsync(uint requestId, bool toShard, bool isProducer, byte[] bytes, CancellationToken ct)
     {
         if (toShard)
@@ -330,7 +341,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 : _hub!;
             await target.SendRawAsync(bytes, ct).ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (!ClientGone(exception, ct))
         {
             await SendToClientAsync(CallFailure(requestId, isProducer, exception.Message), ct).ConfigureAwait(false);
         }
@@ -364,7 +375,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
 
             await target.SendRawAsync(bytes, ct).ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (!ClientGone(exception, ct))
         {
             await SendToClientAsync(new ErrorFrame(
                 MelangeErrorCodes.Internal, exception.Message, SubscriptionId: subscribe.SubscriptionId), ct).ConfigureAwait(false);
@@ -383,9 +394,20 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
 
         var target = onShard ? _shard : _hub;
         if (target is { IsAlive: true })
-            await target.SendRawAsync(bytes, ct).ConfigureAwait(false);
-        else
-            await SendToClientAsync(new UnsubscribedFrame(unsubscribe.SubscriptionId), ct).ConfigureAwait(false);
+        {
+            try
+            {
+                await target.SendRawAsync(bytes, ct).ConfigureAwait(false);
+                return;
+            }
+            catch (Exception exception) when (!ClientGone(exception, ct))
+            {
+                // The upstream died under the send: the subscription went with it, so the
+                // answer the client is owed is the same as for an upstream already gone.
+            }
+        }
+
+        await SendToClientAsync(new UnsubscribedFrame(unsubscribe.SubscriptionId), ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -534,7 +556,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                     var target = await EnsureShardUpstreamAsync(_closed.Token).ConfigureAwait(false);
                     await target.SendRawAsync(bytes, _closed.Token).ConfigureAwait(false);
                 }
-                catch (Exception exception) when (exception is not OperationCanceledException)
+                catch (Exception exception) when (!ClientGone(exception, _closed.Token))
                 {
                     await SendToClientAsync(CallFailure(requestId, isProducer, exception.Message), _closed.Token).ConfigureAwait(false);
                 }
@@ -669,7 +691,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 await session.SendRawAsync(bytes, _closed.Token).ConfigureAwait(false);
             LogSwapCompleted(_gateway.Logger, to.Value, subscribes.Length, held.Count);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (!ClientGone(exception, _closed.Token))
         {
             LogSwapFailed(_gateway.Logger, to.Value, exception.Message);
         }

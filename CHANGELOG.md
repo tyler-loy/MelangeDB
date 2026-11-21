@@ -80,6 +80,15 @@ All packages ship together at one version; there is no per-package versioning. S
   ([#201](https://github.com/tyler-loy/MelangeDB/issues/201)). The hub checked every `FailureTimeoutMs/2`. It now checks each node's deadline every
   `FailureTimeoutMs/20` (25–250 ms), from memory, and reads the membership store only to record a
   death. Measured at defaults: detection 9.0–9.9 s after a kill, from 10.6–13.4 s.
+- **A shard node dying under a forwarded call no longer disconnects the client from the
+  gateway.** When a node was killed while the gateway was sending it a client's call, the
+  websocket reported the aborted send as `OperationCanceledException`. The gateway read that as
+  the client leaving and tore down the client's whole connection, so a client without automatic
+  reconnect stayed disconnected. Found by the failover measurement: about one kill in twelve,
+  with 4 clients at 15 Hz. The gateway now treats a cancellation as the client leaving only when
+  the client connection's own token was cancelled. The call fails on its own and the next one
+  re-attaches. An unsubscribe forwarded to an upstream that dies mid-send is answered as for an
+  upstream already gone.
 - **The shard fence holds without timing luck** (road-to-0.4 phase 30, step 0;
   [design/shard-ha.md](docs/design/shard-ha.md)). Five gaps, each masked today by how slow a
   reassignment is, and each one a warm replica's fast promotion would have exposed:
