@@ -81,8 +81,20 @@ public sealed class ScaleInTests
 
         // 2 p.m.: three busy shards on two nodes. Move-one cannot help (hot to hot), so the loop
         // provisions node-c and spreads onto it — one shard per node.
+        //
+        // "Cannot help" is the move rule's inequality, target + shard < origin, and with three
+        // equally pumped shards it comes down to whether the lone shard happens to measure below
+        // the busier node's quieter one: a coin flip on scheduling noise, which once made the loop
+        // move one shard hot-to-hot before provisioning and left this test waiting for a drain
+        // count it had passed. The lone shard is pumped twice as hard, so the premise is the load,
+        // not the noise: its node then carries as much as the two-shard node, and shedding either
+        // of those shards onto it can never strictly improve the pair.
+        var lone = shards
+            .GroupBy(s => fixture.Hub.Membership.GetAssignment(new ShardKey(s))!.NodeName)
+            .Single(static g => g.Count() == 1)
+            .Single();
         using var pump = new CancellationTokenSource();
-        var pumps = Pump(fixture, shards, pump.Token);
+        var pumps = Pump(fixture, [.. shards, lone], pump.Token);
         try
         {
             await ClusterFixture.WaitUntilAsync(

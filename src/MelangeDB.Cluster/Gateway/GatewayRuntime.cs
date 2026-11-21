@@ -49,6 +49,25 @@ internal sealed class GatewayRuntime
 
     public IOptionsMonitor<MelangeDbOptions> Options { get; }
 
+    /// <summary>
+    /// The bound on one upstream handshake (connect, Hello, Welcome): a quarter of
+    /// Cluster:FailureTimeoutMs, held between 1 and 5 seconds. A healthy node answers in
+    /// milliseconds; one that does not answer within this is treated as unreachable, and the
+    /// attachment retries against whatever the hub names next.
+    /// </summary>
+    internal TimeSpan UpstreamConnectTimeout =>
+        TimeSpan.FromMilliseconds(Math.Clamp(Options.CurrentValue.Cluster.FailureTimeoutMs / 4, 1_000, 5_000));
+
+    /// <summary>
+    /// How long a shard attachment keeps retrying before the call it carries fails: twice
+    /// Cluster:FailureTimeoutMs, and never under 5 seconds. A node death is declared within 1.5x
+    /// the timeout (the hub sweeps every half timeout) and the new owner then recovers the shard,
+    /// so a budget shorter than that, as the old fixed 20 x 250 ms was, failed calls while the
+    /// shard was still being reassigned.
+    /// </summary>
+    internal TimeSpan ShardAttachBudget =>
+        TimeSpan.FromMilliseconds(Math.Max(5_000L, 2L * Options.CurrentValue.Cluster.FailureTimeoutMs));
+
     public IMelangeSerializer Serializer { get; }
 
     public ReducerRegistry Reducers { get; }

@@ -107,7 +107,15 @@ internal sealed record AssignmentsApply(ShardAssignmentDto[] Assignments);
 
 internal sealed record ReplicaSubscribe(ulong FromLsn);
 
-internal sealed record ReplicaBatch(ulong[] Lsns, WireOp[][] Records);
+/// <summary>
+/// One slice of the hub's Replicated stream: the records carrying a Replicated op, in LSN order.
+/// <see cref="PrevLsn"/> is the last Replicated record this stream delivered before the slice (or
+/// where the subscription started), and it is what makes the slice safe to apply: a shard whose
+/// replica cursor — the last Replicated LSN it applied — is behind it would be missing records, and
+/// applying the slice would advance its cursor over the hole for good. Zero (an older hub) means
+/// unknown, and is applied as before.
+/// </summary>
+internal sealed record ReplicaBatch(ulong[] Lsns, WireOp[][] Records, ulong PrevLsn = 0);
 
 internal sealed record ReplicaTableSnapshot(uint Table, WireOp[] Rows);
 

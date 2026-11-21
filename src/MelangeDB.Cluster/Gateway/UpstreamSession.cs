@@ -42,7 +42,14 @@ internal sealed class UpstreamSession : IAsyncDisposable
 
     public bool IsAlive => !_closed.IsCancellationRequested && _socket.State == WebSocketState.Open;
 
-    /// <summary>Connects, presents the assertion in Hello, and awaits the node's Welcome.</summary>
+    /// <summary>
+    /// Connects, presents the assertion in Hello, and awaits the node's Welcome — all inside
+    /// <paramref name="timeout"/>. Without a bound, a connect to a node whose *machine* died (no
+    /// refusal ever comes back) waited out the operating system's TCP connect timeout, about 21 s on
+    /// Windows and about two minutes on stock Linux, while the gateway held the client's attachment
+    /// lock, so every shard-bound call that client made waited behind it (#200).
+    /// </summary>
+    /// <exception cref="TimeoutException">The node did not complete the handshake within <paramref name="timeout"/>.</exception>
     public static async Task<UpstreamSession> ConnectAsync(
         Uri uri,
         string assertion,
@@ -51,19 +58,38 @@ internal sealed class UpstreamSession : IAsyncDisposable
         Action onClosed,
         Action countSent,
         Action countReceived,
+        TimeSpan timeout,
         CancellationToken ct)
     {
+        using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bounded.CancelAfter(timeout);
         var socket = new ClientWebSocket();
         socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
-        await socket.ConnectAsync(uri, ct).ConfigureAwait(false);
-        var session = new UpstreamSession(socket, serializer, onFrame, onClosed, countSent, countReceived);
-        await session.SendFrameAsync(new HelloFrame(
-            MessagePackFrameSerializer.ProtocolVersion,
-            MessagePackFrameSerializer.ProtocolVersion,
-            assertion), ct).ConfigureAwait(false);
-        session.Welcome = await session.ReadUntilWelcomeAsync(ct).ConfigureAwait(false);
-        session._pump = Task.Run(() => session.PumpAsync());
-        return session;
+        try
+        {
+            await socket.ConnectAsync(uri, bounded.Token).ConfigureAwait(false);
+            var session = new UpstreamSession(socket, serializer, onFrame, onClosed, countSent, countReceived);
+            await session.SendFrameAsync(new HelloFrame(
+                MessagePackFrameSerializer.ProtocolVersion,
+                MessagePackFrameSerializer.ProtocolVersion,
+                assertion), bounded.Token).ConfigureAwait(false);
+            session.Welcome = await session.ReadUntilWelcomeAsync(bounded.Token).ConfigureAwait(false);
+            session._pump = Task.Run(() => session.PumpAsync());
+            return session;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            socket.Abort();
+            socket.Dispose();
+            throw new TimeoutException(
+                $"The node at {uri.Authority} did not complete the upstream handshake within {timeout.TotalMilliseconds:F0} ms.");
+        }
+        catch
+        {
+            socket.Abort();
+            socket.Dispose();
+            throw;
+        }
     }
 
     public async Task SendFrameAsync(Frame frame, CancellationToken ct = default)
