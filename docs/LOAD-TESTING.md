@@ -354,9 +354,9 @@ clients at 15 Hz, 3 kills per size. Ranges are over the kills.
 ¹ Measured later, after the [#208](https://github.com/tyler-loy/MelangeDB/issues/208) fix, with 2
 clients and 2 kills rather than 20 and 3. Before it, this row could not be measured: a border reset
 scanned the paged shard under the engine lock and the hub fenced the live owner before the kill.
-Each pre-kill snapshot of this shard took 4–5.5 min (random-order paged reads,
-[#212](https://github.com/tyler-loy/MelangeDB/issues/212)); through them the
-owner's heartbeat staleness peaked at 1.0–1.35 s.
+Each pre-kill snapshot of this shard took 4–5.5 min (one synchronous random read per row); through
+them the owner's heartbeat staleness peaked at 1.0–1.35 s. With paged scans reading a block of rows
+at a time ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)), the same snapshot takes 29–41 s, and the 300k-row one 4.5 s (from 19.4 s).
 
 The reading:
 

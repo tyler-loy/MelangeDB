@@ -247,20 +247,18 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             yield break;
         }
 
-        foreach (var key in ScanKeys(table))
+        foreach (var pair in ScanInBatches(ScanKeys(table), (keys, rows) =>
+                 {
+                     lock (_lock)
+                     {
+                         if (!_tables.TryGetValue(table, out var state))
+                             return false;
+                         state.AddRowsScanned(ReadRowsBatched(state, state.Current, keys, rows, skipUnreadable: true));
+                         return true;
+                     }
+                 }))
         {
-            byte[]? bytes;
-            lock (_lock)
-            {
-                if (!_tables.TryGetValue(table, out var state))
-                    yield break;
-                bytes = TryReadRowForScan(state, key);
-                if (bytes is not null)
-                    state.AddRowsScanned(1);
-            }
-
-            if (bytes is not null)
-                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
+            yield return pair;
         }
     }
 
@@ -548,14 +546,65 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Materialize(PinnedTable pinned, IEnumerable<RowKey> keys)
         {
-            foreach (var key in keys)
+            if (pinned.Version.IsResident)
             {
-                ThrowIfUnusable(pinned);
-                if (Read(pinned, key) is { } bytes)
+                foreach (var key in keys)
                 {
-                    pinned.Owner.AddRowsScanned(1);
-                    yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
+                    ThrowIfUnusable(pinned);
+                    if (Read(pinned, key) is { } bytes)
+                    {
+                        pinned.Owner.AddRowsScanned(1);
+                        yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
+                    }
                 }
+
+                yield break;
+            }
+
+            // Paged: a block of keys at a time, the overlay probes and the store reads under one
+            // hold of the store lock so no write slips between them (as Read below), with the
+            // store's reads for the block in flight together rather than one at a time (#212).
+            var toRead = new RowKey[ScanBatchRows];
+            var slots = new int[ScanBatchRows];
+            var read = new byte[]?[ScanBatchRows];
+            foreach (var pair in store.ScanInBatches(keys, (batch, rows) =>
+                     {
+                         lock (store._lock)
+                         {
+                             ThrowIfUnusable(pinned);
+                             var pending = 0;
+                             for (var i = 0; i < batch.Length; i++)
+                             {
+                                 rows[i] = null;
+                                 if (!pinned.Version.Contains(batch[i]))
+                                     continue;
+                                 if (_undo.TryGetValue(new UndoKey(pinned.Owner.Schema.Id, batch[i]), out var preImage))
+                                 {
+                                     rows[i] = preImage;
+                                     continue;
+                                 }
+
+                                 toRead[pending] = batch[i];
+                                 slots[pending++] = i;
+                             }
+
+                             // A view is a consistent read: an unreadable row is a fault, not a skip.
+                             store.ReadRowsBatched(pinned.Owner, pinned.Version, toRead.AsSpan(0, pending), read, skipUnreadable: false);
+                             for (var j = 0; j < pending; j++)
+                                 rows[slots[j]] = read[j];
+                             var found = 0;
+                             for (var i = 0; i < batch.Length; i++)
+                             {
+                                 if (rows[i] is not null)
+                                     found++;
+                             }
+
+                             pinned.Owner.AddRowsScanned(found);
+                             return true;
+                         }
+                     }))
+            {
+                yield return pair;
             }
         }
 
@@ -626,19 +675,16 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             yield break;
         }
 
-        foreach (var key in keys)
+        foreach (var pair in ScanInBatches(keys, (batch, rows) =>
+                 {
+                     lock (_lock)
+                     {
+                         state.AddRowsScanned(ReadRowsBatched(state, version, batch, rows, skipUnreadable: true));
+                         return true;
+                     }
+                 }))
         {
-            byte[]? bytes;
-            lock (_lock)
-            {
-                bytes = TryReadRowForScan(state, key);
-            }
-
-            if (bytes is not null)
-            {
-                state.AddRowsScanned(1);
-                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(key, bytes);
-            }
+            yield return pair;
         }
     }
 
@@ -696,6 +742,266 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         catch (InvalidDataException fault)
         {
             throw new InvalidDataException($"Table '{table.Schema.Name}': key {rowKey}: {fault.Message}", fault);
+        }
+    }
+
+    /// <summary>Rows per batched scan read; see <see cref="ReadRowsBatched"/>.</summary>
+    private const int ScanBatchRows = 128;
+
+    /// <summary>
+    /// Feeds keys to <paramref name="readBatch"/> a block at a time and yields the rows it found, in
+    /// key order. <paramref name="readBatch"/> fills one slot per key (null for absent) and returns
+    /// false to end the scan, the way a dropped table ends one.
+    /// </summary>
+    private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanInBatches(
+        IEnumerable<RowKey> keys, Func<RowKey[], byte[]?[], bool> readBatch)
+    {
+        var batch = new RowKey[ScanBatchRows];
+        var rows = new byte[]?[ScanBatchRows];
+        var count = 0;
+        foreach (var key in keys)
+        {
+            batch[count++] = key;
+            if (count < ScanBatchRows)
+                continue;
+            if (!readBatch(batch, rows))
+                yield break;
+            for (var i = 0; i < count; i++)
+            {
+                if (rows[i] is { } bytes)
+                    yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(batch[i], bytes);
+            }
+
+            count = 0;
+        }
+
+        if (count == 0)
+            yield break;
+        var tail = batch[..count];
+        var tailRows = new byte[]?[count];
+        if (!readBatch(tail, tailRows))
+            yield break;
+        for (var i = 0; i < count; i++)
+        {
+            if (tailRows[i] is { } bytes)
+                yield return new KeyValuePair<RowKey, ReadOnlyMemory<byte>>(tail[i], bytes);
+        }
+    }
+
+    /// <summary>
+    /// Reads a block of rows with their FASTER reads in flight together: every main record is
+    /// issued, then completed in one wait, then every out-of-line payload the same way. A paged
+    /// scan used to read one row at a time, each read a synchronous wait on a random disk read,
+    /// which made a million-row snapshot or border reset take four to five minutes (#212). The
+    /// order rows come back in, the directory as the source of truth, and the fault messages are
+    /// <see cref="ReadRow(TableState, TableVersion, in RowKey)"/>'s.
+    /// <para>
+    /// The caller holds the store lock, as for any paged read. A row that is absent from the
+    /// version gets null. An unreadable one is logged and gets null when
+    /// <paramref name="skipUnreadable"/> (a scan's rule, see <see cref="TryReadRowForScan"/>), and
+    /// throws otherwise. Returns how many rows were found.
+    /// </para>
+    /// </summary>
+    private int ReadRowsBatched(TableState table, TableVersion version, ReadOnlySpan<RowKey> keys, byte[]?[] rows, bool skipUnreadable)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var count = keys.Length;
+        var found = 0;
+        if (version.IsResident)
+        {
+            for (var i = 0; i < count; i++)
+            {
+                rows[i] = version.ResidentRows.TryGetValue(keys[i], out var resident) ? resident : null;
+                if (rows[i] is not null)
+                    found++;
+            }
+
+            return found;
+        }
+
+        var entries = new DirectoryEntry?[count];
+        var mains = new byte[]?[count];
+        var pendingMains = new Dictionary<byte[], List<int>>(ByteArrayComparer.Instance);
+        for (var i = 0; i < count; i++)
+        {
+            rows[i] = null;
+            if (!version.Directory.TryGetValue(keys[i], out var entry))
+                continue;
+            entries[i] = entry;
+            var storeKey = StoreKey(table.Schema.Id, keys[i]);
+            switch (IssueRead(_mainSession, storeKey, out var value))
+            {
+                case IssuedRead.Found:
+                    mains[i] = value;
+                    break;
+                case IssuedRead.Pending:
+                    AddPending(pendingMains, storeKey, i);
+                    break;
+            }
+        }
+
+        CompleteReads(_mainSession, pendingMains, table, (slot, value) => mains[slot] = value);
+
+        var blobs = new Dictionary<(int Row, int Ordinal), byte[]>();
+        var pendingBlobs = new Dictionary<byte[], List<(int Row, int Ordinal)>>(ByteArrayComparer.Instance);
+        for (var i = 0; i < count; i++)
+        {
+            if (entries[i] is not { } entry || entry.BlobMask == 0 || mains[i] is null)
+                continue;
+            var mask = entry.BlobMask;
+            for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+            {
+                if ((mask & 1) == 0)
+                    continue;
+                var blobKey = BlobKey(table.Schema.Id, keys[i], ordinal);
+                switch (IssueRead(_blobSession!, blobKey, out var value))
+                {
+                    case IssuedRead.Found:
+                        blobs[(i, ordinal)] = value!;
+                        break;
+                    case IssuedRead.Pending:
+                        AddPending(pendingBlobs, blobKey, (i, ordinal));
+                        break;
+                }
+            }
+        }
+
+        if (pendingBlobs.Count > 0)
+            CompleteReads(_blobSession!, pendingBlobs, table, (slot, value) => blobs[slot] = value);
+
+        for (var i = 0; i < count; i++)
+        {
+            if (entries[i] is not { } entry)
+                continue;
+            try
+            {
+                rows[i] = JoinRow(table, keys[i], entry, mains[i], i, blobs);
+                found++;
+            }
+            catch (InvalidDataException fault) when (skipUnreadable)
+            {
+                LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
+            }
+        }
+
+        return found;
+    }
+
+    private static byte[] JoinRow(
+        TableState table, in RowKey key, DirectoryEntry entry, byte[]? main, int row, Dictionary<(int Row, int Ordinal), byte[]> blobs)
+    {
+        if (main is null)
+        {
+            throw new InvalidDataException(
+                $"Table '{table.Schema.Name}': key {key} is in the directory but its main record is missing.");
+        }
+
+        if (entry.BlobMask == 0)
+            return main;
+        try
+        {
+            return RowBlobSplitter.Join(table.Schema, main, entry.BlobMask, ordinal =>
+                blobs.TryGetValue((row, ordinal), out var payload)
+                    ? payload
+                    : throw new InvalidDataException($"out-of-line payload for bytes-column ordinal {ordinal} is missing."));
+        }
+        catch (InvalidDataException fault)
+        {
+            throw new InvalidDataException($"Table '{table.Schema.Name}': key {key}: {fault.Message}", fault);
+        }
+    }
+
+    private enum IssuedRead
+    {
+        NotFound,
+        Found,
+        Pending,
+    }
+
+    /// <summary>Issues one read without waiting for it: a pending read completes in <see cref="CompleteReads{TSlot}"/>.</summary>
+    private static IssuedRead IssueRead(
+        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
+        ReadOnlySpan<byte> keyBytes,
+        out byte[]? value)
+    {
+        Status status;
+        unsafe
+        {
+            fixed (byte* keyPointer = keyBytes)
+            {
+                var key = SpanByte.FromPointer(keyPointer, keyBytes.Length);
+                byte[] result = [];
+                status = session.Read(ref key, ref result);
+                value = result;
+            }
+        }
+
+        if (status.IsPending)
+        {
+            value = null;
+            return IssuedRead.Pending;
+        }
+
+        if (status.Found)
+            return IssuedRead.Found;
+        value = null;
+        return IssuedRead.NotFound;
+    }
+
+    /// <summary>
+    /// Waits once for every read <see cref="IssueRead"/> left pending on <paramref name="session"/>
+    /// and hands each found value to its slot. FASTER copies a pending read's key, so the scratch
+    /// buffer the key was built in is free to be reused while the reads are in flight.
+    /// </summary>
+    private static void CompleteReads<TSlot>(
+        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
+        Dictionary<byte[], List<TSlot>> pending,
+        TableState faultAccounting,
+        Action<TSlot, byte[]> deliver)
+    {
+        if (pending.Count == 0)
+            return;
+        faultAccounting.PageFaults += pending.Count;
+        session.CompletePendingWithOutputs(out var outputs, wait: true);
+        using (outputs)
+        {
+            while (outputs.Next())
+            {
+                if (!outputs.Current.Status.Found || !pending.TryGetValue(outputs.Current.Key.ToByteArray(), out var slots))
+                    continue;
+                foreach (var slot in slots)
+                    deliver(slot, outputs.Current.Output);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records a pending read's slot. A key read twice in one block (never expected from a
+    /// directory or an index, but cheap to tolerate) delivers to both slots rather than leaving
+    /// one looking like a missing record.
+    /// </summary>
+    private static void AddPending<TSlot>(Dictionary<byte[], List<TSlot>> pending, ReadOnlySpan<byte> key, TSlot slot)
+    {
+        var copy = key.ToArray();
+        if (pending.TryGetValue(copy, out var slots))
+            slots.Add(slot);
+        else
+            pending[copy] = [slot];
+    }
+
+    /// <summary>Content equality for FASTER key bytes, to match completed reads back to their rows.</summary>
+    private sealed class ByteArrayComparer : IEqualityComparer<byte[]>
+    {
+        public static readonly ByteArrayComparer Instance = new();
+
+        public bool Equals(byte[]? x, byte[]? y) =>
+            ReferenceEquals(x, y) || (x is not null && y is not null && x.AsSpan().SequenceEqual(y));
+
+        public int GetHashCode(byte[] obj)
+        {
+            var hash = default(HashCode);
+            hash.AddBytes(obj);
+            return hash.ToHashCode();
         }
     }
 

@@ -45,7 +45,16 @@ public class DisposedStoreReadTests(ITestOutputHelper output)
 
         ((IDisposable)harness.Engine.HotStore).Dispose(); // The release, as the shard runtime performs it.
 
-        Assert.Throws<ObjectDisposedException>(() => scan.MoveNext());
+        // Paged scans read a block of rows at a time (#212), so the rest of the block already read
+        // before the release still comes back. Those rows are real. What must never happen is the
+        // scan finishing as if the table ended there, or calling the remaining rows corrupt: the
+        // next store read says the store is gone.
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            while (scan.MoveNext())
+            {
+            }
+        });
     }
 
     [Fact]

@@ -98,8 +98,8 @@ happens, and it shaped it a lot ([idea-bin entry](../idea-bin/shard-ha-warm-repl
   that was a read view outliving its store, fixed. Underneath it, a border reset scanned the
   whole paged shard under the engine lock long enough to starve the heartbeat
   ([#208](https://github.com/tyler-loy/MelangeDB/issues/208), fixed). Under HA that would have been
-  a false failover. Paged scans are still slow, just no longer blocking
-  ([#212](https://github.com/tyler-loy/MelangeDB/issues/212)).
+  a false failover. Paged scans were also slow, and now read a block of rows at a time
+  ([#212](https://github.com/tyler-loy/MelangeDB/issues/212), about 8× faster at 1M rows).
 
 On the phase 28 interaction: the client assumed was phase 28's, with automatic reconnect on. It
 makes no difference to the window, because the client never disconnects. The gateway holds or fails
