@@ -97,8 +97,9 @@ left alone. Reference `MelangeDB.Client` as usual; the generated code needs it e
 ## The manifest format
 
 `melange-schema.json` is public API, format `1` or `2`. It is deliberately language-neutral: a
-non-C# client generator becomes possible by reading this file, not by linking anything. What such a
-client must then do on the wire is [CLIENT-CONFORMANCE.md](CLIENT-CONFORMANCE.md). Format `2`
+non-C# client generator becomes possible by reading this file, not by linking anything, and one
+ships: `melange generate --lang ts` writes the [TypeScript](#typescript) bindings from it. What any
+client must do on the wire is [CLIENT-CONFORMANCE.md](CLIENT-CONFORMANCE.md). Format `2`
 adds `producers` and `types`, and is written **only** by a module that has producers: every other
 module writes format `1` byte for byte as before, so adding the format moved no existing schema
 hash. A generator that reads only format `1` rejects a producer manifest loudly rather than binding
@@ -251,6 +252,55 @@ context: inside `Task.Run(...)` or after `ConfigureAwait(false)` there is no con
 continuation runs on a thread-pool thread, and node access from it is the intermittent renderer-thread
 crash the pump exists to prevent. The same applies to code after `await sub.UnsubscribeAsync()`: the
 cache-eviction `OnDelete` events it triggers fire on the resuming thread.
+
+## TypeScript
+
+`@melangedb/client` (in `clients/typescript`) is the browser client, held to the same
+[conformance contract](CLIENT-CONFORMANCE.md) and live suite as `MelangeDB.Client`. Its typed
+bindings come from the same manifest, written by the CLI rather than an analyzer:
+
+```
+npm install @melangedb/client
+melange generate --lang ts melange-schema.json -o src/generated
+```
+
+That writes one module, `melange-bindings.ts`. The API mirrors the C# one, adjusted to
+TypeScript's conventions:
+
+```ts
+const client = new MelangeClient({ url: "wss://game.example.com/melange", token });
+await client.connect();
+const conn = new MelangeConnection(client);
+
+conn.db.Creature.onInsert((c) => spawn(c));                  // typed events off the merged cache
+const area = await conn.db.Creature.ChunkId.subscribeRange(0, 10);
+await conn.db.Creature.ChunkId.rescopeRange(area, 5, 15);
+conn.db.Creature.Id.find(42n);
+const lsn: bigint = await conn.reducers.spawn(3, "wolf", [1, 2, 3]);
+conn.identity;
+```
+
+- **Names.** Rows keep the server's field names (`row.ChunkId`), tables and column accessors keep
+  their names (`conn.db.Creature.ChunkId`), and methods are camelCase (`subscribeRange`,
+  `conn.reducers.spawn`).
+- **Values.** `Int64`, `UInt64`, timestamps, and LSNs are `bigint`, because JavaScript numbers
+  round past 2^53 and a rounded resume cursor skips or replays commits. 32-bit and smaller integers
+  and floats are `number`. `Identity` is a class (`toString()` is the hex). Enums are generated
+  `as const` objects with a matching type.
+- **Defaults.** A trailing reducer or producer parameter with a default is optional. Leave it off
+  and the server fills it.
+- **Threading.** JavaScript has one thread, so there is no main-thread hazard to guard. The
+  property worth keeping is that cache state and events advance together, and
+  `dispatch: "manual"` with `client.frameTick()` gives a browser engine the C# Manual mode's
+  guarantee inside `requestAnimationFrame`. The default applies frames on arrival.
+- **Browsers and tokens.** A browser cannot set WebSocket headers, so the token travels in
+  `Hello`. With `useTicket: true` it is exchanged for a single-use connect ticket and only the
+  ticket goes in the URL.
+- **Ad-hoc SQL.** `MelangeSql.query()` reads `/melange/sql` results as untyped rows, aggregates
+  included, which neither client covered before. `queryTable(codec, "SELECT * FROM ...")`
+  returns typed rows for the one shape the manifest describes. Integers past 2^53 stay exact.
+
+The package's [README](../clients/typescript/README.md) has the rest.
 
 ## Staleness
 

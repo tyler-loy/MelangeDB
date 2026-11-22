@@ -19,7 +19,8 @@ Two things hold a client to these rules:
   small [adapter](#the-adapter-protocol) the client's language provides, against a real server.
   It covers the behaviours a frame corpus cannot show: the merged cache, the anchor boundary under
   concurrent writes, resume against the same and a new log, backpressure, and the heartbeat. The
-  C# client passes it on every build. See [The live suite](#the-live-suite).
+  C# client passes it on every build, and so does the TypeScript client (`@melangedb/client`,
+  CI's `typescript` job). See [The live suite](#the-live-suite).
 
 The C# client in `src/MelangeDB.Client` defines conformance, so where it and this document disagree
 the disagreement is a [finding](#findings), not a licence.
@@ -539,7 +540,8 @@ merged cache.
 
 An adapter is a small program in the client's own language that drives the real client library.
 It reads requests from stdin and writes responses and events to stdout, as newline-delimited JSON
-(UTF-8). `tools/MelangeDB.Conformance.Adapter.CSharp` is the reference adapter.
+(UTF-8). `tools/MelangeDB.Conformance.Adapter.CSharp` is the reference adapter, and
+`clients/typescript/conformance/adapter.ts` is a second one in about 250 lines.
 
 **Requests** carry an `id` and an `op`. The adapter answers each with the same `id` and
 `"ok": true` plus any results, or `"ok": false` with `"error": {"code", "message"}`. When the
@@ -612,3 +614,10 @@ Writing the contract down found these, as the phase plan said it would.
 4. **The server accepts parameter shapes wider than the closed set** (C15.3). That is harmless while
    there is one client. It becomes a compatibility promise nobody made the moment a second client
    leans on it.
+5. **`/melange/sql` writes 64-bit integers as plain JSON numbers.** Found building the TypeScript
+   client's SQL reader. `JSON.parse` rounds anything past 2^53, so an `Int64` id, a `UInt64`
+   counter, or a microsecond timestamp comes back wrong with no error in a JavaScript consumer.
+   `MelangeSql` reads such numbers from the source text (`JSON.parse`'s source access, in Node 21+
+   and current browsers) and refuses rather than rounds where that is missing. Writing them as
+   strings would be the clean fix, but it is a breaking change to the endpoint, so it is the
+   owner's call.

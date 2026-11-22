@@ -341,3 +341,18 @@ corpus doing its job. The generated bindings for the conformance and transport m
 type-check against the runtime, and a .NET test holds the committed copies to a fresh generation.
 CI gains a `typescript` job.
 
+**Step 5** (2026-11-22). `clients/typescript/conformance/adapter.ts` drives `@melangedb/client`
+through bindings generated from the conformance manifest. It passes all 14 live scenarios on the
+first run. Four mutants of the compiled runtime show the pass is not vacuous; each fails the
+scenario it should:
+
+- without delta buffering, `anchor-boundary`;
+- with a broken refcount, `merged-cache`;
+- without the `overflow_resync` re-subscribe, `overflow-resync`;
+- without `Pong`, `heartbeat`.
+
+CI's `typescript` job now runs the live suite against it after the unit tests.
+CLIENT-BINDINGS.md has its TypeScript section, and the manifest's "a non-C# generator becomes
+possible" is now a link to one. Building the SQL reader found finding 5: the endpoint writes
+64-bit integers as JSON numbers.
+

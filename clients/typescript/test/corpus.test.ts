@@ -14,7 +14,7 @@ import {
   toHex,
   type WireDescriptor,
 } from "../src/index.js";
-import { canonical, parseTagged, parseValue, renderFrame, renderTagged, renderValue, type Json } from "./canonical.js";
+import { canonical, parseTagged, parseValue, renderFrame, renderTagged, renderValue, type Json } from "../conformance/canonical.js";
 
 // build-test/test/corpus.test.js -> repo root/conformance/corpus.json
 const corpusPath = fileURLToPath(new URL("../../../../conformance/corpus.json", import.meta.url));

@@ -39,7 +39,8 @@ all it takes. Add `MelangeDB.Client` to a client project, `MelangeDB.Cluster` to
 node, `MelangeDB.Storage.Postgres` for the optional relational backplane, `MelangeDB.Mcp` for an
 opt-in agent endpoint ([docs/MCP.md](docs/MCP.md)), and `MelangeDB.Testing` to a test project to test
 reducers and ticks against a real engine ([docs/TESTING.md](docs/TESTING.md)). The `melange` CLI is a
-dotnet tool: `dotnet tool install -g MelangeDB.Cli`. See
+dotnet tool: `dotnet tool install -g MelangeDB.Cli`. Browsers use `@melangedb/client` from npm, with
+bindings from `melange generate --lang ts` ([docs/CLIENT-BINDINGS.md](docs/CLIENT-BINDINGS.md#typescript)). See
 [docs/RELEASING.md](docs/RELEASING.md#consuming-the-packages) for the full set and for consuming
 per-commit prereleases.
 

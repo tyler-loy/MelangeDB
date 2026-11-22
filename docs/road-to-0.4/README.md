@@ -49,7 +49,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | --- | --- | --- |
 | [20](../road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half. **Carried from 0.3** | **Measured** 2026-11-20; findings [#198](https://github.com/tyler-loy/MelangeDB/issues/198)–[#204](https://github.com/tyler-loy/MelangeDB/issues/204) |
 | [22](../road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: the reducer test kit. **Carried from 0.3** | **Built** 2026-11-21 ([TESTING.md](../TESTING.md)) |
-| [23](../road-to-0.3/plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate`. **Carried from 0.3** | In progress: step 1, the contract and decode corpus ([CLIENT-CONFORMANCE.md](../CLIENT-CONFORMANCE.md)), built 2026-11-22 |
+| [23](../road-to-0.3/plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate`. **Carried from 0.3** | In progress: steps 1-5 built 2026-11-22: the contract and corpus ([CLIENT-CONFORMANCE.md](../CLIENT-CONFORMANCE.md)), the live suite, `melange generate`, and `@melangedb/client` passing the suite. Step 6, the npm release, left |
 | [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | **Built**; fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | **Built** for a single node 2026-11-21 ([MCP.md](../MCP.md)); cluster routing of reducer calls left |
