@@ -544,6 +544,7 @@ src/MelangeDB.Mcp               optional: an MCP endpoint for agents over schema
 src/MelangeDB.Testing           the reducer test kit: a real engine on a hand-cranked clock
 tests/                          unit + integration
 tools/MelangeDB.LoadTest        the load rig behind the recorded performance numbers
+tools/MelangeDB.Conformance     the client conformance tool; conformance/ holds the corpus it records
 samples/                        worker-service host + console client
 ```
 

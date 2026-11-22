@@ -17,6 +17,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/MelangeDB.Cluster.Tests/MelangeDB.Cluster.Tests.csproj" />
     <Project Path="tests/MelangeDB.CodeGen.Tests/MelangeDB.CodeGen.Tests.csproj" />
+    <Project Path="tests/MelangeDB.Conformance.Tests/MelangeDB.Conformance.Tests.csproj" />
     <Project Path="tests/MelangeDB.Core.Tests/MelangeDB.Core.Tests.csproj" />
     <Project Path="tests/MelangeDB.Host.Tests/MelangeDB.Host.Tests.csproj" />
     <Project Path="tests/MelangeDB.LoadTest.Tests/MelangeDB.LoadTest.Tests.csproj" />
@@ -29,6 +30,7 @@
     <Project Path="bench/MelangeDB.Benchmarks/MelangeDB.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/tools/">
+    <Project Path="tools/MelangeDB.Conformance/MelangeDB.Conformance.csproj" />
     <Project Path="tools/MelangeDB.LoadTest/MelangeDB.LoadTest.csproj" />
   </Folder>
   <Folder Name="/samples/">

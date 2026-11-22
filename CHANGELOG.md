@@ -12,6 +12,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The client conformance contract** (road-to-0.4 phase 23, step 1).
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md) states every rule a MelangeDB client
+  must keep as a numbered obligation with the failure it prevents: framing, the handshake, rows and
+  masks, keys, the anchor boundary, the merged cache, calls, resume, `overflow_resync`, and the
+  subscription parameter map's closed set of value shapes (pinned, not changed). Beside it,
+  `conformance/corpus.json` is a decode corpus recorded from a live server by the new
+  `tools/MelangeDB.Conformance`, with key, column, and argument vectors; a test re-records it on
+  every build and fails when it drifts. Writing it down found four things, listed in the
+  document's Findings section.
+
 - **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
   `AddMelangeMcp()` and `app.MapMelangeMcp()` put a Model Context Protocol endpoint (stateless
   streamable HTTP, `/melange/mcp`) in the host's own pipeline. Tools: `describe_schema`, `query`

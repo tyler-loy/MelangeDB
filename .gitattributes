@@ -2,3 +2,6 @@
 # and the staleness tests hold the committed file byte-identical to the generated constant. Git
 # must never convert their line endings on checkout or checkin.
 melange-schema.json -text
+
+# The decode corpus is compared byte for byte against a fresh recording; same rule.
+conformance/corpus.json -text

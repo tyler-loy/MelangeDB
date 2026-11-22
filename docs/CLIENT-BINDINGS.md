@@ -86,7 +86,8 @@ tool, and a CLI each generate their own tree from the one file, nothing to confi
 ## The manifest format
 
 `melange-schema.json` is public API, format `1` or `2`. It is deliberately language-neutral: a
-non-C# client generator becomes possible by reading this file, not by linking anything. Format `2`
+non-C# client generator becomes possible by reading this file, not by linking anything. What such a
+client must then do on the wire is [CLIENT-CONFORMANCE.md](CLIENT-CONFORMANCE.md). Format `2`
 adds `producers` and `types`, and is written **only** by a module that has producers: every other
 module writes format `1` byte for byte as before, so adding the format moved no existing schema
 hash. A generator that reads only format `1` rejects a producer manifest loudly rather than binding

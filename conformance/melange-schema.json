@@ -1,0 +1,342 @@
+{
+  "format": 2,
+  "generator": "0.3.2.0",
+  "schemaHash": "590344f27a6d0153ec5bfb2e82ff19bbae403f263a43b40e3d54c68b0c8b1f76",
+  "module": "MelangeDB.Conformance",
+  "enums": [
+    {
+      "name": "Mood",
+      "underlying": "UInt8",
+      "members": [
+        {
+          "name": "Calm",
+          "value": "0"
+        },
+        {
+          "name": "Alert",
+          "value": "1"
+        },
+        {
+          "name": "Furious",
+          "value": "255"
+        }
+      ]
+    }
+  ],
+  "tables": [
+    {
+      "name": "Sample",
+      "type": "Sample",
+      "columns": [
+        {
+          "name": "Id",
+          "kind": "Int64",
+          "primaryKey": true,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Group",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": true
+        },
+        {
+          "name": "Flag",
+          "kind": "Bool",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "I8",
+          "kind": "Int8",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "U8",
+          "kind": "UInt8",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "I16",
+          "kind": "Int16",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "U16",
+          "kind": "UInt16",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "I32",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "U32",
+          "kind": "UInt32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "I64",
+          "kind": "Int64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "U64",
+          "kind": "UInt64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "F32",
+          "kind": "Float32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "F64",
+          "kind": "Float64",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Text",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Blob",
+          "kind": "Bytes",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Who",
+          "kind": "Identity",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "At",
+          "kind": "Timestamp",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Mood",
+          "kind": "UInt8",
+          "enum": "Mood",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    },
+    {
+      "name": "Secret",
+      "type": "Secret",
+      "columns": [
+        {
+          "name": "Name",
+          "kind": "String",
+          "primaryKey": true,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Owner",
+          "kind": "Identity",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Visible",
+          "kind": "Int32",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        },
+        {
+          "name": "Hidden",
+          "kind": "String",
+          "primaryKey": false,
+          "autoInc": false,
+          "unique": false,
+          "indexed": false
+        }
+      ]
+    }
+  ],
+  "reducers": [
+    {
+      "name": "ChangeSample",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "variant",
+          "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "DeleteSample",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "PutSample",
+      "params": [
+        {
+          "name": "id",
+          "kind": "Int64",
+          "isArray": false
+        },
+        {
+          "name": "variant",
+          "kind": "Int32",
+          "isArray": false
+        },
+        {
+          "name": "group",
+          "kind": "Int32",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "PutSecret",
+      "params": [
+        {
+          "name": "name",
+          "kind": "String",
+          "isArray": false
+        },
+        {
+          "name": "owner",
+          "kind": "Identity",
+          "isArray": false
+        },
+        {
+          "name": "visible",
+          "kind": "Int32",
+          "isArray": false
+        },
+        {
+          "name": "hidden",
+          "kind": "String",
+          "isArray": false
+        }
+      ]
+    },
+    {
+      "name": "Refuse",
+      "params": [
+        {
+          "name": "reason",
+          "kind": "String",
+          "isArray": false
+        }
+      ]
+    }
+  ],
+  "producers": [
+    {
+      "name": "Summarize",
+      "params": [
+        {
+          "name": "group",
+          "kind": "Int32",
+          "isArray": false
+        },
+        {
+          "name": "label",
+          "kind": "String",
+          "isArray": false,
+          "default": "null"
+        }
+      ],
+      "returns": "GroupSummary"
+    }
+  ],
+  "types": [
+    {
+      "name": "GroupSummary",
+      "valueType": false,
+      "fields": [
+        {
+          "name": "Count",
+          "type": "Int32"
+        },
+        {
+          "name": "MaxId",
+          "type": "Int64"
+        },
+        {
+          "name": "Label",
+          "type": "String"
+        },
+        {
+          "name": "Ids",
+          "type": "Int64[]"
+        }
+      ]
+    }
+  ]
+}

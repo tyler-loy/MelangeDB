@@ -38,7 +38,7 @@ jobs:
       # Individual stress tests inside the kept suites opt out the same way with
       # [Trait("Category", "Stress")] — the --filter below excludes them here, never locally.
       CI_TEST_PROJECTS: >-
-        Core CodeGen Transport Host Storage.Faster Storage.Postgres Testing
+        Core CodeGen Transport Host Storage.Faster Storage.Postgres Testing Conformance
     steps:
       - uses: actions/checkout@v7
 
