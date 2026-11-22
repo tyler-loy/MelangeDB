@@ -1,6 +1,7 @@
 # Phase 23 — The TypeScript client, client conformance, and `melange generate`
 
-**Status: Planned.**
+**Status: Planned; decisions settled 2026-11-21** (road-to-0.4). See [The build, in
+steps](#the-build-in-steps) at the end.
 
 **Goal:** a browser is a first-class MelangeDB client, and "a correct MelangeDB client" stops being
 a thing that exists only as C# code. Three deliverables, and **two of them outlive the client**: a
@@ -139,14 +140,20 @@ become issues.
 
 ## Decisions to settle
 
+All seven settled by the owner on 2026-11-21: five as leaned, two wider than leaned (C# from the
+CLI, and the full live conformance suite). The reasoning is kept below.
+
 ### Does C# generation move to the CLI too
 
 The C# path is a Roslyn incremental generator, which is the right tool for C# — it reruns on edit,
 integrates with the build, and emits diagnostics. Routing C# through the CLI as well would give one
 code path for all languages at the cost of making C# worse.
 
-**Leaning:** it does not move. The CLI and the generator share `ManifestParser` and `ClientModel`;
-only the emitters differ, and `ClientEmitter` stays where it is. **Open:** whether the CLI should be
+**Settled: the CLI emits C# as well** (owner, 2026-11-21), wider than the leaning. The Roslyn
+generator stays the path for MSBuild consumers; `melange generate --lang cs` serves the rest, and a
+byte-identical-output test between the two keeps them from drifting, an ongoing tax accepted. The
+leaning was: it does not move. The CLI and the generator share `ManifestParser` and `ClientModel`;
+only the emitters differ, and `ClientEmitter` stays where it is. **Was open:** whether the CLI should be
 able to emit C# at all for non-MSBuild consumers, and if so, how the two C# paths are kept from
 drifting — a byte-identical-output test between them is the obvious answer and also an ongoing tax.
 
@@ -156,8 +163,10 @@ A suite authored as C# tests can only ever test a C# client, which defeats the p
 data-driven suite — a recorded corpus of frames with expected decodes, plus a small control protocol
 the client under test implements — can test anything, at the cost of inventing that harness protocol.
 
-**Leaning:** data-driven, with the corpus generated from a live server so it cannot drift from the
-real wire. **Open:** how much of the suite can be pure decode-corpus (cheap, covers framing, row
+**Settled: data-driven, and the full live suite in this phase** (owner, 2026-11-21), wider than a
+corpus-first split: the decode corpus generated from a live server, plus every live behaviour
+(handshake, the anchor boundary, resume across an epoch, `DropAndResync` backpressure, the merged
+cache). **Was open:** how much of the suite can be pure decode-corpus (cheap, covers framing, row
 bytes, masks, argument encoding) versus how much needs a live connection (handshake, anchor
 boundary, resume across an epoch, backpressure). The second set is the valuable half and the
 expensive half, and the split decides whether this deliverable is a week or a month.
@@ -167,7 +176,8 @@ expensive half, and the split decides whether this deliverable is a week or a mo
 The refcounted merge is real work and it is tempting to ship a thinner client that surfaces raw
 per-subscription streams and lets the application deduplicate.
 
-**Leaning:** implement it fully. The server's behaviour — send once per subscription, deduplicate
+**Settled: implement it fully, in the runtime package** (owner, 2026-11-21), with generated code kept
+thin as C#'s is. The server's behaviour — send once per subscription, deduplicate
 nothing — is only correct *because* the client merges; a thin client would push a correctness
 obligation onto every application and would quietly not be a MelangeDB client by the contract this
 phase is writing. **Open:** whether the merge is in the runtime package or in generated code; C# puts
@@ -179,7 +189,7 @@ matching that is probably right.
 C# has `DispatchMode.Manual` because Godot and Unity forbid scene mutation off the main thread.
 JavaScript has one thread and no such hazard, so the mode's original motivation does not transfer.
 
-**Leaning:** default to immediate dispatch and offer a `frameTick()` anyway, for browser engines
+**Settled: immediate by default, with `frameTick()` offered** (owner, 2026-11-21), for browser engines
 that want cache mutation and events to land inside a `requestAnimationFrame` rather than at socket
 arrival. The property worth preserving is not thread affinity but the one the C# pump actually
 guarantees — that *what the cache says* and *what handlers have been told* advance on the same clock.
@@ -192,7 +202,9 @@ consumer — also needs one-shot aggregate queries, which are HTTP and owner-mod
 (`Sql:AdHocEnabled` gates the endpoint, `Sql:OwnerRole` is a claim, and owner mode refuses a caller
 without it rather than silently downgrading).
 
-**Leaning:** include a thin typed query helper, because the manifest already knows the column kinds
+**Settled: an untyped row reader for any query, plus typed results only for `SELECT *`-shaped
+queries on one table** (owner, 2026-11-21), the honest surface given that an aggregate's shape is
+not in the manifest. The original leaning was a thin typed query helper, because the manifest already knows the column kinds
 needed to type a result row, and because leaving it out means the phase's justifying consumer still
 hand-rolls the part it actually came for. **Open:** whether that helper types results *at all* —
 an aggregate's result shape is not in the manifest, since `COUNT(*)` is not a table — which may mean
@@ -205,7 +217,7 @@ for it too rather than a TypeScript-only opinion.
 `SubscribeFrame.Parameters` and `ResumeSubscription` still carry MessagePack values. Until now that
 has cost nothing, because there has only ever been one client.
 
-**Leaning:** pin it, do not change it. A wire break to save one map per subscribe is not worth it,
+**Settled: pin it, and enumerate a closed set of value shapes** (owner, 2026-11-21). A wire break to save one map per subscribe is not worth it,
 and protocol v2's break was justified by per-row cost that this does not have. What the phase *must*
 do is write the encoding down in the conformance contract as a frozen decision with that reasoning
 attached, so the next person to notice it finds an answer instead of an omission. **Open:** whether
@@ -217,8 +229,33 @@ shapes a parameter may take, and that enumeration does not exist anywhere today.
 [RELEASING.md](../RELEASING.md) is explicit: all packages ship together at one version, no
 per-package versioning.
 
-**Leaning:** the npm package carries the same version string and is published by the same release,
+**Settled: one version, one pipeline** (owner, 2026-11-21): the npm package carries the same version
+string and is published by the same release job, so a C#-only release still bumps it. Publishing
+needs an npm token in the repository's secrets, which the owner adds. The leaning was the same:
 so a `0.3.0` server, `0.3.0` NuGet packages, and `0.3.0` on npm are one artifact set. **Open:**
 whether npm publication belongs in the existing pipeline or a parallel one, and what the story is
 when a release is C#-only — under one version scheme, an unchanged TypeScript client still gets a
 version bump, which is either honest or noise depending on who is asked.
+
+## The build, in steps
+
+The decisions make this the largest phase on the road, so it lands as a stack, each step usable
+and tested on its own:
+
+1. **The contract.** `docs/CLIENT-CONFORMANCE.md`: every rule in [What a second runtime actually
+   has to implement](#what-a-second-runtime-actually-has-to-implement) as an obligation with the
+   failure it prevents, the parameter map's closed set of MessagePack shapes written down as a
+   frozen decision, and a recorder that captures the decode corpus from a live server.
+2. **The suite.** A language-neutral harness: the server-side orchestrator drives a small
+   client-under-test adapter over a line-delimited JSON control protocol, through the corpus and
+   every live scenario. The C# client gets an adapter and passes it first, since it defines
+   conformance; a place where it is the odd one out is a finding.
+3. **`melange generate --lang ts|cs`.** `ManifestParser` and `ClientModel` behind a CLI verb;
+   the C# emitter shared with the Roslyn generator and held to byte-identical output by a test.
+4. **The TypeScript runtime and bindings.** Browser-first, dependency-free core: framing,
+   connection, subscriptions, the merged refcounted cache, resume, backpressure, reducer calls,
+   `frameTick()`, and the `/melange/sql` reader. Generated bindings mirror the C# shape.
+5. **The TypeScript client passes the suite**, and CLIENT-BINDINGS.md gains its TypeScript section.
+6. **Release.** npm publication in the existing release job, one version with the NuGet packages.
+   Needs the owner's npm token as a repository secret before the first publish.
+
