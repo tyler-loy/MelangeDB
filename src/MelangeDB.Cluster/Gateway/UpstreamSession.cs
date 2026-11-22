@@ -9,23 +9,41 @@ namespace MelangeDB.Cluster;
 /// hands every other frame — with its original bytes, so forwarding never re-serializes — to the
 /// owner. One client maps to one upstream session per attached node: the permanent hub attachment
 /// plus the moving shard attachment.
+/// <para>
+/// Only the frames the gateway acts on are decoded (<see cref="Decoded"/>); everything else, every
+/// delta above all, reaches the owner as bytes with a null frame. Decoding each relayed delta,
+/// into a fresh 64 KiB receive buffer per message, was most of a loaded gateway's allocation:
+/// about a quarter of the serve process's time went to GC pauses at 400 subscribers (road-to-0.4
+/// phase 31).
+/// </para>
 /// </summary>
 internal sealed class UpstreamSession : IAsyncDisposable
 {
     private readonly ClientWebSocket _socket;
     private readonly IMelangeSerializer _serializer;
-    private readonly Func<Frame, byte[], Task> _onFrame;
+    private readonly Func<Frame?, byte[], Task> _onFrame;
     private readonly Action _onClosed;
     private readonly Action _countSent;
     private readonly Action _countReceived;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly CancellationTokenSource _closed = new();
+
+    // One reader at a time (the handshake, then the pump), so one buffer serves every receive.
+    private readonly byte[] _receiveBuffer = new byte[16 * 1024];
+    private readonly MemoryStream _fragments = new();
     private Task? _pump;
+
+    /// <summary>
+    /// The frames the gateway reads rather than relays: the handshake's answer, heartbeats the
+    /// pump answers itself, and the re-authentication result the gateway answers for the client.
+    /// </summary>
+    private static bool Decoded(FrameType type) => type is FrameType.Welcome or FrameType.Error or FrameType.Ping
+        or FrameType.Pong or FrameType.ReauthenticateResult;
 
     private UpstreamSession(
         ClientWebSocket socket,
         IMelangeSerializer serializer,
-        Func<Frame, byte[], Task> onFrame,
+        Func<Frame?, byte[], Task> onFrame,
         Action onClosed,
         Action countSent,
         Action countReceived)
@@ -54,7 +72,7 @@ internal sealed class UpstreamSession : IAsyncDisposable
         Uri uri,
         string assertion,
         IMelangeSerializer serializer,
-        Func<Frame, byte[], Task> onFrame,
+        Func<Frame?, byte[], Task> onFrame,
         Action onClosed,
         Action countSent,
         Action countReceived,
@@ -129,23 +147,40 @@ internal sealed class UpstreamSession : IAsyncDisposable
         }
     }
 
-    private async Task<(Frame Frame, byte[] Bytes)> ReceiveAsync(CancellationToken ct)
+    /// <summary>
+    /// The next message's bytes, and its frame when the gateway needs it decoded; null otherwise.
+    /// A serializer other than MessagePack cannot be peeked, so its frames are all decoded.
+    /// </summary>
+    private async Task<(Frame? Frame, byte[] Bytes)> ReceiveAsync(CancellationToken ct)
     {
-        var buffer = new byte[64 * 1024];
-        using var message = new MemoryStream();
-        while (true)
+        byte[] bytes;
+        var result = await _socket.ReceiveAsync(_receiveBuffer, ct).ConfigureAwait(false);
+        if (result.MessageType == WebSocketMessageType.Close)
+            throw new WebSocketException(WebSocketError.ConnectionClosedPrematurely);
+        if (result.EndOfMessage)
         {
-            var result = await _socket.ReceiveAsync(buffer, ct).ConfigureAwait(false);
-            if (result.MessageType == WebSocketMessageType.Close)
-                throw new WebSocketException(WebSocketError.ConnectionClosedPrematurely);
-            message.Write(buffer, 0, result.Count);
-            if (result.EndOfMessage)
-                break;
+            bytes = _receiveBuffer.AsSpan(0, result.Count).ToArray();
+        }
+        else
+        {
+            _fragments.SetLength(0);
+            _fragments.Write(_receiveBuffer, 0, result.Count);
+            do
+            {
+                result = await _socket.ReceiveAsync(_receiveBuffer, ct).ConfigureAwait(false);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    throw new WebSocketException(WebSocketError.ConnectionClosedPrematurely);
+                _fragments.Write(_receiveBuffer, 0, result.Count);
+            }
+            while (!result.EndOfMessage);
+            bytes = _fragments.ToArray();
         }
 
         _countReceived();
-        var bytes = message.ToArray();
-        return (_serializer.Deserialize(bytes), bytes);
+        var relayOnly = _serializer is MessagePackFrameSerializer
+            && MessagePackFrameSerializer.TryPeekType(bytes, out var type)
+            && !Decoded(type);
+        return (relayOnly ? null : _serializer.Deserialize(bytes), bytes);
     }
 
     private async Task PumpAsync()
@@ -183,6 +218,7 @@ internal sealed class UpstreamSession : IAsyncDisposable
     {
         await _closed.CancelAsync().ConfigureAwait(false);
         _socket.Dispose();
+        _fragments.Dispose();
         if (_pump is { } pump)
         {
             try

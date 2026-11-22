@@ -144,7 +144,7 @@ internal static class LoadTestDriver
 
             var result = Summarize(
                 options, metrics, players, measured, bytesBaseline, finalStats, handoffBaseline, abortBaseline, output,
-                LockSplitShare(measuredStats, finalStats));
+                LockSplitShare(measuredStats, finalStats), measuredStats);
             if (options.OutPath is { } path)
             {
                 WriteSeries(path, series);
@@ -170,7 +170,8 @@ internal static class LoadTestDriver
         long? handoffBaseline,
         long? abortBaseline,
         TextWriter output,
-        (long Transactions, double Share, double MeanLockedMs)? lockSplit)
+        (long Transactions, double Share, double MeanLockedMs)? lockSplit,
+        ServerStats? measuredStats)
     {
         var latency = metrics.CallToDelta.Total();
         var crossing = metrics.CrossingContinuity.Total();
@@ -203,6 +204,19 @@ internal static class LoadTestDriver
             : $"Server process:  working set {finalStats.WorkingSetBytes / (1024 * 1024)} MiB, GC heap " +
               $"{finalStats.GcHeapBytes / (1024 * 1024)} MiB, collections {finalStats.Gen0Collections}/{finalStats.Gen1Collections}/{finalStats.Gen2Collections}; " +
               $"{(finalStats.ServerGc ? "Server" : "workstation")} GC on {finalStats.ProcessorCount} logical processors");
+        if (measuredStats is not null && finalStats is not null && finalStats.ProcessCpuSeconds > 0)
+        {
+            var cores = (finalStats.ProcessCpuSeconds - measuredStats.ProcessCpuSeconds) / seconds;
+            var paused = (finalStats.GcPauseMs - measuredStats.GcPauseMs) / 1000 / seconds;
+            var kinds = finalStats.ThreadCpuSeconds
+                .Select(k => (Kind: k.Key, Cores: (k.Value - measuredStats.ThreadCpuSeconds.GetValueOrDefault(k.Key)) / seconds))
+                .Where(static k => k.Cores >= 0.05)
+                .OrderByDescending(static k => k.Cores)
+                .Take(8)
+                .Select(static k => Invariant($"{k.Kind} {k.Cores:F1}"));
+            output.WriteLine(Invariant($"Server CPU:      {cores:F1} cores; paused for GC {paused:P1} of the window; by thread: {string.Join(", ", kinds)}"));
+        }
+
         if (lockSplit is { } split)
         {
             output.WriteLine(Invariant(

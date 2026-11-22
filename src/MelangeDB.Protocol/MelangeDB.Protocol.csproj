@@ -12,6 +12,8 @@
   <ItemGroup>
     <!-- The server shares one encoding of a subscription group's ops (SubscriptionUpdate.EncodedOps). -->
     <InternalsVisibleTo Include="MelangeDB.Server" />
+    <!-- The gateway peeks a relayed frame's type instead of decoding it. -->
+    <InternalsVisibleTo Include="MelangeDB.Cluster" />
     <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
   </ItemGroup>
 

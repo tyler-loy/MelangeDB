@@ -227,6 +227,28 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
         }
     }
 
+    /// <summary>
+    /// A frame's type from its envelope, without decoding the rest. A relay that only needs to
+    /// know what a frame is (the cluster gateway forwarding a shard's deltas) uses this rather than
+    /// decoding every row it passes on. False when the envelope is not a frame's.
+    /// </summary>
+    internal static bool TryPeekType(ReadOnlySpan<byte> message, out FrameType type)
+    {
+        type = default;
+        try
+        {
+            var reader = new MsgPackReader(message);
+            if (reader.ReadArrayHeader() < 2)
+                return false;
+            type = (FrameType)reader.ReadInt64();
+            return true;
+        }
+        catch (MelangeProtocolException)
+        {
+            return false;
+        }
+    }
+
     public Frame Deserialize(ReadOnlySpan<byte> message)
     {
         var reader = new MsgPackReader(message);
