@@ -192,6 +192,26 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The gateway could stall a player for tens of seconds around a handoff** (found measuring
+  road-to-0.4 phase 31's game shape). Four things, fixed together:
+  - Routing a call or a subscription to a shard held the connection's attachment lock while it
+    connected to a new owner, and a swap held it while it waited for the destination, so either
+    stalled the other for as long as a connect took (29 s seen). Both now connect before taking the
+    lock; swaps stay in order through a lock of their own.
+  - Mid-transfer, the hub's map names the destination before the swap lands, and a subscription
+    routed in that window attached the destination itself, without the subscription replay. The
+    swap then found the session "already there" and returned without flushing the calls it held,
+    so the player's calls queued until the cap refused them. Routing now waits for the swap, and a
+    swap that finds itself already attached still flushes.
+  - Sessions pre-opened to neighbouring shards on approach were never closed unless a swap used
+    them. At 1,200 players that was ten upstream sockets a player, enough to run the host out of
+    ephemeral ports, so connects failed and retried for seconds. One nothing has asked for in 10 s
+    is now closed, and a failed one is retried on the next approach.
+  - The held-call overflow warning (EventId 1720) is logged once per transfer, not per refused call.
+
+  At 1,200 players rejected calls fell from 44,721 to 11,487 in two minutes and swaps that took
+  over 5 s from 236 to 62; at 1,600, rejections fell from 560,585 to 56,300.
+
 - **Handoff refusals that meant "retry" said `internal`** (found measuring road-to-0.4 phase 31's
   game shape). A player who walked past the border band before its handoff landed had the write
   refused as a `ShardSpanException`, logged as a reducer failure and answered `internal`; it is now

@@ -33,11 +33,29 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     private readonly WebSocket _client;
     private readonly GatewayRuntime _gateway;
     private readonly SemaphoreSlim _clientSendLock = new(1, 1);
+    // Guards installing a shard attachment (_shard/_shardKey). Never held across a connect: a call
+    // routed while a connect is in flight would wait for it, and under load a connect can take
+    // seconds (phase 31 measured swaps waiting 29 s on this lock behind one).
     private readonly SemaphoreSlim _attachmentLock = new(1, 1);
+
+    // Serializes swaps with each other, so two transfers in quick succession install in order even
+    // though each connects outside the attachment lock.
+    private readonly SemaphoreSlim _swapLock = new(1, 1);
     private readonly Lock _stateLock = new();
     private readonly Dictionary<uint, bool> _subscriptionOnShard = [];
     private readonly Dictionary<uint, byte[]> _shardSubscribeFrames = [];
-    private readonly Dictionary<ulong, Task<UpstreamSession>> _preopened = [];
+    // Destination sessions opened on approach, by shard, with when an approach last asked for each.
+    // One a swap never uses is closed once nothing has asked for it for PreopenIdle: kept forever,
+    // a roaming player collected one per shard it ever neared, and at 1,200 players that was
+    // ten upstream sockets each, enough to run a gateway host out of ephemeral ports (phase 31).
+    private readonly Dictionary<ulong, (Task<UpstreamSession> Session, long TouchedAt)> _preopened = [];
+
+    /// <summary>
+    /// How long an unused pre-opened session is kept after the last approach that asked for it. The
+    /// boundary monitor re-signals an approach every 3 s while the entity stays in the band, so a
+    /// session still wanted is refreshed well inside this.
+    /// </summary>
+    private static readonly TimeSpan PreopenIdle = TimeSpan.FromSeconds(10);
     private readonly List<(byte[] Bytes, uint RequestId, bool IsProducer)> _heldCalls = [];
     private readonly CancellationTokenSource _closed = new();
     private AuthResult? _session;
@@ -47,6 +65,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     private ShardKey? _shardKey;
     private bool _queueShardCalls;
     private long _queueStartedAt;
+
+    // Completes when the current queueing episode (a transfer or a drain) ends: the swap installed
+    // the destination, or the held calls were released. The attach path waits on it, so only the
+    // swap moves the attachment mid-transfer (see EnsureShardUpstreamAsync).
+    private TaskCompletionSource? _queueSettled;
+    private bool _overflowLogged; // Once per queueing episode: the warning is per transfer, not per refused call.
     private bool _handshaken;
     private IDisposable? _handoffRegistration;
     private IDisposable? _moveRegistration;
@@ -110,12 +134,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             Task<UpstreamSession>[] preopened;
             lock (_stateLock)
             {
-                preopened = [.. _preopened.Values];
+                preopened = [.. _preopened.Values.Select(static p => p.Session)];
                 _preopened.Clear();
             }
 
             foreach (var pending in preopened)
-                _ = pending.ContinueWith(static t => t.Result.DisposeAsync(), TaskContinuationOptions.OnlyOnRanToCompletion);
+                DisposeWhenOpen(pending);
         }
     }
 
@@ -330,7 +354,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                         return;
                     }
 
-                    LogHandoffQueueOverflow(_gateway.Logger, MaxHeldCalls);
+                    if (!_overflowLogged)
+                    {
+                        _overflowLogged = true;
+                        LogHandoffQueueOverflow(_gateway.Logger, MaxHeldCalls);
+                    }
+
                     // Nothing was sent anywhere, so the outcome is known: not run. Transient, so a
                     // client's retry policy (MelangeCallException.IsTransient) applies.
                     _ = SendToClientAsync(CallFailure(
@@ -428,29 +457,96 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         var strategy = _gateway.Strategy
             ?? throw new InvalidOperationException("No IShardStrategy is registered; shard-executed traffic cannot be routed.");
         var session = _session!;
-        var shard = _gateway.Hub.Engine.ReadCommitted(db => strategy.ShardForSession(new SessionContext(
+        ShardKey CurrentShard() => _gateway.Hub.Engine.ReadCommitted(db => strategy.ShardForSession(new SessionContext(
             session.Identity, session.IsGuest, db)));
 
-        await _attachmentLock.WaitAsync(ct).ConfigureAwait(false);
-        try
+        while (true)
         {
-            if (_shard is { IsAlive: true } current && _shardKey == shard)
-                return current;
-
-            if (_shard is { } stale)
+            // Mid-transfer the hub's map can already name the destination while the swap is still
+            // connecting. Attaching here then would race the swap: a second session to the same
+            // shard without the subscription replay, whose stream interleaves with the swap's in
+            // the client's caches. The swap owns the move; wait for it (bounded, so a transfer
+            // that never resolves still lets traffic through on whatever is attached).
+            Task? settled;
+            lock (_stateLock)
             {
-                await stale.DisposeAsync().ConfigureAwait(false);
-                _shard = null;
+                settled = _queueSettled?.Task;
             }
 
+            if (settled is not null)
+            {
+                try
+                {
+                    await settled.WaitAsync(_gateway.ShardAttachBudget, ct).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                }
+            }
+
+            var shard = CurrentShard();
+            UpstreamSession? stale = null;
+            await _attachmentLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (_shard is { IsAlive: true } current && _shardKey == shard)
+                    return current;
+
+                // Detach the old attachment before connecting, as this path always has: its stream
+                // must stop reaching the client now, not once the new session is up, or deltas from
+                // the shard the session left interleave with whatever the client re-establishes.
+                lock (_stateLock)
+                {
+                    stale = _shard;
+                    _shard = null;
+                }
+            }
+            finally
+            {
+                _attachmentLock.Release();
+            }
+
+            if (stale is not null)
+                await stale.DisposeAsync().ConfigureAwait(false);
+
+            // Connect with the lock released, then install only if nothing better arrived meanwhile:
+            // a swap may have attached this shard already, or the map may have moved on.
             var connected = await ConnectShardAsync(shard, ct).ConfigureAwait(false);
-            _shard = connected;
-            _shardKey = shard;
-            return connected;
-        }
-        finally
-        {
-            _attachmentLock.Release();
+            UpstreamSession? discard = connected;
+            UpstreamSession? result = null;
+            await _attachmentLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (_shard is { IsAlive: true } current && _shardKey == shard)
+                {
+                    result = current;
+                }
+                else if (CurrentShard() == shard && !QueueingNow())
+                {
+                    lock (_stateLock)
+                    {
+                        stale = _shard;
+                        _shard = connected;
+                        _shardKey = shard;
+                    }
+
+                    discard = null;
+                    result = connected;
+                }
+            }
+            finally
+            {
+                _attachmentLock.Release();
+            }
+
+            if (discard is not null)
+                await discard.DisposeAsync().ConfigureAwait(false);
+            if (stale is not null)
+                await stale.DisposeAsync().ConfigureAwait(false);
+            if (result is not null)
+                return result;
+
+            // The session's shard changed while connecting; resolve again.
         }
     }
 
@@ -488,26 +584,73 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     {
         if (!_handshaken || _closed.IsCancellationRequested)
             return;
+        List<Task<UpstreamSession>> idle;
         lock (_stateLock)
         {
-            if (_shardKey == to || _preopened.ContainsKey(to.Value))
-                return;
-            _preopened[to.Value] = Task.Run(async () =>
+            var now = Stopwatch.GetTimestamp();
+            idle = TakeIdlePreopensLocked(now, except: to.Value);
+            if (_shardKey != to)
             {
-                var session = await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
-                LogPreopened(_gateway.Logger, to.Value);
-                return session;
-            });
+                if (_preopened.TryGetValue(to.Value, out var existing) && !existing.Session.IsFaulted && !existing.Session.IsCanceled)
+                {
+                    _preopened[to.Value] = (existing.Session, now);
+                }
+                else
+                {
+                    // None yet, or the last one failed (its node was not serving the shard yet):
+                    // a failed pre-open left in place would never be retried, and the swap would
+                    // pay a full connect.
+                    _preopened[to.Value] = (Task.Run(async () =>
+                    {
+                        var session = await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
+                        LogPreopened(_gateway.Logger, to.Value);
+                        return session;
+                    }), now);
+                }
+            }
         }
+
+        foreach (var pending in idle)
+            DisposeWhenOpen(pending);
     }
+
+    /// <summary>Removes the pre-opens nothing has asked for within <see cref="PreopenIdle"/>. Call under <c>_stateLock</c>.</summary>
+    private List<Task<UpstreamSession>> TakeIdlePreopensLocked(long now, ulong except)
+    {
+        List<Task<UpstreamSession>> idle = [];
+        List<ulong>? keys = null;
+        foreach (var (shard, (session, touchedAt)) in _preopened)
+        {
+            if (shard != except && Stopwatch.GetElapsedTime(touchedAt, now) > PreopenIdle)
+            {
+                (keys ??= []).Add(shard);
+                idle.Add(session);
+            }
+        }
+
+        if (keys is not null)
+        {
+            foreach (var key in keys)
+                _preopened.Remove(key);
+        }
+
+        return idle;
+    }
+
+    /// <summary>Closes a pre-opened session once its connect finishes; a failed connect has nothing to close.</summary>
+    private static void DisposeWhenOpen(Task<UpstreamSession> pending) =>
+        _ = pending.ContinueWith(
+            static t => t.Result.DisposeAsync().AsTask(),
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnRanToCompletion,
+            TaskScheduler.Default).Unwrap();
 
     /// <summary>The transfer started: hold shard-routed calls; they land wherever the saga concludes.</summary>
     public void OnStarted(ShardKey from, ShardKey to)
     {
         lock (_stateLock)
         {
-            _queueShardCalls = true;
-            _queueStartedAt = Stopwatch.GetTimestamp();
+            StartQueueingLocked();
         }
     }
 
@@ -550,8 +693,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             lock (_stateLock)
             {
                 _muted = null;
-                _queueShardCalls = false;
-                _queueGeneration++;
+                StopQueueingLocked();
                 held = [.. _heldCalls];
                 _heldCalls.Clear();
             }
@@ -589,7 +731,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 return;
             if (_shard is { } origin)
                 _muted = origin;
-            _queueShardCalls = true;
+            StartQueueingLocked();
             generation = ++_queueGeneration;
         }
 
@@ -645,14 +787,51 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             ReleaseHeldCalls();
     }
 
+    /// <summary>Starts holding shard-bound calls. Call under <c>_stateLock</c>.</summary>
+    private void StartQueueingLocked()
+    {
+        if (!_queueShardCalls)
+        {
+            _queueStartedAt = Stopwatch.GetTimestamp();
+            _queueSettled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _overflowLogged = false;
+        }
+
+        _queueShardCalls = true;
+    }
+
+    /// <summary>Stops holding shard-bound calls and wakes any attach waiting on the episode. Call under <c>_stateLock</c>.</summary>
+    private void StopQueueingLocked()
+    {
+        _queueShardCalls = false;
+        _queueGeneration++;
+        _queueSettled?.TrySetResult();
+        _queueSettled = null;
+    }
+
+    private bool QueueingNow()
+    {
+        lock (_stateLock)
+        {
+            return _queueShardCalls;
+        }
+    }
+
+    /// <summary>Whether the live shard attachment is already <paramref name="shard"/>.</summary>
+    private bool AttachedTo(ShardKey shard)
+    {
+        lock (_stateLock)
+        {
+            return _shardKey == shard && _shard is { IsAlive: true };
+        }
+    }
+
     private async Task SwapToAsync(ShardKey to, bool force = false)
     {
         var metrics = _gateway.Hub.Metrics;
-        var lockStarted = Stopwatch.GetTimestamp();
         try
         {
-            await _attachmentLock.WaitAsync(_closed.Token).ConfigureAwait(false);
-            metrics.GatewaySwapLockWait.Record(Stopwatch.GetElapsedTime(lockStarted));
+            await _swapLock.WaitAsync(_closed.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -660,25 +839,40 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         }
 
         UpstreamSession? retired = null;
+        UpstreamSession? session = null;
+        var installed = false;
         var failed = false;
         try
         {
             // "Already there" short-circuits a duplicate handoff notification — but never a
             // drain's swap, where the shard key is unchanged by design and the whole point is
             // reconnecting the same shard on its new node.
-            if (!force && _shardKey == to && _shard is { IsAlive: true })
-                return;
-
-            Task<UpstreamSession>? preopened;
-            lock (_stateLock)
+            if (!force && AttachedTo(to))
             {
-                _preopened.Remove(to.Value, out preopened);
+                // A duplicate notification, or an attachment that reached the destination some
+                // other way: nothing to connect or replay, but the held calls must still go, or the
+                // connection keeps holding every call until the cap refuses them.
+                ReleaseHeldCalls();
+                return;
             }
 
-            // A pre-open that failed (its node was not serving the shard yet, or not at all) is
-            // not the swap's failure: connect now, with the full retry budget.
+            Task<UpstreamSession>? preopened = null;
+            List<Task<UpstreamSession>> idle;
+            lock (_stateLock)
+            {
+                if (_preopened.Remove(to.Value, out var entry))
+                    preopened = entry.Session;
+                idle = TakeIdlePreopensLocked(Stopwatch.GetTimestamp(), except: to.Value);
+            }
+
+            foreach (var pending in idle)
+                DisposeWhenOpen(pending);
+
+            // The destination session is obtained before the attachment lock is taken, so calls
+            // routed meanwhile never wait on this connect. A pre-open that failed (its node was not
+            // serving the shard yet, or not at all) is not the swap's failure: connect now, with
+            // the full retry budget.
             var connectStarted = Stopwatch.GetTimestamp();
-            UpstreamSession? session = null;
             if (preopened is not null)
             {
                 try
@@ -695,34 +889,44 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             session ??= await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
             metrics.GatewaySwapConnect.Record(Stopwatch.GetElapsedTime(connectStarted));
 
-            byte[][] subscribes;
-            List<(byte[] Bytes, uint RequestId, bool IsProducer)> held;
-            lock (_stateLock)
+            var lockStarted = Stopwatch.GetTimestamp();
+            await _attachmentLock.WaitAsync(_closed.Token).ConfigureAwait(false);
+            metrics.GatewaySwapLockWait.Record(Stopwatch.GetElapsedTime(lockStarted));
+            try
             {
-                retired = _shard;
-                _shard = session;
-                _shardKey = to;
-                subscribes = [.. _shardSubscribeFrames.Values];
-                held = [.. _heldCalls];
-                _heldCalls.Clear();
-                if (_queueShardCalls && !force)
+                byte[][] subscribes;
+                List<(byte[] Bytes, uint RequestId, bool IsProducer)> held;
+                lock (_stateLock)
                 {
-                    _gateway.Hub.Metrics.GatewayHold.Record(Stopwatch.GetElapsedTime(_queueStartedAt));
-                    _gateway.Hub.Metrics.GatewayHeldCalls.Record(held.Count);
+                    retired = _shard;
+                    _shard = session;
+                    _shardKey = to;
+                    installed = true;
+                    subscribes = [.. _shardSubscribeFrames.Values];
+                    held = [.. _heldCalls];
+                    _heldCalls.Clear();
+                    if (_queueShardCalls && !force)
+                    {
+                        metrics.GatewayHold.Record(Stopwatch.GetElapsedTime(_queueStartedAt));
+                        metrics.GatewayHeldCalls.Record(held.Count);
+                    }
+
+                    StopQueueingLocked();
                 }
 
-                _queueShardCalls = false;
-                _queueGeneration++;
+                // Re-scope every shard subscription on the destination: the fresh initial set
+                // (band included) atomically replaces the client's cache — no gap, no missing
+                // terrain, no disconnect.
+                foreach (var frame in subscribes)
+                    await session.SendRawAsync(frame, _closed.Token).ConfigureAwait(false);
+                foreach (var (bytes, _, _) in held)
+                    await session.SendRawAsync(bytes, _closed.Token).ConfigureAwait(false);
+                LogSwapCompleted(_gateway.Logger, to.Value, subscribes.Length, held.Count);
             }
-
-            // Re-scope every shard subscription on the destination: the fresh initial set
-            // (band included) atomically replaces the client's cache — no gap, no missing
-            // terrain, no disconnect.
-            foreach (var frame in subscribes)
-                await session.SendRawAsync(frame, _closed.Token).ConfigureAwait(false);
-            foreach (var (bytes, _, _) in held)
-                await session.SendRawAsync(bytes, _closed.Token).ConfigureAwait(false);
-            LogSwapCompleted(_gateway.Logger, to.Value, subscribes.Length, held.Count);
+            finally
+            {
+                _attachmentLock.Release();
+            }
         }
         catch (Exception exception) when (!ClientGone(exception, _closed.Token))
         {
@@ -731,10 +935,15 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         }
         finally
         {
-            _attachmentLock.Release();
+            _swapLock.Release();
             _muted = null;
             if (retired is not null)
                 await retired.DisposeAsync().ConfigureAwait(false);
+
+            // A session connected for a swap that never installed it (the client left mid-swap)
+            // has nobody else to close it.
+            if (session is not null && !installed)
+                await session.DisposeAsync().ConfigureAwait(false);
         }
 
         // A failed swap must not leave the connection holding calls: nothing else ends the

@@ -536,7 +536,8 @@ durable regardless, but the application's session map may lag until the idempote
 re-scoped and held calls flushed; the client observed nothing), `1719 GatewaySwapFailed` (the swap could not
 complete; its held calls go to the shard's current owner and the client gets an `overflow_resync` error to
 re-establish subscriptions), `1720 GatewayHandoffQueueOverflow` (a client queued more than the cap during
-one transfer; further calls get a retryable error — sustained, it means a transfer is not ending),
+one transfer; further calls get a retryable `transient` error; logged once per transfer — sustained, it means
+transfers are not ending),
 `1721 GatewayPreopened` (Debug: a destination session opened on approach, so the swap is instant),
 `1760 GatewayPreopenFailed` (Debug: that pre-open had failed, so the swap connected afresh), and
 `1722 HandoffRequestStale` (Debug: a transfer request dropped because the sender is not the entity's current

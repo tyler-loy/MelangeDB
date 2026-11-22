@@ -444,6 +444,31 @@ thread pool carries everything that a real deployment spreads over five. The poo
 process would be smaller there; whether the gateway's per-player upstream sessions and the
 calls-held-then-replayed shape hold up is the question either way.
 
+**After the handoff fixes, 2026-11-22.** The first two fixes shipped, and fixing the gateway's swap
+surfaced two more gateway bugs: a subscription routed mid-transfer attached the destination
+without the swap (so the swap found itself "already there" and never flushed its held calls), and
+pre-opened sessions were never closed unless used, about ten upstream sockets a player at 1,200.
+With those fixed (each run started with the previous run's closed sockets drained, which earlier
+back-to-back runs did not wait for):
+
+| Players | Rejected | Resync errors | Swaps over 5 s | Calls held, mean | Delta rows/s | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| 800 | 1 | 0 | 0 | 67 ms | 246k | pass |
+| 1,200 | 11,487 (was 44,721) | 1 (was 2) | 62 (was 236) | 342 ms (was 693) | 382k | 1 resync error |
+| 1,600 | 56,300 (was 560,585) | 76 (was 1,384) | 307 (was 807) | 1.2 s | 475k | 76 resync errors |
+
+Cache inconsistencies stayed at zero. What remains at 1,200:
+
+- **Rate-limited calls (10,722).** The gateway routes a client's frames one at a time, in order,
+  so a subscription waiting on a slow swap stops the client's calls behind it; they reach the shard
+  together and trip the per-player limit. Held calls never exceeded 50, so it is not the replay.
+- **Sockets.** Each player still holds its own upstream session per shard it is attached to or
+  approaching (about six sockets a player at 1,200, and thousands of closes a minute in TIME_WAIT),
+  and a few hundred swaps a run still connect when they arrive.
+- **The saga's round trips** vary with the thread-pool queue (a mean saga of 190 ms in one run,
+  630 ms in the next). Raising the pool's minimum to 256 threads did not change the swap tail, so the
+  pool is busy, not starved.
+
 ### Relating to the in-process hotspot ceiling
 
 CLUSTERING.md publishes the *commit loop's* ceilings, measured in-process on one crowded shard:

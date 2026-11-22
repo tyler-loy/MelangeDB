@@ -202,6 +202,16 @@ The fix is not one contained change. Candidates, for the owner:
 - **The saga's waits:** answer handoff requests off the shared pool, as phase 30 did for the
   liveness ping, then re-measure to see how much of the pool backlog is the one-process harness.
 
+### Fixes 1 and 2 built (2026-11-22)
+
+The owner took the recommendation: fix 1 (transient codes) and fix 2 (the gateway), then
+re-measure. Fix 2 found two more gateway bugs on the way (a mid-transfer attach that bypassed the
+swap, and pre-opened sessions never closed). At 1,200 players rejections fell from 44,721 to 11,487
+and resync errors from 2 to 1; at 1,600, rejections fell tenfold. Results and what remains in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
+The next levers are fix 3 (a client's frames should not wait behind one slow subscription) and an
+upstream shared per node instead of one per player.
+
 ## Steps 3 to 5
 
 Unchanged from the [README](README.md#ordering): conflation for position-like tables, read-side
