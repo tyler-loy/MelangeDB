@@ -90,6 +90,8 @@ noted.
 | `--fast-failover` | off | `failover`: sets `Cluster:FastFailoverOnLinkLoss`, so a killed node is declared dead when its link drops rather than at the failure timeout. The harness kills a process, the case the option is for. |
 | `--lock-split` | — | serve: trace every Move and sum its write-lock split, locked time and the post-commit part of it where subscription fan-out runs, into the stats endpoint; the driver reports the measured window's post-commit share. Sets `Telemetry:SlowReducerMs` to 0, because the split rides the slow-reducer event, and tracing every transaction costs a little. |
 | `--movers` | everyone | drive: only the first N players move; the rest connect, subscribe, and receive. Holds the commit rate fixed across a subscriber sweep. |
+| `--aoi` | — | drive: subscribe to an **area of interest** instead of the whole shard: the chunks within R chunks of the player (a square of side 2R+1), rescoped on every chunk step. Subscription SQL has equality and `BETWEEN`, and a chunk id packs x above y, so each table gets 2R+1 `WHERE ChunkId BETWEEN :lo AND :hi` strips, one per chunk column. R is at least 1, so a walker's next step stays in view. |
+| `--workstation-gc` | off | all: start the serve process with workstation GC (`DOTNET_gcServer=0`). The tool is built with Server GC, which is what a host on the Web SDK runs; this reproduces runs from before phase 31, which all used workstation GC. For a standalone serve, set `DOTNET_gcServer` yourself. The summary records the serve side's GC mode and core count either way. |
 | `--port` / `--listen` | 0 / 127.0.0.1 | Hub bind (gateway + stats). `--listen 0.0.0.0` accepts a remote driver. |
 | `--data` | temp dir | Data root for logs and hot stores; the temp default is deleted on exit. |
 | `--out` | — | Time-series file; `.json` writes JSON, anything else CSV. |
@@ -201,7 +203,9 @@ measured after 10 s warm-up.
 
 ### Capacity ladder — where the fan-out wall is
 
-Four runs, identical topology, only the population moved. Call-to-delta in milliseconds; "acked"
+**Measured under workstation GC, which no real host runs; see
+[Re-measured as a game runs](#re-measured-as-a-game-runs-phase-31-2026-11-22) for the same shape under
+Server GC.** Four runs, identical topology, only the population moved. Call-to-delta in milliseconds; "acked"
 is over the whole 120 s window.
 
 | Players | Calls/s attempted → acked | p50 | p90 | p99 | max | Delta rows/s | Handoffs | Rejected |
@@ -234,6 +238,69 @@ commit loop** — which is the number this tool exists to produce.
 One-machine caveat applies throughout: driver and server shared the same 16 cores, so the absolute
 knee (~150 players ≈ 100k delivered rows/s here) is a lower bound; the *shape* — linear commits,
 quadratic fan-out, backlog past the knee — is the durable result.
+
+### Re-measured as a game runs (phase 31), 2026-11-22
+
+The ladder above has three things in it that a deployed game does not: workstation GC, 50 players to
+a shard, and every player subscribed to its whole shard. Phase 31 changed them one at a time before
+changing any code. Same machine; the driver shares it, so these are still lower bounds.
+
+**At 200 players, arms interleaved A B C D E E D C B A** (ranges are over the two runs of each):
+
+| Arm | Shape | p50 | p99 | Delta rows/s | Rejected |
+| --- | --- | --- | --- | --- | --- |
+| A | The ladder's: workstation GC, 4 shards (2x2 blocks of 8x8), whole-shard subscriptions | 5.4 s | 18.8–19.4 s | 90–91k | 17,105–20,703 |
+| B | A with Server GC | 102–131 ms | 476–503 ms | 206–221k | 13–936 |
+| C | B with 16 shards (4x4 blocks of 8x8, about 12 players each) | 26–28 ms | 345–750 ms | 89k | 4–5 |
+| D | B with `--aoi 2` (each player sees a 5x5-chunk square) | 15.5–15.9 ms | 177–185 ms | 57k | 3–5 |
+| E | B, C and D together: the game's shape | 13.7–13.8 ms | 272–300 ms | 19k | 0–7 |
+
+- **Most of the ladder's wall was the garbage collector.** Arm A ran about 19,000 gen0 collections
+  in two minutes, against about 6,500 under Server GC, and Server GC alone took 200 players from
+  collapse to a p50 of about 0.1 s while delivering more than twice the rows. The tool now runs
+  Server GC by default (`--workstation-gc` reproduces the ladder). A host built on the Web SDK
+  already does; a host built as a plain console app does not, and should set
+  `<ServerGarbageCollection>true</ServerGarbageCollection>`.
+- **Smaller shards and a bounded view each cut the delivered rows,** which is the cost that is
+  quadratic: 16 shards about halve them, a 5x5 view cuts them to a quarter, and together to a
+  tenth. The area-of-interest arm rescoped about 95 steps a second (five strips per table each)
+  without a cache inconsistency.
+
+**The ladder again, under Server GC** (driver also on Server GC):
+
+| Shape | Players | p50 | p90 | p99 | Delta rows/s | Rejected | Handoffs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| B (4 shards, whole-shard) | 300 | 5.6 s | 14.4 s | 25.2 s | 165k | 37,933 | 2,101 + 103 aborted |
+| B | 400 | 10.1 s | 21.8 s | 30.4 s | 147k | 154,014 | 1,647 + 398 aborted |
+| E (game shape) | 400 | 30 ms | 129 ms | 355 ms | 65k | 5 | 4,064 |
+| E | 600 | 74 ms | 211 ms | 398 ms | 123k | 15 | 6,274 |
+| E | 800 | 514 ms | 918 ms | 1.5 s | 181k | 9,752 | 8,227 |
+| E | 1,200 | 3.7 s | 9.2 s | 15.3 s | 183k | 722,250 | 6,315 + 2,030 aborted |
+
+- **The knee in the ladder's shape moved from about 150 players to between 200 and 300; in the
+  game's shape it is between 600 and 800** on this one machine, at about 9,000–12,000 commits a
+  second across 16 shards. No healthy node was declared dead in any run; the longest heartbeat
+  gap was 589 ms.
+- **The ceiling is now about 180–220k delivered rows a second,** about twice the ladder's. Past it,
+  extra players become queueing, the same shape as before. The 300, 400 and 1,200 rows each ended
+  with 1 to 11 resync errors, the overload behaviour described under replica lag below.
+
+**The fan-out sweep again, under Server GC** (one shard, 50 movers, about 750 commits/s, as in the
+sweep below; arms 100, 200, 400, 800, 200, 400, 200):
+
+| Subscribers | Post-commit share | Mean lock hold per Move | Lock demand | Call-to-delta p50 / p99 | Delta rows/s |
+| --- | --- | --- | --- | --- | --- |
+| 100 | 65.6% | 442 µs | 0.33 | 14 / 155 ms | 75,800 |
+| 200 | 73.8–75.5% | 793–848 µs | 0.60–0.64 | 40–43 / 211–647 ms | 152,000 |
+| 400 | 85.7–86.5% | 1.16–1.19 ms | 0.89–0.91 | 16.9–17.7 s | 194–201k |
+| 800 | 92.3% | 1.46 ms | over 1 | 19.7 s | 193,000 |
+
+- **Fan-out costs about 2–3 µs per subscriber per commit under Server GC,** against 5.5 µs under
+  workstation GC: post-commit time is about 290 µs at 100 subscribers, 600 µs at 200 and 1.0 ms at
+  400.
+- **It is still the wall.** The shard saturates at about 400 subscribers at this commit rate
+  instead of 200, and past that the lock queues the way it did before. This is what shared fan-out
+  (phase 31's next step) is aimed at: the per-subscriber work left inside the lock.
 
 ### Relating to the in-process hotspot ceiling
 
@@ -281,7 +348,8 @@ about that tail.
 
 ### Fan-out under the write lock — one shard, subscribers swept
 
-Measured 2026-11-20 for road-to-0.3 phase 20, as [read-side fan-out](idea-bin/read-side-fanout.md)'s
+Under workstation GC; the same sweep under Server GC is in
+[Re-measured as a game runs](#re-measured-as-a-game-runs-phase-31-2026-11-22). Measured 2026-11-20 for road-to-0.3 phase 20, as [read-side fan-out](idea-bin/read-side-fanout.md)'s
 reopening metric. One shard on one node, **50 movers at 15 Hz (a fixed ~750 commits/s)**, and the
 subscriber count swept by adding passive subscribers (`--movers 50 --players N --lock-split`). Every
 subscriber holds the same `PlayerPos` and `Terrain` subscriptions. Arms ran interleaved 50 → 100 →

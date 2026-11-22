@@ -44,6 +44,11 @@ bindings from `melange generate --lang ts` ([docs/CLIENT-BINDINGS.md](docs/CLIEN
 [docs/RELEASING.md](docs/RELEASING.md#consuming-the-packages) for the full set and for consuming
 per-commit prereleases.
 
+Host the engine in a project that runs **Server GC**. A Web SDK project (`Microsoft.NET.Sdk.Web`)
+does by default; a console project needs `<ServerGarbageCollection>true</ServerGarbageCollection>`.
+Under workstation GC the load test delivered half the rows at the same player count
+([docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#re-measured-as-a-game-runs-phase-31-2026-11-22)).
+
 ## A first look
 
 Define a table and a reducer. The reducer is an ordinary class; its dependencies are injected.

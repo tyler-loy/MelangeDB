@@ -5,6 +5,10 @@
     <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
     <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <!-- Server GC, as a host gets from the Web SDK. Workstation GC on this tool halved the
+         delivered-row ceiling it measured (docs/LOAD-TESTING.md, phase 31); the all subcommand's
+         workstation-gc flag reproduces it. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
     <Description>Load-tests a MelangeDB spatial cluster with real clients over real sockets: a serve side hosting hub plus shard nodes, and a drive side generating walking-player load and measuring call-to-delta latency, throughput, handoffs, and bandwidth. See docs/LOAD-TESTING.md.</Description>
   </PropertyGroup>
 

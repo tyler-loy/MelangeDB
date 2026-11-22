@@ -44,6 +44,11 @@ public sealed record ServerStats
 
     public required int Gen2Collections { get; init; }
 
+    /// <summary>Whether the serve process runs Server GC; heap count, and so resident size, follows the core count.</summary>
+    public bool ServerGc { get; init; }
+
+    public int ProcessorCount { get; init; }
+
     // The write-lock split (serve --lock-split), summed over every traced Move; zero when off.
     public long LockSplitTransactions { get; init; }
 

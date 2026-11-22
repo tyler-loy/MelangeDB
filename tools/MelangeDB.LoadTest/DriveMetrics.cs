@@ -104,6 +104,7 @@ internal sealed class DriveMetrics
     private long _disconnects;
     private long _resyncErrors;
     private long _inconsistencies;
+    private long _rescopes;
 
     /// <summary>Call-to-delta: reducer call sent, to the matching self-delta on the caller's own subscription.</summary>
     public LatencySeries CallToDelta { get; } = new();
@@ -142,6 +143,9 @@ internal sealed class DriveMetrics
 
     public void Crossing() => Interlocked.Increment(ref _crossings);
 
+    /// <summary>--aoi: one player step's strips all re-scoped.</summary>
+    public void Rescoped() => Interlocked.Increment(ref _rescopes);
+
     public void AbsorbedSelfDelta() => Interlocked.Increment(ref _absorbedSelfDeltas);
 
     public void LostSelfDelta() => Interlocked.Increment(ref _lostSelfDeltas);
@@ -164,6 +168,8 @@ internal sealed class DriveMetrics
 
     public long Crossings => Interlocked.Read(ref _crossings);
 
+    public long Rescopes => Interlocked.Read(ref _rescopes);
+
     public long AbsorbedSelfDeltas => Interlocked.Read(ref _absorbedSelfDeltas);
 
     public long LostSelfDeltas => Interlocked.Read(ref _lostSelfDeltas);
@@ -183,6 +189,7 @@ internal sealed class DriveMetrics
         Interlocked.Exchange(ref _transportErrors, 0);
         Interlocked.Exchange(ref _deltaRows, 0);
         Interlocked.Exchange(ref _crossings, 0);
+        Interlocked.Exchange(ref _rescopes, 0);
         Interlocked.Exchange(ref _absorbedSelfDeltas, 0);
         Interlocked.Exchange(ref _lostSelfDeltas, 0);
         CallToDelta.Reset();

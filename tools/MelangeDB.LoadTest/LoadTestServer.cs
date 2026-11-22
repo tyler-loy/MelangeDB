@@ -215,6 +215,8 @@ internal sealed class LoadTestServer : IAsyncDisposable
             Gen0Collections = GC.CollectionCount(0),
             Gen1Collections = GC.CollectionCount(1),
             Gen2Collections = GC.CollectionCount(2),
+            ServerGc = System.Runtime.GCSettings.IsServerGC,
+            ProcessorCount = Environment.ProcessorCount,
             LockSplitTransactions = _lockSplit?.Transactions ?? 0,
             LockedMsSum = _lockSplit?.LockedMs ?? 0,
             PostCommitMsSum = _lockSplit?.PostCommitMs ?? 0,

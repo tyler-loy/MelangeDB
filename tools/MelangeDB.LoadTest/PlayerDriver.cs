@@ -28,6 +28,12 @@ internal sealed class PlayerDriver : IAsyncDisposable
     private readonly ConcurrentDictionary<long, long> _pendingSentAt = new();
     private MelangeSubscription? _terrain;
     private MelangeSubscription? _positions;
+
+    // --aoi: one BETWEEN strip per chunk column within the radius, for each table, rescoped as the
+    // player steps. Subscription SQL has equality and BETWEEN, and a chunk id packs x above y, so a
+    // column of chunks is one contiguous range and a square area is 2R+1 of them.
+    private readonly List<(MelangeSubscription Terrain, MelangeSubscription Positions, int Dx)> _strips = [];
+    private Task _rescoping = Task.CompletedTask;
     private long _seq;
     private long _crossingSeq = -1;
     private long _crossingSentAt;
@@ -90,7 +96,9 @@ internal sealed class PlayerDriver : IAsyncDisposable
 
     public long BytesReceived => _client.BytesReceived;
 
-    public long Inconsistencies => (_terrain?.Inconsistencies ?? 0) + (_positions?.Inconsistencies ?? 0);
+    public long Inconsistencies =>
+        (_terrain?.Inconsistencies ?? 0) + (_positions?.Inconsistencies ?? 0)
+        + _strips.Sum(static s => s.Terrain.Inconsistencies + s.Positions.Inconsistencies);
 
     public async Task ConnectAsync(CancellationToken ct)
     {
@@ -102,12 +110,25 @@ internal sealed class PlayerDriver : IAsyncDisposable
         await _client.CallReducerAsync(
             "SetPlayerShard", [SpatialShardStrategy.ShardOfBlock(bx, by).Value], ct).ConfigureAwait(false);
 
-        _terrain = await _client.SubscribeAsync("SELECT * FROM Terrain", null, ct).ConfigureAwait(false);
-        _positions = await _client.SubscribeAsync("SELECT * FROM PlayerPos", null, ct).ConfigureAwait(false);
-        HookDeltaCounters(_terrain);
-        HookDeltaCounters(_positions);
-        _positions.OnInsert += row => OnSelfCandidate(row);
-        _positions.OnUpdate += (_, row) => OnSelfCandidate(row);
+        if (_options.AoiRadius is { } radius)
+        {
+            for (var dx = -radius; dx <= radius; dx++)
+            {
+                var parameters = StripParameters(_cx + dx, _cy);
+                var terrain = await _client.SubscribeAsync(TerrainStrip, parameters, ct).ConfigureAwait(false);
+                var positions = await _client.SubscribeAsync(PositionStrip, parameters, ct).ConfigureAwait(false);
+                HookDeltaCounters(terrain);
+                HookPositions(positions);
+                _strips.Add((terrain, positions, dx));
+            }
+        }
+        else
+        {
+            _terrain = await _client.SubscribeAsync("SELECT * FROM Terrain", null, ct).ConfigureAwait(false);
+            _positions = await _client.SubscribeAsync("SELECT * FROM PlayerPos", null, ct).ConfigureAwait(false);
+            HookDeltaCounters(_terrain);
+            HookPositions(_positions);
+        }
 
         await _client.CallReducerAsync("Move", [Chunks.Id(_cx, _cy), 0L], ct).ConfigureAwait(false);
     }
@@ -212,6 +233,60 @@ internal sealed class PlayerDriver : IAsyncDisposable
         }
     }
 
+    private const string TerrainStrip = "SELECT * FROM Terrain WHERE ChunkId BETWEEN :lo AND :hi";
+
+    private const string PositionStrip = "SELECT * FROM PlayerPos WHERE ChunkId BETWEEN :lo AND :hi";
+
+    /// <summary>
+    /// One column of the area of interest: chunks (x, cy - R) through (x, cy + R), clamped to the
+    /// world's rows. A column off the world's edge still gets a well-formed range; it holds no rows.
+    /// </summary>
+    private Dictionary<string, object?> StripParameters(int x, int cy)
+    {
+        var radius = _options.AoiRadius ?? 0;
+        var low = Math.Max(0, cy - radius);
+        var high = Math.Min(_options.WorldChunksY - 1, cy + radius);
+        return new() { ["lo"] = Chunks.Id(x, low), ["hi"] = Chunks.Id(x, high) };
+    }
+
+    /// <summary>
+    /// Moves every strip to the player's new position. Sends run in order behind the previous
+    /// step's, so a slow send never lets an older scope land after a newer one.
+    /// </summary>
+    private void RescopeStrips()
+    {
+        var (cx, cy) = (_cx, _cy);
+        _rescoping = RescopeAfterAsync(_rescoping, cx, cy);
+    }
+
+    private async Task RescopeAfterAsync(Task previous, int cx, int cy)
+    {
+        await previous.ConfigureAwait(false);
+        try
+        {
+            foreach (var (terrain, positions, dx) in _strips)
+            {
+                var parameters = StripParameters(cx + dx, cy);
+                await _client.RescopeAsync(terrain, parameters).ConfigureAwait(false);
+                await _client.RescopeAsync(positions, parameters).ConfigureAwait(false);
+            }
+
+            _metrics.Rescoped();
+        }
+        catch (Exception)
+        {
+            if (!_stopped)
+                _metrics.TransportError(_metrics.Epoch);
+        }
+    }
+
+    private void HookPositions(MelangeSubscription positions)
+    {
+        HookDeltaCounters(positions);
+        positions.OnInsert += row => OnSelfCandidate(row);
+        positions.OnUpdate += (_, row) => OnSelfCandidate(row);
+    }
+
     private void HookDeltaCounters(MelangeSubscription subscription)
     {
         subscription.OnInsert += _ => _metrics.DeltaRow();
@@ -231,12 +306,15 @@ internal sealed class PlayerDriver : IAsyncDisposable
 
     private void AdvanceChunk()
     {
+        var (previousX, previousY) = (_cx, _cy);
         var (previousBx, previousBy) = (_cx / _options.BlockChunksX, _cy / _options.BlockChunksY);
         if (_seamWalker)
             AdvanceSeam();
         else
             AdvanceRoam();
         _nextMoveCrosses = (_cx / _options.BlockChunksX, _cy / _options.BlockChunksY) != (previousBx, previousBy);
+        if (_strips.Count > 0 && (_cx, _cy) != (previousX, previousY))
+            RescopeStrips();
     }
 
     /// <summary>
