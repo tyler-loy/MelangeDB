@@ -54,6 +54,7 @@ links the entry, and neither restates the other's argument.
 | [identity-sharded-hub.md](identity-sharded-hub.md) | Hub `Global` tables partitioned by identity into fixed buckets | Load test or telemetry projects hub saturation before the target population |
 | [object-storage-driver.md](object-storage-driver.md) | Shard logs as write-once chunk objects on S3 or Azure Blob, with conditional writes as the fence | A deployment without shared filesystem storage, plus a measured PUT latency and request bill |
 | [distributed-reducers.md](distributed-reducers.md) | A reducer spanning declared participants, optimistic body, short prepare, presumed abort | A named flow a saga cannot make correct, after engine sagas ship |
+| [gateway-scale-out.md](gateway-scale-out.md) | The gateway in processes of its own, several behind a load balancer, reaching the hub over the network | A two-machine measurement where the gateway process, not the shard nodes, is saturated |
 
 Six of these came from an outside review of the project, each claim checked against the code before
 it was written down here; the seventh (additional client languages) came out of scoping the

@@ -255,6 +255,52 @@ not kept; that and the driver's own socket ceiling near 2,000 clients on one mac
 next look starts. Details in
 [LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
 
+### Past 1,200: batching and links per node (2026-11-22)
+
+The owner chose three of eight leads to build. Results at 1,600 players, in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22):
+
+- **Batched link messages:** kept. The link's writer was the limit (one websocket message per
+  envelope); batching took the run from 398k to 619k rows a second and rejections from 222,710 to
+  24,451.
+- **Four links per node** (`Cluster:GatewayLinksPerNode`): kept. 680k-743k rows a second over three
+  runs, 173-1,357 rejections, swaps waiting 39-201 ms; zero resync errors. 1,600 players now pass
+  with a p99 of about 5 s.
+- **Fewer relay allocations:** not kept. Measured far worse in two interleaved runs, and GC was no
+  longer the limit; the cause was not isolated.
+
+### Leads past 1,600 players, for later (recorded 2026-11-22)
+
+The owner took three of eight ideas for the 1,600-player runs (batched link messages, several links
+per node, fewer relay allocations; results above) and asked for the rest to be recorded rather than
+built. Each lead names what was measured and what would make it worth doing.
+
+1. **Handoff steps off the shared thread pool.** The saga's freeze, import and release round trips
+   are node-link requests dispatched on the thread pool, so their time follows its queue: a mean
+   saga of 95 ms in one 1,200-player run and 476 ms in another, with thousands of queued work items
+   while the process used a third of its cores. Phase 30 moved the liveness ping onto a dedicated
+   thread for the same reason. *Shape:* answer `handoff-freeze`, `handoff-import` and
+   `handoff-release` on a small dedicated scheduler on the node, and run the hub's saga
+   continuations there too. *Cost:* contained to `NodeLink` dispatch and `HubRuntime`. *Trigger:*
+   saga time, now in `melange.handoff.duration`, varying with load in a deployment while the write
+   lock is idle.
+2. **Measure with the driver on a second machine.** On one machine the driver competes with the
+   server for CPU and runs out of socket buffer space opening about 2,000 clients (`WSAENOBUFS`),
+   so the 1,600-player numbers (a tail of about 5 s) are partly the harness. The tool already serves a remote driver
+   (`serve --listen 0.0.0.0`, `drive --address`). *Cost:* a second machine and an afternoon.
+   *Trigger:* any question about where this shape's real ceiling is; it should come before any of
+   the work below.
+3. **Conflation for position-like tables** (step 3 below, unchanged). Players move 15 times a
+   second and a viewer needs only the latest position per frame; merging a subscriber's pending
+   updates per row would cut delivered rows several-fold at high density. *Trigger:* delivery, not
+   handoffs, being the limit once the leads above are done.
+4. **Read-side fan-out** (step 4 below; [idea-bin/read-side-fanout.md](../idea-bin/read-side-fanout.md)).
+   The write lock was at most 18% busy in every game-shape run, so this matters only for much
+   denser shards than this shape produces.
+5. **More than one gateway** ([idea-bin/gateway-scale-out.md](../idea-bin/gateway-scale-out.md)).
+   Every player connects through the gateway on the hub process, so past a few thousand players
+   that process is the ceiling however many shard nodes there are.
+
 ## Steps 3 to 5
 
 Unchanged from the [README](README.md#ordering): conflation for position-like tables, read-side
