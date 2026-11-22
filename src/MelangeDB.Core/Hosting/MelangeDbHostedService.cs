@@ -259,8 +259,8 @@ internal sealed partial class MelangeDbHostedService : IHostedService
     }
 
     /// <summary>
-    /// Warns when the host runs workstation GC on a machine with cores to spare. The load test
-    /// delivered half the rows under it (road-to-0.4 phase 31), and it is the default for any
+    /// Warns when the host runs workstation GC on a machine with cores to spare. At 400 players the
+    /// load test spent 55% of its time paused under it (road-to-0.4 phase 31), and it is the default for any
     /// host not built on the Web SDK, so the one-line fix is easy to miss. Below four cores
     /// workstation GC is a reasonable choice and says nothing.
     /// </summary>
@@ -274,7 +274,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
 
     [LoggerMessage(EventId = 1108, EventName = "WorkstationGc", Level = LogLevel.Warning,
         Message = "MelangeDB is running under workstation GC on {Processors} logical processors. Subscription fan-out " +
-            "allocates per commit, and under load workstation GC halved delivered throughput in the load test. Set " +
+            "allocates per commit, and under load workstation GC paused the load test for over half its time. Set " +
             "<ServerGarbageCollection>true</ServerGarbageCollection> in the host project (a Web SDK project already does).")]
     private static partial void LogWorkstationGc(ILogger logger, int processors);
 

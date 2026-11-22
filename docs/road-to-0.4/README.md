@@ -54,7 +54,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |
 | [29](plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, owner-mode SQL, and published signals | **Built** for a single node 2026-11-21 ([MCP.md](../MCP.md)); cluster routing of reducer calls left |
 | 30 | Shard HA ([step 2 plan](plan-phase-30.md)) | **Built** 2026-11-21: the fence (step 0, [#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), detection, then the warm replica and promotion ([design record](../design/shard-ha.md)). Fast failover stays opt-in |
-| [31](plan-phase-31.md) | Throughput: the capacity ceiling re-measured, then shared fan-out | **Step 1 measured** 2026-11-22: most of the old wall was workstation GC; in a game's shape the knee is 600–800 players on one machine. Step 2 (shared fan-out) planned. **Last in 0.4** |
+| [31](plan-phase-31.md) | Throughput: the capacity ceiling re-measured, then shared fan-out | **Steps 1 and 2 built** 2026-11-22: shared fan-out, a startup warning for workstation GC, and a gateway fix that was most of the old wall (the 4-shard knee moved from about 150 players to about 600). The game's shape now stops at a different wall, not yet located. **Last in 0.4** |
 
 The plans for 20, 22, and 23 stay where they were written, in [road-to-0.3/](../road-to-0.3/).
 Moving them would break every link into them for no gain; the decision record is the same document

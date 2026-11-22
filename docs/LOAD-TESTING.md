@@ -203,9 +203,9 @@ measured after 10 s warm-up.
 
 ### Capacity ladder — where the fan-out wall is
 
-**Measured under workstation GC, which no real host runs; see
-[Re-measured as a game runs](#re-measured-as-a-game-runs-phase-31-2026-11-22) for the same shape under
-Server GC.** Four runs, identical topology, only the population moved. Call-to-delta in milliseconds; "acked"
+**Measured under workstation GC, which no real host runs, and through a gateway that allocated
+64 KiB and decoded every row for each frame it relayed (fixed in phase 31). See
+[After the gateway fix](#after-the-gateway-fix-2026-11-22) for this shape today.** Four runs, identical topology, only the population moved. Call-to-delta in milliseconds; "acked"
 is over the whole 120 s window.
 
 | Players | Calls/s attempted → acked | p50 | p90 | p99 | max | Delta rows/s | Handoffs | Rejected |
@@ -241,7 +241,9 @@ quadratic fan-out, backlog past the knee — is the durable result.
 
 ### Re-measured as a game runs (phase 31), 2026-11-22
 
-The ladder above has three things in it that a deployed game does not: workstation GC, 50 players to
+**Every table in this section still ran through the gateway bug described in the next section,
+which inflated all of them; they are kept because they are what the step 1 decisions were made
+from.** The ladder above has three things in it that a deployed game does not: workstation GC, 50 players to
 a shard, and every player subscribed to its whole shard. Phase 31 changed them one at a time before
 changing any code. Same machine; the driver shares it, so these are still lower bounds.
 
@@ -302,6 +304,80 @@ sweep below; arms 100, 200, 400, 800, 200, 400, 200):
   instead of 200, and past that the lock queues the way it did before. This is what shared fan-out
   (phase 31's next step) is aimed at: the per-subscriber work left inside the lock.
 
+### After the gateway fix, 2026-11-22
+
+Shared fan-out (phase 31 step 2) cut the fan-out's own cost to about a quarter in the benchmark,
+yet the shard still collapsed at 400 subscribers. The load tool's new CPU line explained why: at
+400 subscribers the **serve process used 18.7 cores and spent 25.6% of the window paused for GC**,
+nearly all of it in thread-pool workers. The gateway's upstream session allocated a fresh 64 KiB
+receive buffer for every message a node sent, copied it through a new stream, and decoded every row
+of every frame, although it only forwards a delta's bytes. A pause stops the thread holding the
+write lock too, so this showed up as lock hold growing with subscribers, which is what the sweeps
+above read as the cost of fan-out. Every capacity number in this document before this section ran
+through it.
+
+The session now reuses one buffer and relays without decoding (it peeks the frame type). Same
+machine, Server GC, defaults otherwise. Interleaved against the build before the fix:
+
+| Run | Before | After |
+| --- | --- | --- |
+| One shard, 400 subscribers, 50 movers: p50 / p99 | 15.3 s / 29.4 s | 9.6 ms / 29.4 ms |
+| Same: delivered rows/s, mean lock hold per Move | 212k, 1,091 µs | 303k (all of it), 233 µs |
+| 4 shards, 300 players: p50 / p99 | 4.7 s / 23.8 s | 11.2 ms / 194 ms |
+| Same: delivered rows/s, rejected calls | 188k, 10,592 | 639k, 0 |
+
+**The fan-out sweep again** (one shard, 50 movers, about 750 commits/s):
+
+| Subscribers | Serve CPU | GC paused | Mean lock hold per Move | Lock demand | p50 / p99 | Delta rows/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 200 | 3.6 cores | 1.4% | 171 µs | 0.13 | 5.9 / 29 ms | 152k |
+| 400 | 6.1 cores | 1.5% | 233 µs | 0.17 | 9.6 / 29 ms | 303k |
+| 800 | 9.4 cores | 1.5% | 393 µs | 0.29 | 17 / 41 ms | 607k |
+| 1,600 | 17.7 cores | 3.1% | 925 µs | 0.69 | 40 / 134 ms | 1.21M |
+
+- **A subscriber now costs the lock about 0.5 µs per commit,** from 2–3 µs. One shard at 750 commits
+  a second carries 1,600 subscribers with the lock idle a third of the time.
+- **The cost that grows now is delivery, off the lock:** about 15 µs of serve CPU per delivered row
+  at 1,600 subscribers, gateway relay included.
+
+**The ladder again** (4 shards of 8x8 chunks, whole-shard subscriptions, Server GC):
+
+| Players | p50 | p90 | p99 | Delta rows/s | Rejected | Serve CPU, GC paused |
+| --- | --- | --- | --- | --- | --- | --- |
+| 200 | 6.2 ms | 12.7 ms | 99 ms | 285k | 0 | 4.1 cores, 1.3% |
+| 400 | 18 ms | 40 ms | 179 ms | 1.13M | 0 | 7.3 cores, 1.7% |
+| 600 | 71 ms | 329 ms | 8.1 s | 1.74M | 2,751 | 10.2 cores, 7.5% |
+
+**The knee in this shape moved from about 150 players to about 600,** at 1.7 million delivered rows
+a second on one machine with the driver beside it.
+
+**The game's shape again** (16 shards, `--aoi 2`):
+
+| Players | p50 | p90 | p99 | Delta rows/s | Rejected | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| 800 | 24 ms | 176 ms | 1.8 s | 236k | 16,965 | pass |
+| 1,200 | 50 ms | 420 ms | 989 ms | 382k | 36,852 | 6 resync errors |
+| 1,600 | 90 ms | 471 ms | 15.3 s | 353k | 520,460 | 1,294 resync errors |
+
+- **This shape now hits a different wall, and delivery is not it:** it delivers a fifth of the rows
+  the whole-shard ladder does at the same CPU. What grows is rejections (seam writes past the band
+  while a transfer catches up) and, at 1,200 and up, resync errors. Each player step rescopes ten
+  subscriptions, and a rescope diffs its range under the write lock; at 1,200 players that is about
+  6,000 rescopes a second across 16 shards, plus 10,000 handoffs in two minutes. Which of these is
+  the limit is not measured yet.
+
+**Workstation GC, re-checked after the fix** (4 shards, interleaved):
+
+| Players | GC | GC paused | p50 | p99 | Rejected |
+| --- | --- | --- | --- | --- | --- |
+| 200 | workstation | 8.8% | 6.6 ms | 135 ms | 0 |
+| 200 | Server | 1.4% | 6.4 ms | 144 ms | 0 |
+| 400 | Server | 1.9% | 19 ms | 269 ms | 1 |
+| 400 | workstation | 54.8% | 149 ms | 15.4 s | 9,713 |
+
+With the gateway's garbage gone, workstation GC keeps up at 200 players, and still collapses at 400.
+The startup warning (EventId 1108) stands.
+
 ### Relating to the in-process hotspot ceiling
 
 CLUSTERING.md publishes the *commit loop's* ceilings, measured in-process on one crowded shard:
@@ -348,8 +424,8 @@ about that tail.
 
 ### Fan-out under the write lock — one shard, subscribers swept
 
-Under workstation GC; the same sweep under Server GC is in
-[Re-measured as a game runs](#re-measured-as-a-game-runs-phase-31-2026-11-22). Measured 2026-11-20 for road-to-0.3 phase 20, as [read-side fan-out](idea-bin/read-side-fanout.md)'s
+Under workstation GC and through the gateway bug; the same sweep today is in
+[After the gateway fix](#after-the-gateway-fix-2026-11-22). Measured 2026-11-20 for road-to-0.3 phase 20, as [read-side fan-out](idea-bin/read-side-fanout.md)'s
 reopening metric. One shard on one node, **50 movers at 15 Hz (a fixed ~750 commits/s)**, and the
 subscriber count swept by adding passive subscribers (`--movers 50 --players N --lock-split`). Every
 subscriber holds the same `PlayerPos` and `Terrain` subscriptions. Arms ran interleaved 50 → 100 →

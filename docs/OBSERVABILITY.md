@@ -548,8 +548,9 @@ is `1204`'s producer twin: a producer threw something other than a rejection, a 
 result during a socket or HTTP call, and the caller was told only to see the logs.
 
 Since road-to-0.4 phase 31: `1108 WorkstationGc`, a Warning at startup when the host runs workstation GC
-on four or more logical processors. Subscription fan-out allocates per commit, and in the load test
-workstation GC halved the rows delivered at 200 players ([LOAD-TESTING.md](LOAD-TESTING.md#re-measured-as-a-game-runs-phase-31-2026-11-22)).
+on four or more logical processors. Subscription fan-out allocates per commit, and at 400 players in
+the load test workstation GC spent 55% of the time paused (2% under Server GC), taking p99
+call-to-delta from 0.27 s to 15 s ([LOAD-TESTING.md](LOAD-TESTING.md#after-the-gateway-fix-2026-11-22)).
 A Web SDK host runs Server GC already; any other host sets `<ServerGarbageCollection>true</ServerGarbageCollection>`.
 There is no setting to silence it: a host that chose workstation GC on purpose sees it once per start.
 

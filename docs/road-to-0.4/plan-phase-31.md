@@ -12,7 +12,8 @@ gained `--aoi R` (each player subscribes to the chunks within R of it, as 2R+1 `
 table, rescoped on every step) and now runs Server GC by default (`--workstation-gc` reproduces the
 old runs).
 
-- **Most of the 200-player wall was workstation GC.** Same shape, Server GC on: p50 call-to-delta
+- **Most of the 200-player wall was workstation GC** (in hindsight, collecting garbage the gateway
+  made; see step 2's outcome below). Same shape, Server GC on: p50 call-to-delta
   went from 5.4 s to 0.10–0.13 s, and delivered rows from 90k/s to 206–221k/s. The reference
   game's host is a Web SDK project and already runs Server GC; only the tool did not. The README
   now tells console-project hosts to opt in.
@@ -137,6 +138,41 @@ The owner took all four leanings as written.
 4. **Where step 2 stops.** Leaning: build 2a–2c, then decide on conflation (step 3) from the
    re-measure. Conflation changes what a client sees (fewer, coalesced updates), so it is a
    protocol choice for the owner, not a tuning step.
+
+### 2b and 2c built; then the wall turned out to be the gateway
+
+Shared fan-out (groups and encode-once) cut the benchmark's per-subscriber share under the lock to
+about 250 ns and 293 bytes, from 575 ns and 865 bytes. In the load test it took 14% off lock hold at
+200 subscribers and did not move the knee: 400 still collapsed. The per-subscriber slope in place
+stayed at about 2 µs, eight times the benchmark's.
+
+The load tool gained a CPU line (process cores, GC pause share, CPU by thread kind, read from the
+runtime's thread names, since attaching a profiler was not available). At 400 subscribers the serve
+process used 18.7 cores and spent 25.6% of the window paused for GC. **The cluster gateway allocated
+a fresh 64 KiB receive buffer for every message a node sent and decoded every row it relayed.** A GC
+pause stops the thread holding the write lock too, so the gateway's garbage read as lock hold that
+grew with subscribers, in phase 20's sweep and in step 1's alike.
+
+Fixed (one buffer per session; frames relayed without decoding). The same run: 9.6 ms p50 instead
+of 15 s, 1.5% GC, 6.1 cores, and every requested row delivered. A subscriber now costs the lock
+about 0.5 µs per commit; one shard at 750 commits/s carries 1,600 subscribers with the lock busy
+69% of the time. The 4-shard ladder's knee moved from about 150 players to about 600 (1.7 million
+delivered rows a second). Full tables in
+[LOAD-TESTING.md](../LOAD-TESTING.md#after-the-gateway-fix-2026-11-22).
+
+Workstation GC, re-checked on the fixed gateway, keeps up at 200 players and still collapses at
+400 (55% of the time paused), so decision 3's warning stands, with its wording updated to these
+numbers.
+
+### What step 2 leaves for the owner
+
+- **The game's shape has a new wall that is not delivery.** At 1,200 players on 16 shards with a
+  5x5 view it delivers a fifth of the rows the ladder does at the same CPU, and fails on rejected
+  seam writes and resync errors. Candidates: rescopes (ten per player step, each a range diff under
+  the write lock, about 6,000 a second at 1,200 players) and handoffs (10,000 in two minutes).
+  Measuring which is the next step if the game's shape matters before 0.4 ships.
+- **Conflation (step 3) is less pressing than it looked.** It was aimed at delivered rows; the
+  whole-shard shape now delivers 1.7 million a second before its knee.
 
 ## Steps 3 to 5
 

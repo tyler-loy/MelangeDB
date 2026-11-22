@@ -46,8 +46,10 @@ per-commit prereleases.
 
 Host the engine in a project that runs **Server GC**. A Web SDK project (`Microsoft.NET.Sdk.Web`)
 does by default; a console project needs `<ServerGarbageCollection>true</ServerGarbageCollection>`.
-Under workstation GC the load test delivered half the rows at the same player count
-([docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#re-measured-as-a-game-runs-phase-31-2026-11-22)).
+At 400 players the load test spent 55% of its time paused under workstation GC, against 2% under
+Server GC, and p99 call-to-delta went from 0.27 s to 15 s
+([docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#after-the-gateway-fix-2026-11-22)). The engine logs EventId 1108 at startup
+when it finds itself on workstation GC with four or more cores.
 
 ## A first look
 

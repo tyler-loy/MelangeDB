@@ -41,8 +41,9 @@ All packages ship together at one version; there is no per-package versioning. S
   log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
   checks. The C# client's adapter passes it on every build.
 - **A startup warning for workstation GC** (road-to-0.4 phase 31): EventId `1108 WorkstationGc`
-  when the host runs workstation GC on four or more logical processors. In the load test it halved
-  the rows delivered at 200 players. A Web SDK host already runs Server GC; any other host should
+  when the host runs workstation GC on four or more logical processors. At 400 players in the load
+  test it spent 55% of the time paused for GC (2% under Server GC) and p99 call-to-delta went from
+  0.27 s to 15 s. A Web SDK host already runs Server GC; any other host should
   set `<ServerGarbageCollection>true</ServerGarbageCollection>` (now also in the README).
 
 - **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
@@ -192,6 +193,13 @@ All packages ship together at one version; there is no per-package versioning. S
   contract). After the server dropped a slow connection's subscriptions, the client raised
   `OnError` and nothing else, so every subscription looked live while its cache stopped changing.
   It now re-subscribes each one at once and reconciles the new initial sets by diff.
+- **The cluster gateway decoded, and freshly buffered, every frame it relayed** (found in road-to-0.4
+  phase 31). Its upstream session allocated a 64 KiB receive buffer per message a node sent,
+  copied it, and decoded every row, although it only forwards a delta's bytes. Under load that was
+  most of a cluster's allocation: at 400 subscribers on one shard the serve process spent a quarter
+  of its time paused for GC and call-to-delta reached 15 s at p50. It now reuses one buffer and
+  relays deltas without decoding them; the same run is at 9.6 ms, delivering every row asked of
+  it. The capacity knee in the load test's 4-shard shape moved from about 150 players to about 600.
 
 - **A large border reset took down the node link, and with it a healthy node.** A band reset was
   sent as one node-link frame, and a link drops any frame over 64 MiB. A million-row shard's band
