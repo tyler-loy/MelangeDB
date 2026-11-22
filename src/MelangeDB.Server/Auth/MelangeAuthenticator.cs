@@ -27,6 +27,7 @@ internal sealed record AuthResult(
     bool IsInternal = false,
     bool FiresLifecycle = true,
     bool IsBackupOwner = false,
+    bool IsMcpOwner = false,
     CallerClaims? Claims = null)
 {
     /// <summary>
@@ -59,6 +60,7 @@ internal sealed class MelangeAuthenticator
     private readonly Func<SqlOptions> _sqlOptions;
     private readonly Func<BulkOptions> _bulkOptions;
     private readonly Func<BackupOptions> _backupOptions;
+    private readonly Func<McpOptions>? _mcpOptions;
     private readonly Func<ClusterOptions>? _clusterOptions;
     private readonly TimeProvider _time;
 
@@ -69,13 +71,15 @@ internal sealed class MelangeAuthenticator
         Func<BulkOptions>? bulkOptions = null,
         Func<ClusterOptions>? clusterOptions = null,
         TimeProvider? time = null,
-        Func<BackupOptions>? backupOptions = null)
+        Func<BackupOptions>? backupOptions = null,
+        Func<McpOptions>? mcpOptions = null)
     {
         _services = services;
         _options = options;
         _sqlOptions = sqlOptions ?? (static () => new SqlOptions());
         _bulkOptions = bulkOptions ?? (static () => new BulkOptions());
         _backupOptions = backupOptions ?? (static () => new BackupOptions());
+        _mcpOptions = mcpOptions;
         _clusterOptions = clusterOptions;
         _time = time ?? TimeProvider.System;
     }
@@ -163,6 +167,7 @@ internal sealed class MelangeAuthenticator
             HasRole(result.ClaimsIdentity, _sqlOptions().OwnerRole),
             HasRole(result.ClaimsIdentity, _bulkOptions().OwnerRole),
             IsBackupOwner: HasRole(result.ClaimsIdentity, _backupOptions().OwnerRole),
+            IsMcpOwner: _mcpOptions is not null && HasRole(result.ClaimsIdentity, _mcpOptions().OwnerRole),
             Claims: Capture(result.ClaimsIdentity, _options().CaptureClaims));
     }
 

@@ -27,6 +27,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
     private readonly string _root;
     private readonly Action<IServiceCollection>? _services;
     private readonly Action<WebApplication>? _middleware;
+    private readonly Action<WebApplication>? _endpoints;
     private WebApplication? _app;
     private int _http1Port;
     private int _http2Port;
@@ -36,8 +37,10 @@ internal sealed class TransportTestHost : IAsyncDisposable
         Dictionary<string, string?> settings,
         ManualTimeProvider? time,
         Action<IServiceCollection>? services,
-        Action<WebApplication>? middleware)
+        Action<WebApplication>? middleware,
+        Action<WebApplication>? endpoints = null)
     {
+        _endpoints = endpoints;
         _root = root;
         _settings = settings;
         Time = time;
@@ -81,10 +84,11 @@ internal sealed class TransportTestHost : IAsyncDisposable
         Dictionary<string, string?>? settings = null,
         bool manualTime = false,
         Action<IServiceCollection>? services = null,
-        Action<WebApplication>? middleware = null)
+        Action<WebApplication>? middleware = null,
+        Action<WebApplication>? endpoints = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-transport-").FullName;
-        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null, services, middleware);
+        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null, services, middleware, endpoints);
         await host.StartAppAsync();
         return host;
     }
@@ -246,6 +250,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
         app.UseWebSockets();
         _middleware?.Invoke(app);
         app.MapMelangeSocket();
+        _endpoints?.Invoke(app);
         try
         {
             await app.StartAsync();

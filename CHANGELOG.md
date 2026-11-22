@@ -12,6 +12,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
+  `AddMelangeMcp()` and `app.MapMelangeMcp()` put a Model Context Protocol endpoint (stateless
+  streamable HTTP, `/melange/mcp`) in the host's own pipeline. Tools: `describe_schema`, `query`
+  (ad-hoc SQL under exactly the `/melange/sql` rules for the same caller), `health` and `signals`.
+  `call_reducer` exists only for reducers named in code (`AllowReducers`, `AllowReducer(name,
+  runAs)`); each call is an ordinary client call, policed and rate-limited, and outside
+  Development it also needs `Mcp:AllowReducersInProduction`. The endpoint is off until
+  `Mcp:Enabled` (`403 mcp_disabled`) and needs its own role claim, `Mcp:OwnerRole`
+  (default `melange-agent`). `melange mcp <url>` in the CLI bridges a stdio-only agent to a
+  running host's endpoint. A `melange.mcp.tool` span per call. See [docs/MCP.md](docs/MCP.md)
+  and the new THREAT-MODEL section.
+
 - **Warm replicas** (road-to-0.4 phase 30, steps 2c to 2e). With two or more shard nodes, the hub
   places each shard's replica on a node other than its owner (`Cluster:ShardReplicas`, default 1;
   0 opts out). The replica's node follows the shard's log read-only and keeps its hot store current

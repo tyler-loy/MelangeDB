@@ -322,21 +322,15 @@ internal static class MelangeHttpEndpoints
     {
         if (await AuthenticateAsync(context, transport).ConfigureAwait(false) is not { } session)
             return;
-        var sqlOptions = transport.Options.Sql;
-        if (!sqlOptions.AdHocEnabled)
+        try
         {
-            await WriteErrorAsync(
-                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.SqlDisabled,
-                "Ad-hoc SQL is disabled; set Sql:AdHocEnabled to true to opt in.").ConfigureAwait(false);
-            return;
+            // The gates first, as before the body is read: a disabled endpoint answers 403
+            // whatever was sent to it.
+            AdHocSql.CheckAccess(transport, session);
         }
-
-        var owner = sqlOptions.AdHocMode == AdHocSqlMode.Owner;
-        if (owner && !session.IsSqlOwner)
+        catch (AdHocSqlRefusal refusal)
         {
-            await WriteErrorAsync(
-                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.OwnerRequired,
-                "Sql:AdHocMode is Owner and this caller's token carries no Sql:OwnerRole claim; owner mode is never granted implicitly.").ConfigureAwait(false);
+            await WriteErrorAsync(context, refusal.Status, refusal.Code, refusal.Message).ConfigureAwait(false);
             return;
         }
 
@@ -361,184 +355,22 @@ internal static class MelangeHttpEndpoints
             return;
         }
 
+        AdHocSqlResult result;
         try
         {
-            var adHoc = SqlSubsetParser.ParseAdHoc(query, parameters);
-            if (adHoc.Aggregate is { } aggregate)
-            {
-                await AggregateAsync(context, transport, aggregate, owner).ConfigureAwait(false);
-                return;
-            }
-
-            var parsed = adHoc.Rows!;
-            var clusterRole = transport.Options.Cluster.Role;
-            var limits = transport.Options.Subscriptions;
-            var enforced = !owner;
-            var callerContext = enforced
-                ? new PolicyContext(session.Identity, session.IsGuest, transport.Engine.CommittedView)
-                : null;
-            var (subscription, rows) = transport.Engine.ReadConsistent(head =>
-            {
-                var compiled = ServerSubscription.Compile(
-                    NullSink.Instance, 0, parsed, transport.Engine.Schema, limits,
-                    enforced ? transport.Policies : null, callerContext,
-                    allowPrivateBackplane: owner);
-
-                // Placement is inert on a single node, so this fires only in a cluster — where
-                // a Partitioned table's rows live in the shard engines and this endpoint reads
-                // the node-local one: on a hub that holds Global/Replicated tables, on a shard
-                // node its own engine rather than any shard's. Refusing beats the empty result
-                // it would otherwise return, which an operator cannot distinguish from "no rows"
-                // and will read as fact. Checked after Compile on purpose: Compile answers
-                // unknown and private tables identically so the error reveals no existence, and
-                // pre-checking here would turn this refusal into that oracle.
-                if (clusterRole != ClusterRole.None && compiled.Schema.Placement == Placement.Partitioned)
-                {
-                    throw new SubscriptionRejectedException(
-                        MelangeErrorCodes.PartitionedElsewhere,
-                        $"Table '{compiled.Schema.Name}' is Placement.Partitioned, and its rows live in the shard "
-                        + $"engines rather than in this node's (Cluster:Role is {clusterRole}). Ad-hoc SQL reads the "
-                        + "node-local engine only. Reach partitioned rows through a reducer or a subscription, which "
-                        + "the gateway routes to the owning shard.");
-                }
-
-                var collected = new List<(ReadOnlyMemory<byte> Row, IReadOnlySet<string>? Columns)>();
-                long bytes = 0;
-                foreach (var pair in compiled.MatchingRows(transport.Engine.HotStore))
-                {
-                    if (!compiled.PolicyAdmits(pair.Value.Span))
-                        continue;
-
-                    // Column masks are evaluated here, under the lock, so they read the same
-                    // committed state the rows were collected at.
-                    collected.Add((pair.Value, compiled.VisibleColumns(pair.Value.Span)));
-                    bytes += pair.Value.Length;
-                    if (collected.Count > limits.MaxRowsPerSubscription || bytes > limits.MaxBytesPerSubscription)
-                    {
-                        throw new SubscriptionRejectedException(
-                            MelangeErrorCodes.TooManyRows,
-                            "The result exceeds the configured row or byte ceiling; narrow the predicate.");
-                    }
-                }
-
-                return (compiled, collected);
-            });
-
-            var schema = subscription.Schema;
-            var columns = subscription.StaticWireColumns is { } wire
-                ? schema.Columns.Select(c => c.Name).Where(wire.Contains).ToArray()
-                : [.. schema.Columns.Select(c => c.Name)];
-            await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
-            {
-                writer.WriteStartArray("columns");
-                foreach (var column in columns)
-                    writer.WriteStringValue(column);
-                writer.WriteEndArray();
-                writer.WriteStartArray("rows");
-                foreach (var (rowBytes, visibleColumns) in rows)
-                {
-                    // A column-policy mask writes null for a hidden value; [ServerOnly] columns
-                    // are absent from the column list entirely.
-                    var values = RowWire.ToColumns(schema, rowBytes.Span, visibleColumns);
-                    writer.WriteStartArray();
-                    foreach (var column in columns)
-                        WriteJsonValue(writer, values.GetValueOrDefault(column));
-                    writer.WriteEndArray();
-                }
-
-                writer.WriteEndArray();
-            }).ConfigureAwait(false);
+            result = await AdHocSql.ExecuteAsync(transport, session, query, parameters, context.RequestServices, context.RequestAborted).ConfigureAwait(false);
         }
-        catch (SqlParseException exception)
+        catch (AdHocSqlRefusal refusal)
         {
-            await WriteErrorAsync(context, StatusCodes.Status400BadRequest, MelangeErrorCodes.ParseError, exception.Message).ConfigureAwait(false);
-        }
-        catch (SubscriptionRejectedException exception)
-        {
-            await WriteErrorAsync(context, StatusCodes.Status400BadRequest, exception.Code, exception.Message).ConfigureAwait(false);
-        }
-    }
-
-    /// <summary>
-    /// The aggregate half of <c>{path}/sql</c>: owner mode only, relational backplane only, executed by
-    /// the registered <see cref="IRelationalQueryExecutor"/> — absent means no relational backplane is
-    /// configured, which is an explicit error rather than an empty result. Results reflect the
-    /// tier at its applier's checkpoint; that lag is the design, not a bug, and the applier's
-    /// health check is where it becomes visible.
-    /// </summary>
-    private static async Task AggregateAsync(HttpContext context, MelangeTransport transport, AggregateQuery aggregate, bool owner)
-    {
-        if (!owner)
-        {
-            await WriteErrorAsync(
-                context, StatusCodes.Status403Forbidden, MelangeErrorCodes.OwnerRequired,
-                "Aggregates run in owner mode only: row policies are in-process code that cannot be pushed into Postgres, " +
-                "and a policy-enforced aggregate would silently drop enforcement. Set Sql:AdHocMode to Owner.").ConfigureAwait(false);
+            await WriteErrorAsync(context, refusal.Status, refusal.Code, refusal.Message).ConfigureAwait(false);
             return;
-        }
-
-        var built = AdHocAggregateBuilder.Build(aggregate, transport.Engine.Schema);
-
-        // Placement and tier are independent axes, so closing the empty-result lie for row shapes
-        // (#114) did not close it here: a Partitioned table can also be Relational, and this node's
-        // relational backplane holds only what this node's engine wrote. On a hub that is every shard's
-        // rows except the partitioned ones — the aggregate would answer a confident number over a
-        // subset, which is worse than the empty result the row path refuses. Checked after Build
-        // for the same reason the row path checks after Compile: Build answers unknown and
-        // wrong-tier tables first, so this refusal is never an existence oracle.
-        var clusterRole = transport.Options.Cluster.Role;
-        if (clusterRole != ClusterRole.None && built.Table.Placement == Placement.Partitioned)
-        {
-            await WriteErrorAsync(
-                context, StatusCodes.Status400BadRequest, MelangeErrorCodes.PartitionedElsewhere,
-                $"Table '{built.Table.Name}' is Placement.Partitioned, and its rows live in the shard engines rather "
-                + $"than in this node's (Cluster:Role is {clusterRole}). An aggregate here would count only what this "
-                + "node wrote and report it as the total.").ConfigureAwait(false);
-            return;
-        }
-
-        var executor = (Core.IRelationalQueryExecutor?)context.RequestServices.GetService(typeof(Core.IRelationalQueryExecutor));
-        if (executor is null)
-        {
-            await WriteErrorAsync(
-                context, StatusCodes.Status400BadRequest, MelangeErrorCodes.NoRelationalTier,
-                "No relational backplane is configured; aggregates need AddPostgres(...).").ConfigureAwait(false);
-            return;
-        }
-        Core.RelationalQueryResult result;
-        try
-        {
-            result = await executor.ExecuteAsync(built, context.RequestAborted).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             return;
         }
-        catch (Exception)
-        {
-            await WriteErrorAsync(
-                context, StatusCodes.Status503ServiceUnavailable, MelangeErrorCodes.RelationalUnavailable,
-                "The relational backplane did not answer; see the server logs. Writes and subscriptions are unaffected.").ConfigureAwait(false);
-            return;
-        }
 
-        await WriteJsonAsync(context, StatusCodes.Status200OK, writer =>
-        {
-            writer.WriteStartArray("columns");
-            foreach (var column in result.Columns)
-                writer.WriteStringValue(column);
-            writer.WriteEndArray();
-            writer.WriteStartArray("rows");
-            foreach (var row in result.Rows)
-            {
-                writer.WriteStartArray();
-                foreach (var value in row)
-                    WriteJsonValue(writer, value);
-                writer.WriteEndArray();
-            }
-
-            writer.WriteEndArray();
-        }).ConfigureAwait(false);
+        await WriteJsonAsync(context, StatusCodes.Status200OK, writer => AdHocSql.WriteResult(writer, result)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -583,7 +415,7 @@ internal static class MelangeHttpEndpoints
     /// <c>{"$interval": micros}</c> exists for bulk-loading repeating timer rows: it coerces to a
     /// repeating <c>ScheduleAt</c>, where a <c>$timestamp</c> coerces to a one-shot.
     /// </summary>
-    private static object? ToArgument(JsonElement element) => element.ValueKind switch
+    internal static object? ToArgument(JsonElement element) => element.ValueKind switch
     {
         JsonValueKind.Null => null,
         JsonValueKind.True => true,
@@ -604,7 +436,7 @@ internal static class MelangeHttpEndpoints
         _ => throw new JsonException($"JSON value of kind {element.ValueKind} is not a valid argument."),
     };
 
-    private static void WriteJsonValue(Utf8JsonWriter writer, object? value)
+    internal static void WriteJsonValue(Utf8JsonWriter writer, object? value)
     {
         switch (value)
         {
@@ -700,7 +532,7 @@ internal static class MelangeHttpEndpoints
         await writer.FlushAsync(context.RequestAborted).ConfigureAwait(false);
     }
 
-    private sealed class NullSink : IDeltaSink
+    internal sealed class NullSink : IDeltaSink
     {
         public static readonly NullSink Instance = new();
 

@@ -36,7 +36,8 @@ dotnet add package MelangeDB.CodeGen          # the source generator
 
 All packages ship together at one version. `MelangeDB.CodeGen` is the generator — referencing it is
 all it takes. Add `MelangeDB.Client` to a client project, `MelangeDB.Cluster` to run more than one
-node, and `MelangeDB.Storage.Postgres` for the optional relational backplane. The `melange` CLI is a
+node, `MelangeDB.Storage.Postgres` for the optional relational backplane, and `MelangeDB.Mcp` for an
+opt-in agent endpoint ([docs/MCP.md](docs/MCP.md)). The `melange` CLI is a
 dotnet tool: `dotnet tool install -g MelangeDB.Cli`. See
 [docs/RELEASING.md](docs/RELEASING.md#consuming-the-packages) for the full set and for consuming
 per-commit prereleases.
@@ -185,6 +186,7 @@ would settle it.
 | `src/MelangeDB.CodeGen` | Roslyn generator: registrations, serializers, typed clients. |
 | `src/MelangeDB.OpenTelemetry` | Optional: registers MelangeDB's signal names with OpenTelemetry. |
 | `src/MelangeDB.Cli` | The `melange` dotnet tool — schema export and tooling. |
+| `src/MelangeDB.Mcp` | Optional: an MCP endpoint for agents, in the host's own pipeline. |
 | `tools/MelangeDB.LoadTest` | The load rig behind the recorded performance numbers. |
 | `bench/MelangeDB.Benchmarks` | BenchmarkDotNet suites for the commit, apply, and wire paths. |
 | `samples/` | A worker-service host and a console client that talk to each other. |

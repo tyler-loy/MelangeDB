@@ -540,6 +540,7 @@ src/MelangeDB.Cluster           hub/shard node roles, placement routing, handoff
 src/MelangeDB.CodeGen           Roslyn source generator: registrations, serializers, typed clients
 src/MelangeDB.OpenTelemetry     optional: registers MelangeDB's ActivitySource/Meter names with OTel
 src/MelangeDB.Cli               the `melange` dotnet tool: schema manifest export
+src/MelangeDB.Mcp               optional: an MCP endpoint for agents over schema, SQL, health and signals
 tests/                          unit + integration
 tools/MelangeDB.LoadTest        the load rig behind the recorded performance numbers
 samples/                        worker-service host + console client

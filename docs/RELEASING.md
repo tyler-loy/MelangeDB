@@ -4,11 +4,11 @@ How MelangeDB packages are versioned, where they are published, and how a consum
 
 ## What ships
 
-Every library under `src/` is a NuGet package — eleven of them:
+Every library under `src/` is a NuGet package — twelve of them:
 
 `MelangeDB.Abstractions`, `MelangeDB.Core`, `MelangeDB.Protocol`, `MelangeDB.Client`,
 `MelangeDB.Server`, `MelangeDB.CodeGen`, `MelangeDB.Storage.Faster`, `MelangeDB.Storage.Postgres`,
-`MelangeDB.Cluster`, `MelangeDB.OpenTelemetry`, `MelangeDB.Cli`.
+`MelangeDB.Cluster`, `MelangeDB.OpenTelemetry`, `MelangeDB.Cli`, `MelangeDB.Mcp`.
 
 Tests, samples, and the load-test tool are never packed (`IsPackable=false`). Shared package metadata
 lives in `Directory.Build.props` at the repo root; a project's `.csproj` only adds what is specific to

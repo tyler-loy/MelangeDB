@@ -20,6 +20,10 @@
     <!-- The cluster package composes per-shard transports and the gateway from the same
          connection, authenticator, and subscription machinery a single node uses. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
+    <!-- The agent endpoint wraps the transport's authentication, ad-hoc SQL and call path, and reads
+         the same engine state the health checks do. -->
+    <InternalsVisibleTo Include="MelangeDB.Mcp" />
+    <InternalsVisibleTo Include="MelangeDB.Mcp.Tests" />
     <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
     <!-- The wire and fan-out suites measure RowWire and the subscription engine directly; the whole
          question they answer is what a row costs between the store and the socket. -->

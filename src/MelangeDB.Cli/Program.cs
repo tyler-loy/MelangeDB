@@ -10,6 +10,7 @@ using MelangeDB.Core;
 //   melange backup verify world.mbak
 //   melange restore world.mbak -o ./data/log [--at-lsn 41200] [--check]
 //   melange clone world.mbak -o ./staging/log
+//   melange mcp https://game.example.com --token <jwt>
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
 // its URL form fetches from a running server's schema endpoint. `backup` captures a stopped
@@ -37,8 +38,35 @@ return args[0] switch
     "backup" => await RunBackupAsync(args.AsSpan(1).ToArray()),
     "restore" => RunRestore(args.AsSpan(1).ToArray()),
     "clone" => RunClone(args.AsSpan(1).ToArray()),
+    "mcp" => await RunMcpAsync(args.AsSpan(1).ToArray()),
     _ => Usage(),
 };
+
+// The stdio bridge to a running host's agent endpoint. Nothing but the protocol may reach stdout.
+static async Task<int> RunMcpAsync(string[] rest)
+{
+    if (!ParseSourceAndOutput(rest, "", out var source, out _, out var token)
+        || !Uri.TryCreate(source, UriKind.Absolute, out var uri)
+        || uri.Scheme is not ("http" or "https"))
+    {
+        return Usage();
+    }
+
+    using var stop = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        stop.Cancel();
+    };
+    try
+    {
+        return await McpBridge.RunAsync(uri, token, stop.Token);
+    }
+    catch (OperationCanceledException) when (stop.IsCancellationRequested)
+    {
+        return 0;
+    }
+}
 
 static async Task<int> RunSchemaAsync(string[] rest)
 {
@@ -260,4 +288,5 @@ static void PrintUsage()
     Console.Error.WriteLine("       melange backup verify <archive>");
     Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>] [--check]");
     Console.Error.WriteLine("       melange clone <archive> -o <data-dir>");
+    Console.Error.WriteLine("       melange mcp <http(s)://host[:port][/path]> [--token <jwt>]   (stdio bridge to the host's MCP endpoint)");
 }

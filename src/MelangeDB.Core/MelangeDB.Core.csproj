@@ -25,6 +25,10 @@
     <!-- The cluster package starts and stops per-shard schedulers and reads the engine's live
          options instance when composing per-shard engines. -->
     <InternalsVisibleTo Include="MelangeDB.Cluster" />
+    <!-- The agent endpoint wraps the transport's authentication, ad-hoc SQL and call path, and reads
+         the same engine state the health checks do. -->
+    <InternalsVisibleTo Include="MelangeDB.Mcp" />
+    <InternalsVisibleTo Include="MelangeDB.Mcp.Tests" />
     <InternalsVisibleTo Include="MelangeDB.Cluster.Tests" />
     <!-- Both storage engines hold secondary indexes in the same container, and a range scan that
          seeks rather than walks is the same code in both. SecondaryIndex stays internal because it
