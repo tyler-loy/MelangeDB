@@ -307,3 +307,13 @@ A client without the delta buffer fails `anchor-boundary` (three runs of three).
 re-subscribe fails `overflow-resync` and the new `BackpressureTests` case. Finding 2 still needs
 two builds of a module, so it stays a finding.
 
+**Step 3** (2026-11-22). `melange generate --lang cs <manifest> -o <dir>`. `ClientBindings.CSharp`
+in CodeGen is now the one list of files both front doors use: the Roslyn generator adds each as a
+source, and the CLI, which references CodeGen as a library, writes each to disk (unchanged files
+untouched). `GenerateCommandTests` runs the real generator and the CLI over the snapshot schema,
+the transport suite's manifest (with producers), and the conformance manifest, and compares
+names and bytes. The C# emitter asks Roslyn which names are keywords, so Roslyn ships in the tool
+(English resources only; the package is 4.9 MB). **`--lang ts` moved to step 4**: the TypeScript
+bindings are code against the TypeScript runtime's API, so the emitter and the runtime are
+designed together rather than one guessing at the other.
+

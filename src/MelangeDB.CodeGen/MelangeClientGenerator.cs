@@ -58,8 +58,7 @@ public sealed class MelangeClientGenerator : IIncrementalGenerator
             return;
         }
 
-        foreach (var table in schema.Tables.Items)
-            production.AddSource($"{table.TypeName}.Client.g.cs", ClientEmitter.EmitTable(table));
-        production.AddSource("MelangeClientModel.g.cs", ClientEmitter.EmitModel(schema));
+        foreach (var file in ClientBindings.CSharp(schema))
+            production.AddSource(file.Name, file.Content);
     }
 }

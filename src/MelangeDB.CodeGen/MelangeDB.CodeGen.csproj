@@ -19,6 +19,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- `melange generate` runs the manifest parser and the emitters as a library, outside any
+         compiler: one implementation behind both front doors. -->
+    <InternalsVisibleTo Include="MelangeDB.Cli" />
+    <InternalsVisibleTo Include="MelangeDB.CodeGen.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
     <AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
   </ItemGroup>

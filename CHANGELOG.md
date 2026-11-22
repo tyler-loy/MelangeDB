@@ -21,6 +21,11 @@ All packages ship together at one version; there is no per-package versioning. S
   `tools/MelangeDB.Conformance`, with key, column, and argument vectors; a test re-records it on
   every build and fails when it drifts. Writing it down found four things, listed in the
   document's Findings section.
+- **`melange generate --lang cs`** (phase 23, step 3). Client bindings from a manifest without
+  a compiler, for engines and builds that cannot run the Roslyn generator. It runs the
+  generator's own parser and emitters as a library, so its files are the analyzer's byte for
+  byte; a test compares the two for three real manifests. TypeScript (`--lang ts`) arrives with
+  the TypeScript client.
 - **The live conformance suite** (phase 23, step 2). `MelangeDB.Conformance run -- <adapter>`
   drives any client through a small newline-delimited JSON adapter against a real server. It
   covers the corpus, the encoding vectors, the handshake, calls, the merged cache, re-scoping,

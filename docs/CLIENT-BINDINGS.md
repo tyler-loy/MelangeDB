@@ -83,6 +83,17 @@ A client project then needs three things — the client library, the analyzer, a
 manifest to several projects is the whole multiple-output-trees story — a game client, an admin
 tool, and a CLI each generate their own tree from the one file, nothing to configure.
 
+A consumer that cannot run an analyzer gets the same files from the CLI. That covers an engine
+that compiles C# its own way, and a build that checks generated code in:
+
+```
+melange generate --lang cs melange-schema.json -o Generated/
+```
+
+It runs the generator's own manifest parser and emitters as a library, so the files are the
+analyzer's byte for byte; a test holds the two together. Files whose content did not change are
+left alone. Reference `MelangeDB.Client` as usual; the generated code needs it either way.
+
 ## The manifest format
 
 `melange-schema.json` is public API, format `1` or `2`. It is deliberately language-neutral: a

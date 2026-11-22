@@ -1,9 +1,10 @@
 using MelangeDB.Cli;
 using MelangeDB.Core;
 
-// The `melange` umbrella command. Five verbs:
+// The `melange` umbrella command. Its verbs:
 //
 //   melange schema path/to/Module.dll [-o melange-schema.json]
+//   melange generate --lang cs melange-schema.json -o ./Generated
 //   melange schema http://localhost:5310 [-o melange-schema.json]
 //   melange backup ./data/log [-o world.mbak]
 //   melange backup https://game.example.com --token <jwt> [-o world.mbak]
@@ -13,7 +14,8 @@ using MelangeDB.Core;
 //   melange mcp https://game.example.com --token <jwt>
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
-// its URL form fetches from a running server's schema endpoint. `backup` captures a stopped
+// its URL form fetches from a running server's schema endpoint. `generate` turns that manifest into
+// client bindings without a compiler: `--lang cs` writes exactly what the Roslyn generator emits. `backup` captures a stopped
 // server's data directory into a .mbak archive — or, in its URL form, streams one from a running
 // server's backup endpoint (Backup:Enabled, and the token must carry the server's
 // Backup:OwnerRole claim); `verify` CRC-walks and dry-replays one; `restore`
@@ -34,6 +36,7 @@ if (args.Length == 0)
 return args[0] switch
 {
     "schema" => await RunSchemaAsync(args.AsSpan(1).ToArray()),
+    "generate" => RunGenerate(args.AsSpan(1).ToArray()),
     "backup" when args.Length >= 2 && args[1] == "verify" => RunVerify(args.AsSpan(2).ToArray()),
     "backup" => await RunBackupAsync(args.AsSpan(1).ToArray()),
     "restore" => RunRestore(args.AsSpan(1).ToArray()),
@@ -41,6 +44,56 @@ return args[0] switch
     "mcp" => await RunMcpAsync(args.AsSpan(1).ToArray()),
     _ => Usage(),
 };
+
+static int RunGenerate(string[] rest)
+{
+    string? language = null;
+    string? manifest = null;
+    string? output = null;
+    for (var i = 0; i < rest.Length; i++)
+    {
+        switch (rest[i])
+        {
+            case "--lang" when i + 1 < rest.Length:
+                language = rest[++i];
+                break;
+            case "-o" or "--output" when i + 1 < rest.Length:
+                output = rest[++i];
+                break;
+            case var value when manifest is null && !value.StartsWith('-'):
+                manifest = value;
+                break;
+            default:
+                return Usage();
+        }
+    }
+
+    if (language is null || manifest is null || output is null)
+        return Usage();
+    if (!ClientGenerate.Languages.Contains(language))
+    {
+        Console.Error.WriteLine($"melange generate: unknown --lang '{language}'; expected one of: {string.Join(", ", ClientGenerate.Languages)}.");
+        return 2;
+    }
+
+    try
+    {
+        var files = ClientGenerate.Generate(File.ReadAllText(manifest), language);
+        var written = ClientGenerate.WriteTo(files, output);
+        Console.Error.WriteLine($"Generated {files.Count} file(s) into {output} ({written.Count} changed).");
+        return 0;
+    }
+    catch (MelangeDB.CodeGen.ManifestException exception)
+    {
+        Console.Error.WriteLine($"melange generate: {manifest} is not a valid manifest: {exception.Message}");
+        return 1;
+    }
+    catch (IOException exception)
+    {
+        Console.Error.WriteLine($"melange generate: {exception.Message}");
+        return 1;
+    }
+}
 
 // The stdio bridge to a running host's agent endpoint. Nothing but the protocol may reach stdout.
 static async Task<int> RunMcpAsync(string[] rest)
@@ -284,6 +337,7 @@ static int Usage()
 static void PrintUsage()
 {
     Console.Error.WriteLine("usage: melange schema <module.dll | http(s)://host[:port][/path]> [-o melange-schema.json]");
+    Console.Error.WriteLine("       melange generate --lang cs <melange-schema.json> -o <directory>");
     Console.Error.WriteLine("       melange backup <data-dir | http(s)://host[:port][/path]> [-o world.mbak] [--token <jwt>]");
     Console.Error.WriteLine("       melange backup verify <archive>");
     Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>] [--check]");
