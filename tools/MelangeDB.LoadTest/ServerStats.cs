@@ -44,6 +44,20 @@ public sealed record ServerStats
 
     public required int Gen2Collections { get; init; }
 
+    /// <summary>Whether the serve process runs Server GC; heap count, and so resident size, follows the core count.</summary>
+    public bool ServerGc { get; init; }
+
+    public int ProcessorCount { get; init; }
+
+    /// <summary>Total time the process has spent paused for garbage collection.</summary>
+    public double GcPauseMs { get; init; }
+
+    /// <summary>Processor seconds so far by kind of thread (<see cref="ThreadCpu"/>); empty off Windows.</summary>
+    public Dictionary<string, double> ThreadCpuSeconds { get; init; } = [];
+
+    /// <summary>The serve process's total processor seconds so far.</summary>
+    public double ProcessCpuSeconds { get; init; }
+
     // The write-lock split (serve --lock-split), summed over every traced Move; zero when off.
     public long LockSplitTransactions { get; init; }
 

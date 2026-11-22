@@ -60,6 +60,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
             ApplyResidencyOverrides(next, engine.Options, engine);
         });
         ReportUnpolicedReducers();
+        ReportGarbageCollector(System.Runtime.GCSettings.IsServerGC, Environment.ProcessorCount, _logger);
 
         // The event bus starts before the scheduler so a recovered timer's first fire can already
         // publish; its subscribers catch up from their checkpoints against the recovered log.
@@ -256,6 +257,26 @@ internal sealed partial class MelangeDbHostedService : IHostedService
             }
         }
     }
+
+    /// <summary>
+    /// Warns when the host runs workstation GC on a machine with cores to spare. At 400 players the
+    /// load test spent 55% of its time paused under it (road-to-0.4 phase 31), and it is the default for any
+    /// host not built on the Web SDK, so the one-line fix is easy to miss. Below four cores
+    /// workstation GC is a reasonable choice and says nothing.
+    /// </summary>
+    internal static bool ReportGarbageCollector(bool serverGc, int processors, ILogger logger)
+    {
+        if (serverGc || processors < 4)
+            return false;
+        LogWorkstationGc(logger, processors);
+        return true;
+    }
+
+    [LoggerMessage(EventId = 1108, EventName = "WorkstationGc", Level = LogLevel.Warning,
+        Message = "MelangeDB is running under workstation GC on {Processors} logical processors. Subscription fan-out " +
+            "allocates per commit, and under load workstation GC paused the load test for over half its time. Set " +
+            "<ServerGarbageCollection>true</ServerGarbageCollection> in the host project (a Web SDK project already does).")]
+    private static partial void LogWorkstationGc(ILogger logger, int processors);
 
     [LoggerMessage(EventId = 1507, EventName = "ResidencyChangeFailed", Level = LogLevel.Error,
         Message = "Applying the Residency:{Table} override ({Residency}) to the running store failed; the table keeps its previous residency until restart.")]

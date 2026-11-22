@@ -45,6 +45,36 @@ public class SmokeTests(ITestOutputHelper output)
         Assert.True(long.Parse(handoffs, System.Globalization.CultureInfo.InvariantCulture) >= 1,
             $"at least one seam walker must have completed a handoff: {summary}");
     }
+
+    /// <summary>
+    /// --aoi: every player holds BETWEEN strips and rescopes them on each step, through the
+    /// gateway and across handoff swaps. The player's own row must keep arriving on a strip, and
+    /// the rescoped caches must stay consistent.
+    /// </summary>
+    [Fact]
+    public async Task An_area_of_interest_run_rescopes_and_keeps_measuring()
+    {
+        using var console = new StringWriter();
+        var exitCode = await LoadTestTool.RunAsync(
+            ["all", "--smoke", "--in-process-server", "--aoi", "1"],
+            console,
+            TestContext.Current.CancellationToken)
+            .WaitAsync(TimeSpan.FromMinutes(5), TestContext.Current.CancellationToken);
+        var transcript = console.ToString();
+        output.WriteLine(transcript);
+
+        Assert.Equal(0, exitCode);
+        var summary = transcript.Split('\n')
+            .Select(static line => line.TrimEnd('\r'))
+            .Single(static line => line.StartsWith("LOADTEST RESULT=", StringComparison.Ordinal));
+        Assert.StartsWith("LOADTEST RESULT=PASS", summary, StringComparison.Ordinal);
+        Assert.Contains("aoi_radius=1", summary, StringComparison.Ordinal);
+        Assert.True(long.Parse(Regex.Match(summary, @"\brescopes=(\d+)").Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) > 0,
+            $"walkers must have rescoped: {summary}");
+        Assert.True(double.Parse(Regex.Match(summary, @"\bcall_to_delta_ms_p50=([\d.]+)").Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) > 0,
+            $"self-deltas must arrive on the strips: {summary}");
+        Assert.Contains("inconsistencies=0", summary, StringComparison.Ordinal);
+    }
 }
 
 /// <summary>

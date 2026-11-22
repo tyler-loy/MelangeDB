@@ -7,8 +7,21 @@ namespace MelangeDB.Server;
 /// <summary>Receives delta frames computed under the engine's write lock. Implementations must not block.</summary>
 internal interface IDeltaSink
 {
-    /// <summary>Queues one transaction's deltas for this connection. Called in LSN order.</summary>
+    /// <summary>Queues one transaction's deltas for this connection and wakes its sender. Called in LSN order.</summary>
     void EnqueueDelta(TransactionUpdateFrame frame);
+
+    /// <summary>
+    /// <see cref="EnqueueDelta"/> without waking the sender. The live fan-out queues this way
+    /// under the write lock and calls <see cref="Wake"/> once the lock no longer has to cover it:
+    /// waking a send loop queues its continuation to the thread pool, which measured at about 70%
+    /// of what a subscriber cost the lock (road-to-0.4 phase 31, step 2a).
+    /// </summary>
+    void EnqueueDeltaQuietly(TransactionUpdateFrame frame) => EnqueueDelta(frame);
+
+    /// <summary>Wakes the sender for frames queued by <see cref="EnqueueDeltaQuietly"/>. Never under the write lock.</summary>
+    void Wake()
+    {
+    }
 }
 
 /// <summary>Thrown when a subscription fails validation or its estimated cost exceeds a ceiling.</summary>
@@ -89,6 +102,15 @@ internal sealed class ServerSubscription
 
     /// <summary>The inclusive upper bound; see <see cref="RangeLow"/>.</summary>
     public RowKey RangeHigh { get; private set; }
+
+    /// <summary>The group this subscription shares its fan-out with, or null when it is evaluated alone.</summary>
+    internal SubscriptionGroup? Group { get; set; }
+
+    /// <summary>The fan-out's record counter value at which this subscription was last added to its sink's frame.</summary>
+    internal long FanoutStamp { get; set; } = -1;
+
+    /// <summary>This record's ops, for a subscription evaluated alone; a grouped one reads its group's.</summary>
+    internal List<WireRowOp>? PendingOps { get; set; }
 
     /// <summary>
     /// Compiles and validates a query against the schema and the configured cost limits.

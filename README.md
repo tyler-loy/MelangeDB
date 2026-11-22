@@ -44,6 +44,13 @@ bindings from `melange generate --lang ts` ([docs/CLIENT-BINDINGS.md](docs/CLIEN
 [docs/RELEASING.md](docs/RELEASING.md#consuming-the-packages) for the full set and for consuming
 per-commit prereleases.
 
+Host the engine in a project that runs **Server GC**. A Web SDK project (`Microsoft.NET.Sdk.Web`)
+does by default; a console project needs `<ServerGarbageCollection>true</ServerGarbageCollection>`.
+At 400 players the load test spent 55% of its time paused under workstation GC, against 2% under
+Server GC, and p99 call-to-delta went from 0.27 s to 15 s
+([docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#after-the-gateway-fix-2026-11-22)). The engine logs EventId 1108 at startup
+when it finds itself on workstation GC with four or more cores.
+
 ## A first look
 
 Define a table and a reducer. The reducer is an ordinary class; its dependencies are injected.

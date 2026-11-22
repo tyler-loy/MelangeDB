@@ -247,7 +247,8 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             "An attachment behind the gateway was re-established; re-establish subscriptions."), CancellationToken.None);
     }
 
-    private async Task ForwardUpstreamFrameAsync(UpstreamSession? source, Frame frame, byte[] bytes)
+    /// <summary>Relays one upstream frame; <paramref name="frame"/> is null for one the session did not decode, which is every delta.</summary>
+    private async Task ForwardUpstreamFrameAsync(UpstreamSession? source, Frame? frame, byte[] bytes)
     {
         // Frames forward only from the current attachments: a muted origin's frames (the
         // release's deletions above all) and a pre-opened destination's frames never reach the

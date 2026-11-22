@@ -58,6 +58,31 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
         return writer.Length;
     }
 
+    /// <summary>
+    /// One subscription's ops as the array a <see cref="TransactionUpdateFrame"/> carries, for
+    /// <see cref="SubscriptionUpdate.EncodedOps"/>: encoded once, written into every frame that
+    /// shares them.
+    /// </summary>
+    internal static byte[] EncodeOps(IReadOnlyList<WireRowOp> ops)
+    {
+        var writer = new MsgPackWriter(64);
+        WriteOps(ref writer, ops);
+        return writer.ToArray();
+    }
+
+    private static void WriteOps(ref MsgPackWriter writer, IReadOnlyList<WireRowOp> ops)
+    {
+        writer.WriteArrayHeader(ops.Count);
+        foreach (var op in ops)
+        {
+            writer.WriteArrayHeader(4);
+            writer.WriteInt64((byte)op.Kind);
+            writer.WriteBinary(op.Key);
+            writer.WriteBinary(op.Row.Span);
+            writer.WriteBinary(op.ColumnMask.Span);
+        }
+    }
+
     private static void Write(ref MsgPackWriter writer, Frame frame)
     {
         switch (frame)
@@ -147,15 +172,10 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 {
                     writer.WriteArrayHeader(2);
                     writer.WriteUInt64(update.SubscriptionId);
-                    writer.WriteArrayHeader(update.Ops.Count);
-                    foreach (var op in update.Ops)
-                    {
-                        writer.WriteArrayHeader(4);
-                        writer.WriteInt64((byte)op.Kind);
-                        writer.WriteBinary(op.Key);
-                        writer.WriteBinary(op.Row.Span);
-                        writer.WriteBinary(op.ColumnMask.Span);
-                    }
+                    if (update.EncodedOps.IsEmpty)
+                        WriteOps(ref writer, update.Ops);
+                    else
+                        writer.WriteRaw(update.EncodedOps.Span);
                 }
 
                 break;
@@ -204,6 +224,28 @@ public sealed class MessagePackFrameSerializer : IMelangeSerializer
                 break;
             default:
                 throw new NotSupportedException($"Unknown frame type {frame.GetType()}.");
+        }
+    }
+
+    /// <summary>
+    /// A frame's type from its envelope, without decoding the rest. A relay that only needs to
+    /// know what a frame is (the cluster gateway forwarding a shard's deltas) uses this rather than
+    /// decoding every row it passes on. False when the envelope is not a frame's.
+    /// </summary>
+    internal static bool TryPeekType(ReadOnlySpan<byte> message, out FrameType type)
+    {
+        type = default;
+        try
+        {
+            var reader = new MsgPackReader(message);
+            if (reader.ReadArrayHeader() < 2)
+                return false;
+            type = (FrameType)reader.ReadInt64();
+            return true;
+        }
+        catch (MelangeProtocolException)
+        {
+            return false;
         }
     }
 

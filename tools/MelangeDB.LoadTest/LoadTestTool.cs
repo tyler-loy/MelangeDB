@@ -98,6 +98,8 @@ public static class LoadTestTool
             RedirectStandardOutput = true,
             UseShellExecute = false,
         };
+        if (options.WorkstationGc)
+            start.Environment["DOTNET_gcServer"] = "0";
         foreach (var argument in ServeArguments(options))
             start.ArgumentList.Add(argument);
         using var child = Process.Start(start)

@@ -126,6 +126,20 @@ public sealed class LoadTestOptions
     /// </summary>
     public int? Movers { get; set; }
 
+    /// <summary>
+    /// drive: subscribe to an area of interest, the chunks within this many chunks of the player
+    /// (a square of side 2R+1), rescoped on every chunk step, instead of everything the server
+    /// scopes to the player's shard and band. Null keeps the shard-wide subscriptions.
+    /// </summary>
+    public int? AoiRadius { get; set; }
+
+    /// <summary>
+    /// all: start the serve process with workstation GC (DOTNET_gcServer=0) instead of the Server GC
+    /// the tool is built with, which is what a Web SDK host runs. Reproduces the measurements
+    /// taken before phase 31.
+    /// </summary>
+    public bool WorkstationGc { get; set; }
+
     /// <summary>Movement reducer calls per player per second.</summary>
     public double TickHz { get; set; } = 15;
 
@@ -216,6 +230,9 @@ public sealed class LoadTestOptions
                 case "--fast-failover":
                     options.FastFailover = true;
                     continue;
+                case "--workstation-gc":
+                    options.WorkstationGc = true;
+                    continue;
             }
 
             if (i + 1 >= args.Length)
@@ -272,6 +289,15 @@ public sealed class LoadTestOptions
                     case "--address": options.Address = new Uri(value); break;
                     case "--players": options.Players = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--movers": options.Movers = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--aoi":
+                        options.AoiRadius = int.Parse(value, CultureInfo.InvariantCulture);
+                        if (options.AoiRadius < 1)
+                        {
+                            error.WriteLine("--aoi takes a radius of at least 1 chunk: a walker's next step must stay in view.");
+                            return null;
+                        }
+
+                        break;
                     case "--tick-hz": options.TickHz = double.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--chunk-every": options.ChunkEveryTicks = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--seam-fraction": options.SeamFraction = double.Parse(value, CultureInfo.InvariantCulture); break;

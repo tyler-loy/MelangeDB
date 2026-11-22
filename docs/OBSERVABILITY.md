@@ -547,6 +547,13 @@ Since phase 26: `1107 UnpolicedProducers`, the unpoliced report's producer half 
 is `1204`'s producer twin: a producer threw something other than a rejection, a timeout, or an oversized
 result during a socket or HTTP call, and the caller was told only to see the logs.
 
+Since road-to-0.4 phase 31: `1108 WorkstationGc`, a Warning at startup when the host runs workstation GC
+on four or more logical processors. Subscription fan-out allocates per commit, and at 400 players in
+the load test workstation GC spent 55% of the time paused (2% under Server GC), taking p99
+call-to-delta from 0.27 s to 15 s ([LOAD-TESTING.md](LOAD-TESTING.md#after-the-gateway-fix-2026-11-22)).
+A Web SDK host runs Server GC already; any other host sets `<ServerGarbageCollection>true</ServerGarbageCollection>`.
+There is no setting to silence it: a host that chose workstation GC on purpose sees it once per start.
+
 Reaping a shard (issue #112) is the one cluster operation that destroys durable state, so both of its
 receipts are warnings and the refusal is not: `1747 ShardReaped` (node-side — the shard held nothing of
 its own, its engine closed and its directory was deleted), `1748 ShardReaped` (hub-side — the owner

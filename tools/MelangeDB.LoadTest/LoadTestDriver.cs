@@ -144,7 +144,7 @@ internal static class LoadTestDriver
 
             var result = Summarize(
                 options, metrics, players, measured, bytesBaseline, finalStats, handoffBaseline, abortBaseline, output,
-                LockSplitShare(measuredStats, finalStats));
+                LockSplitShare(measuredStats, finalStats), measuredStats);
             if (options.OutPath is { } path)
             {
                 WriteSeries(path, series);
@@ -170,7 +170,8 @@ internal static class LoadTestDriver
         long? handoffBaseline,
         long? abortBaseline,
         TextWriter output,
-        (long Transactions, double Share, double MeanLockedMs)? lockSplit)
+        (long Transactions, double Share, double MeanLockedMs)? lockSplit,
+        ServerStats? measuredStats)
     {
         var latency = metrics.CallToDelta.Total();
         var crossing = metrics.CrossingContinuity.Total();
@@ -186,6 +187,11 @@ internal static class LoadTestDriver
         output.WriteLine($"Call-to-delta:   {latency} over {latency.Count} samples " +
             $"({metrics.AbsorbedSelfDeltas} absorbed by handoff swaps and unmeasurable, {metrics.LostSelfDeltas} lost)");
         output.WriteLine($"Seam crossings:  {metrics.Crossings} block crossings; continuity {crossing}");
+        if (options.AoiRadius is { } radius)
+        {
+            output.WriteLine(Invariant(
+                $"Area of interest: radius {radius} ({2 * radius + 1} strips per table); {metrics.Rescopes} steps re-scoped ({metrics.Rescopes / seconds:F0}/s)"));
+        }
         output.WriteLine(handoffs is null
             ? "Handoffs:        server counters unreachable — not measured"
             : $"Handoffs:        {handoffs} completed, {handoffsAborted} aborted, " +
@@ -196,7 +202,21 @@ internal static class LoadTestDriver
         output.WriteLine(finalStats is null
             ? "Server process:  unreachable — memory not measured (drive the serve host locally or scrape its console)"
             : $"Server process:  working set {finalStats.WorkingSetBytes / (1024 * 1024)} MiB, GC heap " +
-              $"{finalStats.GcHeapBytes / (1024 * 1024)} MiB, collections {finalStats.Gen0Collections}/{finalStats.Gen1Collections}/{finalStats.Gen2Collections}");
+              $"{finalStats.GcHeapBytes / (1024 * 1024)} MiB, collections {finalStats.Gen0Collections}/{finalStats.Gen1Collections}/{finalStats.Gen2Collections}; " +
+              $"{(finalStats.ServerGc ? "Server" : "workstation")} GC on {finalStats.ProcessorCount} logical processors");
+        if (measuredStats is not null && finalStats is not null && finalStats.ProcessCpuSeconds > 0)
+        {
+            var cores = (finalStats.ProcessCpuSeconds - measuredStats.ProcessCpuSeconds) / seconds;
+            var paused = (finalStats.GcPauseMs - measuredStats.GcPauseMs) / 1000 / seconds;
+            var kinds = finalStats.ThreadCpuSeconds
+                .Select(k => (Kind: k.Key, Cores: (k.Value - measuredStats.ThreadCpuSeconds.GetValueOrDefault(k.Key)) / seconds))
+                .Where(static k => k.Cores >= 0.05)
+                .OrderByDescending(static k => k.Cores)
+                .Take(8)
+                .Select(static k => Invariant($"{k.Kind} {k.Cores:F1}"));
+            output.WriteLine(Invariant($"Server CPU:      {cores:F1} cores; paused for GC {paused:P1} of the window; by thread: {string.Join(", ", kinds)}"));
+        }
+
         if (lockSplit is { } split)
         {
             output.WriteLine(Invariant(
@@ -244,6 +264,8 @@ internal static class LoadTestDriver
             Invariant($"handoffs_aborted={handoffsAborted?.ToString(CultureInfo.InvariantCulture) ?? "unavailable"} ") +
             Invariant($"delta_rows_per_s={metrics.DeltaRows / seconds:F0} delta_bytes_per_s={bytes / seconds:F0} ") +
             Invariant($"disconnects={metrics.Disconnects} inconsistencies={metrics.InconsistencyCount}") +
+            (options.AoiRadius is { } aoi ? Invariant($" aoi_radius={aoi} rescopes={metrics.Rescopes}") : string.Empty) +
+            (finalStats is { } gc ? Invariant($" server_gc={(gc.ServerGc ? 1 : 0)}") : string.Empty) +
             (finalStats is { } live
                 ? Invariant($" hb_gap_max_ms={live.HeartbeatGapMaxMs:F0} hb_gaps_over_1000={live.HeartbeatGapsOverMs.GetValueOrDefault(1_000)} ") +
                   Invariant($"hb_gaps_over_2000={live.HeartbeatGapsOverMs.GetValueOrDefault(2_000)} hb_gaps_over_3000={live.HeartbeatGapsOverMs.GetValueOrDefault(3_000)} ") +
