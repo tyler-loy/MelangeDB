@@ -192,6 +192,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **Handoff refusals that meant "retry" said `internal`** (found measuring road-to-0.4 phase 31's
+  game shape). A player who walked past the border band before its handoff landed had the write
+  refused as a `ShardSpanException`, logged as a reducer failure and answered `internal`; it is now
+  a transient rejection, counted in `ShardRuntime.BandOverruns`. Other writes past the band are
+  still span violations. The gateway's held-call cap (256 calls during one transfer) also answered
+  `internal`, though nothing had run; it now answers `transient`. At 1,200 players these were
+  2,164 `internal` refusals in two minutes.
+
 - **`MelangeClient` recovers from `overflow_resync`** (found writing the phase 23 conformance
   contract). After the server dropped a slow connection's subscriptions, the client raised
   `OnError` and nothing else, so every subscription looked live while its cache stopped changing.

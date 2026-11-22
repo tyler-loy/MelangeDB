@@ -291,10 +291,10 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         _gateway.Producers.TryGet(producer, out var descriptor) && descriptor.ExecutionSite == ReducerSite.Shard;
 
     /// <summary>The refusal a call gets when the gateway cannot deliver it, in the frame its kind answers with.</summary>
-    private static Frame CallFailure(uint requestId, bool isProducer, string message) =>
+    private static Frame CallFailure(uint requestId, bool isProducer, string message, string code = MelangeErrorCodes.Internal) =>
         isProducer
-            ? new ProducerResultFrame(requestId, false, 0, ReadOnlyMemory<byte>.Empty, MelangeErrorCodes.Internal, message) { Channel = MelangeChannels.Calls }
-            : new ReducerResultFrame(requestId, false, 0, MelangeErrorCodes.Internal, message) { Channel = MelangeChannels.Calls };
+            ? new ProducerResultFrame(requestId, false, 0, ReadOnlyMemory<byte>.Empty, code, message) { Channel = MelangeChannels.Calls }
+            : new ReducerResultFrame(requestId, false, 0, code, message) { Channel = MelangeChannels.Calls };
 
     /// <summary>
     /// Sends a reducer or producer call to its execution site. Shard-bound calls are held during a
@@ -331,7 +331,10 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                     }
 
                     LogHandoffQueueOverflow(_gateway.Logger, MaxHeldCalls);
-                    _ = SendToClientAsync(CallFailure(requestId, isProducer, "The transfer in progress has queued too many calls; retry."), ct);
+                    // Nothing was sent anywhere, so the outcome is known: not run. Transient, so a
+                    // client's retry policy (MelangeCallException.IsTransient) applies.
+                    _ = SendToClientAsync(CallFailure(
+                        requestId, isProducer, "The transfer in progress has queued too many calls; retry.", MelangeErrorCodes.Transient), ct);
                     return;
                 }
             }

@@ -247,7 +247,8 @@ internal static class LoadTestDriver
                 StepLine(step.Key, step.Value, measuredStats.HandoffSteps.GetValueOrDefault(step.Key)))));
             output.WriteLine(Invariant(
                 $"Boundary queue:  {finalStats.BoundarySignalsDropped - measuredStats.BoundarySignalsDropped} signals dropped full, {finalStats.BoundaryCrossingsDropped - measuredStats.BoundaryCrossingsDropped} of them crossings (handoff triggers); ") +
-                Invariant($"swaps used a pre-opened session {finalStats.GatewaySwapsPreopened - measuredStats.GatewaySwapsPreopened} times, connected then {finalStats.GatewaySwapsConnected - measuredStats.GatewaySwapsConnected}"));
+                Invariant($"swaps used a pre-opened session {finalStats.GatewaySwapsPreopened - measuredStats.GatewaySwapsPreopened} times, connected then {finalStats.GatewaySwapsConnected - measuredStats.GatewaySwapsConnected}; ") +
+                Invariant($"{finalStats.BandOverruns} writes refused as band overruns (whole run)"));
             output.WriteLine(Invariant(
                 $"Thread pool:     queued work items mean {finalStats.ThreadPoolQueueMean:F0}, p99 {finalStats.ThreadPoolQueueP99}, max {finalStats.ThreadPoolQueueMax}; up to {finalStats.ThreadPoolThreadsMax} threads (whole run, sampled every 100 ms)"));
         }

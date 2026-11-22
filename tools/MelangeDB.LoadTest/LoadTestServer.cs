@@ -247,6 +247,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
             BoundarySignalsDropped = nodes.Sum(static n => n.BoundarySignalsDropped),
             BoundaryCrossingsDropped = nodes.Sum(static n => n.BoundaryCrossingsDropped),
             GatewaySwapsPreopened = metrics.GatewaySwapsPreopened,
+            BandOverruns = Shards().Sum(static r => r.BandOverruns),
             GatewaySwapsConnected = metrics.GatewaySwapsConnected,
             ThreadPoolSamples = pool.Count,
             ThreadPoolQueueMean = pool.Count == 0 ? 0 : pool.Average(),
@@ -274,6 +275,18 @@ internal sealed class LoadTestServer : IAsyncDisposable
     /// Each owned shard's cumulative write-lock busy time, keyed by shard value: reducers, re-scopes,
     /// handoffs and border work alike. A shard that moved mid-run restarts its count on the new owner.
     /// </summary>
+    private IEnumerable<ShardRuntime> Shards()
+    {
+        for (var bx = 0; bx < _options.WorldBlocksX; bx++)
+        {
+            for (var by = 0; by < _options.WorldBlocksY; by++)
+            {
+                if (TryGetShard(SpatialShardStrategy.ShardOfBlock(bx, by)) is { } runtime)
+                    yield return runtime;
+            }
+        }
+    }
+
     private Dictionary<string, double> WriteLockBusyMsByShard()
     {
         var busy = new Dictionary<string, double>();

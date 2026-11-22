@@ -135,7 +135,8 @@ internal sealed partial class ShardRuntime : IDisposable
             () => ShardSpanCheck.IsEnabled(options.CurrentValue.Cluster.ShardSpanCheck),
             leaseValid,
             FrozenSnapshot,
-            BorrowedOwnerOf));
+            BorrowedOwnerOf,
+            () => Interlocked.Increment(ref _bandOverruns)));
 
         RecoverHandoffState();
 
@@ -194,6 +195,15 @@ internal sealed partial class ShardRuntime : IDisposable
     public MelangeDbOptions Options { get; }
 
     public MelangeEngine Engine { get; }
+
+    private long _bandOverruns;
+
+    /// <summary>
+    /// Writes refused because they carried a row this shard owned past its border band before the
+    /// entity's handoff landed (answered <c>transient</c>). A steady rate says handoffs are not
+    /// keeping up with <c>Cluster:BorderBandChunks</c>.
+    /// </summary>
+    public long BandOverruns => Interlocked.Read(ref _bandOverruns);
 
     public MelangeReducerHost ReducerHost { get; }
 

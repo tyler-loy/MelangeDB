@@ -200,8 +200,10 @@ contracts worth knowing:
 - **Ownership widens at the seam.** The strict rule — a shard commits only rows resolving to itself — would
   freeze the world at every boundary line, because an entity mid-handoff stands *across* the line while its
   origin still owns it. `MayCommit` therefore admits rows up to the band's depth inside a neighbouring block;
-  beyond the band the write fails loudly, because an entity that deep into foreign territory means handoffs
-  are not keeping up and the band was sized too shallow.
+  beyond the band the write is refused, because an entity that deep into foreign territory means handoffs
+  are not keeping up and the band was sized too shallow. The span check refuses it as transient (the
+  entity's handoff is already due, so the caller's retry lands on the destination) and counts it in
+  `ShardRuntime.BandOverruns`, which is the loud part: a steady rate is the sizing signal.
 - **Transferred rows re-home by content** (`RowRehoming.ByContent`): a spatial row's chunk id *is* its shard,
   so the import asserts the row already resolves to the destination instead of rewriting anything —
   instancing's column rewrite would corrupt a chunk id.
@@ -284,6 +286,7 @@ is the opposite of the impression `Cluster:ShardSpanCheck` alone gives:
 | Borrowed — `BorderReadOnlyException` | Writing a row this node holds as a read-only border-band copy | Always |
 | Placement — `InvalidOperationException` | Writing a `Global` or `Replicated` table on a shard node | Always |
 | Span — `ShardSpanException` | A write set resolving to more than one shard, per `MayCommit` | `Cluster:ShardSpanCheck`, default `DebugOnly` |
+| Band overrun — `TransientRejectionException` | The span check's one retryable case, spatial strategies only: an update carrying a row this shard owned past its border band, an entity that outran its own handoff. Retrying lands on the destination; `ShardRuntime.BandOverruns` counts them, and a steady rate means handoffs are not keeping up with `Cluster:BorderBandChunks` | With the span check |
 
 Commits with `CommitOrigin.Internal` — replication, handoff imports, saga markers — skip all of it
 by design: the write set was validated where it originated, and the applying node holds it precisely

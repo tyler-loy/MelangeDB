@@ -206,6 +206,7 @@ internal sealed class ShardCommitGuard : ICommitGuard
     private readonly Func<bool> _leaseValid;
     private readonly Func<IReadOnlySet<(TableId, RowKey)>> _frozenRows;
     private readonly Func<TableId, RowKey, ulong?> _borrowedOwner;
+    private readonly Action? _bandOverrun;
 
     public ShardCommitGuard(
         SchemaRegistry schema,
@@ -215,8 +216,10 @@ internal sealed class ShardCommitGuard : ICommitGuard
         Func<bool> spanCheckEnabled,
         Func<bool> leaseValid,
         Func<IReadOnlySet<(TableId, RowKey)>> frozenRows,
-        Func<TableId, RowKey, ulong?> borrowedOwner)
+        Func<TableId, RowKey, ulong?> borrowedOwner,
+        Action? bandOverrun = null)
     {
+        _bandOverrun = bandOverrun;
         _schema = schema;
         _store = store;
         _shard = shard;
@@ -314,7 +317,7 @@ internal sealed class ShardCommitGuard : ICommitGuard
         }
 
         if (_strategy is not null && _spanCheckEnabled())
-            ShardSpan.Check(_schema, _store(), _strategy, _shard, reducerName, writeSet);
+            ShardSpan.Check(_schema, _store(), _strategy, _shard, reducerName, writeSet, _bandOverrun);
     }
 }
 
@@ -330,9 +333,12 @@ internal static class ShardSpan
         IShardStrategy strategy,
         ShardKey? executingShard,
         string reducerName,
-        IReadOnlyList<RowOp> writeSet)
+        IReadOnlyList<RowOp> writeSet,
+        Action? bandOverrun = null)
     {
         SortedSet<ulong>? shards = null;
+        string? overrunTable = null;
+        var onlyOverruns = true;
         foreach (var op in writeSet)
         {
             if (!schema.TryGet(op.Table, out var table) || table.Placement != Placement.Partitioned)
@@ -346,13 +352,36 @@ internal static class ShardSpan
             // mid-handoff), while instancing keeps the strict same-shard contract. Single-node has
             // no executing shard, so the strict contract applies unchanged.
             if (executingShard is { } own && !strategy.MayCommit(own, op.Table, row))
+            {
                 (shards ??= []).Add(strategy.ShardForRow(op.Table, row).Value);
+                if (IsBandOverrun(store, strategy, own, table, op))
+                    overrunTable ??= table.Name;
+                else
+                    onlyOverruns = false;
+            }
             else if (executingShard is null)
+            {
                 (shards ??= []).Add(strategy.ShardForRow(op.Table, row).Value);
+                onlyOverruns = false;
+            }
         }
 
         if (shards is null)
             return;
+
+        // Every foreign row is one this shard owned a moment ago, moved past the band: an entity
+        // that outran its own handoff. The transfer is already due (the boundary monitor fires on
+        // the margin, well inside the band), so the caller's next try lands on the destination.
+        // That is a retry, not a contract violation; the counter keeps it loud for operators,
+        // since a steady rate of these says handoffs are not keeping up with the band's depth.
+        if (onlyOverruns && overrunTable is not null)
+        {
+            bandOverrun?.Invoke();
+            throw new TransientRejectionException(
+                $"'{reducerName}' moves a row of '{overrunTable}' past this shard's border band before its handoff " +
+                "completed. The entity is being transferred to the shard it walked into; retry, and the write " +
+                "lands there. A steady rate of these means handoffs are not keeping up with Cluster:BorderBandChunks.");
+        }
         if (executingShard is { } executing)
             shards.Add(executing.Value);
         if (shards.Count > 1)
@@ -365,6 +394,18 @@ internal static class ShardSpan
                 "call. Give the rows the same shard key, or split the work so each transaction stays inside one shard " +
                 "(see docs/CLUSTERING.md). This check runs per Cluster:ShardSpanCheck.");
         }
+    }
+
+    /// <summary>
+    /// An update, on a shard with boundaries, of a row whose stored pre-image this shard may commit:
+    /// the row was this shard's to write, and the transaction carries it past the band.
+    /// </summary>
+    private static bool IsBandOverrun(IHotStore store, IShardStrategy strategy, ShardKey own, TableSchema table, in RowOp op)
+    {
+        if (op.Kind != RowOpKind.Update || strategy is not IBoundaryStrategy)
+            return false;
+        return store.TryGetRow(op.Table, op.Key, out var before)
+            && strategy.MayCommit(own, op.Table, table.ToRowRef(before));
     }
 
     /// <summary>A delete carries no row, so its shard is judged from the store's pre-image (the guard runs pre-apply).</summary>

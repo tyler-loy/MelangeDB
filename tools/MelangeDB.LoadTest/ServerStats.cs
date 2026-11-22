@@ -83,6 +83,9 @@ public sealed record ServerStats
 
     public long GatewaySwapsPreopened { get; init; }
 
+    /// <summary>Writes refused as band overruns (an entity past the band before its handoff), over the shards' current owners.</summary>
+    public long BandOverruns { get; init; }
+
     public long GatewaySwapsConnected { get; init; }
 
     // The serve process's thread pool, sampled every 100 ms over the whole run: queued work items
