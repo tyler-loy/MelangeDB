@@ -8,6 +8,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
+    <!-- The manual clock: this suite is the test kit's first consumer. -->
+    <ProjectReference Include="..\..\src\MelangeDB.Testing\MelangeDB.Testing.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\..\samples\MelangeDB.Sample.Worker\MelangeDB.Sample.Worker.csproj" />
     <!-- The sample client carries the generated typed bindings for the worker's manifest; the

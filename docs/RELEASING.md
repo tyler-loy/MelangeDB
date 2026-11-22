@@ -4,11 +4,12 @@ How MelangeDB packages are versioned, where they are published, and how a consum
 
 ## What ships
 
-Every library under `src/` is a NuGet package — twelve of them:
+Every library under `src/` is a NuGet package — thirteen of them:
 
 `MelangeDB.Abstractions`, `MelangeDB.Core`, `MelangeDB.Protocol`, `MelangeDB.Client`,
 `MelangeDB.Server`, `MelangeDB.CodeGen`, `MelangeDB.Storage.Faster`, `MelangeDB.Storage.Postgres`,
-`MelangeDB.Cluster`, `MelangeDB.OpenTelemetry`, `MelangeDB.Cli`, `MelangeDB.Mcp`.
+`MelangeDB.Cluster`, `MelangeDB.OpenTelemetry`, `MelangeDB.Cli`, `MelangeDB.Mcp`,
+`MelangeDB.Testing`.
 
 Tests, samples, and the load-test tool are never packed (`IsPackable=false`). Shared package metadata
 lives in `Directory.Build.props` at the repo root; a project's `.csproj` only adds what is specific to
@@ -48,7 +49,7 @@ Simple and boring, on purpose:
   [Consuming prereleases](#consuming-prereleases) — restoring from that feed needs
   authentication even though the repository is public.
 
-All eleven packages always publish together at the same version. There is no per-package versioning —
+All thirteen packages always publish together at the same version. There is no per-package versioning —
 a MelangeDB version is one coherent set.
 
 **Pre-1.0 means the public API may break in any release.** That is stated in the README, the
@@ -235,7 +236,7 @@ dependency steady:
 <PackageReference Include="MelangeDB.Core" Version="0.1.1-ci.42" />
 ```
 
-All eleven packages are pushed together at the same `-ci.N`, so pin them to one number. Prereleases
+All thirteen packages are pushed together at the same `-ci.N`, so pin them to one number. Prereleases
 are **not** a supported surface: they are whatever `main` was at that commit, they can be deleted,
 and the API may change between two consecutive ones. Use them to try a fix before a release exists,
 not to run anything you care about.

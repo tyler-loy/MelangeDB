@@ -3,6 +3,7 @@ using System.Net;
 using MelangeDB.Client;
 using MelangeDB.Core;
 using MelangeDB.Server;
+using MelangeDB.Testing;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -35,7 +36,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
     private TransportTestHost(
         string root,
         Dictionary<string, string?> settings,
-        ManualTimeProvider? time,
+        ManualClock? time,
         Action<IServiceCollection>? services,
         Action<WebApplication>? middleware,
         Action<WebApplication>? endpoints = null)
@@ -48,7 +49,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
         _middleware = middleware;
     }
 
-    public ManualTimeProvider? Time { get; }
+    public ManualClock? Time { get; }
 
     public Uri WsUri => new($"ws://127.0.0.1:{_http1Port}/melange");
 
@@ -88,7 +89,7 @@ internal sealed class TransportTestHost : IAsyncDisposable
         Action<WebApplication>? endpoints = null)
     {
         var root = Directory.CreateTempSubdirectory("melange-transport-").FullName;
-        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualTimeProvider() : null, services, middleware, endpoints);
+        var host = new TransportTestHost(root, settings ?? [], manualTime ? new ManualClock() : null, services, middleware, endpoints);
         await host.StartAppAsync();
         return host;
     }

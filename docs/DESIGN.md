@@ -541,6 +541,7 @@ src/MelangeDB.CodeGen           Roslyn source generator: registrations, serializ
 src/MelangeDB.OpenTelemetry     optional: registers MelangeDB's ActivitySource/Meter names with OTel
 src/MelangeDB.Cli               the `melange` dotnet tool: schema manifest export
 src/MelangeDB.Mcp               optional: an MCP endpoint for agents over schema, SQL, health and signals
+src/MelangeDB.Testing           the reducer test kit: a real engine on a hand-cranked clock
 tests/                          unit + integration
 tools/MelangeDB.LoadTest        the load rig behind the recorded performance numbers
 samples/                        worker-service host + console client

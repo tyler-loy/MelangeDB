@@ -28,7 +28,7 @@ seventh:
 
 | SpacetimeDB has | Since | MelangeDB today | Answered by |
 | --- | --- | --- | --- |
-| Unit testing for module code | 2.12 | Planned, not built | [Phase 22](../road-to-0.3/plan-phase-22.md), carried from 0.3 |
+| Unit testing for module code | 2.12 | **Built**: `MelangeDB.Testing` | [Phase 22](../road-to-0.3/plan-phase-22.md), carried from 0.3 |
 | A TypeScript client | 1.x | Planned, not built | [Phase 23](../road-to-0.3/plan-phase-23.md), carried from 0.3 |
 | A constraint added by migration is checked against existing rows | 2.7 | Built in phase 27 | [Phase 27](plan-phase-27.md) |
 | Old clients survive added columns | 2.16.1 | A stale client is refused at subscribe | [Phase 28](plan-phase-28.md) |
@@ -48,7 +48,7 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 | | Phase | Status |
 | --- | --- | --- |
 | [20](../road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half. **Carried from 0.3** | **Measured** 2026-11-20; findings [#198](https://github.com/tyler-loy/MelangeDB/issues/198)–[#204](https://github.com/tyler-loy/MelangeDB/issues/204) |
-| [22](../road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: the reducer test kit. **Carried from 0.3** | Planned |
+| [22](../road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: the reducer test kit. **Carried from 0.3** | **Built** 2026-11-21 ([TESTING.md](../TESTING.md)) |
 | [23](../road-to-0.3/plan-phase-23.md) | The TypeScript client, client conformance, and `melange generate`. **Carried from 0.3** | Planned |
 | [27](plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed | **Built**; fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) |
 | [28](plan-phase-28.md) | Clients that outlive a deploy: additive schema changes stay invisible to old bindings, and reconnect is automatic | **Built** |

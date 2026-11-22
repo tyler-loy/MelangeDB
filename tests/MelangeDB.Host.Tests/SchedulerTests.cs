@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using MelangeDB.Core;
+using MelangeDB.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Xunit;
@@ -15,7 +16,7 @@ namespace MelangeDB.Host.Tests;
 public class SchedulerTests : IDisposable
 {
     private readonly string _root = Directory.CreateTempSubdirectory("melange-scheduler-").FullName;
-    private readonly ManualTimeProvider _time = new();
+    private readonly ManualClock _time = new();
 
     public void Dispose()
     {
@@ -518,8 +519,8 @@ public class SchedulerTests : IDisposable
         // so the drain fires it — or a delay long enough to be worth waiting for. Never a
         // sub-tolerance positive delay, which is the one that spins.
         var tolerance = TimeSpan.FromMilliseconds(2);
-        Assert.DoesNotContain(_time.ArmDelays, d => d > TimeSpan.Zero && d < tolerance);
-        Assert.Contains(_time.ArmDelays, d => d == TimeSpan.Zero);
+        Assert.DoesNotContain(_time.ArmedDelays, d => d > TimeSpan.Zero && d < tolerance);
+        Assert.Contains(_time.ArmedDelays, d => d == TimeSpan.Zero);
 
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
