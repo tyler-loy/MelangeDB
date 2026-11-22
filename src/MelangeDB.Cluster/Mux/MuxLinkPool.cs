@@ -3,18 +3,26 @@ using System.Net.WebSockets;
 namespace MelangeDB.Cluster;
 
 /// <summary>
-/// The gateway's links to shard nodes, one per node address (<c>Cluster:GatewayUpstream = Shared</c>).
-/// A link is connected on first use and replaced when it dies; every player session to that node
-/// rides it. Concurrent callers share one connect attempt.
+/// The gateway's links to shard nodes (<c>Cluster:GatewayUpstream = Shared</c>):
+/// <c>Cluster:GatewayLinksPerNode</c> of them per node address, each new session taking the next in
+/// turn. One link has one writer and one reader, so a node's few hundred sessions through a single
+/// link queue behind each other; several spread them (phase 31). A link is connected on first use
+/// and replaced when it dies. Concurrent callers share one connect attempt.
 /// </summary>
 internal sealed class MuxLinkPool : IAsyncDisposable
 {
     private readonly Func<string, Uri> _linkUri;
+    private readonly Func<int> _linksPerNode;
     private readonly Lock _gate = new();
-    private readonly Dictionary<string, Task<MuxLink>> _links = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<(string Address, int Slot), Task<MuxLink>> _links = [];
+    private int _nextSlot;
     private bool _disposed;
 
-    public MuxLinkPool(Func<string, Uri> linkUri) => _linkUri = linkUri;
+    public MuxLinkPool(Func<string, Uri> linkUri, Func<int>? linksPerNode = null)
+    {
+        _linkUri = linkUri;
+        _linksPerNode = linksPerNode ?? (static () => 1);
+    }
 
     /// <summary>Live links, for tests and diagnostics.</summary>
     internal int LiveLinks
@@ -37,11 +45,13 @@ internal sealed class MuxLinkPool : IAsyncDisposable
 
     private async Task<MuxLink> LinkAsync(string publicAddress, CancellationToken ct)
     {
+        var slot = (int)((uint)Interlocked.Increment(ref _nextSlot) % (uint)Math.Clamp(_linksPerNode(), 1, 64));
+        var key = (publicAddress, slot);
         Task<MuxLink> pending;
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (!_links.TryGetValue(publicAddress, out pending!)
+            if (!_links.TryGetValue(key, out pending!)
                 || pending.IsFaulted
                 || pending.IsCanceled
                 || (pending.IsCompletedSuccessfully && !pending.Result.IsAlive))
@@ -49,7 +59,7 @@ internal sealed class MuxLinkPool : IAsyncDisposable
                 // The connect runs on its own token: callers come and go, and the first caller's
                 // cancellation must not fail the link for the ones waiting with it.
                 pending = ConnectAsync(publicAddress);
-                _links[publicAddress] = pending;
+                _links[key] = pending;
             }
         }
 

@@ -59,6 +59,51 @@ public class GatewayAttachmentTests
     }
 
     /// <summary>
+    /// Sessions to one node are spread over Cluster:GatewayLinksPerNode links (default 4), each
+    /// session taking the next: one link per node queued all of a node's sessions behind one writer.
+    /// </summary>
+    [Fact]
+    public async Task Sessions_to_one_node_are_spread_over_its_links()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(shardNodes: 1);
+        var shard = new ShardKey(5);
+        await cluster.EnsureShardOwnedAsync(shard.Value);
+        var gateway = new GatewayRuntime(cluster.HubApp.Services, cluster.Hub);
+        var (_, address) = cluster.Hub.ResolveShard(shard);
+        var assertion = cluster.Hub.MintAssertion(
+            ClusterFixture.Caller, isGuest: false, isSqlOwner: false, isBulkOwner: false,
+            DateTimeOffset.UtcNow.AddMinutes(5), firesLifecycle: false);
+
+        var sessions = new List<UpstreamSession>();
+        try
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                sessions.Add(await UpstreamSession.ConnectAsync(
+                    token => gateway.Links.OpenAsync(address, shard, token),
+                    "the shard",
+                    assertion,
+                    gateway.Serializer,
+                    static (_, _) => Task.CompletedTask,
+                    static () => { },
+                    static () => { },
+                    static () => { },
+                    TestTime.Dilated(TimeSpan.FromSeconds(10)),
+                    TestContext.Current.CancellationToken));
+            }
+
+            Assert.All(sessions, static s => Assert.True(s.IsAlive));
+            Assert.Equal(4, gateway.Links.LiveLinks);
+        }
+        finally
+        {
+            foreach (var session in sessions)
+                await session.DisposeAsync();
+            await gateway.Links.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A swap whose destination never answers used to leave the connection holding calls: nothing
     /// else ends a transfer for the gateway, so every later call was held, then refused at the
     /// 256-call cap, for as long as the client stayed connected. Now the held calls go to the
