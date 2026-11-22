@@ -74,9 +74,15 @@ public sealed class FanoutCostMeasurementTests(ITestOutputHelper output) : IDisp
                 Record("evaluate + delta-rows counter (listened)", Run(query, Subscribers, _ => new DropSink(), listened));
                 Record("+ Measure", Run(query, Subscribers, _ => new MeasureSink(serializer), null));
                 var queued = new List<QueueSink>();
-                Record("+ Measure, enqueue, signal", Run(query, Subscribers, _ =>
+                Record("+ Measure, enqueue, signal under the lock (before step 2d)", Run(query, Subscribers, _ =>
                 {
-                    var sink = new QueueSink(serializer);
+                    var sink = new QueueSink(serializer, wakeUnderLock: true);
+                    queued.Add(sink);
+                    return sink;
+                }, null));
+                Record("+ Measure, enqueue; signal from the pool (step 2d)", Run(query, Subscribers, _ =>
+                {
+                    var sink = new QueueSink(serializer, wakeUnderLock: false);
                     queued.Add(sink);
                     return sink;
                 }, null));
@@ -215,9 +221,16 @@ public sealed class FanoutCostMeasurementTests(ITestOutputHelper output) : IDisp
         private readonly Task _sender;
         private long _buffered;
 
-        public QueueSink(IMelangeSerializer serializer)
+        private readonly bool _wakeUnderLock;
+
+        /// <param name="wakeUnderLock">
+        /// True reproduces the connection before step 2d, which released the signal inside every
+        /// enqueue; false is the connection now, which queues quietly and is woken from the pool.
+        /// </param>
+        public QueueSink(IMelangeSerializer serializer, bool wakeUnderLock)
         {
             _serializer = serializer;
+            _wakeUnderLock = wakeUnderLock;
             _sender = Task.Run(SendLoopAsync);
         }
 
@@ -227,10 +240,28 @@ public sealed class FanoutCostMeasurementTests(ITestOutputHelper output) : IDisp
 
         public void EnqueueDelta(TransactionUpdateFrame frame)
         {
+            Queue(frame);
+            _signal.Release();
+        }
+
+        public void EnqueueDeltaQuietly(TransactionUpdateFrame frame)
+        {
+            Queue(frame);
+            if (_wakeUnderLock)
+                _signal.Release();
+        }
+
+        public void Wake()
+        {
+            if (!_wakeUnderLock)
+                _signal.Release();
+        }
+
+        private void Queue(TransactionUpdateFrame frame)
+        {
             var length = _serializer.Measure(frame);
             Interlocked.Add(ref _buffered, length);
             _queue.Enqueue((frame, length));
-            _signal.Release();
         }
 
         private async Task SendLoopAsync()

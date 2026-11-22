@@ -100,6 +100,21 @@ Off the lock, each send loop then spends 324–466 ns serializing its copy of th
   absolute cost.
 - **Telemetry is not a cost.** The per-subscriber counter is a few nanoseconds even when listened to.
 
+### 2d: built, and a small win in the load test
+
+The fan-out now queues each commit's frames quietly (`IDeltaSink.EnqueueDeltaQuietly`) and wakes
+every connection it reached with one thread-pool item (`IDeltaSink.Wake`). In the benchmark,
+a subscriber's share under the lock fell from 575 to 369 ns (whole table) and 632 to 421 ns
+(equality); the rest of the saving is eaten by the woken loops competing with the next commit.
+
+In the load test (one shard, 50 movers, Server GC, arms interleaved before and after, 200 and 400
+subscribers twice each), the post-commit share of locked time fell in all four pairs, by 3–4
+points: 74.3–74.4% to 70.1–70.8% at 200, 84.8–85.2% to 80.9–82.7% at 400. That is about 6% of
+post-commit time. Mean lock hold moved within run-to-run noise (775–833 µs at 200 either way),
+and 400 subscribers still queue into seconds. As 2a said, the isolated benchmark ranks the parts
+but does not reproduce the in-place cost, which is dominated by what scale adds. 2b and 2c go at
+that directly: they remove the per-subscriber allocation and evaluation.
+
 **So the build order is 2d, then 2b and 2c.** Moving the wake-ups out of the lock is the largest
 single item and does not touch what is evaluated or sent. Groups and encode-once then remove the
 allocation, `Measure`, and the evaluation.

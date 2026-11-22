@@ -309,6 +309,8 @@ internal sealed class SubscriptionEngine
         if (perSink is null)
             return;
 
+        var woken = new IDeltaSink[perSink.Count];
+        var next = 0;
         foreach (var (sink, bySubscription) in perSink)
         {
             var updates = new List<SubscriptionUpdate>(bySubscription.Count);
@@ -318,8 +320,19 @@ internal sealed class SubscriptionEngine
                 _telemetry?.RecordDeltaRows(subscription.Schema.Name, ops.Count);
             }
 
-            sink.EnqueueDelta(new TransactionUpdateFrame(record.Lsn, updates) { Channel = MelangeChannels.Data });
+            sink.EnqueueDeltaQuietly(new TransactionUpdateFrame(record.Lsn, updates) { Channel = MelangeChannels.Data });
+            woken[next++] = sink;
         }
+
+        // One pool item wakes every connection this commit reached, instead of one wake-up per
+        // connection inside the lock (each queues a send loop's continuation to the pool). A frame
+        // that waits for its wake-up waits for one pool dispatch, and its sender would need a pool
+        // thread to run anyway.
+        ThreadPool.UnsafeQueueUserWorkItem(static sinks =>
+        {
+            foreach (var sink in sinks)
+                sink.Wake();
+        }, woken, preferLocal: false);
     }
 
     /// <summary>

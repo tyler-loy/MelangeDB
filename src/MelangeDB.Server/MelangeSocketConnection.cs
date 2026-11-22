@@ -202,10 +202,26 @@ internal sealed class MelangeSocketConnection : IDeltaSink
     /// </summary>
     public void EnqueueDelta(TransactionUpdateFrame frame)
     {
+        if (QueueDelta(frame))
+            _sendSignal.Release();
+    }
+
+    /// <summary>
+    /// <see cref="EnqueueDelta"/> minus the wake-up, which the fan-out sends from the thread pool
+    /// once per commit (<see cref="Wake"/>). Measuring and the backpressure verdict stay here,
+    /// under the lock, for the reason above.
+    /// </summary>
+    public void EnqueueDeltaQuietly(TransactionUpdateFrame frame) => QueueDelta(frame);
+
+    public void Wake() => _sendSignal.Release();
+
+    /// <summary>Queues a delta, or applies backpressure; true when the sender has a new frame to send.</summary>
+    private bool QueueDelta(TransactionUpdateFrame frame)
+    {
         if (_resumeBuffering)
         {
             _resumeBuffer.Add(frame);
-            return;
+            return false;
         }
 
         var length = _serializer.Measure(frame);
@@ -214,11 +230,11 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         if (buffered > limits.MaxBufferedBytes && limits.BackpressurePolicy != BackpressurePolicy.Buffer)
         {
             ApplyBackpressure(limits.BackpressurePolicy);
-            return;
+            return false;
         }
 
         _delta.Enqueue(new PendingDelta(frame, length));
-        _sendSignal.Release();
+        return true;
     }
 
     /// <summary>
