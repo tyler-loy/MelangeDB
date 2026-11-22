@@ -24,7 +24,20 @@ public class LivenessPingTests
         Assert.Same(node, owner);
 
         node.Runtime.StallHeartbeatLoop = true;
+
+        // An iteration already past the stall check when the flag flipped still sends its
+        // heartbeat; counting from the instant of the flip read that one as the stall failing.
+        // Count from once the count has held still for a few intervals.
         var heartbeatsBefore = node.Metrics.SentByType.GetValueOrDefault("heartbeat");
+        while (true)
+        {
+            await Task.Delay(TestTime.Dilated(TimeSpan.FromMilliseconds(300)), TestContext.Current.CancellationToken);
+            var now = node.Metrics.SentByType.GetValueOrDefault("heartbeat");
+            if (now == heartbeatsBefore)
+                break;
+            heartbeatsBefore = now;
+        }
+
         await Task.Delay(TestTime.Dilated(TimeSpan.FromMilliseconds(4 * timeoutMs)), TestContext.Current.CancellationToken);
 
         Assert.Equal(heartbeatsBefore, node.Metrics.SentByType.GetValueOrDefault("heartbeat")); // Stalled indeed.
