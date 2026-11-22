@@ -39,6 +39,24 @@ public class GenerateCommandTests
         }
     }
 
+    /// <summary>
+    /// The TypeScript bindings the repo commits — the conformance adapter's, and a fixture the
+    /// TypeScript package type-checks — are what `generate --lang ts` writes today.
+    /// </summary>
+    [Theory]
+    [InlineData("conformance.json", "conformance.ts")]
+    [InlineData("transport.json", "transport.ts")]
+    public void The_committed_typescript_bindings_are_current(string manifest, string bindings)
+    {
+        var json = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Manifests", manifest));
+        var generated = Assert.Single(ClientGenerate.Generate(json, "ts"));
+        Assert.Equal("melange-bindings.ts", generated.Name);
+        var committed = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Bindings", bindings)).ReplaceLineEndings("\n");
+        Assert.True(
+            generated.Content == committed,
+            $"The committed TypeScript bindings for {manifest} are stale. Regenerate with `melange generate --lang ts <manifest> -o <dir>` (see clients/typescript/README.md).");
+    }
+
     [Fact]
     public void Rewriting_unchanged_files_touches_nothing()
     {

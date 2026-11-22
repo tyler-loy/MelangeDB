@@ -84,6 +84,24 @@ jobs:
             exit 1
           fi
 
+  # The TypeScript client (@melangedb/client): strict build, unit tests, and the decode corpus
+  # replayed through its decoder. Node 24 is the LTS line the package is published from.
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - run: npm ci
+
+      - run: npm test
+
   # Packs a -ci.N prerelease from main and publishes it to this repository's GitHub Packages feed,
   # which is a different bargain from nuget.org: a version there can never be deleted, only
   # unlisted, and a prerelease per commit to main is not a stream worth making permanent. A

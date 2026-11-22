@@ -5,3 +5,6 @@ melange-schema.json -text
 
 # The decode corpus is compared byte for byte against a fresh recording; same rule.
 conformance/corpus.json -text
+
+# Generated TypeScript bindings are compared to fresh generation; keep their LF endings.
+clients/typescript/**/melange-bindings.ts -text

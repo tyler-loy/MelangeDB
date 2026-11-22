@@ -317,3 +317,27 @@ names and bytes. The C# emitter asks Roslyn which names are keywords, so Roslyn 
 bindings are code against the TypeScript runtime's API, so the emitter and the runtime are
 designed together rather than one guessing at the other.
 
+**Step 4** (2026-11-22). `clients/typescript`, the `@melangedb/client` package: dependency-free,
+browser-first (the core needs `WebSocket`, `fetch`, and `TextEncoder`), strict TypeScript 7.
+Its parts:
+
+- its own MessagePack subset, accepting every width and returning 64-bit values as `bigint`;
+- frames, ignoring trailing fields;
+- rows, keys, and the argument encoding;
+- `Subscription`, with anchor buffering and tolerance of redundant ops;
+- `TableCache`, merged and refcounted, mapping columns by name with fingerprinted change
+  detection;
+- `MelangeClient`, covering resume, full resync by diff, `overflow_resync`, heartbeat answers,
+  reauthentication, manual dispatch with `frameTick()`, and automatic reconnect;
+- `MelangeSql`, untyped rows for any query and typed `SELECT *`, with integers past 2^53 read
+  exactly from the JSON source text.
+
+`melange generate --lang ts` writes one module from the same parsed manifest as the C# emitter,
+mirroring the C# shape (`conn.db.Table.Column.subscribeRange`, `conn.reducers.x`,
+`conn.producers.y`). A defaulted parameter left off trailing is dropped so the server fills it;
+one left off mid-list takes its manifest default. The unit tests replay the whole decode corpus
+and every vector through the TypeScript decoder. That passed on the first run, which is the
+corpus doing its job. The generated bindings for the conformance and transport manifests
+type-check against the runtime, and a .NET test holds the committed copies to a fresh generation.
+CI gains a `typescript` job.
+

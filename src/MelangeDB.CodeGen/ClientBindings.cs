@@ -20,4 +20,8 @@ internal static class ClientBindings
         files.Add(new GeneratedFile("MelangeClientModel.g.cs", ClientEmitter.EmitModel(schema)));
         return files;
     }
+
+    /// <summary>The TypeScript bindings for <c>@melangedb/client</c>: one module.</summary>
+    public static IReadOnlyList<GeneratedFile> TypeScript(ClientSchemaModel schema) =>
+        [new GeneratedFile(TypeScriptEmitter.FileName, TypeScriptEmitter.Emit(schema))];
 }

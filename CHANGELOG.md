@@ -21,6 +21,12 @@ All packages ship together at one version; there is no per-package versioning. S
   `tools/MelangeDB.Conformance`, with key, column, and argument vectors; a test re-records it on
   every build and fails when it drifts. Writing it down found four things, listed in the
   document's Findings section.
+- **`@melangedb/client`, the TypeScript client** (phase 23, step 4), in `clients/typescript`.
+  Browser-first and dependency-free. It provides subscriptions into a merged, refcounted cache;
+  reducer and producer calls; resume and resync by diff; recovery from `overflow_resync`; manual
+  dispatch with `frameTick()`; automatic reconnect; and a `/melange/sql` reader that keeps
+  64-bit integers exact. `melange generate --lang ts` writes its typed bindings, mirroring the
+  C# API. It decodes the whole conformance corpus.
 - **`melange generate --lang cs`** (phase 23, step 3). Client bindings from a manifest without
   a compiler, for engines and builds that cannot run the Roslyn generator. It runs the
   generator's own parser and emitters as a library, so its files are the analyzer's byte for

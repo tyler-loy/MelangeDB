@@ -11,7 +11,7 @@ namespace MelangeDB.Cli;
 internal static class ClientGenerate
 {
     /// <summary>The languages <c>--lang</c> accepts.</summary>
-    public static readonly IReadOnlyList<string> Languages = ["cs"];
+    public static readonly IReadOnlyList<string> Languages = ["cs", "ts"];
 
     /// <summary>The files a manifest generates in <paramref name="language"/>; throws <see cref="ManifestException"/> on a bad manifest.</summary>
     public static IReadOnlyList<GeneratedFile> Generate(string manifestJson, string language)
@@ -20,6 +20,7 @@ internal static class ClientGenerate
         return language switch
         {
             "cs" => ClientBindings.CSharp(schema),
+            "ts" => ClientBindings.TypeScript(schema),
             _ => throw new ArgumentException($"Unknown language '{language}'; expected one of: {string.Join(", ", Languages)}.", nameof(language)),
         };
     }

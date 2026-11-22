@@ -337,7 +337,7 @@ static int Usage()
 static void PrintUsage()
 {
     Console.Error.WriteLine("usage: melange schema <module.dll | http(s)://host[:port][/path]> [-o melange-schema.json]");
-    Console.Error.WriteLine("       melange generate --lang cs <melange-schema.json> -o <directory>");
+    Console.Error.WriteLine("       melange generate --lang cs|ts <melange-schema.json> -o <directory>");
     Console.Error.WriteLine("       melange backup <data-dir | http(s)://host[:port][/path]> [-o world.mbak] [--token <jwt>]");
     Console.Error.WriteLine("       melange backup verify <archive>");
     Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>] [--check]");
