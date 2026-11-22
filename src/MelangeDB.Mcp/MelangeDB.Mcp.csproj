@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Mcp.Tests" />
+    <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
   </ItemGroup>
 
 </Project>

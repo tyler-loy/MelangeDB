@@ -56,7 +56,18 @@ internal sealed class SignalReader : IDisposable
     /// </summary>
     public (IReadOnlyList<Series> Series, int Matched) Read(string? prefix, int max)
     {
-        _listener.RecordObservableInstruments();
+        try
+        {
+            _listener.RecordObservableInstruments();
+        }
+        catch (AggregateException)
+        {
+            // An observable whose source has gone (another engine in this process, disposed; its
+            // meter outlives it) throws when polled. The listener polls every other instrument
+            // first and then throws them together, so the reading is complete without the dead
+            // ones; failing the whole tool call for them made signals fail at random under load.
+        }
+
         var matching = _series.Values
             .Where(s => string.IsNullOrEmpty(prefix) || s.Instrument.StartsWith(prefix, StringComparison.Ordinal))
             .OrderBy(static s => s.Instrument, StringComparer.Ordinal)
