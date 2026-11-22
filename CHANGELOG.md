@@ -26,7 +26,9 @@ All packages ship together at one version; there is no per-package versioning. S
   reducer and producer calls; resume and resync by diff; recovery from `overflow_resync`; manual
   dispatch with `frameTick()`; automatic reconnect; and a `/melange/sql` reader that keeps
   64-bit integers exact. `melange generate --lang ts` writes its typed bindings, mirroring the
-  C# API. It passes the live conformance suite, every scenario the C# client passes, in CI.
+  C# API. It passes the live conformance suite, every scenario the C# client passes, in CI. It
+  publishes to npm at the same version as the NuGet packages, from the same release job, by
+  trusted publishing ([docs/RELEASING.md](docs/RELEASING.md#npm)).
 - **`melange generate --lang cs`** (phase 23, step 3). Client bindings from a manifest without
   a compiler, for engines and builds that cannot run the Roslyn generator. It runs the
   generator's own parser and emitters as a library, so its files are the analyzer's byte for

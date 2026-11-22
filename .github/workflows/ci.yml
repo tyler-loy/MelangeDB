@@ -104,6 +104,17 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # One version, one artifact set: the npm package carries VersionPrefix, so a bump that
+      # forgets package.json fails here rather than at release.
+      - name: Verify package.json version matches VersionPrefix
+        run: |
+          prefix=$(sed -n 's/.*<VersionPrefix>\(.*\)<\/VersionPrefix>.*/\1/p' ../../Directory.Build.props)
+          version=$(node -p "require('./package.json').version")
+          if [ "$version" != "$prefix" ]; then
+            echo "::error::clients/typescript/package.json is $version but VersionPrefix is $prefix; bump them together (docs/RELEASING.md)."
+            exit 1
+          fi
+
       - run: npm ci
 
       - run: npm test
@@ -192,7 +203,7 @@ jobs:
   # is updated to match. If the policy also names an Environment, it must equal `release` below.
   publish:
     if: github.event_name == 'release'
-    needs: test
+    needs: [test, typescript]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -248,3 +259,27 @@ jobs:
             --source "$FEED" \
             --api-key '${{ steps.login.outputs.NUGET_API_KEY }}' \
             --skip-duplicate
+
+      # npm, by trusted publishing (OIDC) too: the trusted publisher on npmjs.com names this file
+      # and the `release` environment, with `npm publish` allowed, so no npm token exists anywhere.
+      # Last, after NuGet: a re-run after an npm failure skips the NuGet duplicates and retries
+      # only this. The repository is public, so npm attaches provenance on its own.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish @melangedb/client to npm
+        working-directory: clients/typescript
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          npm install -g npm@11.8.0   # trusted publishing needs npm 11.5.1 or later
+          version=$(node -p "require('./package.json').version")
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Release tag $TAG does not match clients/typescript/package.json ($version)."
+            exit 1
+          fi
+          npm ci
+          npm test
+          npm publish

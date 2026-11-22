@@ -1,7 +1,8 @@
 # Phase 23 — The TypeScript client, client conformance, and `melange generate`
 
-**Status: In progress; decisions settled 2026-11-21** (road-to-0.4). Step 1 built 2026-11-22. See
-[The build, in steps](#the-build-in-steps) at the end.
+**Status: Built 2026-11-22; decisions settled 2026-11-21** (road-to-0.4). All six steps are built;
+the first npm publish happens at the next release. See [The build, in steps](#the-build-in-steps)
+at the end.
 
 **Goal:** a browser is a first-class MelangeDB client, and "a correct MelangeDB client" stops being
 a thing that exists only as C# code. Three deliverables, and **two of them outlive the client**: a
@@ -355,4 +356,12 @@ CI's `typescript` job now runs the live suite against it after the unit tests.
 CLIENT-BINDINGS.md has its TypeScript section, and the manifest's "a non-C# generator becomes
 possible" is now a link to one. Building the SQL reader found finding 5: the endpoint writes
 64-bit integers as JSON numbers.
+
+**Step 6** (2026-11-22). The `publish` job, after the NuGet push, sets up Node 24, installs npm
+11.8.0, checks the tag against `clients/typescript/package.json`, runs the package's tests, and
+runs `npm publish` by trusted publishing. `publishConfig.access` is `public`, and provenance is
+automatic for a public repository. `publish` now also needs the `typescript` job, and that job
+fails any push where `package.json` and `VersionPrefix` disagree. RELEASING.md covers the npm
+package, the trusted-publisher fields, the two-day lapse, and the version bump's third manifest
+(the conformance module's). The first real npm publish happens at the next GitHub Release.
 

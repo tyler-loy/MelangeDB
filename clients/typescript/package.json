@@ -19,14 +19,19 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "sideEffects": false,
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "test": "tsc -p tsconfig.json && tsc -p tsconfig.test.json && node --test \"build-test/test/**/*.test.js\""
   },
   "devDependencies": {
