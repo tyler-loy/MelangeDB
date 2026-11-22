@@ -135,6 +135,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **Shared subscription fan-out** (road-to-0.4 phase 31). Subscriptions that are one query (same
+  table, projection, predicate and operands, on a table with no row or column policies) are
+  evaluated once per committed row instead of once each, and when two or more share it their row
+  ops are encoded once and written into every member's frame. Each connection's send loop is now
+  woken once per commit from the thread pool rather than from inside the write lock. No protocol
+  change: the bytes on the wire are identical. Under the write lock a subscriber now costs about
+  250 ns and 293 bytes per commit in the benchmark, from about 575 ns and 865 bytes.
+
 - **Cluster defaults: `Cluster:HeartbeatIntervalMs` 250 (was 1000), `Cluster:FailureTimeoutMs`
   5000 (was 10000)** (road-to-0.4 phase 30). Chosen from a soak under load: with the liveness ping,
   no healthy node went silent longer than 3.2 s even with the cluster collapsing. A killed shard
