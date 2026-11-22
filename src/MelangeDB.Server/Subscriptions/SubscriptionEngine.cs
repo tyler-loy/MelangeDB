@@ -328,11 +328,27 @@ internal sealed class SubscriptionEngine
         // connection inside the lock (each queues a send loop's continuation to the pool). A frame
         // that waits for its wake-up waits for one pool dispatch, and its sender would need a pool
         // thread to run anyway.
-        ThreadPool.UnsafeQueueUserWorkItem(static sinks =>
+        ThreadPool.UnsafeQueueUserWorkItem(static sinks => WakeAll(sinks), woken, preferLocal: false);
+    }
+
+    /// <summary>
+    /// The deferred wake-up. It runs on a pool thread, possibly after a connection has closed, so a
+    /// sink that throws is skipped rather than allowed to stop the others or escape: an exception
+    /// on a pool work item ends the process.
+    /// </summary>
+    internal static void WakeAll(IDeltaSink[] sinks)
+    {
+        foreach (var sink in sinks)
         {
-            foreach (var sink in sinks)
+            try
+            {
                 sink.Wake();
-        }, woken, preferLocal: false);
+            }
+            catch (Exception)
+            {
+                // A closed connection has nothing left to send.
+            }
+        }
     }
 
     /// <summary>

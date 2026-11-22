@@ -253,7 +253,8 @@ public sealed class FanoutCostMeasurementTests(ITestOutputHelper output) : IDisp
 
         public void Wake()
         {
-            if (!_wakeUnderLock)
+            // A wake-up can arrive from the pool after this sink is disposed.
+            if (!_wakeUnderLock && !_stop.IsCancellationRequested)
                 _signal.Release();
         }
 
@@ -293,5 +294,43 @@ public sealed class FanoutCostMeasurementTests(ITestOutputHelper output) : IDisp
             _stop.Dispose();
             _signal.Dispose();
         }
+    }
+}
+
+/// <summary>
+/// The fan-out wakes connections from a pool thread after the write lock (phase 31 step 2d), so a
+/// wake-up can land on a connection that has since closed. One sink that throws must neither stop
+/// the others nor escape: an exception on a pool work item ends the process, which is how a test
+/// sink disposed under a pending wake once took down CI.
+/// </summary>
+public class DeferredWakeTests
+{
+    [Fact]
+    public void A_sink_that_throws_on_wake_does_not_stop_the_others()
+    {
+        var woken = new List<int>();
+        IDeltaSink[] sinks = [new Sink(woken, 1), new ThrowingSink(), new Sink(woken, 3)];
+
+        SubscriptionEngine.WakeAll(sinks);
+
+        Assert.Equal([1, 3], woken);
+    }
+
+    private sealed class Sink(List<int> woken, int id) : IDeltaSink
+    {
+        public void EnqueueDelta(TransactionUpdateFrame frame)
+        {
+        }
+
+        public void Wake() => woken.Add(id);
+    }
+
+    private sealed class ThrowingSink : IDeltaSink
+    {
+        public void EnqueueDelta(TransactionUpdateFrame frame)
+        {
+        }
+
+        public void Wake() => throw new ObjectDisposedException("SemaphoreSlim");
     }
 }
