@@ -1,7 +1,8 @@
 # Phase 23 — The TypeScript client, client conformance, and `melange generate`
 
-**Status: Planned; decisions settled 2026-11-21** (road-to-0.4). See [The build, in
-steps](#the-build-in-steps) at the end.
+**Status: Built 2026-11-22; decisions settled 2026-11-21** (road-to-0.4). All six steps are built;
+the first npm publish happens at the next release. See [The build, in steps](#the-build-in-steps)
+at the end.
 
 **Goal:** a browser is a first-class MelangeDB client, and "a correct MelangeDB client" stops being
 a thing that exists only as C# code. Three deliverables, and **two of them outlive the client**: a
@@ -231,7 +232,9 @@ per-package versioning.
 
 **Settled: one version, one pipeline** (owner, 2026-11-21): the npm package carries the same version
 string and is published by the same release job, so a C#-only release still bumps it. Publishing
-needs an npm token in the repository's secrets, which the owner adds. The leaning was the same:
+uses npm trusted publishing, not a token: the package is `@melangedb/client` in the owner's
+`melangedb` npm organization, trusted for `ci.yml`'s `release` environment with `npm publish`
+allowed (owner, 2026-11-22), the same arrangement nuget.org has. The leaning was the same:
 so a `0.3.0` server, `0.3.0` NuGet packages, and `0.3.0` on npm are one artifact set. **Open:**
 whether npm publication belongs in the existing pipeline or a parallel one, and what the story is
 when a release is C#-only — under one version scheme, an unchanged TypeScript client still gets a
@@ -256,6 +259,109 @@ and tested on its own:
    connection, subscriptions, the merged refcounted cache, resume, backpressure, reducer calls,
    `frameTick()`, and the `/melange/sql` reader. Generated bindings mirror the C# shape.
 5. **The TypeScript client passes the suite**, and CLIENT-BINDINGS.md gains its TypeScript section.
-6. **Release.** npm publication in the existing release job, one version with the NuGet packages.
-   Needs the owner's npm token as a repository secret before the first publish.
+6. **Release.** npm publication in the existing release job, one version with the NuGet packages:
+   `npm publish` of `@melangedb/client` from the `publish` job (Node 24, npm 11.5.1 or later), whose
+   `id-token: write` and `release` environment the trusted publisher already names. No token
+   secret exists. The publisher configuration lapses if unused for two days after it is created,
+   so it is re-created just before the first release.
+
+### As built
+
+**Step 1** (2026-11-22). [CLIENT-CONFORMANCE.md](../CLIENT-CONFORMANCE.md) holds the contract as
+numbered obligations, each with the failure it prevents, and the parameter map's frozen decision
+with its closed value set. `tools/MelangeDB.Conformance` hosts a conformance module (every column
+kind public tables can hold, an enum, a column policy, a producer) on a live server with a manual
+clock, and records `conformance/corpus.json`: 11 sessions covering every server-to-client frame
+type, plus column, key, and argument vectors. The recording is deterministic. A fresh data
+directory, a scripted order, frames ordered by channel within a step, and fixed values for
+`Welcome`'s two per-run ids make it so. `MelangeDB.Conformance.Tests` therefore re-records it on
+every build and compares byte for byte. The recorder also checks every decoded row against the
+values the module wrote, so the corpus proves more than the C# decoder agreeing with itself.
+
+Writing it down produced four findings, recorded in the document:
+
+- the C# client does not recover from `overflow_resync`;
+- resume across an additive migration may decode with a stale descriptor (found by reading, not
+  yet reproduced);
+- scheduled tables silently drop `Public = true`, so no frame can carry `ScheduleAt`;
+- the server accepts parameter shapes wider than the closed set.
+
+The first two are for step 2's live suite to settle.
+
+**Step 2a** (2026-11-22). The harness: `MelangeDB.Conformance run -- <adapter>` and the adapter
+protocol (newline-delimited JSON; requests, responses, and cache events on one ordered stream, so
+a `sync` on an LSN is a barrier). The scenarios are `corpus-decode`, `encoding-vectors`,
+`handshake`, `initial-set`, `calls`, `merged-cache`, `rescope`, and `column-masks`.
+`tools/MelangeDB.Conformance.Adapter.CSharp` drives `MelangeDB.Client` through bindings generated
+from the conformance manifest. It passes in-process over pipes on every build
+(`LiveSuiteTests`) and as a subprocess through `run`. An adapter that raises an insert per
+subscription instead of per merged row fails three scenarios.
+
+**Step 2b** (2026-11-22). The scenarios that need time, failure, or a second server:
+`anchor-boundary` (a 600-row, many-chunk initial set with commits landing throughout; every event
+must follow from the one before it), `resume-accepted`, `resume-new-epoch` (the server restarts
+over a fresh log on the same port), `overflow-resync` (one delta larger than a 16 KiB
+`MaxBufferedBytes`), `reauthenticate`, and `heartbeat` (the server's manual clock runs through
+five intervals). Finding 1 is fixed: `MelangeClient` re-subscribes everything on
+`overflow_resync`, and chunk 0 now discards rows left from an initial set that never completed.
+A client without the delta buffer fails `anchor-boundary` (three runs of three). One without the
+re-subscribe fails `overflow-resync` and the new `BackpressureTests` case. Finding 2 still needs
+two builds of a module, so it stays a finding.
+
+**Step 3** (2026-11-22). `melange generate --lang cs <manifest> -o <dir>`. `ClientBindings.CSharp`
+in CodeGen is now the one list of files both front doors use: the Roslyn generator adds each as a
+source, and the CLI, which references CodeGen as a library, writes each to disk (unchanged files
+untouched). `GenerateCommandTests` runs the real generator and the CLI over the snapshot schema,
+the transport suite's manifest (with producers), and the conformance manifest, and compares
+names and bytes. The C# emitter asks Roslyn which names are keywords, so Roslyn ships in the tool
+(English resources only; the package is 4.9 MB). **`--lang ts` moved to step 4**: the TypeScript
+bindings are code against the TypeScript runtime's API, so the emitter and the runtime are
+designed together rather than one guessing at the other.
+
+**Step 4** (2026-11-22). `clients/typescript`, the `@melangedb/client` package: dependency-free,
+browser-first (the core needs `WebSocket`, `fetch`, and `TextEncoder`), strict TypeScript 7.
+Its parts:
+
+- its own MessagePack subset, accepting every width and returning 64-bit values as `bigint`;
+- frames, ignoring trailing fields;
+- rows, keys, and the argument encoding;
+- `Subscription`, with anchor buffering and tolerance of redundant ops;
+- `TableCache`, merged and refcounted, mapping columns by name with fingerprinted change
+  detection;
+- `MelangeClient`, covering resume, full resync by diff, `overflow_resync`, heartbeat answers,
+  reauthentication, manual dispatch with `frameTick()`, and automatic reconnect;
+- `MelangeSql`, untyped rows for any query and typed `SELECT *`, with integers past 2^53 read
+  exactly from the JSON source text.
+
+`melange generate --lang ts` writes one module from the same parsed manifest as the C# emitter,
+mirroring the C# shape (`conn.db.Table.Column.subscribeRange`, `conn.reducers.x`,
+`conn.producers.y`). A defaulted parameter left off trailing is dropped so the server fills it;
+one left off mid-list takes its manifest default. The unit tests replay the whole decode corpus
+and every vector through the TypeScript decoder. That passed on the first run, which is the
+corpus doing its job. The generated bindings for the conformance and transport manifests
+type-check against the runtime, and a .NET test holds the committed copies to a fresh generation.
+CI gains a `typescript` job.
+
+**Step 5** (2026-11-22). `clients/typescript/conformance/adapter.ts` drives `@melangedb/client`
+through bindings generated from the conformance manifest. It passes all 14 live scenarios on the
+first run. Four mutants of the compiled runtime show the pass is not vacuous; each fails the
+scenario it should:
+
+- without delta buffering, `anchor-boundary`;
+- with a broken refcount, `merged-cache`;
+- without the `overflow_resync` re-subscribe, `overflow-resync`;
+- without `Pong`, `heartbeat`.
+
+CI's `typescript` job now runs the live suite against it after the unit tests.
+CLIENT-BINDINGS.md has its TypeScript section, and the manifest's "a non-C# generator becomes
+possible" is now a link to one. Building the SQL reader found finding 5: the endpoint writes
+64-bit integers as JSON numbers.
+
+**Step 6** (2026-11-22). The `publish` job, after the NuGet push, sets up Node 24, installs npm
+11.8.0, checks the tag against `clients/typescript/package.json`, runs the package's tests, and
+runs `npm publish` by trusted publishing. `publishConfig.access` is `public`, and provenance is
+automatic for a public repository. `publish` now also needs the `typescript` job, and that job
+fails any push where `package.json` and `VersionPrefix` disagree. RELEASING.md covers the npm
+package, the trusted-publisher fields, the two-day lapse, and the version bump's third manifest
+(the conformance module's). The first real npm publish happens at the next GitHub Release.
 

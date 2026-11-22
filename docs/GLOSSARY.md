@@ -214,6 +214,10 @@ channels are carried — interleaved on one socket, several sockets over HTTP/2,
 opening a socket. Exists because the browser WebSocket API cannot set headers, so header-based auth would lock
 out web clients entirely.
 
+**Conformance corpus** — `conformance/corpus.json`: frames a live server sent, byte for byte, each beside its
+exact expected decode, plus key, column, and argument encoding vectors. What a client in another language is
+held to; a test fails the build when it drifts from the server. See [CLIENT-CONFORMANCE.md](CLIENT-CONFORMANCE.md).
+
 **Commit point** — The single atomic log append. Before it nothing happened; after it the transaction is
 durable. This is what buys atomicity across heterogeneous stores with no 2PC.
 

@@ -11,6 +11,9 @@ Every library under `src/` is a NuGet package — thirteen of them:
 `MelangeDB.Cluster`, `MelangeDB.OpenTelemetry`, `MelangeDB.Cli`, `MelangeDB.Mcp`,
 `MelangeDB.Testing`.
 
+Beside them, one npm package: **`@melangedb/client`**, the TypeScript client in
+`clients/typescript`, released at the same version by the same job (road-to-0.4 phase 23).
+
 Tests, samples, and the load-test tool are never packed (`IsPackable=false`). Shared package metadata
 lives in `Directory.Build.props` at the repo root; a project's `.csproj` only adds what is specific to
 it.
@@ -49,8 +52,11 @@ Simple and boring, on purpose:
   [Consuming prereleases](#consuming-prereleases) — restoring from that feed needs
   authentication even though the repository is public.
 
-All thirteen packages always publish together at the same version. There is no per-package versioning —
-a MelangeDB version is one coherent set.
+All thirteen packages always publish together at the same version, and so does
+`@melangedb/client` on npm. There is no per-package versioning: a MelangeDB version is one coherent
+set, so a C#-only release still bumps the npm package, as the owner decided for phase 23.
+`clients/typescript/package.json` carries the version beside `VersionPrefix`, and CI's
+`typescript` job fails if the two disagree.
 
 **Pre-1.0 means the public API may break in any release.** That is stated in the README, the
 changelog, and here, because a consumer pinning `0.x` deserves to know it before rather than after.
@@ -63,17 +69,21 @@ package, and a second ecosystem tests it — see
 
 ## Cutting a release
 
-1. Open a PR that bumps `VersionPrefix` in `Directory.Build.props` and moves the `CHANGELOG.md`
-   `[Unreleased]` section under the new version heading. Merge it.
+1. Open a PR that bumps `VersionPrefix` in `Directory.Build.props` (and the `version` in
+   `clients/typescript/package.json` to match) and moves the `CHANGELOG.md` `[Unreleased]`
+   section under the new version heading. Merge it.
 2. Tag the merge commit `v<VersionPrefix>` and push the tag. **Nothing publishes yet** — a tag on
    its own does nothing.
 3. Draft a GitHub Release against that tag, write the notes, and publish it. That starts the run.
-4. The `test` job runs first. When it passes, the `publish` job parks awaiting approval of the
-   `release` environment. Approve it, and the packages go to nuget.org.
-5. Bump `VersionPrefix` to the next version so `main` prereleases sort above the release. **The
-   bump changes two committed files**, because a manifest records the generator version that wrote
-   it and their staleness guards compare byte-for-byte on purpose. Re-export both in the same PR,
-   or CI fails on the bump alone:
+4. The `test` and `typescript` jobs run first. When they pass, the `publish` job parks awaiting
+   approval of the `release` environment. Approve it, and the packages go to nuget.org and then
+   `@melangedb/client` to npm. Before approving, check that the npm trusted publisher is active
+   (see [npm](#npm)): a new one lapses two days after it is created if nothing publishes through it.
+5. Bump `VersionPrefix` to the next version, and `clients/typescript/package.json` with it, so
+   `main` prereleases sort above the release. **The bump changes three committed manifests**,
+   because a manifest records the generator version that wrote it and their staleness guards
+   compare byte-for-byte on purpose. Re-export all three in the same PR, or CI fails on the bump
+   alone:
 
    ```
    dotnet build samples/MelangeDB.Sample.Worker -c Debug
@@ -84,7 +94,11 @@ package, and a second ecosystem tests it — see
    dotnet run --project src/MelangeDB.Cli -- schema \
      tests/MelangeDB.Transport.Tests/bin/Debug/net10.0/MelangeDB.Transport.Tests.dll \
      -o tests/MelangeDB.Transport.Tests/melange-schema.json
+   dotnet run --project tools/MelangeDB.Conformance -c Release -- schema
    ```
+
+   The committed TypeScript bindings and the conformance corpus need nothing: the schema hash
+   excludes the generator version, and no frame carries it.
 
    The generator-code snapshots under `tests/MelangeDB.CodeGen.Tests/Snapshots/` need no such
    treatment — they pin the version to `0.0.0.0` before comparing, because a snapshot of generated
@@ -168,6 +182,30 @@ Two more things worth knowing:
 - **Reserve the `MelangeDB.*` package ID prefix** (Account → Reserved package ID prefixes) if you
   haven't. That's separate from trusted publishing, and it's what stops anyone else from publishing a
   `MelangeDB.Something` that looks official.
+
+### npm
+
+`@melangedb/client` publishes from the same `publish` job, last, by npm's
+[trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC), so there is no npm token
+anywhere either. The job installs npm 11.8.0 (trusted publishing needs 11.5.1 or later), checks
+that the release tag matches `package.json`, runs the package's tests, and runs `npm publish`. The
+repository is public, so npm attaches provenance itself. The package lives in the `melangedb` npm
+organization, and its trusted publisher is configured on npmjs.com under the package's Settings:
+
+| Field | Value here | Breaks if |
+| --- | --- | --- |
+| Organization or user | `tyler-loy` | The repo moves to an org |
+| Repository | `MelangeDB` | The repo is renamed |
+| Workflow filename | `ci.yml` | The file is renamed, or the publish job moves to another workflow file |
+| Environment | `release` | The job's `environment:` is renamed or removed |
+| Allowed actions | `npm publish` | Unticked: CI could then only stage, and every release would wait on a manual approval at npmjs.com |
+
+Two npm-specific things:
+
+- **A new trusted publisher lapses after two days** if nothing publishes through it, and then can
+  only be deleted and re-created. Re-create it shortly before the first release that uses it.
+- `package.json`'s `repository.url` (`git+https://github.com/tyler-loy/MelangeDB.git`) must name
+  this repository exactly, or npm refuses the OIDC token.
 
 ## Consuming the packages
 

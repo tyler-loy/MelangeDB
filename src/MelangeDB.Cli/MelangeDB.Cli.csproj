@@ -5,11 +5,14 @@
     <OutputType>Exe</OutputType>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>melange</ToolCommandName>
-    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md). `melange mcp` bridges a local agent's stdio to a running host's MCP endpoint (docs/MCP.md).</Description>
+    <!-- Roslyn ships a dozen resource languages; a CLI's messages are English. -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator, and `melange generate` turns a manifest into client bindings without a compiler (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md). `melange mcp` bridges a local agent's stdio to a running host's MCP endpoint (docs/MCP.md).</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+    <InternalsVisibleTo Include="MelangeDB.CodeGen.Tests" />
   </ItemGroup>
 
   <ItemGroup>
@@ -17,6 +20,11 @@
          the machinery that writes them — the CLI must never grow a second implementation of a
          format the engine owns. `schema` still depends on nothing but the BCL. -->
     <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
+    <!-- `generate` runs the generator's own manifest parser and emitters as a library, so its C#
+         output is the analyzer's byte for byte. The C# emitter asks Roslyn which names are
+         keywords, so Roslyn ships with the tool. -->
+    <ProjectReference Include="..\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
   </ItemGroup>
 
   <ItemGroup>

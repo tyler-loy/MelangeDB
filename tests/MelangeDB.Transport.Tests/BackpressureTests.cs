@@ -158,4 +158,34 @@ public class BackpressureTests
                 await raw.ReceiveAsync(TestContext.Current.CancellationToken);
         });
     }
+
+    /// <summary>
+    /// The C# client recovers from overflow_resync on its own (CLIENT-CONFORMANCE C11.1). Before
+    /// this it raised OnError and nothing else: every subscription still looked live while the
+    /// server held none of them, so the cache silently stopped changing. One delta larger than the
+    /// buffer is enough to trip the policy, with no need to stall the reader.
+    /// </summary>
+    [Fact]
+    public async Task DropAndResync_the_client_reestablishes_its_subscriptions_by_itself()
+    {
+        await using var host = await TransportTestHost.StartAsync(Settings("DropAndResync"));
+        await using var client = host.CreateClient();
+        var errors = new List<string>();
+        client.OnError += error => { lock (errors) { errors.Add(error.Code); } };
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        var subscription = await client.SubscribeAsync("SELECT * FROM Chunk", cancellationToken: TestContext.Current.CancellationToken);
+
+        var big = host.Call("SetChunk", 1L, 1L, new byte[FloodRowBytes]);
+        await TransportTestHost.WaitUntilAsync(() => client.LastAckedLsn >= big, "the re-established initial set to cover the dropped delta");
+        Assert.Equal(1, subscription.Count);
+        lock (errors)
+        {
+            Assert.Contains(MelangeErrorCodes.OverflowResync, errors);
+        }
+
+        var small = host.Call("SetChunk", 2L, 2L, new byte[16]);
+        await TransportTestHost.WaitUntilAsync(() => client.LastAckedLsn >= small, "a delta on the re-established subscription");
+        Assert.Equal(2, subscription.Count);
+        Assert.Equal(0, subscription.Inconsistencies);
+    }
 }

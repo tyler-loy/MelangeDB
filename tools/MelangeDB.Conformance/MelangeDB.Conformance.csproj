@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <Description>The client conformance tool: a conformance module on a live server, and the recorder that captures the decode corpus every MelangeDB client is held to. See docs/CLIENT-CONFORMANCE.md.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- A real Kestrel host: the corpus is what a real server puts on a real socket. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MelangeDB.Server\MelangeDB.Server.csproj" />
+    <!-- The manual clock: heartbeats and token lifetimes move only when a run moves them. -->
+    <ProjectReference Include="..\..\src\MelangeDB.Testing\MelangeDB.Testing.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MelangeDB.Conformance.Tests" />
+  </ItemGroup>
+
+</Project>

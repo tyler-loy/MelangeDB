@@ -11,6 +11,8 @@
     <ProjectReference Include="..\..\src\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Core\MelangeDB.Core.csproj" />
     <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
+    <!-- `melange generate`, held byte-identical to this generator's own output. -->
+    <ProjectReference Include="..\..\src\MelangeDB.Cli\MelangeDB.Cli.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -24,6 +26,12 @@
     <!-- Snapshots are expected generator output, compared as text — never compiled. -->
     <Compile Remove="Snapshots\**" />
     <None Include="Snapshots\**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Real committed manifests, for the generate-versus-generator identity test. -->
+    <None Include="..\..\conformance\melange-schema.json" Link="Manifests\conformance.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\MelangeDB.Transport.Tests\melange-schema.json" Link="Manifests\transport.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The committed TypeScript bindings, held to a fresh `melange generate`. -->
+    <None Include="..\..\clients\typescript\conformance\melange-bindings.ts" Link="Bindings\conformance.ts" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\clients\typescript\test\generated\transport\melange-bindings.ts" Link="Bindings\transport.ts" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

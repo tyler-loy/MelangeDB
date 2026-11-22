@@ -38,7 +38,7 @@ jobs:
       # Individual stress tests inside the kept suites opt out the same way with
       # [Trait("Category", "Stress")] — the --filter below excludes them here, never locally.
       CI_TEST_PROJECTS: >-
-        Core CodeGen Transport Host Storage.Faster Storage.Postgres Testing
+        Core CodeGen Transport Host Storage.Faster Storage.Postgres Testing Conformance
     steps:
       - uses: actions/checkout@v7
 
@@ -83,6 +83,45 @@ jobs:
             echo '::error::Skipped tests detected in the Debug run; CI requires zero skips.'
             exit 1
           fi
+
+  # The TypeScript client (@melangedb/client): strict build, unit tests, the decode corpus
+  # replayed through its decoder, and then the live conformance suite against a real server
+  # through its adapter, the same suite the C# client passes. Node 24 is the LTS line the
+  # package is published from.
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      # One version, one artifact set: the npm package carries VersionPrefix, so a bump that
+      # forgets package.json fails here rather than at release.
+      - name: Verify package.json version matches VersionPrefix
+        run: |
+          prefix=$(sed -n 's/.*<VersionPrefix>\(.*\)<\/VersionPrefix>.*/\1/p' ../../Directory.Build.props)
+          version=$(node -p "require('./package.json').version")
+          if [ "$version" != "$prefix" ]; then
+            echo "::error::clients/typescript/package.json is $version but VersionPrefix is $prefix; bump them together (docs/RELEASING.md)."
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm test
+
+      - name: Live conformance suite
+        working-directory: .
+        run: dotnet run --project tools/MelangeDB.Conformance -c Release -- run -- node clients/typescript/build-test/conformance/adapter.js
 
   # Packs a -ci.N prerelease from main and publishes it to this repository's GitHub Packages feed,
   # which is a different bargain from nuget.org: a version there can never be deleted, only
@@ -164,7 +203,7 @@ jobs:
   # is updated to match. If the policy also names an Environment, it must equal `release` below.
   publish:
     if: github.event_name == 'release'
-    needs: test
+    needs: [test, typescript]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -220,3 +259,27 @@ jobs:
             --source "$FEED" \
             --api-key '${{ steps.login.outputs.NUGET_API_KEY }}' \
             --skip-duplicate
+
+      # npm, by trusted publishing (OIDC) too: the trusted publisher on npmjs.com names this file
+      # and the `release` environment, with `npm publish` allowed, so no npm token exists anywhere.
+      # Last, after NuGet: a re-run after an npm failure skips the NuGet duplicates and retries
+      # only this. The repository is public, so npm attaches provenance on its own.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish @melangedb/client to npm
+        working-directory: clients/typescript
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          npm install -g npm@11.8.0   # trusted publishing needs npm 11.5.1 or later
+          version=$(node -p "require('./package.json').version")
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Release tag $TAG does not match clients/typescript/package.json ($version)."
+            exit 1
+          fi
+          npm ci
+          npm test
+          npm publish

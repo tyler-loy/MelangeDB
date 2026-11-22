@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <Description>The C# client's conformance adapter: MelangeDB.Client and bindings generated from the conformance manifest, driven over the adapter protocol. See docs/CLIENT-CONFORMANCE.md.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- A client, and only a client: the bindings come from the manifest, never from the module. -->
+    <ProjectReference Include="..\..\src\MelangeDB.Client\MelangeDB.Client.csproj" />
+    <ProjectReference Include="..\..\src\MelangeDB.CodeGen\MelangeDB.CodeGen.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <AdditionalFiles Include="..\..\conformance\melange-schema.json" Link="melange-schema.json" />
+    <!-- The corpus's canonical JSON forms, shared rather than transcribed: this adapter's decode
+         answers must be written exactly as the corpus writes them. -->
+    <Compile Include="..\MelangeDB.Conformance\CorpusJson.cs" Link="CorpusJson.cs" />
+  </ItemGroup>
+
+</Project>

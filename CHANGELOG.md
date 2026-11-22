@@ -12,6 +12,35 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The client conformance contract** (road-to-0.4 phase 23, step 1).
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md) states every rule a MelangeDB client
+  must keep as a numbered obligation with the failure it prevents: framing, the handshake, rows and
+  masks, keys, the anchor boundary, the merged cache, calls, resume, `overflow_resync`, and the
+  subscription parameter map's closed set of value shapes (pinned, not changed). Beside it,
+  `conformance/corpus.json` is a decode corpus recorded from a live server by the new
+  `tools/MelangeDB.Conformance`, with key, column, and argument vectors; a test re-records it on
+  every build and fails when it drifts. Writing it down found four things, listed in the
+  document's Findings section.
+- **`@melangedb/client`, the TypeScript client** (phase 23, step 4), in `clients/typescript`.
+  Browser-first and dependency-free. It provides subscriptions into a merged, refcounted cache;
+  reducer and producer calls; resume and resync by diff; recovery from `overflow_resync`; manual
+  dispatch with `frameTick()`; automatic reconnect; and a `/melange/sql` reader that keeps
+  64-bit integers exact. `melange generate --lang ts` writes its typed bindings, mirroring the
+  C# API. It passes the live conformance suite, every scenario the C# client passes, in CI. It
+  publishes to npm at the same version as the NuGet packages, from the same release job, by
+  trusted publishing ([docs/RELEASING.md](docs/RELEASING.md#npm)).
+- **`melange generate --lang cs`** (phase 23, step 3). Client bindings from a manifest without
+  a compiler, for engines and builds that cannot run the Roslyn generator. It runs the
+  generator's own parser and emitters as a library, so its files are the analyzer's byte for
+  byte; a test compares the two for three real manifests. TypeScript (`--lang ts`) arrives with
+  the TypeScript client.
+- **The live conformance suite** (phase 23, step 2). `MelangeDB.Conformance run -- <adapter>`
+  drives any client through a small newline-delimited JSON adapter against a real server. It
+  covers the corpus, the encoding vectors, the handshake, calls, the merged cache, re-scoping,
+  column masks, the anchor boundary under concurrent writes, resume against the same and a new
+  log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
+  checks. The C# client's adapter passes it on every build.
+
 - **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
   `AddMelangeMcp()` and `app.MapMelangeMcp()` put a Model Context Protocol endpoint (stateless
   streamable HTTP, `/melange/mcp`) in the host's own pipeline. Tools: `describe_schema`, `query`
@@ -146,6 +175,11 @@ All packages ship together at one version; there is no per-package versioning. S
   rows.
 
 ### Fixed
+
+- **`MelangeClient` recovers from `overflow_resync`** (found writing the phase 23 conformance
+  contract). After the server dropped a slow connection's subscriptions, the client raised
+  `OnError` and nothing else, so every subscription looked live while its cache stopped changing.
+  It now re-subscribes each one at once and reconciles the new initial sets by diff.
 
 - **A large border reset took down the node link, and with it a healthy node.** A band reset was
   sent as one node-link frame, and a link drops any frame over 64 MiB. A million-row shard's band
