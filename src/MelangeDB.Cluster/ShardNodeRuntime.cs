@@ -169,6 +169,18 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         }
     }
 
+    /// <summary>
+    /// For the load tool's lag sampler: every replica this node keeps, with how far it has applied
+    /// and the commit time of the last record it applied.
+    /// </summary>
+    internal List<(ShardKey Shard, ulong AppliedLsn, Timestamp? Tail)> ReplicaProgress()
+    {
+        lock (_followersLock)
+        {
+            return [.. _followers.Select(static pair => (new ShardKey(pair.Key), pair.Value.AppliedLsn, pair.Value.TailTimestamp))];
+        }
+    }
+
     /// <summary>For the failover tool: how far this node's replica of <paramref name="shard"/> has applied; null without one.</summary>
     internal ulong? ReplicaAppliedLsn(ShardKey shard) => TryGetFollower(shard)?.AppliedLsn;
 

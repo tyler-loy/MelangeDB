@@ -469,6 +469,37 @@ lapse in any run; the longest heartbeat gap was 320 ms.
   gateway's first reattach attempt goes to the dead node's port. On Linux a refused connect fails
   at once.
 
+#### Replica lag under the soak (phase 30), 2026-11-21
+
+Same soak as the liveness tables below (`all --nodes 4 --soak`, heartbeat 250 ms, 15 s timeout),
+now with replicas, the default. The serve process samples every replica every 100 ms: the owner's
+durable LSN, read from the owner's engine in the same process, minus what the replica has applied.
+The hub's relay delay therefore counts as lag, where the `melange.cluster.replica.lag` gauge
+measures against the ceiling the hub last relayed and does not see it. *Oldest unapplied* is how
+long the oldest record the replica had not applied had been durable on its owner, in samples
+where it was behind: what a promotion at that instant would have replayed, in time.
+
+| Players | Hot store | Lag p50 / p99 / max (records) | Oldest unapplied p99 / max | Acked calls | Deaths / lapses |
+| --- | --- | --- | --- | --- | --- |
+| 100 | in-memory | 6 / 263 / 480 | 0.51 / 0.70 s | 454,686 | 0 / 0 |
+| 100 | FASTER | 6 / 254 / 442 | 0.51 / 0.71 s | 454,771 | 0 / 0 |
+| 200 | in-memory | 0 / 4,891 / 7,206 | 7.5 / 9.8 s | 792,513 | 0 / 0 |
+| 200 | FASTER | 0 / 4,599 / 6,294 | 6.7 / 8.8 s | 776,434 | 0 / 0 |
+
+- **At sustainable load a replica is about two heartbeats behind:** half a second at p99, never
+  more than 0.71 s. The ceiling rides the heartbeat (250 ms) and the follower polls every 50 ms.
+- **Past the knee it falls up to ten seconds behind, in bursts.** The median stays at zero. The
+  ceiling travels in the heartbeat's load sample and comes back in its reply, and the heartbeat
+  loop runs on the thread pool, which is what starves at 200 players. The liveness ping, which
+  moved off the pool for the same reason, does not carry it. Lag costs a promotion replay time
+  (7,000 records is about a second), never data: the replay reads the log, not the replica.
+- **Replicas cost no measurable throughput here:** 776–793k acked calls at 200 players, against
+  770–800k before phase 30's step 2.
+- **The 200-player FASTER run ended with 2 resync errors** (3 in a first run), where the runs
+  without replicas had none below 300 players. Each is the gateway failing to move a client to a
+  shard whose pre-opened socket had already been aborted, which tells the client to resubscribe.
+  It is overload behaviour past the knee, and it is the run's only failure.
+
 #### Liveness soak (phase 30), 2026-11-21
 
 How close a healthy cluster comes to its failure timeout: `all --nodes 4 --soak` with heartbeat

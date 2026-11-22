@@ -214,4 +214,7 @@ fault its working set in from disk, which is the reopen cost again in another fo
   and the server window to 0.72–1.14 s; at 1M rows, 6 of 6 promoted in 1.6–4.7 s against a
   4.6–6.1 s cold reopen. The 1M runs found that a border reset larger than the node link's 64 MiB
   frame cap dropped the link, which predates this phase; resets now travel in parts (fixed on
-  the same stack).
+  the same stack). Lag under the 200-player soak (LOAD-TESTING, "Replica lag under the soak"):
+  about two heartbeats at sustainable load (p99 0.51 s), up to 9.8 s in bursts past the knee,
+  where the ceiling's ride on the pool-run heartbeat starves. Carrying it on the liveness ping
+  instead is the obvious next step if that matters.

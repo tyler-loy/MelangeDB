@@ -68,5 +68,26 @@ public sealed record ServerStats
 
     public long NodesDeclaredDead { get; init; }
 
+    // Replica lag (phase 30), sampled every 100 ms in the serve process: each replica's applied
+    // LSN against its owner's durable LSN, both read directly, so the hub's relay delay is in it.
+
+    /// <summary>Samples taken (one per replica per tick).</summary>
+    public long ReplicaLagSamples { get; init; }
+
+    public long ReplicaLagP50Records { get; init; }
+
+    public long ReplicaLagP99Records { get; init; }
+
+    public long ReplicaLagMaxRecords { get; init; }
+
+    /// <summary>
+    /// How long the oldest record a replica had not applied had been durable on its owner, taken
+    /// in samples where it was behind (100 ms resolution): what a promotion at that instant would
+    /// have had to replay, in time rather than records.
+    /// </summary>
+    public double ReplicaStalenessMaxMs { get; init; }
+
+    public double ReplicaStalenessP99Ms { get; init; }
+
     public long LeaseLapses { get; init; }
 }

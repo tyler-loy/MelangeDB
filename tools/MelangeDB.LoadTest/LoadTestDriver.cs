@@ -211,6 +211,10 @@ internal static class LoadTestDriver
                 $"Liveness:        hub heartbeat gaps max {finalStats.HeartbeatGapMaxMs:F0} ms over {finalStats.HeartbeatGapCount} ({GapsOver(finalStats.HeartbeatGapsOverMs)}); ") +
                 Invariant($"lease renewal gaps max {finalStats.LeaseRenewalGapMaxMs:F0} ms over {finalStats.LeaseRenewalGapCount} ({GapsOver(finalStats.LeaseRenewalGapsOverMs)}); ") +
                 Invariant($"{finalStats.NodesDeclaredDead} node(s) declared dead, {finalStats.LeaseLapses} lease lapse(s) (whole run)"));
+            output.WriteLine(finalStats.ReplicaLagSamples == 0
+                ? "Replica lag:     no replicas sampled (one shard node, or Cluster:ShardReplicas 0)"
+                : Invariant($"Replica lag:     p50 {finalStats.ReplicaLagP50Records} / p99 {finalStats.ReplicaLagP99Records} / max {finalStats.ReplicaLagMaxRecords} records behind the owner's durable LSN over {finalStats.ReplicaLagSamples} samples; ") +
+                  Invariant($"oldest unapplied record durable for p99 {finalStats.ReplicaStalenessP99Ms:F0} / max {finalStats.ReplicaStalenessMaxMs:F0} ms (whole run)"));
         }
 
         var failures = new List<string>();
@@ -244,7 +248,9 @@ internal static class LoadTestDriver
                 ? Invariant($" hb_gap_max_ms={live.HeartbeatGapMaxMs:F0} hb_gaps_over_1000={live.HeartbeatGapsOverMs.GetValueOrDefault(1_000)} ") +
                   Invariant($"hb_gaps_over_2000={live.HeartbeatGapsOverMs.GetValueOrDefault(2_000)} hb_gaps_over_3000={live.HeartbeatGapsOverMs.GetValueOrDefault(3_000)} ") +
                   Invariant($"lease_gap_max_ms={live.LeaseRenewalGapMaxMs:F0} lease_gaps_over_1000={live.LeaseRenewalGapsOverMs.GetValueOrDefault(1_000)} ") +
-                  Invariant($"lease_gaps_over_2000={live.LeaseRenewalGapsOverMs.GetValueOrDefault(2_000)} nodes_declared_dead={live.NodesDeclaredDead} lease_lapses={live.LeaseLapses}")
+                  Invariant($"lease_gaps_over_2000={live.LeaseRenewalGapsOverMs.GetValueOrDefault(2_000)} nodes_declared_dead={live.NodesDeclaredDead} lease_lapses={live.LeaseLapses} ") +
+                  Invariant($"replica_lag_p50={live.ReplicaLagP50Records} replica_lag_p99={live.ReplicaLagP99Records} replica_lag_max={live.ReplicaLagMaxRecords} ") +
+                  Invariant($"replica_staleness_p99_ms={live.ReplicaStalenessP99Ms:F0} replica_staleness_max_ms={live.ReplicaStalenessMaxMs:F0}")
                 : string.Empty) +
             (lockSplit is { } s ? Invariant($" post_commit_share={s.Share:F4} lock_split_transactions={s.Transactions} mean_locked_us={s.MeanLockedMs * 1000:F0}") : string.Empty) +
             (pass ? string.Empty : $" failures=[{string.Join("; ", failures)}]");
