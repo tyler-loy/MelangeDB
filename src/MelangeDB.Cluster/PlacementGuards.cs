@@ -377,6 +377,7 @@ internal static class ShardSpan
         if (onlyOverruns && overrunTable is not null)
         {
             bandOverrun?.Invoke();
+            ClusterInstruments.BandOverrun(overrunTable);
             throw new TransientRejectionException(
                 $"'{reducerName}' moves a row of '{overrunTable}' past this shard's border band before its handoff " +
                 "completed. The entity is being transferred to the shard it walked into; retry, and the write " +
@@ -386,6 +387,7 @@ internal static class ShardSpan
             shards.Add(executing.Value);
         if (shards.Count > 1)
         {
+            ClusterInstruments.SpanViolation(reducerName);
             throw new ShardSpanException(
                 $"Reducer '{reducerName}' writes rows resolving to more than one shard " +
                 $"({string.Join(", ", shards.Select(static s => $"shard:{s}"))}" +

@@ -49,6 +49,7 @@ public class BandOverrunTests
     [Fact]
     public void An_owned_entity_walking_past_the_band_is_refused_as_transient_and_counted()
     {
+        using var metrics = new MetricCapture("melange.shard.band_overruns");
         var (engine, root, overruns) = CreateEngine();
         try
         {
@@ -66,6 +67,7 @@ public class BandOverrunTests
             Assert.IsNotType<ShardSpanException>(refused);
             Assert.Equal(1, overruns());
             Assert.Equal(head, engine.Log.HeadLsn);
+            Assert.Contains(metrics.Of("melange.shard.band_overruns"), static m => (string?)m.Tags["table"] == "PlayerPos");
         }
         finally
         {

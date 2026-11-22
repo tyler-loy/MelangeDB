@@ -160,6 +160,8 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly System.Diagnostics.Metrics.Counter<long> _decommissions;
     private readonly System.Diagnostics.Metrics.Histogram<double> _heartbeatGap;
     private readonly System.Diagnostics.Metrics.Counter<long> _nodesDeclaredDead;
+    private readonly System.Diagnostics.Metrics.Histogram<double> _handoffDuration;
+    private readonly System.Diagnostics.Metrics.Counter<long> _handoffFailed;
 
     public HubRuntime(IServiceProvider services)
     {
@@ -209,6 +211,14 @@ internal sealed partial class HubRuntime : IDisposable
             "melange.cluster.nodes.declared_dead",
             unit: "{node}",
             description: "Shard nodes the hub declared dead, by reason: timeout, or link_lost under Cluster:FastFailoverOnLinkLoss.");
+        _handoffDuration = _capacityMeter.CreateHistogram<double>(
+            "melange.handoff.duration",
+            unit: "ms",
+            description: "A completed player transfer, from the saga's start to the origin's release answered: freeze, import, the gateway notification, and release.");
+        _handoffFailed = _capacityMeter.CreateCounter<long>(
+            "melange.handoff.failed",
+            unit: "{handoff}",
+            description: "Player transfers that did not complete, by reason: aborted (the destination refused; the player stays on the origin) or unresolved (the outcome is unknown; the player is frozen until a reconciler resolves it).");
     }
 
     public ClusterMetrics Metrics { get; } = new();
@@ -478,7 +488,9 @@ internal sealed partial class HubRuntime : IDisposable
                 Metrics.HandoffRelease.Record(Stopwatch.GetElapsedTime(releaseStarted));
             }
 
-            Metrics.HandoffSaga.Record(Stopwatch.GetElapsedTime(sagaStarted));
+            var sagaElapsed = Stopwatch.GetElapsedTime(sagaStarted);
+            Metrics.HandoffSaga.Record(sagaElapsed);
+            _handoffDuration.Record(sagaElapsed.TotalMilliseconds);
             LogHandoffCompleted(_logger, handoffId, player.ToString(), from.Value, to.Value);
         }
         finally
@@ -486,6 +498,8 @@ internal sealed partial class HubRuntime : IDisposable
             _sagas.TryRemove(handoffId, out _);
             _sagasByPlayer.TryRemove(new KeyValuePair<Identity, string>(player, handoffId));
             Metrics.HandoffEnded(completed, aborted, unresolved: !completed && !aborted);
+            if (!completed)
+                _handoffFailed.Add(1, new KeyValuePair<string, object?>("reason", aborted ? "aborted" : "unresolved"));
             if (completed || aborted)
                 Handoffs.NotifyClosed(player, from, to, completed);
 

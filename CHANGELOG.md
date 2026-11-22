@@ -40,6 +40,12 @@ All packages ship together at one version; there is no per-package versioning. S
   column masks, the anchor boundary under concurrent writes, resume against the same and a new
   log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
   checks. The C# client's adapter passes it on every build.
+- **The cluster metrics the docs listed but nothing emitted** (road-to-0.4 phase 31).
+  `melange.handoff.duration` (a completed transfer, start to release), `melange.handoff.failed`
+  (`reason`: `aborted` or `unresolved`), `melange.shard.owned` (per node) and
+  `melange.shard.span_violations` (by reducer) had been in [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)
+  since phase 09 without being implemented; they are now. New beside them,
+  `melange.shard.band_overruns` (by table) counts writes refused because an entity outran its handoff.
 - **`melange.subscription.rescope.duration`** (road-to-0.4 phase 31): a histogram of how long
   each re-scope held the write lock, by table. A client that moves its area of interest every step
   pays this per step; the load test now reports its share of the lock.

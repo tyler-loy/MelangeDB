@@ -299,10 +299,11 @@ Meter name: `MelangeDB`.
 | `melange.events.queue_depth` | gauge | `{event}` | — | 06 |
 | `melange.events.deadlettered` | counter | `{event}` | `event_type` | 06 |
 | `melange.archive.dead_lettered` | counter | `{row}` | `table` | 25 |
-| `melange.handoff.duration` | histogram | `ms` | — | 09 |
-| `melange.handoff.failed` | counter | `{handoff}` | `reason` | 09 |
-| `melange.shard.owned` | gauge | `{shard}` | — | 09 |
-| `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 |
+| `melange.handoff.duration` | histogram | `ms` | — | 09 (emitted from 31) |
+| `melange.handoff.failed` | counter | `{handoff}` | `reason` | 09 (emitted from 31) |
+| `melange.shard.owned` | gauge | `{shard}` | `node` | 09 (emitted from 31) |
+| `melange.shard.span_violations` | counter | `{tx}` | `reducer` | 09 (emitted from 31) |
+| `melange.shard.band_overruns` | counter | `{tx}` | `table` | 31 |
 | `melange.cluster.shard.utilization` | gauge | `{ratio}` | `shard`, `node` | 13 |
 | `melange.cluster.shard.resident_bytes` | gauge | `By` | `shard`, `node` | 13 |
 | `melange.cluster.shard.authoritative_rows` | gauge | `{row}` | `shard`, `node` | 13 |
@@ -399,8 +400,14 @@ corresponds to a documented silent failure mode:
   continuously observable. "Does a 20km world fit in 8GB" becomes a dashboard rather than an argument.
 - **`melange.scheduler.overruns`** — a tick overrunning its interval is how a simulation death-spirals under
   load. It needs to be visible before players feel it.
-- **`melange.shard.span_violations`** — the one contract MelangeDB cannot verify statically. Non-zero in
-  production means transactions are silently going distributed.
+- **`melange.shard.span_violations`** — the one contract MelangeDB cannot verify statically: transactions the
+  span check refused because their rows resolve to more than one shard. It counts only where the check runs
+  (`Cluster:ShardSpanCheck`: Debug builds by default, or `Always`), and a counted transaction was refused, not
+  committed. A Release build on the default records nothing here and commits such a transaction, so run a
+  staging or canary deployment with `Always` to watch for them.
+- **`melange.shard.band_overruns`** — an entity carried past its shard's border band before its handoff
+  landed; the write was refused as transient and the caller's retry lands on the destination. A steady rate
+  means handoffs are not keeping up with `Cluster:BorderBandChunks`.
 - **`melange.log.pinned_records`** — the log is the system of record, so anything that still needs old records
   keeps them, and a holder that stops checkpointing fills a disk with a log that will not compact. Alert on
   this one number; drill into `melange.log.truncation_floor`'s `floor` tag for the name.
