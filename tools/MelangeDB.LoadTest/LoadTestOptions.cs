@@ -134,6 +134,13 @@ public sealed class LoadTestOptions
     public int? AoiRadius { get; set; }
 
     /// <summary>
+    /// drive: every player roams inside the block it spawned in and never crosses into another
+    /// shard, so a run has no handoffs while everything else (steps, re-scopes, commits) carries on.
+    /// Seam walkers are off with it. Separates handoff cost from the rest of the game's shape.
+    /// </summary>
+    public bool StayInBlock { get; set; }
+
+    /// <summary>
     /// all: start the serve process with workstation GC (DOTNET_gcServer=0) instead of the Server GC
     /// the tool is built with, which is what a Web SDK host runs. Reproduces the measurements
     /// taken before phase 31.
@@ -232,6 +239,9 @@ public sealed class LoadTestOptions
                     continue;
                 case "--workstation-gc":
                     options.WorkstationGc = true;
+                    continue;
+                case "--stay-in-block":
+                    options.StayInBlock = true;
                     continue;
             }
 

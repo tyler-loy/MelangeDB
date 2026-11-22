@@ -160,6 +160,8 @@ internal sealed partial class HubRuntime : IDisposable
     private readonly System.Diagnostics.Metrics.Counter<long> _decommissions;
     private readonly System.Diagnostics.Metrics.Histogram<double> _heartbeatGap;
     private readonly System.Diagnostics.Metrics.Counter<long> _nodesDeclaredDead;
+    private readonly System.Diagnostics.Metrics.Histogram<double> _handoffDuration;
+    private readonly System.Diagnostics.Metrics.Counter<long> _handoffFailed;
 
     public HubRuntime(IServiceProvider services)
     {
@@ -209,6 +211,14 @@ internal sealed partial class HubRuntime : IDisposable
             "melange.cluster.nodes.declared_dead",
             unit: "{node}",
             description: "Shard nodes the hub declared dead, by reason: timeout, or link_lost under Cluster:FastFailoverOnLinkLoss.");
+        _handoffDuration = _capacityMeter.CreateHistogram<double>(
+            "melange.handoff.duration",
+            unit: "ms",
+            description: "A completed player transfer, from the saga's start to the origin's release answered: freeze, import, the gateway notification, and release.");
+        _handoffFailed = _capacityMeter.CreateCounter<long>(
+            "melange.handoff.failed",
+            unit: "{handoff}",
+            description: "Player transfers that did not complete, by reason: aborted (the destination refused; the player stays on the origin) or unresolved (the outcome is unknown; the player is frozen until a reconciler resolves it).");
     }
 
     public ClusterMetrics Metrics { get; } = new();
@@ -389,6 +399,7 @@ internal sealed partial class HubRuntime : IDisposable
             throw new InvalidOperationException($"A transfer is already in flight for {player}; one entity, one saga at a time.");
         _sagas[handoffId] = new Saga(handoffId, player, from, to);
         _lastHandoffStartTicks[player] = _time.GetUtcNow().UtcTicks;
+        var sagaStarted = Stopwatch.GetTimestamp();
         Metrics.HandoffStarted();
         Handoffs.NotifyStarted(player, from, to);
         var completed = false;
@@ -404,10 +415,12 @@ internal sealed partial class HubRuntime : IDisposable
             WireOp[] rows = [];
             if (origin is not null && originLink is not null)
             {
+                var freezeStarted = Stopwatch.GetTimestamp();
                 var frozen = await originLink.RequestAsync(
                     "handoff-freeze",
                     new HandoffFreeze(handoffId, from.Value, to.Value, origin.FencingToken, player.ToString()),
                     ct).ConfigureAwait(false);
+                Metrics.HandoffFreeze.Record(Stopwatch.GetElapsedTime(freezeStarted));
                 rows = frozen!.Value.Deserialize<HandoffFrozenRows>()!.Rows;
             }
 
@@ -417,6 +430,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             if (HandoffStepHook is { } beforeImport)
                 await beforeImport("import").ConfigureAwait(false);
+            var importStarted = Stopwatch.GetTimestamp();
             try
             {
                 await destinationLink.RequestAsync(
@@ -458,17 +472,25 @@ internal sealed partial class HubRuntime : IDisposable
             // The destination's import is durable: it owns the player from this instant. The
             // session map flips and the gateways swap BEFORE the release is requested, so the
             // release's row deletions on the origin can never reach a client still attached there.
+            Metrics.HandoffImport.Record(Stopwatch.GetElapsedTime(importStarted));
             completed = true;
+            var notifyStarted = Stopwatch.GetTimestamp();
             NotifyTransferred(player, from, to);
+            Metrics.HandoffNotify.Record(Stopwatch.GetElapsedTime(notifyStarted));
 
             if (originLink is not null && origin is not null)
             {
                 if (HandoffStepHook is { } beforeRelease)
                     await beforeRelease("release").ConfigureAwait(false);
+                var releaseStarted = Stopwatch.GetTimestamp();
                 await originLink.RequestAsync(
                     "handoff-release", new HandoffRelease(handoffId, from.Value, origin.FencingToken), ct).ConfigureAwait(false);
+                Metrics.HandoffRelease.Record(Stopwatch.GetElapsedTime(releaseStarted));
             }
 
+            var sagaElapsed = Stopwatch.GetElapsedTime(sagaStarted);
+            Metrics.HandoffSaga.Record(sagaElapsed);
+            _handoffDuration.Record(sagaElapsed.TotalMilliseconds);
             LogHandoffCompleted(_logger, handoffId, player.ToString(), from.Value, to.Value);
         }
         finally
@@ -476,6 +498,8 @@ internal sealed partial class HubRuntime : IDisposable
             _sagas.TryRemove(handoffId, out _);
             _sagasByPlayer.TryRemove(new KeyValuePair<Identity, string>(player, handoffId));
             Metrics.HandoffEnded(completed, aborted, unresolved: !completed && !aborted);
+            if (!completed)
+                _handoffFailed.Add(1, new KeyValuePair<string, object?>("reason", aborted ? "aborted" : "unresolved"));
             if (completed || aborted)
                 Handoffs.NotifyClosed(player, from, to, completed);
 

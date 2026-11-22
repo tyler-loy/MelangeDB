@@ -49,6 +49,23 @@ public enum ShardSpanCheckMode
     Off,
 }
 
+/// <summary>How a gateway reaches shard nodes for its players (<c>Cluster:GatewayUpstream</c>).</summary>
+public enum GatewayUpstreamMode
+{
+    /// <summary>
+    /// One websocket per shard node, carrying every player's session as a stream of its own. A
+    /// handoff opens a session, not a connection, so it costs no local port and leaves nothing in
+    /// TIME_WAIT. The default.
+    /// </summary>
+    Shared,
+
+    /// <summary>
+    /// One websocket per player per node, as before phase 31. Each handoff closes one and opens
+    /// another. Kept so a deployment can step back without a release.
+    /// </summary>
+    PerSession,
+}
+
 /// <summary>
 /// Clustering options (<c>MelangeDb:Cluster:*</c>). Everything here is restart-only: a node's
 /// role, name, and addresses are its identity in the cluster, and changing them live would be a
@@ -138,6 +155,9 @@ public sealed class ClusterOptions
 
     /// <summary>See <see cref="ShardSpanCheckMode"/>.</summary>
     public ShardSpanCheckMode ShardSpanCheck { get; set; } = ShardSpanCheckMode.DebugOnly;
+
+    /// <summary>Hub only. See <see cref="GatewayUpstreamMode"/>. Read per connect, so a change applies to new sessions.</summary>
+    public GatewayUpstreamMode GatewayUpstream { get; set; } = GatewayUpstreamMode.Shared;
 
     /// <summary>
     /// Shard only: the directory per-shard engines root their commit logs and hot stores under;

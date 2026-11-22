@@ -20,6 +20,7 @@ internal sealed class ServerTelemetry : IDisposable
     private readonly Counter<long> _rowsFiltered;
     private readonly Counter<long> _backupBytes;
     private readonly Histogram<double> _backupDuration;
+    private readonly Histogram<double> _rescopeDuration;
 
     public ServerTelemetry(
         Func<TelemetryOptions> options,
@@ -33,6 +34,10 @@ internal sealed class ServerTelemetry : IDisposable
         _rowsFiltered = _meter.CreateCounter<long>("melange.policy.rows_filtered", "{row}", "Rows a row policy hid from a subscribed client.");
         _backupBytes = _meter.CreateCounter<long>("melange.backup.bytes", "By", "Archive bytes streamed by the online backup endpoint.");
         _backupDuration = _meter.CreateHistogram<double>("melange.backup.duration", "ms", "Online backup stream duration — also the truncation pin's hold time, which is why it is worth watching.");
+        _rescopeDuration = _meter.CreateHistogram<double>(
+            "melange.subscription.rescope.duration",
+            "ms",
+            "Time a re-scope held the write lock: compiling the new scope and diffing the rows it leaves and enters. Every commit on the engine waits behind it.");
         _meter.CreateObservableGauge("melange.connections.active", () => (long)activeConnections(), "{conn}", "Live websocket connections.");
         _meter.CreateObservableGauge(
             "melange.subscriptions.active",
@@ -70,6 +75,9 @@ internal sealed class ServerTelemetry : IDisposable
 
     public void RecordRejected(string reason) =>
         _rejected.Add(1, new KeyValuePair<string, object?>("reason", reason));
+
+    public void RecordRescope(string table, double milliseconds) =>
+        _rescopeDuration.Record(milliseconds, new KeyValuePair<string, object?>("table", table));
 
     public void RecordRowsFiltered(string table, int rows) =>
         _rowsFiltered.Add(rows, new KeyValuePair<string, object?>("table", table));

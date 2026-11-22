@@ -248,6 +248,126 @@ public class SeamlessWalkTests
     }
 
     [Fact]
+    public async Task A_completed_handoff_is_timed_and_each_node_reports_the_shards_it_owns()
+    {
+        using var metrics = new MetricCapture("melange.handoff.duration", "melange.shard.owned");
+        await using var cluster = await StartAsync(shardNodes: 2);
+        await SeedTerrainAsync(cluster, 0);
+        await SeedTerrainAsync(cluster, 1);
+        await using var client = cluster.CreateClient(TestTokens.For("timed-walker"));
+        var player = TestTokens.IdentityOf("timed-walker");
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await MoveAsync(client, Chunks.Id(3, 2));
+        await MoveAsync(client, Chunks.Id(4, 2));
+        await MoveAsync(client, Chunks.Id(5, 2));
+        await ClusterFixture.WaitUntilAsync(
+            () => cluster.ShardOf(BlockB).Engine.CommittedView.Find<PlayerPos>(player) is { } pos
+                && cluster.ShardOf(BlockB).BorrowedOwnerOf(
+                    cluster.ShardOf(BlockB).Engine.Schema.Get(typeof(PlayerPos)).Id,
+                    SchemaKeyCodec.Encode(cluster.ShardOf(BlockB).Engine.Schema.Get(typeof(PlayerPos)).PrimaryKey, player)) is null
+                && metrics.Of("melange.handoff.duration").Any(),
+            "the transfer completed and was timed");
+
+        Assert.All(metrics.Of("melange.handoff.duration"), static m => Assert.True(m.Value > 0));
+
+        metrics.Observe();
+        var nodeNames = cluster.Nodes.Select(static n => n.Name).ToHashSet();
+        var owned = metrics.Of("melange.shard.owned")
+            .Where(m => m.Tags.TryGetValue("node", out var node) && node is string name && nodeNames.Contains(name))
+            .ToList();
+        Assert.NotEmpty(owned);
+        Assert.True(owned.Sum(static m => m.Value) >= 2, "the two seeded blocks are owned by this cluster's nodes");
+    }
+
+    [Fact]
+    public async Task A_handoff_that_cannot_finish_counts_as_failed_with_its_reason()
+    {
+        using var metrics = new MetricCapture("melange.handoff.failed");
+        await using var cluster = await StartAsync(shardNodes: 2);
+        await SeedTerrainAsync(cluster, 0);
+        await SeedTerrainAsync(cluster, 1);
+        await using var client = cluster.CreateClient(TestTokens.For("stuck-walker"));
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.CallReducerAsync("Move", [Chunks.Id(3, 2)], TestContext.Current.CancellationToken);
+
+        // The hub loses the import's answer: the outcome is unknown, so the origin keeps its freeze
+        // and the saga ends unresolved.
+        cluster.Hub.HandoffStepHook = static step => step == "import"
+            ? throw new TimeoutException("the import's answer was lost")
+            : Task.CompletedTask;
+        try
+        {
+            await client.CallReducerAsync("Move", [Chunks.Id(4, 2)], TestContext.Current.CancellationToken);
+            await client.CallReducerAsync("Move", [Chunks.Id(5, 2)], TestContext.Current.CancellationToken);
+            await ClusterFixture.WaitUntilAsync(
+                () => metrics.Of("melange.handoff.failed").Any(), "the stuck transfer was counted");
+        }
+        finally
+        {
+            cluster.Hub.HandoffStepHook = null;
+        }
+
+        Assert.Contains(metrics.Of("melange.handoff.failed"), static m => (string?)m.Tags["reason"] == "unresolved");
+    }
+
+    [Fact]
+    public async Task A_call_past_the_gateways_held_call_cap_is_refused_as_transient()
+    {
+        await using var cluster = await StartAsync(shardNodes: 2);
+        await SeedTerrainAsync(cluster, 0);
+        await SeedTerrainAsync(cluster, 1);
+        await using var client = cluster.CreateClient(TestTokens.For("capped-walker"));
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        await client.CallReducerAsync("Move", [Chunks.Id(3, 2)], TestContext.Current.CancellationToken);
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reachedImport = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        cluster.Hub.HandoffStepHook = async step =>
+        {
+            if (step == "import")
+            {
+                reachedImport.TrySetResult();
+                await gate.Task;
+            }
+        };
+        List<Task> calls = [];
+        try
+        {
+            await client.CallReducerAsync("Move", [Chunks.Id(4, 2)], TestContext.Current.CancellationToken);
+            await client.CallReducerAsync("Move", [Chunks.Id(5, 2)], TestContext.Current.CancellationToken);
+            await reachedImport.Task.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(15)), TestContext.Current.CancellationToken);
+
+            // The gateway holds 256 calls for a transfer. One more is refused at once, and nothing
+            // was sent anywhere, so it is a retry, not an internal failure.
+            for (var i = 0; i < 257; i++)
+                calls.Add(client.CallReducerAsync("Move", [Chunks.Id(5, 2)], TestContext.Current.CancellationToken));
+            var refused = await Assert.ThrowsAsync<MelangeCallException>(() => calls[^1]
+                .WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(15)), TestContext.Current.CancellationToken));
+            Assert.Equal(MelangeErrorCodes.Transient, refused.Code);
+            Assert.True(refused.IsTransient);
+        }
+        finally
+        {
+            gate.TrySetResult();
+            cluster.Hub.HandoffStepHook = null;
+        }
+
+        // The held ones replay on the destination once the transfer lands. Some may be refused
+        // there (the replay is a burst the per-identity rate limit can see), but none is lost.
+        foreach (var call in calls[..^1])
+        {
+            try
+            {
+                await call.WaitAsync(TestTime.Dilated(TimeSpan.FromSeconds(30)), TestContext.Current.CancellationToken);
+            }
+            catch (MelangeCallException exception)
+            {
+                Assert.NotEqual(MelangeErrorCodes.Internal, exception.Code);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Killing_the_destination_mid_handoff_leaves_the_player_on_the_origin_alive_and_playable()
     {
         await using var cluster = await StartAsync(shardNodes: 2);

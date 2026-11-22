@@ -245,8 +245,14 @@ public static class MelangeClusterEndpointRouteBuilderExtensions
         var options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
         // Unconstrained, parsed as ulong below: a :long constraint refused every key with the top
         // bit set, which SpatialShardStrategy gives every block with a negative x coordinate.
-        var path = (basePath ?? options.CurrentValue.Transport.Path).TrimEnd('/') + "/shard/{shardKey}";
-        return endpoints.Map(path, context => HandleShardSocketAsync(context, services));
+        var root = (basePath ?? options.CurrentValue.Transport.Path).TrimEnd('/');
+        var perSession = endpoints.Map(root + "/shard/{shardKey}", context => HandleShardSocketAsync(context, services));
+
+        // The shared upstream (Cluster:GatewayUpstream = Shared): one link from each gateway,
+        // carrying its players' sessions. Served beside the per-session route so a gateway on either
+        // setting works against any node.
+        var shared = endpoints.Map(root + "/mux", context => HandleMuxLinkAsync(context, services));
+        return new CompositeEndpointConventionBuilder([perSession, shared]);
     }
 
     private static async Task HandleGatewayAsync(HttpContext context, GatewayRuntime gateway)
@@ -260,6 +266,66 @@ public static class MelangeClusterEndpointRouteBuilderExtensions
 
         using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
         await new GatewayConnection(socket, gateway).RunAsync(context.RequestAborted).ConfigureAwait(false);
+    }
+
+    private static async Task HandleMuxLinkAsync(HttpContext context, IServiceProvider services)
+    {
+        if (!context.WebSockets.IsWebSocketRequest)
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsync("This endpoint speaks the MelangeDB gateway link protocol.").ConfigureAwait(false);
+            return;
+        }
+
+        var node = services.GetRequiredService<ShardNodeRuntime>();
+        var protocol = context.Request.Protocol;
+
+        // The link is a request that lasts as long as the gateway does. Kestrel's graceful stop
+        // waits for in-flight requests, so the link must end when the host starts stopping, not
+        // when the shutdown timeout aborts it: per-session sockets ended with their connections,
+        // which the node closes as it stops, but the link outlives every session on it.
+        var stopping = services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>()?.ApplicationStopping
+            ?? CancellationToken.None;
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, stopping);
+        var requestAborted = lifetime.Token;
+        using var socket = await context.WebSockets.AcceptWebSocketAsync().ConfigureAwait(false);
+
+        // Each session the gateway opens runs exactly as a per-session socket did: a connection
+        // on the shard's transport, authenticated by its own Hello. A shard this node does not own
+        // is refused the way the per-session route refuses it, so the gateway retries elsewhere.
+        await using var link = MuxLink.Server(socket, async (session, shardValue) =>
+        {
+            if (node.TryGetShard(new ShardKey(shardValue)) is not { } shard)
+            {
+                await session.CloseOutputAsync(
+                    System.Net.WebSockets.WebSocketCloseStatus.PolicyViolation,
+                    $"This node does not own shard:{shardValue}.",
+                    CancellationToken.None).ConfigureAwait(false);
+                return;
+            }
+
+            try
+            {
+                var connection = new MelangeSocketConnection(session, shard.Transport, protocol);
+                shard.Transport.OnConnectionOpened(connection);
+                await connection.RunAsync(requestAborted).ConfigureAwait(false);
+            }
+            finally
+            {
+                // A per-session socket is disposed by its request; this one by its connection's
+                // end, so a half-closed session does not stay in the link's table.
+                session.Dispose();
+            }
+        });
+        link.Start();
+        try
+        {
+            await link.Completion.WaitAsync(requestAborted).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // The node is stopping; disposing the link drops its sessions.
+        }
     }
 
     private static async Task HandleShardSocketAsync(HttpContext context, IServiceProvider services)
@@ -290,5 +356,21 @@ public static class MelangeClusterEndpointRouteBuilderExtensions
         var connection = new MelangeSocketConnection(socket, shard.Transport, context.Request.Protocol);
         shard.Transport.OnConnectionOpened(connection);
         await connection.RunAsync(context.RequestAborted).ConfigureAwait(false);
+    }
+}
+
+/// <summary>Applies an endpoint convention to several endpoints mapped as one feature.</summary>
+internal sealed class CompositeEndpointConventionBuilder(IReadOnlyList<IEndpointConventionBuilder> builders) : IEndpointConventionBuilder
+{
+    public void Add(Action<EndpointBuilder> convention)
+    {
+        foreach (var builder in builders)
+            builder.Add(convention);
+    }
+
+    public void Finally(Action<EndpointBuilder> finallyConvention)
+    {
+        foreach (var builder in builders)
+            builder.Finally(finallyConvention);
     }
 }

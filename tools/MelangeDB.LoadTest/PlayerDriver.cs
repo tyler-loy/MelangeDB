@@ -48,6 +48,10 @@ internal sealed class PlayerDriver : IAsyncDisposable
     private int _dirStepsLeft;
     private readonly int _seamBoundary; // First chunk column (or row) of the far block.
     private readonly bool _seamVertical;
+    private readonly int _minX;
+    private readonly int _maxX;
+    private readonly int _minY;
+    private readonly int _maxY;
 
     public PlayerDriver(int index, LoadTestOptions options, DriveMetrics metrics)
     {
@@ -66,15 +70,16 @@ internal sealed class PlayerDriver : IAsyncDisposable
             if (!_stopped)
                 _metrics.Disconnected();
         };
-        _client.OnError += _ =>
+        _client.OnError += error =>
         {
             if (!_stopped)
-                _metrics.ResyncError();
+                _metrics.ResyncError(error.Code);
         };
 
         _mover = options.Movers is not { } movers || index < movers;
         _seamVertical = options.WorldBlocksX > 1;
-        _seamWalker = index < options.Players * options.SeamFraction && (options.WorldBlocksX > 1 || options.WorldBlocksY > 1);
+        _seamWalker = !options.StayInBlock
+            && index < options.Players * options.SeamFraction && (options.WorldBlocksX > 1 || options.WorldBlocksY > 1);
         if (_seamWalker)
         {
             // Oscillate across one block boundary, one chunk past the hysteresis margin each
@@ -92,6 +97,12 @@ internal sealed class PlayerDriver : IAsyncDisposable
             _cy = _random.Next(options.WorldChunksY);
             PickRoamDirection();
         }
+
+        // --stay-in-block: the roam is clamped to the spawn block, so the player never leaves its shard.
+        (_minX, _maxX, _minY, _maxY) = options.StayInBlock
+            ? (_cx / options.BlockChunksX * options.BlockChunksX, (_cx / options.BlockChunksX + 1) * options.BlockChunksX - 1,
+               _cy / options.BlockChunksY * options.BlockChunksY, (_cy / options.BlockChunksY + 1) * options.BlockChunksY - 1)
+            : (0, options.WorldChunksX - 1, 0, options.WorldChunksY - 1);
     }
 
     public long BytesReceived => _client.BytesReceived;
@@ -183,13 +194,13 @@ internal sealed class PlayerDriver : IAsyncDisposable
             await _client.CallReducerAsync("Move", [chunkId, seq]).ConfigureAwait(false);
             _metrics.CallAcked(epoch);
         }
-        catch (MelangeCallException)
+        catch (MelangeCallException exception)
         {
             // Rejected — typically a write past the band while a transfer catches up, or the
             // gateway's held-call cap during a wedged transfer. The walk continues; the next
             // tick retries the position.
             _pendingSentAt.TryRemove(seq, out _);
-            _metrics.CallRejected(epoch);
+            _metrics.CallRejected(epoch, exception.Code);
         }
         catch (Exception)
         {
@@ -273,10 +284,13 @@ internal sealed class PlayerDriver : IAsyncDisposable
 
             _metrics.Rescoped();
         }
-        catch (Exception)
+        catch (Exception exception)
         {
             if (!_stopped)
+            {
                 _metrics.TransportError(_metrics.Epoch);
+                _metrics.RescopeFailed(exception is MelangeCallException call ? call.Code : exception.GetType().Name);
+            }
         }
     }
 
@@ -344,12 +358,12 @@ internal sealed class PlayerDriver : IAsyncDisposable
     {
         if (_dirStepsLeft <= 0)
             PickRoamDirection();
-        var nx = Math.Clamp(_cx + _dirX, 0, _options.WorldChunksX - 1);
-        var ny = Math.Clamp(_cy + _dirY, 0, _options.WorldChunksY - 1);
+        var nx = Math.Clamp(_cx + _dirX, _minX, _maxX);
+        var ny = Math.Clamp(_cy + _dirY, _minY, _maxY);
         if (nx == _cx && ny == _cy)
         {
             PickRoamDirection();
-            return; // Against the world edge; step next tick in the new direction.
+            return; // Against the world's (or the block's) edge; step next tick in the new direction.
         }
 
         (_cx, _cy) = (nx, ny);

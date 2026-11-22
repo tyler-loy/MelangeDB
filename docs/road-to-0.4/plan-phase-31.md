@@ -174,6 +174,87 @@ numbers.
 - **Conflation (step 3) is less pressing than it looked.** It was aimed at delivered rows; the
   whole-shard shape now delivers 1.7 million a second before its knee.
 
+### The game's wall, measured (2026-11-22)
+
+The owner asked for the measurement first. It ruled re-scoping out: re-scopes take 2-4% of locked
+time at about 10 µs each, and no shard's write lock is more than 18% busy. With handoffs off
+(`--stay-in-block`), 1,200 players pass with no rejections and deliver 585k rows a second. The
+wall is handoffs, and the time goes in two places:
+
+1. **Every saga round trip slows from about 45 ms to about 160 ms** at 1,200 players, waiting in
+   a thread pool that holds thousands of queued items while the process uses 12 of 32 cores.
+2. **The gateway's swap has a tail of tens of seconds:** it waits for a destination session when
+   the pre-opened one is missing, and for the connection's attachment lock, which
+   `EnsureShardUpstreamAsync` holds across a connect.
+
+The client-visible failures follow from the long holds: replayed bursts trip the per-player rate
+limit, players walk past the band (refused as a span violation, reported as `internal`), and the
+held-call cap answers `internal` though it means "retry". Full tables in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
+The fix is not one contained change. Candidates, for the owner:
+
+- **Small and clearly right:** answer the held-call cap with `transient`, not `internal`; and treat
+  an owned entity's write past the band as a transient rejection (its handoff is behind) rather
+  than a span violation.
+- **The gateway:** never connect while holding the attachment lock, and make the swap not depend
+  on a per-player connection succeeding in time (pre-open reliably, or share an upstream per node).
+- **Replay:** held calls should not reach the rate limiter as a burst the player never sent.
+- **The saga's waits:** answer handoff requests off the shared pool, as phase 30 did for the
+  liveness ping, then re-measure to see how much of the pool backlog is the one-process harness.
+
+### Fixes 1 and 2 built (2026-11-22)
+
+The owner took the recommendation: fix 1 (transient codes) and fix 2 (the gateway), then
+re-measure. Fix 2 found two more gateway bugs on the way (a mid-transfer attach that bypassed the
+swap, and pre-opened sessions never closed). At 1,200 players rejections fell from 44,721 to 11,487
+and resync errors from 2 to 1; at 1,600, rejections fell tenfold. Results and what remains in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
+The next levers are fix 3 (a client's frames should not wait behind one slow subscription) and an
+upstream shared per node instead of one per player.
+
+### Next: one upstream link per gateway and node (decided 2026-11-22)
+
+The owner chose to remove per-player upstream sockets rather than tune around them. After the
+gateway fixes, each handoff still closed one per-player socket and opened another, about 90 a
+second at 1,200 players, and each closed socket held a local port for two minutes (TIME_WAIT):
+11,000-14,000 ports against Windows' 16,384, so connects at swap time still ran to seconds. A real
+gateway host has the same limit per destination node.
+
+**Design.** A gateway keeps one websocket per shard node, at a new node endpoint
+`{Transport:Path}/mux`, and carries every player's session over it as a numbered stream:
+
+- **Each end sees a `WebSocket`.** A session is a virtual `WebSocket` on both sides, so the gateway's
+  `UpstreamSession` and the node's `MelangeSocketConnection` run unchanged on top of it, Hello and
+  the hub-minted assertion included. Authentication is exactly what it is today: the link carries
+  sessions, and each session proves its identity as before.
+- **Envelopes.** One binary websocket message per envelope: a kind (open, data, close, abort,
+  credit) and a session id, then the payload. A session's messages are cut into chunks of at most
+  16 KiB, so one player's large initial set does not hold the link for the others.
+- **Flow control per session.** Each direction of each session has a 256 KiB window of unacknowledged
+  bytes; the receiver grants credit as its reader consumes. A slow client therefore backs up only
+  its own session: the node's send loop for that player waits on credit, its queue grows, and the
+  existing slow-consumer policy (`Subscriptions:MaxBufferedBytes`, `overflow_resync`) applies, as
+  it did when TCP backpressure did the same job per socket. No one player can stall the link.
+- **Failure.** If the link drops, every session on it reads as a dropped connection, exactly what
+  the node's death looks like today; the gateway reconnects the link on next use.
+- **Fallback.** `Cluster:GatewayUpstream` = `Shared` (default) or `PerSession` (the old behavior),
+  so a deployment can step back without a release.
+
+**Steps.** (A) the link and the virtual socket, with unit tests over real websockets; (B) the node
+endpoint, the gateway's link pool and the option, with the cluster tests run both ways; (C)
+re-measure the game shape and update the docs.
+
+### The shared link, measured (2026-11-22)
+
+Built as designed above. The game's shape at 1,200 players passes with no rejected calls, no
+resync errors and 483k delta rows a second (per-session upstreams: 11,487 rejected, 1 resync
+error, 382k), and handoffs take 95 ms. At 1,600 it passes the tool's checks but degrades: swaps
+wait about 2 s for their destination session, whose handshake answer queues on the link behind
+other sessions' deltas. A fair writer (control first, sessions in turn) measured far worse and was
+not kept; that and the driver's own socket ceiling near 2,000 clients on one machine are where the
+next look starts. Details in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
+
 ## Steps 3 to 5
 
 Unchanged from the [README](README.md#ordering): conflation for position-like tables, read-side

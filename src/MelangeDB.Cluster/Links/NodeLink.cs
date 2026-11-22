@@ -191,6 +191,125 @@ public sealed class ClusterMetrics
     internal void NodeDeclaredDead() => Interlocked.Increment(ref _nodesDeclaredDead);
 
     internal void LeaseLapsed() => Interlocked.Increment(ref _leaseLapses);
+
+    // ---- Handoff timing (phase 31): where a transfer's time goes under load. ----
+
+    /// <summary>Hub: the freeze request to the origin, sent to answered.</summary>
+    public StepDurations HandoffFreeze { get; } = new();
+
+    /// <summary>Hub: the import request to the destination, sent to durably answered.</summary>
+    public StepDurations HandoffImport { get; } = new();
+
+    /// <summary>Hub: the destination-authoritative notification (transfer listeners, gateway mutes).</summary>
+    public StepDurations HandoffNotify { get; } = new();
+
+    /// <summary>Hub: the release request to the origin, sent to answered.</summary>
+    public StepDurations HandoffRelease { get; } = new();
+
+    /// <summary>Hub: a completed saga, start to release answered.</summary>
+    public StepDurations HandoffSaga { get; } = new();
+
+    /// <summary>
+    /// Hub (gateway): how long a client connection held its shard-bound calls for a transfer, from
+    /// the saga's start to the swap flushing them on the destination.
+    /// </summary>
+    public StepDurations GatewayHold { get; } = new();
+
+    /// <summary>Hub (gateway): calls held per completed swap: the burst the destination receives at once.</summary>
+    public StepDurations GatewayHeldCalls { get; } = new();
+
+    /// <summary>Hub (gateway): a swap's wait for the connection's attachment lock.</summary>
+    public StepDurations GatewaySwapLockWait { get; } = new();
+
+    /// <summary>Hub (gateway): a swap's wait for its destination session, pre-opened or connected then.</summary>
+    public StepDurations GatewaySwapConnect { get; } = new();
+
+    private long _gatewaySwapsPreopened;
+    private long _gatewaySwapsConnected;
+
+    /// <summary>Hub (gateway): swaps that used a session pre-opened on approach.</summary>
+    public long GatewaySwapsPreopened => Interlocked.Read(ref _gatewaySwapsPreopened);
+
+    /// <summary>Hub (gateway): swaps that had to connect to the destination then (no pre-open, or it failed).</summary>
+    public long GatewaySwapsConnected => Interlocked.Read(ref _gatewaySwapsConnected);
+
+    internal void GatewaySwapSession(bool preopened) =>
+        Interlocked.Increment(ref preopened ? ref _gatewaySwapsPreopened : ref _gatewaySwapsConnected);
+
+    /// <summary>
+    /// Shard node: how long a crossing signal (an entity past a boundary) waited in its shard's
+    /// boundary monitor queue before the monitor looked at it.
+    /// </summary>
+    public StepDurations BoundaryCrossingWait { get; } = new();
+
+    private long _boundarySignalsDropped;
+    private long _boundaryCrossingsDropped;
+
+    /// <summary>Shard node: boundary signals the monitor queue dropped, full, to make room.</summary>
+    public long BoundarySignalsDropped => Interlocked.Read(ref _boundarySignalsDropped);
+
+    /// <summary>Shard node: of those, crossing signals (handoff triggers) rather than approaches.</summary>
+    public long BoundaryCrossingsDropped => Interlocked.Read(ref _boundaryCrossingsDropped);
+
+    internal void BoundarySignalDropped(bool crossing)
+    {
+        Interlocked.Increment(ref _boundarySignalsDropped);
+        if (crossing)
+            Interlocked.Increment(ref _boundaryCrossingsDropped);
+    }
+}
+
+/// <summary>
+/// A running record of one step's durations (or, for <see cref="ClusterMetrics.GatewayHeldCalls"/>,
+/// counts): how many, their total, the largest, and how many exceeded each of a fixed set of thresholds.
+/// </summary>
+public sealed class StepDurations
+{
+    /// <summary>The thresholds <see cref="Over"/> counts against.</summary>
+    public static IReadOnlyList<int> Thresholds { get; } = [10, 50, 100, 250, 500, 1_000, 2_000, 5_000];
+
+    private readonly long[] _over = new long[Thresholds.Count];
+    private long _count;
+    private long _totalMicros;
+    private long _maxMicros;
+
+    public long Count => Interlocked.Read(ref _count);
+
+    public double TotalMs => Interlocked.Read(ref _totalMicros) / 1000d;
+
+    public double MaxMs => Interlocked.Read(ref _maxMicros) / 1000d;
+
+    /// <summary>Records longer than <paramref name="threshold"/>, which must be one of <see cref="Thresholds"/>.</summary>
+    public long Over(int threshold)
+    {
+        for (var i = 0; i < Thresholds.Count; i++)
+        {
+            if (Thresholds[i] == threshold)
+                return Interlocked.Read(ref _over[i]);
+        }
+
+        throw new ArgumentOutOfRangeException(nameof(threshold), threshold, "Not one of StepDurations.Thresholds.");
+    }
+
+    internal void Record(TimeSpan duration) => Record(duration.TotalMilliseconds);
+
+    internal void Record(double value)
+    {
+        Interlocked.Increment(ref _count);
+        var micros = (long)(value * 1000);
+        Interlocked.Add(ref _totalMicros, micros);
+        long current;
+        do
+        {
+            current = Interlocked.Read(ref _maxMicros);
+            if (micros <= current)
+                break;
+        }
+        while (Interlocked.CompareExchange(ref _maxMicros, micros, current) != current);
+
+        for (var i = 0; i < Thresholds.Count && value > Thresholds[i]; i++)
+            Interlocked.Increment(ref _over[i]);
+    }
 }
 
 /// <summary>

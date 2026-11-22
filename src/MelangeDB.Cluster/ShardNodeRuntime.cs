@@ -127,6 +127,20 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             "melange.cluster.lease.lapses",
             unit: "{lapse}",
             description: "Times a shard node's lease lapsed and it parked its shards.");
+        _livenessMeter.CreateObservableGauge(
+            "melange.shard.owned",
+            () =>
+            {
+                int owned;
+                lock (_shardsLock)
+                {
+                    owned = _shards.Count;
+                }
+
+                return new System.Diagnostics.Metrics.Measurement<long>(owned, new KeyValuePair<string, object?>("node", NodeName));
+            },
+            unit: "{shard}",
+            description: "Shards this node currently owns and serves, tagged by node.");
     }
 
     public ClusterMetrics Metrics { get; } = new();
@@ -883,7 +897,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 var monitor = new BoundaryMonitor(
                     runtime.Engine, shard, strategy, anchors,
                     () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, runtime.IsFrozen,
-                    _options, _time);
+                    _options, _time, Metrics);
                 _boundaryMonitors[shard] = monitor;
                 monitor.Start();
             }

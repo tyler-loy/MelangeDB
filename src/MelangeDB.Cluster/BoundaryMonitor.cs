@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading.Channels;
 using MelangeDB.Core;
 using Microsoft.Extensions.Options;
@@ -17,7 +18,7 @@ namespace MelangeDB.Cluster;
 /// </summary>
 internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
 {
-    private readonly record struct Signal(MigrationAnchor Anchor, BoundaryAssessment Assessment);
+    private readonly record struct Signal(MigrationAnchor Anchor, BoundaryAssessment Assessment, long QueuedAt);
 
     private readonly MelangeEngine _engine;
     private readonly ShardKey _shard;
@@ -30,8 +31,8 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
     private readonly Func<TableId, RowKey, bool> _isFrozen;
     private readonly IOptionsMonitor<MelangeDbOptions> _options;
     private readonly TimeProvider _time;
-    private readonly Channel<Signal> _signals = Channel.CreateBounded<Signal>(
-        new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly Channel<Signal> _signals;
+    private readonly ClusterMetrics? _metrics;
     private readonly Dictionary<Identity, long> _lastRequestTicks = [];
     private readonly Dictionary<(Identity, ShardKey), long> _lastApproachTicks = [];
 
@@ -73,8 +74,13 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
         Func<TableId, RowKey, ulong?> borrowedOwner,
         Func<TableId, RowKey, bool> isFrozen,
         IOptionsMonitor<MelangeDbOptions> options,
-        TimeProvider time)
+        TimeProvider time,
+        ClusterMetrics? metrics = null)
     {
+        _metrics = metrics;
+        _signals = Channel.CreateBounded<Signal>(
+            new BoundedChannelOptions(1024) { FullMode = BoundedChannelFullMode.DropOldest },
+            dropped => _metrics?.BoundarySignalDropped(dropped.Assessment.CrossedInto is not null));
         _isFrozen = isFrozen;
         _engine = engine;
         _shard = shard;
@@ -131,7 +137,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
             }
 
             if (assessment.CrossedInto is not null || assessment.Approaching.Count > 0)
-                _signals.Writer.TryWrite(new Signal(anchor, assessment));
+                _signals.Writer.TryWrite(new Signal(anchor, assessment, Stopwatch.GetTimestamp()));
         }
     }
 
@@ -161,7 +167,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
                         _strays[anchor.Id] = (table.Id, key, anchor.Immediate);
                     }
 
-                    _signals.Writer.TryWrite(new Signal(anchor, assessment));
+                    _signals.Writer.TryWrite(new Signal(anchor, assessment, Stopwatch.GetTimestamp()));
                 }
             }
         }
@@ -226,7 +232,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
                         continue;
                     }
 
-                    _signals.Writer.TryWrite(new Signal(new MigrationAnchor(stray.Id, stray.Immediate), assessment));
+                    _signals.Writer.TryWrite(new Signal(new MigrationAnchor(stray.Id, stray.Immediate), assessment, Stopwatch.GetTimestamp()));
                 }
                 catch (Exception) when (!ct.IsCancellationRequested)
                 {
@@ -322,6 +328,7 @@ internal sealed class BoundaryMonitor : ICommitObserver, IDisposable
 
         if (signal.Assessment.CrossedInto is { } destination)
         {
+            _metrics?.BoundaryCrossingWait.Record(Stopwatch.GetElapsedTime(signal.QueuedAt));
             var margin = Math.Max(0, cluster.HandoffMarginChunks);
             if (!signal.Anchor.Immediate && signal.Assessment.CrossedDepthChunks <= margin)
                 return; // Within the hysteresis margin: still the origin's, deliberately.

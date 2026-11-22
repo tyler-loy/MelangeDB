@@ -27,6 +27,7 @@ public class SpanCheckTests
     [Fact]
     public void A_single_node_deployment_with_a_strategy_trips_the_span_check()
     {
+        using var metrics = new MetricCapture("melange.shard.span_violations");
         var (engine, root) = CreateEngine();
         try
         {
@@ -41,6 +42,7 @@ public class SpanCheckTests
 
             Assert.Contains("must resolve to the same shard", failure.Message);
             Assert.Equal(0UL, engine.Log.HeadLsn);
+            Assert.Contains(metrics.Of("melange.shard.span_violations"), static m => (string?)m.Tags["reducer"] == "SpanBoth");
 
             // Same-shard transactions pass, deletes included (their shard is the pre-image's).
             engine.Invoke("SameShard", ClusterFixture.Caller, ctx =>

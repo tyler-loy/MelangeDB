@@ -644,9 +644,11 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 // engine lock, so it cannot interleave incorrectly with commit deltas. It is
                 // synthetic rather than commit-tied, so it carries LSN 0, which a client applies
                 // unconditionally instead of judging against its anchor.
+                var started = Stopwatch.GetTimestamp();
                 var ops = _transport.Subscriptions.Rescope(existing, query, limits);
                 if (ops.Count > 0)
                     EnqueueDelta(new TransactionUpdateFrame(0, [new SubscriptionUpdate(existing.Id, ops)]) { Channel = MelangeChannels.Data });
+                _transport.Telemetry?.RecordRescope(query.Table, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
                 return true;
             });
             if (rescoped)

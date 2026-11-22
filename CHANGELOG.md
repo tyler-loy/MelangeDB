@@ -40,6 +40,15 @@ All packages ship together at one version; there is no per-package versioning. S
   column masks, the anchor boundary under concurrent writes, resume against the same and a new
   log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
   checks. The C# client's adapter passes it on every build.
+- **The cluster metrics the docs listed but nothing emitted** (road-to-0.4 phase 31).
+  `melange.handoff.duration` (a completed transfer, start to release), `melange.handoff.failed`
+  (`reason`: `aborted` or `unresolved`), `melange.shard.owned` (per node) and
+  `melange.shard.span_violations` (by reducer) had been in [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)
+  since phase 09 without being implemented; they are now. New beside them,
+  `melange.shard.band_overruns` (by table) counts writes refused because an entity outran its handoff.
+- **`melange.subscription.rescope.duration`** (road-to-0.4 phase 31): a histogram of how long
+  each re-scope held the write lock, by table. A client that moves its area of interest every step
+  pays this per step; the load test now reports its share of the lock.
 - **A startup warning for workstation GC** (road-to-0.4 phase 31): EventId `1108 WorkstationGc`
   when the host runs workstation GC on four or more logical processors. At 400 players in the load
   test it spent 55% of the time paused for GC (2% under Server GC) and p99 call-to-delta went from
@@ -140,6 +149,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **The gateway reaches each shard node over one shared link** (road-to-0.4 phase 31;
+  `Cluster:GatewayUpstream`, default `Shared`). Every player's session to a node rides one
+  websocket (`{Transport:Path}/mux`) as a stream with its own flow control, instead of a websocket
+  per player per node. A handoff now opens a session rather than a connection, so it costs no local
+  port; per-player sockets churned one connection per handoff, enough at 1,200 players to hold most
+  of a gateway host's ephemeral ports in TIME_WAIT. Sessions authenticate as before, and a slow
+  client backs up only its own session. `PerSession` restores the old shape; nodes serve both
+  endpoints, so either setting works against any node of this release.
+
 - **Shared subscription fan-out** (road-to-0.4 phase 31). Subscriptions that are one query (same
   table, projection, predicate and operands, on a table with no row or column policies) are
   evaluated once per committed row instead of once each, and when two or more share it their row
@@ -188,6 +206,34 @@ All packages ship together at one version; there is no per-package versioning. S
   rows.
 
 ### Fixed
+
+- **The gateway could stall a player for tens of seconds around a handoff** (found measuring
+  road-to-0.4 phase 31's game shape). Four things, fixed together:
+  - Routing a call or a subscription to a shard held the connection's attachment lock while it
+    connected to a new owner, and a swap held it while it waited for the destination, so either
+    stalled the other for as long as a connect took (29 s seen). Both now connect before taking the
+    lock; swaps stay in order through a lock of their own.
+  - Mid-transfer, the hub's map names the destination before the swap lands, and a subscription
+    routed in that window attached the destination itself, without the subscription replay. The
+    swap then found the session "already there" and returned without flushing the calls it held,
+    so the player's calls queued until the cap refused them. Routing now waits for the swap, and a
+    swap that finds itself already attached still flushes.
+  - Sessions pre-opened to neighbouring shards on approach were never closed unless a swap used
+    them. At 1,200 players that was ten upstream sockets a player, enough to run the host out of
+    ephemeral ports, so connects failed and retried for seconds. One nothing has asked for in 10 s
+    is now closed, and a failed one is retried on the next approach.
+  - The held-call overflow warning (EventId 1720) is logged once per transfer, not per refused call.
+
+  At 1,200 players rejected calls fell from 44,721 to 11,487 in two minutes and swaps that took
+  over 5 s from 236 to 62; at 1,600, rejections fell from 560,585 to 56,300.
+
+- **Handoff refusals that meant "retry" said `internal`** (found measuring road-to-0.4 phase 31's
+  game shape). A player who walked past the border band before its handoff landed had the write
+  refused as a `ShardSpanException`, logged as a reducer failure and answered `internal`; it is now
+  a transient rejection, counted in `ShardRuntime.BandOverruns`. Other writes past the band are
+  still span violations. The gateway's held-call cap (256 calls during one transfer) also answered
+  `internal`, though nothing had run; it now answers `transient`. At 1,200 players these were
+  2,164 `internal` refusals in two minutes.
 
 - **`MelangeClient` recovers from `overflow_resync`** (found writing the phase 23 conformance
   contract). After the server dropped a slow connection's subscriptions, the client raised

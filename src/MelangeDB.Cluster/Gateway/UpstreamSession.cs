@@ -19,7 +19,7 @@ namespace MelangeDB.Cluster;
 /// </summary>
 internal sealed class UpstreamSession : IAsyncDisposable
 {
-    private readonly ClientWebSocket _socket;
+    private readonly WebSocket _socket;
     private readonly IMelangeSerializer _serializer;
     private readonly Func<Frame?, byte[], Task> _onFrame;
     private readonly Action _onClosed;
@@ -41,7 +41,7 @@ internal sealed class UpstreamSession : IAsyncDisposable
         or FrameType.Pong or FrameType.ReauthenticateResult;
 
     private UpstreamSession(
-        ClientWebSocket socket,
+        WebSocket socket,
         IMelangeSerializer serializer,
         Func<Frame?, byte[], Task> onFrame,
         Action onClosed,
@@ -69,7 +69,8 @@ internal sealed class UpstreamSession : IAsyncDisposable
     /// </summary>
     /// <exception cref="TimeoutException">The node did not complete the handshake within <paramref name="timeout"/>.</exception>
     public static async Task<UpstreamSession> ConnectAsync(
-        Uri uri,
+        Func<CancellationToken, Task<WebSocket>> open,
+        string target,
         string assertion,
         IMelangeSerializer serializer,
         Func<Frame?, byte[], Task> onFrame,
@@ -81,11 +82,10 @@ internal sealed class UpstreamSession : IAsyncDisposable
     {
         using var bounded = CancellationTokenSource.CreateLinkedTokenSource(ct);
         bounded.CancelAfter(timeout);
-        var socket = new ClientWebSocket();
-        socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
+        WebSocket? socket = null;
         try
         {
-            await socket.ConnectAsync(uri, bounded.Token).ConfigureAwait(false);
+            socket = await open(bounded.Token).ConfigureAwait(false);
             var session = new UpstreamSession(socket, serializer, onFrame, onClosed, countSent, countReceived);
             await session.SendFrameAsync(new HelloFrame(
                 MessagePackFrameSerializer.ProtocolVersion,
@@ -97,18 +97,35 @@ internal sealed class UpstreamSession : IAsyncDisposable
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            socket.Abort();
-            socket.Dispose();
+            socket?.Abort();
+            socket?.Dispose();
             throw new TimeoutException(
-                $"The node at {uri.Authority} did not complete the upstream handshake within {timeout.TotalMilliseconds:F0} ms.");
+                $"{target} did not complete the upstream handshake within {timeout.TotalMilliseconds:F0} ms.");
         }
         catch
         {
-            socket.Abort();
-            socket.Dispose();
+            socket?.Abort();
+            socket?.Dispose();
             throw;
         }
     }
+
+    /// <summary>A websocket of its own to <paramref name="uri"/>: the per-session upstream.</summary>
+    public static Func<CancellationToken, Task<WebSocket>> Dial(Uri uri) => async ct =>
+    {
+        var socket = new ClientWebSocket();
+        socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
+        try
+        {
+            await socket.ConnectAsync(uri, ct).ConfigureAwait(false);
+            return socket;
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    };
 
     public async Task SendFrameAsync(Frame frame, CancellationToken ct = default)
     {

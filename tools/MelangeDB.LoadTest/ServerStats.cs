@@ -65,6 +65,41 @@ public sealed record ServerStats
 
     public double PostCommitMsSum { get; init; }
 
+    // Phase 31's wall attribution: re-scopes (melange.subscription.rescope.duration) summed over
+    // every shard, and each shard's cumulative write-lock busy time, keyed by shard value.
+    public long RescopeCount { get; init; }
+
+    public double RescopeMsSum { get; init; }
+
+    public Dictionary<string, double> WriteLockBusyMsByShard { get; init; } = [];
+
+    // Handoff timing (ClusterMetrics' StepDurations): the hub's saga steps and gateway holds, and the
+    // shard nodes' boundary-monitor crossing waits, summed over nodes. Keyed by step name.
+    public Dictionary<string, StepStat> HandoffSteps { get; init; } = [];
+
+    public long BoundarySignalsDropped { get; init; }
+
+    public long BoundaryCrossingsDropped { get; init; }
+
+    public long GatewaySwapsPreopened { get; init; }
+
+    /// <summary>Writes refused as band overruns (an entity past the band before its handoff), over the shards' current owners.</summary>
+    public long BandOverruns { get; init; }
+
+    public long GatewaySwapsConnected { get; init; }
+
+    // The serve process's thread pool, sampled every 100 ms over the whole run: queued work items
+    // (a request handler waits behind these) and thread count.
+    public long ThreadPoolSamples { get; init; }
+
+    public double ThreadPoolQueueMean { get; init; }
+
+    public long ThreadPoolQueueMax { get; init; }
+
+    public long ThreadPoolQueueP99 { get; init; }
+
+    public int ThreadPoolThreadsMax { get; init; }
+
     // Liveness, whole-run (phase 30's timing soak): heartbeat gaps as the hub received them, the
     // shard nodes' lease-renewal gaps (all nodes together), and the false deaths they caused. The
     // "over" maps are keyed by threshold in ms (ClusterMetrics' LivenessGaps thresholds).
@@ -104,4 +139,37 @@ public sealed record ServerStats
     public double ReplicaStalenessP99Ms { get; init; }
 
     public long LeaseLapses { get; init; }
+}
+
+/// <summary>One <see cref="MelangeDB.Cluster.StepDurations"/> as served: cumulative, so a window is a difference.</summary>
+public sealed record StepStat
+{
+    public long Count { get; init; }
+
+    public double TotalMs { get; init; }
+
+    public double MaxMs { get; init; }
+
+    /// <summary>Records over each threshold (StepDurations.Thresholds), keyed by threshold.</summary>
+    public Dictionary<int, long> Over { get; init; } = [];
+
+    public static StepStat Of(MelangeDB.Cluster.StepDurations steps) => new()
+    {
+        Count = steps.Count,
+        TotalMs = steps.TotalMs,
+        MaxMs = steps.MaxMs,
+        Over = MelangeDB.Cluster.StepDurations.Thresholds.ToDictionary(static t => t, steps.Over),
+    };
+
+    public static StepStat Sum(IEnumerable<StepStat> stats)
+    {
+        var list = stats.ToList();
+        return new StepStat
+        {
+            Count = list.Sum(static s => s.Count),
+            TotalMs = list.Sum(static s => s.TotalMs),
+            MaxMs = list.Count == 0 ? 0 : list.Max(static s => s.MaxMs),
+            Over = MelangeDB.Cluster.StepDurations.Thresholds.ToDictionary(static t => t, t => list.Sum(s => s.Over.GetValueOrDefault(t))),
+        };
+    }
 }
