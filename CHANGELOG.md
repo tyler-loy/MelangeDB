@@ -21,6 +21,11 @@ All packages ship together at one version; there is no per-package versioning. S
   `tools/MelangeDB.Conformance`, with key, column, and argument vectors; a test re-records it on
   every build and fails when it drifts. Writing it down found four things, listed in the
   document's Findings section.
+- **The live conformance suite** (phase 23, step 2). `MelangeDB.Conformance run -- <adapter>`
+  drives any client through a small newline-delimited JSON adapter against a real server. It
+  covers the corpus, the encoding vectors, the handshake, calls, the merged cache, re-scoping,
+  and column masks, each scenario naming the obligations it checks. The C# client's adapter
+  passes it on every build.
 
 - **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
   `AddMelangeMcp()` and `app.MapMelangeMcp()` put a Model Context Protocol endpoint (stateless

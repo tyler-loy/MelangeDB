@@ -287,3 +287,12 @@ Writing it down produced four findings, recorded in the document:
 
 The first two are for step 2's live suite to settle.
 
+**Step 2a** (2026-11-22). The harness: `MelangeDB.Conformance run -- <adapter>` and the adapter
+protocol (newline-delimited JSON; requests, responses, and cache events on one ordered stream, so
+a `sync` on an LSN is a barrier). The scenarios are `corpus-decode`, `encoding-vectors`,
+`handshake`, `initial-set`, `calls`, `merged-cache`, `rescope`, and `column-masks`.
+`tools/MelangeDB.Conformance.Adapter.CSharp` drives `MelangeDB.Client` through bindings generated
+from the conformance manifest. It passes in-process over pipes on every build
+(`LiveSuiteTests`) and as a subprocess through `run`. An adapter that raises an insert per
+subscription instead of per merged row fails three scenarios.
+

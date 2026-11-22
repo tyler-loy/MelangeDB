@@ -190,7 +190,8 @@ would settle it.
 | `src/MelangeDB.Mcp` | Optional: an MCP endpoint for agents, in the host's own pipeline. |
 | `src/MelangeDB.Testing` | The reducer test kit: a real engine on a hand-cranked clock. |
 | `tools/MelangeDB.LoadTest` | The load rig behind the recorded performance numbers. |
-| `tools/MelangeDB.Conformance` | The client conformance tool: records the decode corpus in `conformance/`. |
+| `tools/MelangeDB.Conformance` | The client conformance tool: records the decode corpus in `conformance/` and runs the live suite. |
+| `tools/MelangeDB.Conformance.Adapter.CSharp` | The C# client's conformance adapter, the reference for other languages'. |
 | `bench/MelangeDB.Benchmarks` | BenchmarkDotNet suites for the commit, apply, and wire paths. |
 | `samples/` | A worker-service host and a console client that talk to each other. |
 

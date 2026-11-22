@@ -11,6 +11,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\tools\MelangeDB.Conformance\MelangeDB.Conformance.csproj" />
+    <!-- The C# client's adapter, run in-process over pipes: the suite holds it to the same
+         protocol any other language's adapter speaks over stdin and stdout. -->
+    <ProjectReference Include="..\..\tools\MelangeDB.Conformance.Adapter.CSharp\MelangeDB.Conformance.Adapter.CSharp.csproj" />
   </ItemGroup>
 
   <ItemGroup>

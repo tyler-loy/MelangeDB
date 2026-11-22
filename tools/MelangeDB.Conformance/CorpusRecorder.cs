@@ -35,7 +35,7 @@ public static class CorpusRecorder
 
     public static async Task<JsonObject> RecordAsync(CancellationToken cancellationToken = default)
     {
-        await using var server = await ConformanceServer.StartAsync(cancellationToken).ConfigureAwait(false);
+        await using var server = await ConformanceServer.StartAsync(null, cancellationToken).ConfigureAwait(false);
         var sessions = new JsonArray
         {
             await HandshakeAndInitialSetAsync(server, cancellationToken).ConfigureAwait(false),
@@ -303,33 +303,12 @@ public static class CorpusRecorder
         {
             var id = BitConverter.ToInt64(row.Row.Span[..8]);
             var decoded = CorpusJson.Row(row.Key, row.Row.Span, row.ColumnMask.Span, descriptor)["columns"]!;
-            var expected = Expected(SampleRows.Build(id, (int)id - 1, group));
+            var expected = Harness.Truth.Sample(id, (int)id - 1, group);
             if (!JsonNode.DeepEquals(decoded, expected))
                 throw new InvalidOperationException($"Sample {id} decoded as {decoded.ToJsonString()}, but the module wrote {expected.ToJsonString()}.");
         }
     }
 
-    private static JsonObject Expected(Sample row) => new()
-    {
-        ["Id"] = CorpusJson.I64(row.Id),
-        ["Group"] = row.Group,
-        ["Flag"] = row.Flag,
-        ["I8"] = row.I8,
-        ["U8"] = row.U8,
-        ["I16"] = row.I16,
-        ["U16"] = row.U16,
-        ["I32"] = row.I32,
-        ["U32"] = row.U32,
-        ["I64"] = CorpusJson.I64(row.I64),
-        ["U64"] = CorpusJson.U64(row.U64),
-        ["F32"] = CorpusJson.F32(row.F32),
-        ["F64"] = CorpusJson.F64(row.F64),
-        ["Text"] = row.Text,
-        ["Blob"] = row.Blob is null ? null : CorpusJson.Hex(row.Blob),
-        ["Who"] = CorpusJson.Hex(row.Who.ToByteArray()),
-        ["At"] = CorpusJson.I64(row.At.UnixTimeMicroseconds),
-        ["Mood"] = (byte)row.Mood,
-    };
 
     /// <summary>One recorded connection: raw socket, the frames it received, and the steps that caused them.</summary>
     private sealed class RecordingSession : IAsyncDisposable

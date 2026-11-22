@@ -21,7 +21,7 @@ namespace MelangeDB.Conformance;
 /// <item>A column a mask excludes is absent from <c>columns</c>, not null.</item>
 /// </list>
 /// </summary>
-public static class CorpusJson
+internal static class CorpusJson
 {
     /// <summary>
     /// Renders one server-to-client frame. <paramref name="descriptors"/> is the session's

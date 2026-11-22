@@ -30,6 +30,7 @@
     <Project Path="bench/MelangeDB.Benchmarks/MelangeDB.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/tools/">
+    <Project Path="tools/MelangeDB.Conformance.Adapter.CSharp/MelangeDB.Conformance.Adapter.CSharp.csproj" />
     <Project Path="tools/MelangeDB.Conformance/MelangeDB.Conformance.csproj" />
     <Project Path="tools/MelangeDB.LoadTest/MelangeDB.LoadTest.csproj" />
   </Folder>

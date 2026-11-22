@@ -42,26 +42,33 @@ public sealed class ConformanceServer : IAsyncDisposable
         new(System.Text.Encoding.UTF8.GetBytes("melange-conformance-signing-key-0123456789"));
 
     private readonly string _root;
-    private readonly WebApplication _app;
+    private readonly Dictionary<string, string?> _settings;
+    private WebApplication _app;
+    private int _port;
 
-    private ConformanceServer(string root, WebApplication app, ManualClock clock)
+    private ConformanceServer(string root, Dictionary<string, string?> settings, ManualClock clock)
     {
         _root = root;
-        _app = app;
+        _settings = settings;
         Clock = clock;
-        var address = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First();
-        HttpBase = new Uri(address);
-        SocketUri = new UriBuilder(HttpBase) { Scheme = "ws", Path = "/melange" }.Uri;
+        _app = null!;
     }
 
     /// <summary>The clock the server reads; heartbeats and token lifetimes move only with it.</summary>
     public ManualClock Clock { get; }
 
-    public Uri SocketUri { get; }
+    public Uri SocketUri => new($"ws://127.0.0.1:{_port}/melange");
 
-    public Uri HttpBase { get; }
+    public Uri HttpBase => new($"http://127.0.0.1:{_port}");
 
     public MelangeEngine Engine => _app.Services.GetRequiredService<MelangeEngine>();
+
+    /// <summary>The live connections, for the suite to observe what the server holds.</summary>
+    public MelangeSessions Sessions => _app.Services.GetRequiredService<MelangeSessions>();
+
+    /// <summary>Calls a reducer server-side, as <see cref="Caller"/> — writes a client observes only as deltas.</summary>
+    public ulong Call(string reducer, params object?[] arguments) =>
+        _app.Services.GetRequiredService<MelangeReducerHost>().Call(reducer, Caller, arguments);
 
     /// <summary>The identity <see cref="Token"/> authenticates as.</summary>
     public static Identity Caller { get; } = Identity.FromIssuerSubject(Issuer, Subject);
@@ -80,23 +87,72 @@ public sealed class ConformanceServer : IAsyncDisposable
         SigningCredentials = new SigningCredentials(Key, SecurityAlgorithms.HmacSha256),
     });
 
-    public static async Task<ConformanceServer> StartAsync(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Starts a server over a fresh data directory. <paramref name="settings"/> are extra
+    /// <c>MelangeDb:*</c> keys (full paths), for a scenario that needs a limit set differently.
+    /// </summary>
+    public static async Task<ConformanceServer> StartAsync(Dictionary<string, string?>? settings = null, CancellationToken cancellationToken = default)
     {
-        var root = Directory.CreateTempSubdirectory("melange-conformance-").FullName;
-        var clock = new ManualClock();
+        var server = new ConformanceServer(
+            Directory.CreateTempSubdirectory("melange-conformance-").FullName,
+            settings ?? [],
+            new ManualClock());
+        await server.StartAppAsync(cancellationToken).ConfigureAwait(false);
+        return server;
+    }
+
+    public static Task<ConformanceServer> StartAsync(CancellationToken cancellationToken) => StartAsync(null, cancellationToken);
+
+    /// <summary>
+    /// Stops the server without a goodbye to anyone and starts it again on the same port, so a
+    /// client reconnects to the address it knows. <paramref name="freshLog"/> wipes the data
+    /// directory: a new log, so a new epoch, and every resume cursor counts against a log that
+    /// no longer exists.
+    /// </summary>
+    public async Task RestartAsync(bool freshLog, CancellationToken cancellationToken = default)
+    {
+        await _app.StopAsync(cancellationToken).ConfigureAwait(false);
+        await _app.DisposeAsync().ConfigureAwait(false);
+        if (freshLog)
+        {
+            Directory.Delete(_root, recursive: true);
+            Directory.CreateDirectory(_root);
+        }
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (true)
+        {
+            try
+            {
+                await StartAppAsync(cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (IOException) when (DateTime.UtcNow < deadline)
+            {
+                // The port is briefly held by a socket in teardown; same-port rebinding is the point.
+                await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task StartAppAsync(CancellationToken cancellationToken)
+    {
+        var clock = Clock;
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(kestrel =>
-            kestrel.Listen(IPAddress.Loopback, 0, listen => listen.Protocols = HttpProtocols.Http1));
+            kestrel.Listen(IPAddress.Loopback, _port, listen => listen.Protocols = HttpProtocols.Http1));
         builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
         {
-            ["MelangeDb:CommitLog:Path"] = Path.Combine(root, "log"),
-            ["MelangeDb:HotStore:Path"] = Path.Combine(root, "hot"),
+            ["MelangeDb:CommitLog:Path"] = Path.Combine(_root, "log"),
+            ["MelangeDb:HotStore:Path"] = Path.Combine(_root, "hot"),
             ["MelangeDb:Transport:MaxInitialSetChunkBytes"] = InitialSetChunkBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Transport:HeartbeatIntervalMs"] = HeartbeatIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Transport:HeartbeatTimeoutMs"] = (HeartbeatIntervalMs * 3).ToString(System.Globalization.CultureInfo.InvariantCulture),
         });
+        builder.Configuration.AddInMemoryCollection(_settings);
         builder.Services.AddSingleton<TimeProvider>(clock);
+        builder.Services.AddSingleton<MelangeSessions>();
         builder.Services.AddAuthentication().AddJwtBearer(jwt =>
         {
             jwt.TokenValidationParameters = new TokenValidationParameters
@@ -119,7 +175,9 @@ public sealed class ConformanceServer : IAsyncDisposable
         app.UseWebSockets();
         app.MapMelangeSocket();
         await app.StartAsync(cancellationToken).ConfigureAwait(false);
-        return new ConformanceServer(root, app, clock);
+        _app = app;
+        if (_port == 0)
+            _port = new Uri(app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.First()).Port;
     }
 
     public async ValueTask DisposeAsync()

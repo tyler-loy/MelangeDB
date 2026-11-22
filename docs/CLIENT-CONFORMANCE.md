@@ -15,9 +15,10 @@ Two things hold a client to these rules:
   live server sent, byte for byte, each beside its exact expected decode, plus pure-function vectors
   for key, column, and argument encoding. It is recorded by `tools/MelangeDB.Conformance` and a test
   fails the build when it drifts from what the server sends. See [The corpus](#the-corpus).
-- **The live suite** (step 2 of phase 23, not yet built): a harness that drives a client under
-  test against a real server through the behaviours a frame corpus cannot show — the anchor
-  boundary, resume, backpressure, the merged cache.
+- **The live suite**: `tools/MelangeDB.Conformance run` drives a client under test, through a
+  small [adapter](#the-adapter-protocol) the client's language provides, against a real server.
+  It covers the behaviours a frame corpus cannot show: the merged cache, re-scoping, masks, and
+  calls. The C# client passes it on every build. See [The live suite](#the-live-suite).
 
 The C# client in `src/MelangeDB.Client` defines conformance, so where it and this document disagree
 the disagreement is a [finding](#findings), not a licence.
@@ -499,6 +500,74 @@ subscription id (C4.1), and compare your decode to `expect` exactly. Then check 
 | `ScheduleAt` | `{"interval": bool, "micros": "<decimal>"}` |
 | a masked-out column | absent from `columns` |
 | a tagged value | `{"tag": "Int64", "value": ...}`; `Null` has no value; `Array` has `items` |
+
+## The live suite
+
+```
+dotnet run --project tools/MelangeDB.Conformance -c Release -- run -- <adapter command> [args...]
+```
+
+The suite starts its own server (the conformance module, a manual clock, its own token issuer),
+launches the adapter, and runs each scenario on a fresh connection, printing `PASS` or `FAIL` per
+scenario with the obligations it checks. `--only a,b` runs a subset; `--corpus <path>` points at
+another corpus. The suite writes to the server directly, so it always knows what the client must
+end up holding and which events it must have raised. An exact event sequence is how it checks the
+merged cache.
+
+| Scenario | Checks |
+| --- | --- |
+| `corpus-decode` | every corpus frame, decoded by the client, equals its `expect` |
+| `encoding-vectors` | the client's column decode, key encoding, and argument encoding, byte for byte |
+| `handshake` | the negotiated version, and the identity read from `Welcome` |
+| `initial-set` | every column kind arrives as written, as one insert event per row |
+| `calls` | a committing call's LSN; `rejected`, `unknown_reducer`, `invalid_args`; a producer's result with a defaulted parameter left off |
+| `merged-cache` | one event for a row two subscriptions carry; no delete while another subscription still covers a row |
+| `rescope` | the LSN-0 diff applies; the subscription carries on live |
+| `column-masks` | a masked column is never presented as a value |
+
+## The adapter protocol
+
+An adapter is a small program in the client's own language that drives the real client library.
+It reads requests from stdin and writes responses and events to stdout, as newline-delimited JSON
+(UTF-8). `tools/MelangeDB.Conformance.Adapter.CSharp` is the reference adapter.
+
+**Requests** carry an `id` and an `op`. The adapter answers each with the same `id` and
+`"ok": true` plus any results, or `"ok": false` with `"error": {"code", "message"}`. When the
+client reports a MelangeDB error code, `code` is that code. Requests may arrive while earlier ones
+are pending.
+
+**Events** are lines with an `event` field, written as the client raises them:
+
+- `{"event": "insert" | "delete", "table", "row"}`;
+- `{"event": "update", "table", "old", "new"}`, from the **merged** cache (C8.1);
+- `{"event": "error", "code", "message"}` for a connection-scoped error;
+- `{"event": "disconnected"}`.
+
+Rows use the corpus's canonical column forms.
+
+**Requests and events share one ordered stream**: write each line whole, and never write an event
+after the response to a later request it preceded. That is what makes `sync` a barrier.
+
+| `op` | Request fields | Response fields |
+| --- | --- | --- |
+| `hello` | | `adapter`, `language` |
+| `decodeFrames` | `frames`: hex strings, one session in order | `decoded`: each frame's canonical decode, carrying descriptors across the list |
+| `decodeColumn` | `kind`, `bytes` (hex) | `value`, `consumed` (bytes read) |
+| `encodeKey` | `kind`, `value` (canonical) | `key` (hex) |
+| `encodeArguments` | `arguments`: tagged values | `bytes` (hex) |
+| `connect` | `url`, `token` | `identity` (hex), `protocolVersion` |
+| `subscribe` | `table`, `query`, `parameters`: name to tagged value, or `null` | `subscription`: a handle, once the initial set is applied |
+| `rescope` | `subscription`, `parameters` | |
+| `unsubscribe` | `subscription` | once acknowledged and the cache is updated |
+| `call` | `reducer`, `arguments` | `lsn` |
+| `callProducer` | `producer`, `arguments` | `lsn`, `value` (tagged) |
+| `sync` | `lsn` | once the client's resume cursor has reached `lsn` |
+| `cache` | `table` | `rows`: the merged cache's rows |
+| `close` | | the connection is closed and forgotten |
+
+Tagged values are the corpus's argument form: `{"tag": "Int64", "value": "-5"}`, with
+`{"tag": "Null"}` and `{"tag": "Array", "items": [...]}`. An adapter converts each to whatever its
+client takes for that parameter. When stdin closes, the adapter closes its client and exits.
 
 ## Findings
 

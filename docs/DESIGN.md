@@ -545,6 +545,7 @@ src/MelangeDB.Testing           the reducer test kit: a real engine on a hand-cr
 tests/                          unit + integration
 tools/MelangeDB.LoadTest        the load rig behind the recorded performance numbers
 tools/MelangeDB.Conformance     the client conformance tool; conformance/ holds the corpus it records
+tools/MelangeDB.Conformance.Adapter.CSharp   the C# client under the conformance adapter protocol
 samples/                        worker-service host + console client
 ```
 
