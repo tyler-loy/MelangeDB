@@ -40,6 +40,10 @@ All packages ship together at one version; there is no per-package versioning. S
   column masks, the anchor boundary under concurrent writes, resume against the same and a new
   log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
   checks. The C# client's adapter passes it on every build.
+- **A startup warning for workstation GC** (road-to-0.4 phase 31): EventId `1108 WorkstationGc`
+  when the host runs workstation GC on four or more logical processors. In the load test it halved
+  the rows delivered at 200 players. A Web SDK host already runs Server GC; any other host should
+  set `<ServerGarbageCollection>true</ServerGarbageCollection>` (now also in the README).
 
 - **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
   `AddMelangeMcp()` and `app.MapMelangeMcp()` put a Model Context Protocol endpoint (stateless
