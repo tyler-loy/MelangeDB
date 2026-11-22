@@ -88,6 +88,18 @@ public sealed record ServerStats
 
     public long GatewaySwapsConnected { get; init; }
 
+    // The shared upstream links (MuxLinkStats), both ends, cumulative: envelopes and websocket
+    // messages written, payload bytes, and the time link writers and readers spent working.
+    public long LinkEnvelopes { get; init; }
+
+    public long LinkMessages { get; init; }
+
+    public long LinkBytes { get; init; }
+
+    public double LinkWriterBusyMs { get; init; }
+
+    public double LinkReaderBusyMs { get; init; }
+
     // The serve process's thread pool, sampled every 100 ms over the whole run: queued work items
     // (a request handler waits behind these) and thread count.
     public long ThreadPoolSamples { get; init; }

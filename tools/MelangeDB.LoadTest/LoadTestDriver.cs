@@ -249,6 +249,15 @@ internal static class LoadTestDriver
                 $"Boundary queue:  {finalStats.BoundarySignalsDropped - measuredStats.BoundarySignalsDropped} signals dropped full, {finalStats.BoundaryCrossingsDropped - measuredStats.BoundaryCrossingsDropped} of them crossings (handoff triggers); ") +
                 Invariant($"swaps used a pre-opened session {finalStats.GatewaySwapsPreopened - measuredStats.GatewaySwapsPreopened} times, connected then {finalStats.GatewaySwapsConnected - measuredStats.GatewaySwapsConnected}; ") +
                 Invariant($"{finalStats.BandOverruns} writes refused as band overruns (whole run)"));
+            var linkMessages = finalStats.LinkMessages - measuredStats.LinkMessages;
+            if (linkMessages > 0)
+            {
+                var envelopes = finalStats.LinkEnvelopes - measuredStats.LinkEnvelopes;
+                output.WriteLine(Invariant(
+                    $"Upstream links:  {envelopes / seconds:F0} envelopes/s in {linkMessages / seconds:F0} messages/s ({(double)envelopes / linkMessages:F1} per message, {(finalStats.LinkBytes - measuredStats.LinkBytes) / seconds / (1024 * 1024):F1} MiB/s); ") +
+                    Invariant($"writers busy {(finalStats.LinkWriterBusyMs - measuredStats.LinkWriterBusyMs) / 1000 / seconds:F2} link-seconds per second, readers {(finalStats.LinkReaderBusyMs - measuredStats.LinkReaderBusyMs) / 1000 / seconds:F2} (both ends, all links)"));
+            }
+
             output.WriteLine(Invariant(
                 $"Thread pool:     queued work items mean {finalStats.ThreadPoolQueueMean:F0}, p99 {finalStats.ThreadPoolQueueP99}, max {finalStats.ThreadPoolQueueMax}; up to {finalStats.ThreadPoolThreadsMax} threads (whole run, sampled every 100 ms)"));
         }
