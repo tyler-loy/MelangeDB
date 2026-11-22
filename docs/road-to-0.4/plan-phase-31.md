@@ -212,6 +212,38 @@ and resync errors from 2 to 1; at 1,600, rejections fell tenfold. Results and wh
 The next levers are fix 3 (a client's frames should not wait behind one slow subscription) and an
 upstream shared per node instead of one per player.
 
+### Next: one upstream link per gateway and node (decided 2026-11-22)
+
+The owner chose to remove per-player upstream sockets rather than tune around them. After the
+gateway fixes, each handoff still closed one per-player socket and opened another, about 90 a
+second at 1,200 players, and each closed socket held a local port for two minutes (TIME_WAIT):
+11,000-14,000 ports against Windows' 16,384, so connects at swap time still ran to seconds. A real
+gateway host has the same limit per destination node.
+
+**Design.** A gateway keeps one websocket per shard node, at a new node endpoint
+`{Transport:Path}/mux`, and carries every player's session over it as a numbered stream:
+
+- **Each end sees a `WebSocket`.** A session is a virtual `WebSocket` on both sides, so the gateway's
+  `UpstreamSession` and the node's `MelangeSocketConnection` run unchanged on top of it, Hello and
+  the hub-minted assertion included. Authentication is exactly what it is today: the link carries
+  sessions, and each session proves its identity as before.
+- **Envelopes.** One binary websocket message per envelope: a kind (open, data, close, abort,
+  credit) and a session id, then the payload. A session's messages are cut into chunks of at most
+  16 KiB, so one player's large initial set does not hold the link for the others.
+- **Flow control per session.** Each direction of each session has a 256 KiB window of unacknowledged
+  bytes; the receiver grants credit as its reader consumes. A slow client therefore backs up only
+  its own session: the node's send loop for that player waits on credit, its queue grows, and the
+  existing slow-consumer policy (`Subscriptions:MaxBufferedBytes`, `overflow_resync`) applies, as
+  it did when TCP backpressure did the same job per socket. No one player can stall the link.
+- **Failure.** If the link drops, every session on it reads as a dropped connection, exactly what
+  the node's death looks like today; the gateway reconnects the link on next use.
+- **Fallback.** `Cluster:GatewayUpstream` = `Shared` (default) or `PerSession` (the old behavior),
+  so a deployment can step back without a release.
+
+**Steps.** (A) the link and the virtual socket, with unit tests over real websockets; (B) the node
+endpoint, the gateway's link pool and the option, with the cluster tests run both ways; (C)
+re-measure the game shape and update the docs.
+
 ## Steps 3 to 5
 
 Unchanged from the [README](README.md#ordering): conflation for position-like tables, read-side
