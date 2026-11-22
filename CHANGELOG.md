@@ -200,6 +200,9 @@ All packages ship together at one version; there is no per-package versioning. S
   of its time paused for GC and call-to-delta reached 15 s at p50. It now reuses one buffer and
   relays deltas without decoding them; the same run is at 9.6 ms, delivering every row asked of
   it. The capacity knee in the load test's 4-shard shape moved from about 150 players to about 600.
+- **The MCP `signals` tool failed whenever any MelangeDB observable instrument in the process threw**
+  when polled, such as a gauge over an engine already disposed whose meter outlived it. It now
+  returns every other instrument's reading. Seen as a random `signals` failure in CI.
 
 - **A large border reset took down the node link, and with it a healthy node.** A band reset was
   sent as one node-link frame, and a link drops any frame over 64 MiB. A million-row shard's band
