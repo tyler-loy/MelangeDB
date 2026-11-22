@@ -137,8 +137,9 @@ developer needs to get placement right.
 `MapMelangeSocket` maps `/call/{reducer}`, `/producers/{producer}`, `/bulk`, `/sql`, and `/ticket` against the engine
 registered in DI — **this node's engine, not a shard's.** A shard node's `ShardRuntime` builds its
 own engine per owned shard, so the HTTP endpoints on a shard node reach none of them; the shard
-engines are reachable only over the internal `/{path}/shard/{shardKey}` sockets, which are
-hub-assertion authenticated and never exposed to clients.
+engines are reachable only over the internal gateway link (`/{path}/mux`) and per-session
+(`/{path}/shard/{shardKey}`) sockets, whose sessions are hub-assertion authenticated and which are never
+exposed to clients.
 
 The consequence worth stating plainly, because it is not what a single-node deployment trains you
 to expect:
@@ -459,6 +460,16 @@ because each is the answer to a specific failure mode:
   player is already there) atomically replaces the client's cache. No disconnect, no resync error, no gap.
   The trade: those calls wait out the transfer window, and a wedged transfer caps the queue with a retryable
   error.
+- **One link per gateway and node** (phase 31; `Cluster:GatewayUpstream`, default `Shared`). The gateway
+  reaches a shard node over one websocket, `{Transport:Path}/mux`, that carries every player's session to
+  that node as a stream of its own, each authenticated by its own Hello exactly as before. A handoff opens a
+  session on the destination's link, not a connection, so it costs no local port and leaves nothing in
+  TIME_WAIT; per-player sockets churned one connection per handoff, which at 1,200 players held most of a
+  gateway host's ephemeral ports and made swaps wait seconds for a connect. Each session has its own flow
+  control (a 256 KiB window per direction), so a slow client backs up only its own session and the node's
+  slow-consumer handling applies to it as before; no player can stall the link. A link that drops reads as
+  every session on it dropping, the same as the node dying. `PerSession` keeps the old one-socket-per-player
+  shape (`{Transport:Path}/shard/{shardKey}`) as a fallback; nodes serve both.
 - **Expected refusals are typed `transient`, never `internal`** (settled: [#22](https://github.com/tyler-loy/MelangeDB/issues/22)).
   The guards that fire for conditions the cluster itself designed — a row frozen mid-handoff, a write routed
   to a border copy just after the shard map flips, a fenced node awaiting re-registration — reach the client

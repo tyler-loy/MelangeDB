@@ -149,6 +149,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Changed
 
+- **The gateway reaches each shard node over one shared link** (road-to-0.4 phase 31;
+  `Cluster:GatewayUpstream`, default `Shared`). Every player's session to a node rides one
+  websocket (`{Transport:Path}/mux`) as a stream with its own flow control, instead of a websocket
+  per player per node. A handoff now opens a session rather than a connection, so it costs no local
+  port; per-player sockets churned one connection per handoff, enough at 1,200 players to hold most
+  of a gateway host's ephemeral ports in TIME_WAIT. Sessions authenticate as before, and a slow
+  client backs up only its own session. `PerSession` restores the old shape; nodes serve both
+  endpoints, so either setting works against any node of this release.
+
 - **Shared subscription fan-out** (road-to-0.4 phase 31). Subscriptions that are one query (same
   table, projection, predicate and operands, on a table with no row or column policies) are
   evaluated once per committed row instead of once each, and when two or more share it their row

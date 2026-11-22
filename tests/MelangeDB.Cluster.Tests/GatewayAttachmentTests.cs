@@ -32,17 +32,30 @@ public class GatewayAttachmentTests
         var assertion = cluster.Hub.MintAssertion(
             ClusterFixture.Caller, isGuest: false, isSqlOwner: false, isBulkOwner: false,
             DateTimeOffset.UtcNow.AddMinutes(5), firesLifecycle: false);
-        await using var session = await UpstreamSession.ConnectAsync(
-            gateway.ShardSocketUri(address, shard),
-            assertion,
-            gateway.Serializer,
-            static (_, _) => Task.CompletedTask,
-            static () => { },
-            static () => { },
-            static () => { },
-            TestTime.Dilated(TimeSpan.FromSeconds(10)),
-            TestContext.Current.CancellationToken);
-        Assert.True(session.IsAlive);
+
+        // Both upstream shapes: a socket of its own, and a session on the node's shared link.
+        Func<CancellationToken, Task<System.Net.WebSockets.WebSocket>>[] openers =
+        [
+            UpstreamSession.Dial(gateway.ShardSocketUri(address, shard)),
+            token => gateway.Links.OpenAsync(address, shard, token),
+        ];
+        foreach (var open in openers)
+        {
+            await using var session = await UpstreamSession.ConnectAsync(
+                open,
+                "the shard",
+                assertion,
+                gateway.Serializer,
+                static (_, _) => Task.CompletedTask,
+                static () => { },
+                static () => { },
+                static () => { },
+                TestTime.Dilated(TimeSpan.FromSeconds(10)),
+                TestContext.Current.CancellationToken);
+            Assert.True(session.IsAlive);
+        }
+
+        await gateway.Links.DisposeAsync();
     }
 
     /// <summary>

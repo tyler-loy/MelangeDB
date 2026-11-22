@@ -43,7 +43,16 @@ internal sealed class GatewayRuntime
             () => Options.CurrentValue.Bulk,
             () => Options.CurrentValue.Cluster,
             Time);
+        Links = new MuxLinkPool(address => ToWebSocketUri(address, $"{Options.CurrentValue.Transport.Path}/mux"));
+
+        // Close the node links with the host, so nodes see the gateway leave rather than a
+        // connection that stops answering.
+        services.GetService<Microsoft.Extensions.Hosting.IHostApplicationLifetime>()?.ApplicationStopping
+            .Register(() => _ = Links.DisposeAsync().AsTask());
     }
+
+    /// <summary>The shared upstream links to shard nodes (<c>Cluster:GatewayUpstream = Shared</c>).</summary>
+    public MuxLinkPool Links { get; }
 
     public HubRuntime Hub { get; }
 

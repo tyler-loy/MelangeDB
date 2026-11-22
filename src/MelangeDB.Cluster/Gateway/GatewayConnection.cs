@@ -226,7 +226,9 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         // The permanent hub attachment: it fires the client's lifecycle reducers and carries
         // Global/Replicated traffic. Its Welcome is the one the client sees, so resume epochs and
         // head LSNs are the hub's.
-        _hub = await ConnectUpstreamAsync(_gateway.HubSocketUri(), firesLifecycle: true, ct).ConfigureAwait(false);
+        var hubUri = _gateway.HubSocketUri();
+        _hub = await ConnectUpstreamAsync(UpstreamSession.Dial(hubUri), $"The hub at {hubUri.Authority}", firesLifecycle: true, ct)
+            .ConfigureAwait(false);
         _handoffRegistration = _gateway.Hub.Handoffs.Register(_session!.Identity, this);
         _moveRegistration = _gateway.Hub.ShardMoves.Register(this);
         _handshaken = true;
@@ -239,7 +241,8 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             _session!.Identity), ct).ConfigureAwait(false);
     }
 
-    private async Task<UpstreamSession> ConnectUpstreamAsync(Uri uri, bool firesLifecycle, CancellationToken ct)
+    private async Task<UpstreamSession> ConnectUpstreamAsync(
+        Func<CancellationToken, Task<System.Net.WebSockets.WebSocket>> open, string target, bool firesLifecycle, CancellationToken ct)
     {
         var session = _session!;
         var assertion = _gateway.Hub.MintAssertion(
@@ -247,7 +250,8 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             session.CapturedClaims);
         UpstreamSession? self = null;
         var connected = await UpstreamSession.ConnectAsync(
-            uri,
+            open,
+            target,
             assertion,
             _gateway.Serializer,
             (frame, bytes) => ForwardUpstreamFrameAsync(self, frame, bytes),
@@ -567,7 +571,13 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
             try
             {
                 var (_, publicAddress) = _gateway.Hub.ResolveShard(shard);
-                return await ConnectUpstreamAsync(_gateway.ShardSocketUri(publicAddress, shard), firesLifecycle: false, ct)
+
+                // Shared: a session on the node's link, no connection of its own (phase 31).
+                // PerSession: a websocket per player, the pre-phase-31 shape, kept as a fallback.
+                var open = _gateway.Options.CurrentValue.Cluster.GatewayUpstream == GatewayUpstreamMode.Shared
+                    ? (Func<CancellationToken, Task<System.Net.WebSockets.WebSocket>>)(token => _gateway.Links.OpenAsync(publicAddress, shard, token))
+                    : UpstreamSession.Dial(_gateway.ShardSocketUri(publicAddress, shard));
+                return await ConnectUpstreamAsync(open, $"Shard {shard.Value} on {publicAddress}", firesLifecycle: false, ct)
                     .ConfigureAwait(false);
             }
             catch (Exception) when (!ct.IsCancellationRequested && System.Diagnostics.Stopwatch.GetElapsedTime(started) < budget)
