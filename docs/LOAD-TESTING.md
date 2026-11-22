@@ -469,6 +469,29 @@ Cache inconsistencies stayed at zero. What remains at 1,200:
   630 ms in the next). Raising the pool's minimum to 256 threads did not change the swap tail, so the
   pool is busy, not starved.
 
+**On the shared upstream link, 2026-11-22.** With `Cluster:GatewayUpstream = Shared` (now the
+default), each node gets one websocket from the gateway and a handoff opens a session on it rather
+than a connection. Same runs, ports drained between them:
+
+| Players | Rejected | Resync errors | p50 / p99 / max | Delta rows/s | Sockets mid-run | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| 800 | 3 | 0 | 23 ms / 590 ms / 1.3 s | 242k | 3.4k (TIME_WAIT 133) | pass |
+| 1,200 | **0** (per-session: 11,487) | **0** | 47 ms / 1.05 s / 1.9 s | **483k** (382k) | 5.0k (14.5k) | **pass** |
+| 1,600 | 167,090 | 0 | 2.9 s / 14.5 s / 32 s | 467k | 6.7k | passes, degraded |
+
+A handoff at 1,200 players now takes 95 ms (631 ms per-session) and holds calls for 70 ms, with a
+longest hold of 0.6 s; per-session swaps had a 38 s tail. **The game's shape now carries 1,200 players
+cleanly on one machine,** where it failed before phase 31 started.
+
+At 1,600 the new limit is the swap waiting for its destination session (mean 1.9 s, 2,163 over 5 s):
+the session's handshake answer travels the link behind the other sessions' deltas. Sending control
+envelopes first and taking data from sessions in turn looked like the fix and measured far worse
+(1,200 players: 212k rows/s, call-to-delta p50 2.5 s, half the calls unacknowledged inside the
+window), so the link keeps its first-in, first-out writer; why the fair writer collapsed is not
+understood yet. A 2,000-player run could not start: the driver, on the same machine, ran out of
+socket buffer space connecting its clients (`WSAENOBUFS`), which is this harness's ceiling rather
+than the server's.
+
 ### Relating to the in-process hotspot ceiling
 
 CLUSTERING.md publishes the *commit loop's* ceilings, measured in-process on one crowded shard:

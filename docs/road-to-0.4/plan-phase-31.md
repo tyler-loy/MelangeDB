@@ -244,6 +244,17 @@ gateway host has the same limit per destination node.
 endpoint, the gateway's link pool and the option, with the cluster tests run both ways; (C)
 re-measure the game shape and update the docs.
 
+### The shared link, measured (2026-11-22)
+
+Built as designed above. The game's shape at 1,200 players passes with no rejected calls, no
+resync errors and 483k delta rows a second (per-session upstreams: 11,487 rejected, 1 resync
+error, 382k), and handoffs take 95 ms. At 1,600 it passes the tool's checks but degrades: swaps
+wait about 2 s for their destination session, whose handshake answer queues on the link behind
+other sessions' deltas. A fair writer (control first, sessions in turn) measured far worse and was
+not kept; that and the driver's own socket ceiling near 2,000 clients on one machine are where the
+next look starts. Details in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
+
 ## Steps 3 to 5
 
 Unchanged from the [README](README.md#ordering): conflation for position-like tables, read-side
