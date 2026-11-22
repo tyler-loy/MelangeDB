@@ -57,7 +57,7 @@ builds first, so it is measured before anything is built.
 
 - **2a. Apportion the cost.** An in-process benchmark of `Fanout`: one table, N subscribers on
   counting sinks, a fixed commit stream, timed per commit. Then the same with each item stubbed
-  out in turn. No product change; the numbers go in this plan.
+  out in turn. No product change; the numbers go in this plan. *Measured 2026-11-22, below.*
 - **2b. Subscription groups.** At registration, a subscription with no row policy and static wire
   columns joins the group keyed by (table, predicate kind, column, operand values, projection).
   The fan-out evaluates each group once per op and hands the resulting op list to every member.
@@ -68,9 +68,41 @@ builds first, so it is measured before anything is built.
   send loop. Its length is known without walking it, so the backpressure ledger is still debited
   under the lock, where the drop-and-resync path needs it. **The bytes on the wire stay identical** to
   what the per-subscriber path writes; the conformance corpus and the live suite check that.
-- **2d. Wake-ups.** If 2a shows the send signal matters: release it once per connection per commit
+- **2d. Wake-ups.** 2a shows the send signal matters most (below): release it once per connection per commit
   instead of per frame, or after the lock drops.
 - **2e. Re-measure** the sweep and the ladder as in step 1, interleaved against the step 1 build.
+
+### 2a: where a subscriber's share goes
+
+`FanoutCostMeasurementTests` (Transport tests): 200 subscribers on one table, 2,000 in-place
+updates per run, each layer run five times interleaved with the others, median kept. Two runs of
+the whole test agreed within about 20 ns. Per subscriber per commit, on the load test's machine:
+
+| Layer, added in turn | Whole table (`SELECT *`) | Equality on an indexed column |
+| --- | --- | --- |
+| Evaluate: verdicts, op list, frame | 103–108 ns | 181–186 ns |
+| + `Measure` | 146–148 ns | 181–203 ns |
+| + enqueue and send-signal release, a send loop waiting | **558–567 ns** | **564–572 ns** |
+| Delta-rows counter with a listener attached | +3–4 ns | none measurable |
+| Allocated | 865 B | 869 B |
+
+Off the lock, each send loop then spends 324–466 ns serializing its copy of the frame.
+
+- **Waking the send loops is about 70% of what a subscriber costs under the lock.** Releasing a
+  `SemaphoreSlim` that an async send loop waits on queues that loop's continuation to the thread
+  pool, from inside the write lock, once per subscriber per commit.
+- **Each subscriber allocates about 865 bytes per commit.** At the sweep's 200 subscribers and 750
+  commits a second that is about 130 MB/s of garbage from the fan-out alone, which fits Server GC
+  having halved the cost in step 1.
+- **The isolated total, about 0.56 µs, is a quarter of the 2–3 µs the load test measured.** The
+  rest is what the load test adds: 200 connections' state out of cache, the woken send loops and
+  the GC competing for the same cores. The benchmark ranks the parts; it does not reproduce the
+  absolute cost.
+- **Telemetry is not a cost.** The per-subscriber counter is a few nanoseconds even when listened to.
+
+**So the build order is 2d, then 2b and 2c.** Moving the wake-ups out of the lock is the largest
+single item and does not touch what is evaluated or sent. Groups and encode-once then remove the
+allocation, `Measure`, and the evaluation.
 
 ### Decisions (settled 2026-11-22)
 
