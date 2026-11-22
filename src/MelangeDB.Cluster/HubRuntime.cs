@@ -389,6 +389,7 @@ internal sealed partial class HubRuntime : IDisposable
             throw new InvalidOperationException($"A transfer is already in flight for {player}; one entity, one saga at a time.");
         _sagas[handoffId] = new Saga(handoffId, player, from, to);
         _lastHandoffStartTicks[player] = _time.GetUtcNow().UtcTicks;
+        var sagaStarted = Stopwatch.GetTimestamp();
         Metrics.HandoffStarted();
         Handoffs.NotifyStarted(player, from, to);
         var completed = false;
@@ -404,10 +405,12 @@ internal sealed partial class HubRuntime : IDisposable
             WireOp[] rows = [];
             if (origin is not null && originLink is not null)
             {
+                var freezeStarted = Stopwatch.GetTimestamp();
                 var frozen = await originLink.RequestAsync(
                     "handoff-freeze",
                     new HandoffFreeze(handoffId, from.Value, to.Value, origin.FencingToken, player.ToString()),
                     ct).ConfigureAwait(false);
+                Metrics.HandoffFreeze.Record(Stopwatch.GetElapsedTime(freezeStarted));
                 rows = frozen!.Value.Deserialize<HandoffFrozenRows>()!.Rows;
             }
 
@@ -417,6 +420,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             if (HandoffStepHook is { } beforeImport)
                 await beforeImport("import").ConfigureAwait(false);
+            var importStarted = Stopwatch.GetTimestamp();
             try
             {
                 await destinationLink.RequestAsync(
@@ -458,17 +462,23 @@ internal sealed partial class HubRuntime : IDisposable
             // The destination's import is durable: it owns the player from this instant. The
             // session map flips and the gateways swap BEFORE the release is requested, so the
             // release's row deletions on the origin can never reach a client still attached there.
+            Metrics.HandoffImport.Record(Stopwatch.GetElapsedTime(importStarted));
             completed = true;
+            var notifyStarted = Stopwatch.GetTimestamp();
             NotifyTransferred(player, from, to);
+            Metrics.HandoffNotify.Record(Stopwatch.GetElapsedTime(notifyStarted));
 
             if (originLink is not null && origin is not null)
             {
                 if (HandoffStepHook is { } beforeRelease)
                     await beforeRelease("release").ConfigureAwait(false);
+                var releaseStarted = Stopwatch.GetTimestamp();
                 await originLink.RequestAsync(
                     "handoff-release", new HandoffRelease(handoffId, from.Value, origin.FencingToken), ct).ConfigureAwait(false);
+                Metrics.HandoffRelease.Record(Stopwatch.GetElapsedTime(releaseStarted));
             }
 
+            Metrics.HandoffSaga.Record(Stopwatch.GetElapsedTime(sagaStarted));
             LogHandoffCompleted(_logger, handoffId, player.ToString(), from.Value, to.Value);
         }
         finally

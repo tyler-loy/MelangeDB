@@ -287,6 +287,7 @@ Meter name: `MelangeDB`.
 | `melange.subscriptions.active` | gauge | `{sub}` | `table` | 03 |
 | `melange.subscription.delta_rows` | counter | `{row}` | `table` | 03 |
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |
+| `melange.subscription.rescope.duration` | histogram | `ms` | `table` | 31 |
 | `melange.connections.active` | gauge | `{conn}` | — | 03 |
 | `melange.ratelimit.rejected` | counter | `{call}` | `reducer` | 04 |
 | `melange.producer.calls` | counter | `{call}` | `producer`, `outcome` | 26 |
@@ -317,6 +318,14 @@ Meter name: `MelangeDB`.
 | `melange.cluster.replica.lag` | gauge | `{record}` | `shard` | 30 |
 | `melange.backup.bytes` | counter | `By` | `outcome` | 15 |
 | `melange.backup.duration` | histogram | `ms` | `outcome` | 15 |
+
+### Reading the re-scope histogram
+
+`melange.subscription.rescope.duration` is how long one re-scope (a subscribe frame that reuses a
+live subscription's id, the moving-area pattern) held the engine's write lock. That covers
+compiling the new scope and diffing the rows it leaves and enters. Commits on that engine wait
+for it, so its sum over a second is the share of the lock that re-scoping takes from reducers.
+A client that re-scopes on every step of a moving player multiplies it by the step rate.
 
 ### Reading the liveness instruments
 

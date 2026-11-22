@@ -91,6 +91,7 @@ noted.
 | `--lock-split` | — | serve: trace every Move and sum its write-lock split, locked time and the post-commit part of it where subscription fan-out runs, into the stats endpoint; the driver reports the measured window's post-commit share. Sets `Telemetry:SlowReducerMs` to 0, because the split rides the slow-reducer event, and tracing every transaction costs a little. |
 | `--movers` | everyone | drive: only the first N players move; the rest connect, subscribe, and receive. Holds the commit rate fixed across a subscriber sweep. |
 | `--aoi` | — | drive: subscribe to an **area of interest** instead of the whole shard: the chunks within R chunks of the player (a square of side 2R+1), rescoped on every chunk step. Subscription SQL has equality and `BETWEEN`, and a chunk id packs x above y, so each table gets 2R+1 `WHERE ChunkId BETWEEN :lo AND :hi` strips, one per chunk column. R is at least 1, so a walker's next step stays in view. |
+| `--stay-in-block` | off | drive: every player roams inside the block it spawned in, so no one crosses into another shard and the run has no handoffs. Seam walkers are off with it. Set against the same run without it, it separates handoff cost from stepping and re-scoping. |
 | `--workstation-gc` | off | all: start the serve process with workstation GC (`DOTNET_gcServer=0`). The tool is built with Server GC, which is what a host on the Web SDK runs; this reproduces runs from before phase 31, which all used workstation GC. For a standalone serve, set `DOTNET_gcServer` yourself. The summary records the serve side's GC mode and core count either way. |
 | `--port` / `--listen` | 0 / 127.0.0.1 | Hub bind (gateway + stats). `--listen 0.0.0.0` accepts a remote driver. |
 | `--data` | temp dir | Data root for logs and hot stores; the temp default is deleted on exit. |
@@ -377,6 +378,71 @@ a second on one machine with the driver beside it.
 
 With the gateway's garbage gone, workstation GC keeps up at 200 players, and still collapses at 400.
 The startup warning (EventId 1108) stands.
+
+### Where the game's shape breaks (phase 31), 2026-11-22
+
+The runs above left the game's shape (16 shards, `--aoi 2`) failing at about 1,200 players without
+saying why. The suspects were re-scoping (ten re-scopes per player step, each diffing under the
+write lock) and handoffs. The driver now reports both: each shard's write-lock busy time with the
+re-scopes' share of it (`melange.subscription.rescope.duration`), rejections and client errors by
+code, each step of a handoff, and the serve process's thread-pool queue. `--stay-in-block` keeps
+every player inside its spawn block, so a run has no handoffs and changes nothing else.
+
+**Re-scoping is not it, and neither is the write lock:**
+
+| Players | Handoffs | Busiest shard's lock busy | Re-scopes' share of locked time | Rejected | Delta rows/s | Result |
+| --- | --- | --- | --- | --- | --- | --- |
+| 800 | on | 14.5% | 1.7% (8 µs each) | 20 | 244k | pass |
+| 800 | off | 12.2% | 1.9% | 0 | 278k | pass |
+| 1,200 | on | 14.5% | 2.6% (10 µs each) | 44,721 | 379k | 2 resync errors |
+| 1,200 | off | 18.1% | 2.2% | **0** | **585k** | pass |
+| 1,600 | on | 15.2% | 3.8% (13 µs each) | 560,585 | 333k | 1,384 resync errors |
+
+Without handoffs, 1,200 players pass clean and deliver half again as many rows. The lock is idle
+more than 80% of the time on every shard in every run.
+
+**What the failures are.** Rejections by code at 1,200 players were 42,555 `rate_limited`, 2,164
+`internal` and 2 `transient`. All three trace back to handoffs that take seconds:
+
+- `rate_limited` is the per-player reducer limit (`RateLimit:ReducerCallsPerSecond` 20, burst 60).
+  Players call at 15 Hz, under it. They trip it when the gateway replays the calls it held through
+  a long handoff in one burst.
+- `internal` is mostly `ShardSpanException`. A player walks past the border band before its
+  handoff lands, and with `Cluster:ShardSpanCheck` on, the write is refused as a span violation
+  and logged as a reducer failure. The rest is the gateway refusing calls past its held-call cap
+  (256), which it also answers with `internal` although its message says "retry".
+- `overflow_resync` is a gateway swap that failed outright: it could not connect to the
+  destination node, so the client re-establishes its subscriptions.
+
+**Where a handoff's time goes:**
+
+| Step | 800 players | 1,200 players |
+| --- | --- | --- |
+| Trigger: crossing signal queued in the boundary monitor | 9.9 ms mean | 45 ms mean; none dropped |
+| Freeze on the origin | 40 ms | 147 ms |
+| Import on the destination | 49 ms | 154 ms |
+| Release on the origin | 43 ms | 181 ms |
+| Whole saga | 133 ms (max 0.6 s) | 476 ms (908 over 1 s, max 2.4 s) |
+| Gateway swap: wait for the destination session | 0.1 ms | 432 ms mean, 243 over 5 s, max 41 s |
+| Gateway swap: wait for the connection's attachment lock | 0 | 17 ms mean, 11 over 5 s, max 29 s |
+| Calls held by the gateway, start to flush | 90 ms (max 0.6 s) | 693 ms (254 over 5 s, max 42 s) |
+| Serve thread pool, queued work items | mean 468, p99 3,532 | mean 2,560, p99 7,987 |
+
+- **Each round trip of the saga gets four times slower,** from about 45 ms to about 160 ms. The
+  steps themselves are small (a freeze and a durable marker), and the lock is mostly idle, so the
+  time is waiting: the serve process's thread pool holds thousands of queued items at 1,200
+  players while the process uses 12 of 32 cores. Node-link request handlers wait in that queue.
+- **The tail is the gateway's swap, not the saga.** The longest saga was 2.4 s, but calls were
+  held up to 42 s. A swap uses the session the gateway pre-opened to the destination when the
+  player approached; 431 swaps at 1,200 had none and connected then. Connecting runs through the
+  same queued pool, retries on timeout, and at 1,600 sometimes fails ("Unable to connect").
+  `EnsureShardUpstreamAsync` holds the connection's attachment lock while it connects, so a swap
+  can wait for that too.
+
+**Caveat:** this harness runs the hub, the gateway and all four shard nodes in one process, so one
+thread pool carries everything that a real deployment spreads over five. The pool backlog per
+process would be smaller there; whether the gateway's per-player upstream sessions and the
+calls-held-then-replayed shape hold up is the question either way.
 
 ### Relating to the in-process hotspot ceiling
 

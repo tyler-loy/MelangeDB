@@ -174,6 +174,34 @@ numbers.
 - **Conflation (step 3) is less pressing than it looked.** It was aimed at delivered rows; the
   whole-shard shape now delivers 1.7 million a second before its knee.
 
+### The game's wall, measured (2026-11-22)
+
+The owner asked for the measurement first. It ruled re-scoping out: re-scopes take 2-4% of locked
+time at about 10 µs each, and no shard's write lock is more than 18% busy. With handoffs off
+(`--stay-in-block`), 1,200 players pass with no rejections and deliver 585k rows a second. The
+wall is handoffs, and the time goes in two places:
+
+1. **Every saga round trip slows from about 45 ms to about 160 ms** at 1,200 players, waiting in
+   a thread pool that holds thousands of queued items while the process uses 12 of 32 cores.
+2. **The gateway's swap has a tail of tens of seconds:** it waits for a destination session when
+   the pre-opened one is missing, and for the connection's attachment lock, which
+   `EnsureShardUpstreamAsync` holds across a connect.
+
+The client-visible failures follow from the long holds: replayed bursts trip the per-player rate
+limit, players walk past the band (refused as a span violation, reported as `internal`), and the
+held-call cap answers `internal` though it means "retry". Full tables in
+[LOAD-TESTING.md](../LOAD-TESTING.md#where-the-games-shape-breaks-phase-31-2026-11-22).
+The fix is not one contained change. Candidates, for the owner:
+
+- **Small and clearly right:** answer the held-call cap with `transient`, not `internal`; and treat
+  an owned entity's write past the band as a transient rejection (its handoff is behind) rather
+  than a span violation.
+- **The gateway:** never connect while holding the attachment lock, and make the swap not depend
+  on a per-player connection succeeding in time (pre-open reliably, or share an upstream per node).
+- **Replay:** held calls should not reach the rate limiter as a burst the player never sent.
+- **The saga's waits:** answer handoff requests off the shared pool, as phase 30 did for the
+  liveness ping, then re-measure to see how much of the pool backlog is the one-process harness.
+
 ## Steps 3 to 5
 
 Unchanged from the [README](README.md#ordering): conflation for position-like tables, read-side

@@ -883,7 +883,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 var monitor = new BoundaryMonitor(
                     runtime.Engine, shard, strategy, anchors,
                     () => _link, () => runtime.FencingToken, runtime.BorrowedOwnerOf, runtime.IsFrozen,
-                    _options, _time);
+                    _options, _time, Metrics);
                 _boundaryMonitors[shard] = monitor;
                 monitor.Start();
             }

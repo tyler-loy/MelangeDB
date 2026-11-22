@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 
 namespace MelangeDB.LoadTest;
@@ -106,6 +107,13 @@ internal sealed class DriveMetrics
     private long _inconsistencies;
     private long _rescopes;
 
+    // Why calls were rejected, why the client raised errors, and why re-scopes failed, by wire
+    // code (or exception type where there is none). Rejections reset at the measured window like
+    // their count; errors are whole-run, like the resync count they explain.
+    private readonly ConcurrentDictionary<string, long> _rejectedByCode = new();
+    private readonly ConcurrentDictionary<string, long> _errorsByCode = new();
+    private readonly ConcurrentDictionary<string, long> _rescopeFailuresByCode = new();
+
     /// <summary>Call-to-delta: reducer call sent, to the matching self-delta on the caller's own subscription.</summary>
     public LatencySeries CallToDelta { get; } = new();
 
@@ -127,10 +135,12 @@ internal sealed class DriveMetrics
             Interlocked.Increment(ref _acked);
     }
 
-    public void CallRejected(int epoch)
+    public void CallRejected(int epoch, string code)
     {
-        if (epoch == Epoch)
-            Interlocked.Increment(ref _rejected);
+        if (epoch != Epoch)
+            return;
+        Interlocked.Increment(ref _rejected);
+        _rejectedByCode.AddOrUpdate(code, 1, static (_, n) => n + 1);
     }
 
     public void TransportError(int epoch)
@@ -152,7 +162,20 @@ internal sealed class DriveMetrics
 
     public void Disconnected() => Interlocked.Increment(ref _disconnects);
 
-    public void ResyncError() => Interlocked.Increment(ref _resyncErrors);
+    public void ResyncError(string code)
+    {
+        Interlocked.Increment(ref _resyncErrors);
+        _errorsByCode.AddOrUpdate(code, 1, static (_, n) => n + 1);
+    }
+
+    /// <summary>--aoi: a step's re-scope failed (also counted as a transport error in its epoch).</summary>
+    public void RescopeFailed(string code) => _rescopeFailuresByCode.AddOrUpdate(code, 1, static (_, n) => n + 1);
+
+    public IReadOnlyDictionary<string, long> RejectedByCode => _rejectedByCode;
+
+    public IReadOnlyDictionary<string, long> ErrorsByCode => _errorsByCode;
+
+    public IReadOnlyDictionary<string, long> RescopeFailuresByCode => _rescopeFailuresByCode;
 
     public void Inconsistencies(long count) => Interlocked.Add(ref _inconsistencies, count);
 
@@ -186,6 +209,7 @@ internal sealed class DriveMetrics
         Interlocked.Exchange(ref _attempted, 0);
         Interlocked.Exchange(ref _acked, 0);
         Interlocked.Exchange(ref _rejected, 0);
+        _rejectedByCode.Clear();
         Interlocked.Exchange(ref _transportErrors, 0);
         Interlocked.Exchange(ref _deltaRows, 0);
         Interlocked.Exchange(ref _crossings, 0);

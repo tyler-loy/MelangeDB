@@ -40,6 +40,9 @@ All packages ship together at one version; there is no per-package versioning. S
   column masks, the anchor boundary under concurrent writes, resume against the same and a new
   log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
   checks. The C# client's adapter passes it on every build.
+- **`melange.subscription.rescope.duration`** (road-to-0.4 phase 31): a histogram of how long
+  each re-scope held the write lock, by table. A client that moves its area of interest every step
+  pays this per step; the load test now reports its share of the lock.
 - **A startup warning for workstation GC** (road-to-0.4 phase 31): EventId `1108 WorkstationGc`
   when the host runs workstation GC on four or more logical processors. At 400 players in the load
   test it spent 55% of the time paused for GC (2% under Server GC) and p99 call-to-delta went from

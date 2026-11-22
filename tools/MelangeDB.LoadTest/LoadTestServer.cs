@@ -36,11 +36,14 @@ internal sealed class LoadTestServer : IAsyncDisposable
     private readonly Lock _lagLock = new();
     private readonly List<long> _lagRecords = [];
     private readonly List<double> _stalenessMs = [];
+    private readonly List<long> _poolQueue = [];
+    private int _poolThreadsMax;
 
     // Per owner shard: when each durable LSN was first seen, oldest first, trimmed to two minutes.
     private readonly Dictionary<ulong, Queue<(long At, ulong Durable)>> _durableHistory = [];
     private Timer? _lagSampler;
     private LockSplitListener? _lockSplit;
+    private readonly RescopeListener _rescopes = new();
     private WebApplication _hubApp = null!;
     private int _hubHttpPort;
     private int _nodeListenPort;
@@ -191,10 +194,12 @@ internal sealed class LoadTestServer : IAsyncDisposable
             .ToList();
         List<long> lag;
         List<double> staleness;
+        List<long> pool;
         lock (_lagLock)
         {
             lag = [.. _lagRecords.Order()];
             staleness = [.. _stalenessMs.Order()];
+            pool = [.. _poolQueue.Order()];
         }
 
         return new ServerStats
@@ -223,6 +228,31 @@ internal sealed class LoadTestServer : IAsyncDisposable
             LockSplitTransactions = _lockSplit?.Transactions ?? 0,
             LockedMsSum = _lockSplit?.LockedMs ?? 0,
             PostCommitMsSum = _lockSplit?.PostCommitMs ?? 0,
+            RescopeCount = _rescopes.Count,
+            RescopeMsSum = _rescopes.Milliseconds,
+            WriteLockBusyMsByShard = WriteLockBusyMsByShard(),
+            HandoffSteps = new Dictionary<string, StepStat>
+            {
+                ["trigger_wait"] = StepStat.Sum(nodes.Select(static n => StepStat.Of(n.BoundaryCrossingWait))),
+                ["freeze"] = StepStat.Of(metrics.HandoffFreeze),
+                ["import"] = StepStat.Of(metrics.HandoffImport),
+                ["notify"] = StepStat.Of(metrics.HandoffNotify),
+                ["release"] = StepStat.Of(metrics.HandoffRelease),
+                ["saga"] = StepStat.Of(metrics.HandoffSaga),
+                ["swap_lock"] = StepStat.Of(metrics.GatewaySwapLockWait),
+                ["swap_connect"] = StepStat.Of(metrics.GatewaySwapConnect),
+                ["gateway_hold"] = StepStat.Of(metrics.GatewayHold),
+                ["held_calls"] = StepStat.Of(metrics.GatewayHeldCalls),
+            },
+            BoundarySignalsDropped = nodes.Sum(static n => n.BoundarySignalsDropped),
+            BoundaryCrossingsDropped = nodes.Sum(static n => n.BoundaryCrossingsDropped),
+            GatewaySwapsPreopened = metrics.GatewaySwapsPreopened,
+            GatewaySwapsConnected = metrics.GatewaySwapsConnected,
+            ThreadPoolSamples = pool.Count,
+            ThreadPoolQueueMean = pool.Count == 0 ? 0 : pool.Average(),
+            ThreadPoolQueueMax = pool.Count == 0 ? 0 : pool[^1],
+            ThreadPoolQueueP99 = Quantile(pool, 0.99),
+            ThreadPoolThreadsMax = _poolThreadsMax,
             HeartbeatGapCount = metrics.HeartbeatGaps.Count,
             HeartbeatGapMaxMs = metrics.HeartbeatGaps.MaxMs,
             HeartbeatGapsOverMs = LivenessGaps.ThresholdsMs.ToDictionary(static t => t, metrics.HeartbeatGaps.Over),
@@ -238,6 +268,29 @@ internal sealed class LoadTestServer : IAsyncDisposable
             ReplicaStalenessP99Ms = Quantile(staleness, 0.99),
             LeaseLapses = nodes.Sum(static n => n.LeaseLapses),
         };
+    }
+
+    /// <summary>
+    /// Each owned shard's cumulative write-lock busy time, keyed by shard value: reducers, re-scopes,
+    /// handoffs and border work alike. A shard that moved mid-run restarts its count on the new owner.
+    /// </summary>
+    private Dictionary<string, double> WriteLockBusyMsByShard()
+    {
+        var busy = new Dictionary<string, double>();
+        for (var bx = 0; bx < _options.WorldBlocksX; bx++)
+        {
+            for (var by = 0; by < _options.WorldBlocksY; by++)
+            {
+                var shard = SpatialShardStrategy.ShardOfBlock(bx, by);
+                if (TryGetShard(shard) is { } runtime)
+                {
+                    busy[shard.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)] =
+                        Stopwatch.GetElapsedTime(0, runtime.Engine.WriteLockBusyTicks).TotalMilliseconds;
+                }
+            }
+        }
+
+        return busy;
     }
 
     private async Task<WebApplication> StartAppAsync(string nodeName, ClusterRole role, int httpPort)
@@ -421,6 +474,12 @@ internal sealed class LoadTestServer : IAsyncDisposable
     /// </summary>
     private void SampleReplicaLag()
     {
+        lock (_lagLock)
+        {
+            _poolQueue.Add(ThreadPool.PendingWorkItemCount);
+            _poolThreadsMax = Math.Max(_poolThreadsMax, ThreadPool.ThreadCount);
+        }
+
         try
         {
             var now = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -476,6 +535,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
         if (_hubApp is not null)
             await StopAsync(_hubApp).ConfigureAwait(false);
         _lockSplit?.Dispose();
+        _rescopes.Dispose();
         if (_ownsRoot)
         {
             try

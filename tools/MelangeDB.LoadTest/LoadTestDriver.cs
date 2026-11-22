@@ -78,6 +78,7 @@ internal static class LoadTestDriver
             output.WriteLine($"Warm-up: {options.WarmupSeconds} s (excluded from all statistics)...");
             await Task.Delay(TimeSpan.FromSeconds(options.WarmupSeconds), ct).ConfigureAwait(false);
             metrics.ResetForMeasurement();
+            var driverCpuBaseline = DriverCpuSeconds();
             var bytesBaseline = players.Sum(static p => p.BytesReceived);
             var measuredStats = statsUri is null ? null : await TryFetchStatsAsync(http, statsUri, ct).ConfigureAwait(false);
             var handoffBaseline = measuredStats?.HandoffsCompleted;
@@ -133,6 +134,7 @@ internal static class LoadTestDriver
             }
 
             var measured = clock.Elapsed;
+            var driverCpu = DriverCpuSeconds() - driverCpuBaseline;
             await walkers.CancelAsync().ConfigureAwait(false);
             await Task.WhenAll(walkTasks).ConfigureAwait(false);
 
@@ -144,7 +146,7 @@ internal static class LoadTestDriver
 
             var result = Summarize(
                 options, metrics, players, measured, bytesBaseline, finalStats, handoffBaseline, abortBaseline, output,
-                LockSplitShare(measuredStats, finalStats), measuredStats);
+                LockSplitShare(measuredStats, finalStats), measuredStats, driverCpu);
             if (options.OutPath is { } path)
             {
                 WriteSeries(path, series);
@@ -171,7 +173,8 @@ internal static class LoadTestDriver
         long? abortBaseline,
         TextWriter output,
         (long Transactions, double Share, double MeanLockedMs)? lockSplit,
-        ServerStats? measuredStats)
+        ServerStats? measuredStats,
+        double driverCpuSeconds)
     {
         var latency = metrics.CallToDelta.Total();
         var crossing = metrics.CrossingContinuity.Total();
@@ -217,14 +220,46 @@ internal static class LoadTestDriver
             output.WriteLine(Invariant($"Server CPU:      {cores:F1} cores; paused for GC {paused:P1} of the window; by thread: {string.Join(", ", kinds)}"));
         }
 
+        output.WriteLine(Invariant(
+            $"Driver CPU:      {driverCpuSeconds / seconds:F1} cores of {Environment.ProcessorCount} (this process: {(options.InProcessServer ? "drive and serve together" : "the players alone")})"));
+
         if (lockSplit is { } split)
         {
             output.WriteLine(Invariant(
                 $"Write lock:      post-commit (fan-out) is {split.Share:P1} of locked time over {split.Transactions} Move transactions (mean lock hold {split.MeanLockedMs * 1000:F0} µs)"));
         }
 
+        var lockUse = LockUse(measuredStats, finalStats, seconds);
+        if (lockUse is { } use)
+        {
+            var moveMs = lockSplit is { } moves ? moves.Transactions * moves.MeanLockedMs : (double?)null;
+            output.WriteLine(Invariant(
+                $"Lock busy:       busiest shard {use.BusiestShare:P1} of the window (shard {use.BusiestShard}), mean {use.MeanShare:P1} over {use.Shards} shards; ") +
+                Invariant($"of all locked time, re-scopes {Share(use.RescopeMs, use.BusyMs)} ({use.Rescopes} at mean {(use.Rescopes == 0 ? 0 : use.RescopeMs / use.Rescopes * 1000):F0} µs), ") +
+                (moveMs is { } m
+                    ? Invariant($"Move transactions {Share(m, use.BusyMs)}, everything else {Share(use.BusyMs - m - use.RescopeMs, use.BusyMs)}")
+                    : "Move transactions not traced (pass --lock-split)"));
+        }
+
+        if (measuredStats is not null && finalStats is not null && finalStats.HandoffSteps.Count > 0)
+        {
+            output.WriteLine("Handoff steps:   " + string.Join("; ", finalStats.HandoffSteps.Select(step =>
+                StepLine(step.Key, step.Value, measuredStats.HandoffSteps.GetValueOrDefault(step.Key)))));
+            output.WriteLine(Invariant(
+                $"Boundary queue:  {finalStats.BoundarySignalsDropped - measuredStats.BoundarySignalsDropped} signals dropped full, {finalStats.BoundaryCrossingsDropped - measuredStats.BoundaryCrossingsDropped} of them crossings (handoff triggers); ") +
+                Invariant($"swaps used a pre-opened session {finalStats.GatewaySwapsPreopened - measuredStats.GatewaySwapsPreopened} times, connected then {finalStats.GatewaySwapsConnected - measuredStats.GatewaySwapsConnected}"));
+            output.WriteLine(Invariant(
+                $"Thread pool:     queued work items mean {finalStats.ThreadPoolQueueMean:F0}, p99 {finalStats.ThreadPoolQueueP99}, max {finalStats.ThreadPoolQueueMax}; up to {finalStats.ThreadPoolThreadsMax} threads (whole run, sampled every 100 ms)"));
+        }
+
         output.WriteLine($"Client health:   {metrics.Disconnects} disconnects, {metrics.ResyncErrors} resync errors, " +
             $"{metrics.InconsistencyCount} cache inconsistencies");
+        if (metrics.RejectedByCode.Count > 0)
+            output.WriteLine($"Rejected calls:  {ByCode(metrics.RejectedByCode)}");
+        if (metrics.ErrorsByCode.Count > 0)
+            output.WriteLine($"Client errors:   {ByCode(metrics.ErrorsByCode)} (whole run)");
+        if (metrics.RescopeFailuresByCode.Count > 0)
+            output.WriteLine($"Failed re-scopes: {ByCode(metrics.RescopeFailuresByCode)} (whole run)");
         if (finalStats is not null)
         {
             output.WriteLine(Invariant(
@@ -244,7 +279,7 @@ internal static class LoadTestDriver
             failures.Add($"{metrics.Disconnects} client disconnects");
         if (metrics.ResyncErrors > 0)
             failures.Add($"{metrics.ResyncErrors} resync errors");
-        if (handoffs == 0 && options.SeamFraction > 0 && (options.WorldBlocksX > 1 || options.WorldBlocksY > 1))
+        if (handoffs == 0 && options.SeamFraction > 0 && !options.StayInBlock && (options.WorldBlocksX > 1 || options.WorldBlocksY > 1))
             failures.Add("no completed handoffs despite seam walkers");
 
         // Nothing is killed in a drive run, so any death is a false one.
@@ -275,6 +310,10 @@ internal static class LoadTestDriver
                   Invariant($"replica_staleness_p99_ms={live.ReplicaStalenessP99Ms:F0} replica_staleness_max_ms={live.ReplicaStalenessMaxMs:F0}")
                 : string.Empty) +
             (lockSplit is { } s ? Invariant($" post_commit_share={s.Share:F4} lock_split_transactions={s.Transactions} mean_locked_us={s.MeanLockedMs * 1000:F0}") : string.Empty) +
+            (lockUse is { } u
+                ? Invariant($" lock_busy_max_share={u.BusiestShare:F4} lock_busy_mean_share={u.MeanShare:F4} rescopes_server={u.Rescopes} rescope_lock_ms={u.RescopeMs:F0} lock_busy_ms={u.BusyMs:F0}")
+                : string.Empty) +
+            Invariant($" driver_cores={driverCpuSeconds / seconds:F1}") +
             (pass ? string.Empty : $" failures=[{string.Join("; ", failures)}]");
         output.WriteLine();
         output.WriteLine(summary);
@@ -302,6 +341,50 @@ internal static class LoadTestDriver
         return transactions <= 0 || locked <= 0
             ? null
             : (transactions, (end.PostCommitMsSum - start.PostCommitMsSum) / locked, locked / transactions);
+    }
+
+    /// <summary>
+    /// The measured window's write-lock use: each shard's busy share (shards present at both ends
+    /// only, since a moved shard restarts its count), and the re-scopes' part of the total.
+    /// </summary>
+    private static (double BusiestShare, string BusiestShard, double MeanShare, int Shards, double BusyMs, long Rescopes, double RescopeMs)?
+        LockUse(ServerStats? start, ServerStats? end, double seconds)
+    {
+        if (start is null || end is null || end.WriteLockBusyMsByShard.Count == 0)
+            return null;
+        var shards = end.WriteLockBusyMsByShard
+            .Where(e => start.WriteLockBusyMsByShard.TryGetValue(e.Key, out var before) && e.Value >= before)
+            .Select(e => (Shard: e.Key, Ms: e.Value - start.WriteLockBusyMsByShard[e.Key]))
+            .ToList();
+        if (shards.Count == 0)
+            return null;
+        var busiest = shards.MaxBy(static s => s.Ms);
+        var busy = shards.Sum(static s => s.Ms);
+        return (busiest.Ms / 1000 / seconds, busiest.Shard, busy / shards.Count / 1000 / seconds, shards.Count, busy,
+            end.RescopeCount - start.RescopeCount, end.RescopeMsSum - start.RescopeMsSum);
+    }
+
+    /// <summary>"freeze n=…, mean … ms, >1 s …, max … ms": the window's count, mean and tail; max is whole-run.</summary>
+    private static string StepLine(string name, StepStat end, StepStat? start)
+    {
+        var count = end.Count - (start?.Count ?? 0);
+        var total = end.TotalMs - (start?.TotalMs ?? 0);
+        long Over(int t) => end.Over.GetValueOrDefault(t) - (start?.Over.GetValueOrDefault(t) ?? 0);
+        var unit = name == "held_calls" ? string.Empty : " ms";
+        return count == 0
+            ? $"{name} none"
+            : Invariant($"{name} n={count} mean {total / count:F1}{unit} >100 {Over(100)} >1000 {Over(1_000)} >5000 {Over(5_000)} max {end.MaxMs:F0}{unit}");
+    }
+
+    private static string Share(double part, double whole) => whole <= 0 ? "n/a" : Invariant($"{part / whole:P1}");
+
+    private static string ByCode(IReadOnlyDictionary<string, long> counts) =>
+        string.Join(", ", counts.OrderByDescending(static c => c.Value).Select(static c => Invariant($"{c.Key} {c.Value}")));
+
+    private static double DriverCpuSeconds()
+    {
+        using var process = Process.GetCurrentProcess();
+        return process.TotalProcessorTime.TotalSeconds;
     }
 
     private static void WriteSeries(string path, List<TimeSeriesSample> series)

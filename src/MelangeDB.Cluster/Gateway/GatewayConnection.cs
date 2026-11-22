@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.WebSockets;
 using MelangeDB.Core;
 using MelangeDB.Protocol;
@@ -45,6 +46,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
     private volatile UpstreamSession? _muted;
     private ShardKey? _shardKey;
     private bool _queueShardCalls;
+    private long _queueStartedAt;
     private bool _handshaken;
     private IDisposable? _handoffRegistration;
     private IDisposable? _moveRegistration;
@@ -502,6 +504,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
         lock (_stateLock)
         {
             _queueShardCalls = true;
+            _queueStartedAt = Stopwatch.GetTimestamp();
         }
     }
 
@@ -641,9 +644,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
 
     private async Task SwapToAsync(ShardKey to, bool force = false)
     {
+        var metrics = _gateway.Hub.Metrics;
+        var lockStarted = Stopwatch.GetTimestamp();
         try
         {
             await _attachmentLock.WaitAsync(_closed.Token).ConfigureAwait(false);
+            metrics.GatewaySwapLockWait.Record(Stopwatch.GetElapsedTime(lockStarted));
         }
         catch (OperationCanceledException)
         {
@@ -668,6 +674,7 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
 
             // A pre-open that failed (its node was not serving the shard yet, or not at all) is
             // not the swap's failure: connect now, with the full retry budget.
+            var connectStarted = Stopwatch.GetTimestamp();
             UpstreamSession? session = null;
             if (preopened is not null)
             {
@@ -681,7 +688,9 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 }
             }
 
+            metrics.GatewaySwapSession(preopened: session is not null);
             session ??= await ConnectShardAsync(to, _closed.Token).ConfigureAwait(false);
+            metrics.GatewaySwapConnect.Record(Stopwatch.GetElapsedTime(connectStarted));
 
             byte[][] subscribes;
             List<(byte[] Bytes, uint RequestId, bool IsProducer)> held;
@@ -693,6 +702,12 @@ internal sealed partial class GatewayConnection : IPlayerHandoffObserver, IShard
                 subscribes = [.. _shardSubscribeFrames.Values];
                 held = [.. _heldCalls];
                 _heldCalls.Clear();
+                if (_queueShardCalls && !force)
+                {
+                    _gateway.Hub.Metrics.GatewayHold.Record(Stopwatch.GetElapsedTime(_queueStartedAt));
+                    _gateway.Hub.Metrics.GatewayHeldCalls.Record(held.Count);
+                }
+
                 _queueShardCalls = false;
                 _queueGeneration++;
             }

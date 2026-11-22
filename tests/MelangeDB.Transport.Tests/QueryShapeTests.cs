@@ -157,6 +157,44 @@ public class QueryShapeTests
     }
 
     [Fact]
+    public async Task A_rescope_records_how_long_it_held_the_write_lock()
+    {
+        // The meter is process-wide and other tests rescope too, so this one counts only rescopes
+        // of a table no other test subscribes to by range.
+        var recorded = new System.Collections.Concurrent.ConcurrentBag<double>();
+        using var listener = new System.Diagnostics.Metrics.MeterListener();
+        listener.InstrumentPublished = static (instrument, l) =>
+        {
+            if (instrument.Meter.Name == "MelangeDB" && instrument.Name == "melange.subscription.rescope.duration")
+                l.EnableMeasurementEvents(instrument);
+        };
+        listener.SetMeasurementEventCallback<double>((_, milliseconds, tags, _) =>
+        {
+            foreach (var tag in tags)
+            {
+                if (tag.Key == "table" && tag.Value as string == "PlayerState")
+                    recorded.Add(milliseconds);
+            }
+        });
+        listener.Start();
+
+        await using var host = await TransportTestHost.StartAsync();
+        host.Reducers.Call("Spawn", Identity.Hash("alice"), "Alice", 1);
+        await using var client = host.CreateClient();
+        await client.ConnectAsync(TestContext.Current.CancellationToken);
+        var room = await client.SubscribeAsync(
+            "SELECT * FROM PlayerState WHERE RoomId = :room",
+            new Dictionary<string, object?> { ["room"] = 1 },
+            TestContext.Current.CancellationToken);
+        Assert.Empty(recorded); // A first subscribe is not a rescope.
+
+        await client.RescopeAsync(room, new Dictionary<string, object?> { ["room"] = 2 }, TestContext.Current.CancellationToken);
+        await TransportTestHost.WaitUntilAsync(() => room.Count == 0 && !recorded.IsEmpty, "the rescope and its measurement");
+
+        Assert.All(recorded, static ms => Assert.True(ms >= 0));
+    }
+
+    [Fact]
     public async Task Private_and_unknown_tables_are_rejected_with_the_same_non_leaking_error()
     {
         await using var host = await TransportTestHost.StartAsync();
