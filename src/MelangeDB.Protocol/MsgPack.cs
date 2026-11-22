@@ -224,6 +224,18 @@ public struct MsgPackWriter
     /// </summary>
     public readonly byte[] ToArray() => _counting ? [] : _buffer.AsSpan(0, _position).ToArray();
 
+    /// <summary>Writes bytes that are already MessagePack, as they are: a value encoded once and shared.</summary>
+    internal void WriteRaw(ReadOnlySpan<byte> encoded)
+    {
+        if (!_counting)
+        {
+            Ensure(encoded.Length);
+            encoded.CopyTo(_buffer.AsSpan(_position));
+        }
+
+        _position += encoded.Length;
+    }
+
     private void WriteByte(byte value)
     {
         if (_counting)

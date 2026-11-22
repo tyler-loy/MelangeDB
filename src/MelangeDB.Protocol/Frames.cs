@@ -255,7 +255,17 @@ public sealed record SubscriptionAppliedFrame(
 public readonly record struct WireRowOp(RowOpKind Kind, byte[] Key, ReadOnlyMemory<byte> Row, ReadOnlyMemory<byte> ColumnMask);
 
 /// <summary>The deltas one subscription receives from one committed transaction.</summary>
-public sealed record SubscriptionUpdate(uint SubscriptionId, IReadOnlyList<WireRowOp> Ops);
+public sealed record SubscriptionUpdate(uint SubscriptionId, IReadOnlyList<WireRowOp> Ops)
+{
+    /// <summary>
+    /// <see cref="Ops"/> already encoded as the MessagePack array the frame carries, when the
+    /// server computed it once for every subscription sharing these ops (road-to-0.4 phase 31).
+    /// Empty means encode <see cref="Ops"/> as usual. When set it must encode exactly
+    /// <see cref="Ops"/>: the frame's bytes are identical either way, which is what lets the
+    /// server share it without a protocol change.
+    /// </summary>
+    internal ReadOnlyMemory<byte> EncodedOps { get; init; }
+}
 
 /// <summary>
 /// One committed transaction's deltas for every matching subscription on this connection. Frames

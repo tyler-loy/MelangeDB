@@ -30,6 +30,13 @@ internal sealed class SubscriptionEngine
     private readonly ConcurrentDictionary<string, int> _activeByTable = new(StringComparer.Ordinal);
     private readonly ServerTelemetry? _telemetry;
 
+    // Shared fan-out (road-to-0.4 phase 31). Groups by key; the counters stamp per-op and
+    // per-record scratch so nothing has to be cleared between commits; the sink map is reused.
+    private readonly Dictionary<SubscriptionGroup.GroupKey, SubscriptionGroup> _groups = [];
+    private readonly Dictionary<IDeltaSink, List<ServerSubscription>> _touched = [];
+    private long _opCounter;
+    private long _recordCounter;
+
     /// <summary>
     /// Initial sets being collected off the write lock, each recording the commits that land while
     /// it reads. Mutated and read only under the engine's write lock (Fanout runs under it).
@@ -87,8 +94,35 @@ internal sealed class SubscriptionEngine
         // so in practice a table's subscriptions share one set object.
         subscription.ShareWireColumns(list);
         list.Add(subscription);
+        JoinGroup(subscription);
         _activeByTable.AddOrUpdate(subscription.Schema.Name, 1, static (_, count) => count + 1);
     }
+
+    /// <summary>Puts a subscription in the group for its query, if it may share one. Under the write lock.</summary>
+    private void JoinGroup(ServerSubscription subscription)
+    {
+        if (!SubscriptionGroup.CanGroup(subscription))
+            return;
+        var key = SubscriptionGroup.KeyOf(subscription);
+        if (!_groups.TryGetValue(key, out var group))
+            _groups[key] = group = new SubscriptionGroup(key);
+        group.Members.Add(subscription);
+        subscription.Group = group;
+    }
+
+    /// <summary>Takes a subscription out of its group, dropping the group when it empties. Under the write lock.</summary>
+    private void LeaveGroup(ServerSubscription subscription)
+    {
+        if (subscription.Group is not { } group)
+            return;
+        group.Members.Remove(subscription);
+        subscription.Group = null;
+        if (group.Members.Count == 0)
+            _groups.Remove(group.Key);
+    }
+
+    /// <summary>The number of groups, for tests: identical queries must collapse into one.</summary>
+    internal int GroupCount => _groups.Count;
 
     /// <summary>
     /// The commits that land while an initial set is read off the write lock. Begun under the same
@@ -178,7 +212,10 @@ internal sealed class SubscriptionEngine
     public void Unregister(ServerSubscription subscription)
     {
         if (_byTable.TryGetValue(subscription.Schema.Id, out var list) && list.Remove(subscription))
+        {
+            LeaveGroup(subscription);
             _activeByTable.AddOrUpdate(subscription.Schema.Name, 0, static (_, count) => count - 1);
+        }
     }
 
     /// <summary>
@@ -208,7 +245,13 @@ internal sealed class SubscriptionEngine
                 previousKeys.Add(key);
         }
 
+        // A new predicate is a different query: the subscription changes group. Only a registered
+        // one is grouped (a re-scope can run on one still collecting its initial set).
+        var grouped = subscription.Group is not null;
+        LeaveGroup(subscription);
         subscription.Rescope(query, limits);
+        if (grouped)
+            JoinGroup(subscription);
 
         var ops = new List<WireRowOp>();
         var nowKeys = new HashSet<RowKey>();
@@ -247,7 +290,23 @@ internal sealed class SubscriptionEngine
         foreach (var catchUp in _catchUps)
             catchUp.Records.Add(record);
 
-        var perSink = default(Dictionary<IDeltaSink, Dictionary<ServerSubscription, List<WireRowOp>>>);
+        try
+        {
+            FanoutCore(record);
+        }
+        catch
+        {
+            // The engine logs an observer's failure and carries on, so this record's half-built
+            // frames must not survive into the next one's.
+            _touched.Clear();
+            throw;
+        }
+    }
+
+    private void FanoutCore(CommitRecord record)
+    {
+
+        var recordStamp = ++_recordCounter;
         var wire = default(WireRowMemo);
         var before = default(DecodedRow);
         var after = default(DecodedRow);
@@ -292,37 +351,80 @@ internal sealed class SubscriptionEngine
             (before ??= new DecodedRow()).Reset(schema, oldRow, present: hasOld);
             (after ??= new DecodedRow()).Reset(schema, op.Row, present: op.Kind != RowOpKind.Delete);
 
+            var opStamp = ++_opCounter;
             foreach (var subscription in subscriptions)
             {
-                var delta = ComputeDelta(subscription, op.Key, key, wire, before, after);
-                if (delta is not { } wireOp)
+                // A grouped subscription takes its group's verdict, computed by whichever member
+                // comes first; the group's op list is appended once and shared by every member.
+                // The walk itself stays in registration order, so each connection's frame lists
+                // its subscriptions in the order it always did.
+                if (subscription.Group is { } group)
+                {
+                    if (group.OpStamp != opStamp)
+                    {
+                        group.OpStamp = opStamp;
+                        group.OpResult = ComputeDelta(group.Representative, op.Key, key, wire, before, after);
+                        if (group.OpResult is { } shared)
+                        {
+                            if (group.RecordStamp != recordStamp)
+                            {
+                                group.RecordStamp = recordStamp;
+                                group.Ops = [];
+                                group.EncodedOps = null;
+                            }
+
+                            group.Ops!.Add(shared);
+                        }
+                    }
+
+                    if (group.OpResult is null)
+                        continue;
+                    Touch(subscription, recordStamp);
                     continue;
-                perSink ??= [];
-                if (!perSink.TryGetValue(subscription.Sink, out var perSubscription))
-                    perSink[subscription.Sink] = perSubscription = [];
-                if (!perSubscription.TryGetValue(subscription, out var ops))
-                    perSubscription[subscription] = ops = [];
-                ops.Add(wireOp);
+                }
+
+                if (ComputeDelta(subscription, op.Key, key, wire, before, after) is not { } wireOp)
+                    continue;
+                if (Touch(subscription, recordStamp))
+                    subscription.PendingOps = [];
+                subscription.PendingOps!.Add(wireOp);
             }
         }
 
-        if (perSink is null)
+        if (_touched.Count == 0)
             return;
 
-        var woken = new IDeltaSink[perSink.Count];
+        var woken = new IDeltaSink[_touched.Count];
         var next = 0;
-        foreach (var (sink, bySubscription) in perSink)
+        foreach (var (sink, touched) in _touched)
         {
-            var updates = new List<SubscriptionUpdate>(bySubscription.Count);
-            foreach (var (subscription, ops) in bySubscription)
+            var updates = new List<SubscriptionUpdate>(touched.Count);
+            foreach (var subscription in touched)
             {
-                updates.Add(new SubscriptionUpdate(subscription.Id, ops));
-                _telemetry?.RecordDeltaRows(subscription.Schema.Name, ops.Count);
+                SubscriptionUpdate update;
+                if (subscription.Group is { } group)
+                {
+                    // Encoding moves the serialization under the lock, so it pays only when the
+                    // bytes are shared; a lone member's frame is encoded on its send loop as before.
+                    if (group.Members.Count > 1)
+                        group.EncodedOps ??= MessagePackFrameSerializer.EncodeOps(group.Ops!);
+                    update = new SubscriptionUpdate(subscription.Id, group.Ops!) { EncodedOps = group.EncodedOps };
+                }
+                else
+                {
+                    update = new SubscriptionUpdate(subscription.Id, subscription.PendingOps!);
+                    subscription.PendingOps = null;
+                }
+
+                updates.Add(update);
+                _telemetry?.RecordDeltaRows(subscription.Schema.Name, update.Ops.Count);
             }
 
             sink.EnqueueDeltaQuietly(new TransactionUpdateFrame(record.Lsn, updates) { Channel = MelangeChannels.Data });
             woken[next++] = sink;
         }
+
+        _touched.Clear();
 
         // One pool item wakes every connection this commit reached, instead of one wake-up per
         // connection inside the lock (each queues a send loop's continuation to the pool). A frame
@@ -349,6 +451,21 @@ internal sealed class SubscriptionEngine
                 // A closed connection has nothing left to send.
             }
         }
+    }
+
+    /// <summary>
+    /// Lists a subscription in its connection's frame for this record, once. True the first time
+    /// in the record, which is when an ungrouped subscription starts its op list.
+    /// </summary>
+    private bool Touch(ServerSubscription subscription, long recordStamp)
+    {
+        if (subscription.FanoutStamp == recordStamp)
+            return false;
+        subscription.FanoutStamp = recordStamp;
+        if (!_touched.TryGetValue(subscription.Sink, out var list))
+            _touched[subscription.Sink] = list = [];
+        list.Add(subscription);
+        return true;
     }
 
     /// <summary>

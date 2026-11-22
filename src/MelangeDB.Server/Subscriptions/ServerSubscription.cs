@@ -103,6 +103,15 @@ internal sealed class ServerSubscription
     /// <summary>The inclusive upper bound; see <see cref="RangeLow"/>.</summary>
     public RowKey RangeHigh { get; private set; }
 
+    /// <summary>The group this subscription shares its fan-out with, or null when it is evaluated alone.</summary>
+    internal SubscriptionGroup? Group { get; set; }
+
+    /// <summary>The fan-out's record counter value at which this subscription was last added to its sink's frame.</summary>
+    internal long FanoutStamp { get; set; } = -1;
+
+    /// <summary>This record's ops, for a subscription evaluated alone; a grouped one reads its group's.</summary>
+    internal List<WireRowOp>? PendingOps { get; set; }
+
     /// <summary>
     /// Compiles and validates a query against the schema and the configured cost limits.
     /// <paramref name="context"/> is the caller policies filter for; null (with a null

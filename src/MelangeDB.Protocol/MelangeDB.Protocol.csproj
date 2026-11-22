@@ -9,4 +9,10 @@
     <ProjectReference Include="..\MelangeDB.Abstractions\MelangeDB.Abstractions.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The server shares one encoding of a subscription group's ops (SubscriptionUpdate.EncodedOps). -->
+    <InternalsVisibleTo Include="MelangeDB.Server" />
+    <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+  </ItemGroup>
+
 </Project>
