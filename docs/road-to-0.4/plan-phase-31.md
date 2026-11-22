@@ -1,6 +1,6 @@
 # Phase 31: throughput, the ceiling re-measured, then shared fan-out
 
-**Status:** step 1 measured 2026-11-22; step 2 planned, its decisions open. Phase 31 is the last
+**Status:** step 1 measured 2026-11-22; step 2 planned, its decisions settled the same day (owner took every leaning). Phase 31 is the last
 phase of 0.4 (owner, 2026-11-21). The ideas and their order are in the
 [0.4 README](README.md#ordering); this plan records what step 1 found and cuts step 2 into changes.
 
@@ -72,7 +72,9 @@ builds first, so it is measured before anything is built.
   instead of per frame, or after the lock drops.
 - **2e. Re-measure** the sweep and the ladder as in step 1, interleaved against the step 1 build.
 
-### Decisions to settle
+### Decisions (settled 2026-11-22)
+
+The owner took all four leanings as written.
 
 1. **Wire format.** Leaning: no protocol change. 2c splices a header onto shared bytes and must be
    byte-identical to today's frames. A frame that names a group instead of a subscription would
