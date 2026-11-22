@@ -17,8 +17,9 @@ Two things hold a client to these rules:
   fails the build when it drifts from what the server sends. See [The corpus](#the-corpus).
 - **The live suite**: `tools/MelangeDB.Conformance run` drives a client under test, through a
   small [adapter](#the-adapter-protocol) the client's language provides, against a real server.
-  It covers the behaviours a frame corpus cannot show: the merged cache, re-scoping, masks, and
-  calls. The C# client passes it on every build. See [The live suite](#the-live-suite).
+  It covers the behaviours a frame corpus cannot show: the merged cache, the anchor boundary under
+  concurrent writes, resume against the same and a new log, backpressure, and the heartbeat. The
+  C# client passes it on every build. See [The live suite](#the-live-suite).
 
 The C# client in `src/MelangeDB.Client` defines conformance, so where it and this document disagree
 the disagreement is a [finding](#findings), not a licence.
@@ -243,7 +244,9 @@ bulk channel. Buffer them, and when the set completes apply the buffered deltas 
 the anchor, in order. Drop any at or below it. *Fails if:* a client applies early deltas straight
 away (the set then overwrites them, losing commits) or applies them after the set without the
 anchor test (commits already in the set apply twice). Both failures are intermittent and depend on
-timing, which makes this the rule most worth getting right. The live suite forces both races.
+timing, which makes this the rule most worth getting right. The suite's `anchor-boundary` scenario
+commits into the subscribed group throughout a many-chunk initial set; a client without the
+buffer fails it.
 
 **C6.4 — Subscription refusals are `Error` frames carrying the subscription id**, on channel 0.
 Codes include `unknown_table` (also for private tables: the server does not reveal which),
@@ -382,7 +385,8 @@ every subscription on the connection**, and sends one connection-scoped `Error o
 **C11.1 — On `overflow_resync`, re-establish every subscription.** Re-send `Subscribe` for each one
 (the same ids are fine: the server no longer holds them), and reconcile each new initial set by
 diff (C8.2). *Fails if:* a client only reports the error. Its subscriptions look live, and its
-caches stop changing, with no further error.
+caches stop changing, with no further error. The C# client re-sends `Subscribe` for every
+subscription as soon as the error arrives, and still raises `OnError`.
 
 **C11.2 — Never block the receive path.** A client that stops reading the socket stops answering
 pings and is disconnected (§12), and a full receive buffer is what triggers backpressure in the
@@ -524,6 +528,12 @@ merged cache.
 | `merged-cache` | one event for a row two subscriptions carry; no delete while another subscription still covers a row |
 | `rescope` | the LSN-0 diff applies; the subscription carries on live |
 | `column-masks` | a masked column is never presented as a value |
+| `anchor-boundary` | commits throughout a many-chunk initial set: every event follows from the one before it, and the cache ends where the server is |
+| `resume-accepted` | a dropped socket resumes; exactly the missed commits replay, in order |
+| `reauthenticate` | a same-identity refresh is accepted; a different identity is refused and reported |
+| `resume-new-epoch` | after the server restarts over a fresh log, the resume is rejected and the cache reconciles by diff |
+| `overflow-resync` | one delta larger than `Subscriptions:MaxBufferedBytes` drops the subscriptions; the client re-establishes them on its own |
+| `heartbeat` | the server's clock runs through more than its heartbeat timeout; a client that answers every `Ping` survives |
 
 ## The adapter protocol
 
@@ -563,6 +573,12 @@ after the response to a later request it preceded. That is what makes `sync` a b
 | `callProducer` | `producer`, `arguments` | `lsn`, `value` (tagged) |
 | `sync` | `lsn` | once the client's resume cursor has reached `lsn` |
 | `cache` | `table` | `rows`: the merged cache's rows |
+| `drop` | | the socket is aborted with no close frame; the client reports `disconnected` |
+| `reconnect` | | `resumed`: whether the server accepted a resume (true) or the client fully resynced (false), once done |
+| `reauthenticate` | `token` | once the server accepts it; an error when it refuses |
+| `drop` | | the socket is aborted with no close frame; the client reports `disconnected` |
+| `reconnect` | | `resumed`: whether the server accepted a resume (true) or the client fully resynced (false), once done |
+| `reauthenticate` | `token` | once the server accepts it; an error when it refuses |
 | `close` | | the connection is closed and forgotten |
 
 Tagged values are the corpus's argument form: `{"tag": "Int64", "value": "-5"}`, with
@@ -571,14 +587,15 @@ client takes for that parameter. When stdin closes, the adapter closes its clien
 
 ## Findings
 
-Writing the contract down found these, as the phase plan said it would. None is fixed in this
-step; each becomes an issue or a fix in a later step, at the owner's call.
+Writing the contract down found these, as the phase plan said it would.
 
-1. **The C# client does not recover from `overflow_resync`** (C11.1). `MelangeClient` raises
-   `OnError` and keeps treating its subscriptions as live; nothing re-subscribes, so the caches
-   stop changing with no further signal until the application reconnects. `BackpressureTests`
-   re-subscribe by hand over a raw socket, which is why no test noticed. The live suite's
-   backpressure scenario will fail the C# adapter until this is fixed.
+1. **The C# client did not recover from `overflow_resync`** (C11.1). **Fixed in phase 23 step 2.**
+   `MelangeClient` raised `OnError` and kept treating its subscriptions as live; nothing
+   re-subscribed, so the caches stopped changing with no further signal until the application
+   reconnected. `BackpressureTests` re-subscribed by hand over a raw socket, which is why no test
+   noticed. The client now re-establishes every subscription itself. The `overflow-resync`
+   scenario and a `BackpressureTests` case through the real client both fail without the fix.
+   The same change makes chunk 0 discard rows left from an initial set that never completed.
 2. **Resume across an additive migration may decode with a stale descriptor.** Found by reading;
    not yet reproduced. An additive migration keeps the log's epoch
    (`SchemaShapeResumeTests` relies on that), so a client that reconnects after a deploy which
@@ -587,7 +604,8 @@ step; each becomes an issue or a fix in a later step, at the owner's call.
    column added mid-table would shift every column after it. `SchemaShapeResumeTests` reorders
    stored history without changing the live descriptor, so it does not cover this. The fix is
    probably to refuse a resume whose subscriptions' shapes changed since the cursor, which falls
-   back to a full resync with fresh descriptors.
+   back to a full resync with fresh descriptors. The live suite cannot stage it yet: a column
+   added between restarts needs two builds of the module, and the conformance tool has one.
 3. **`Public = true` on a scheduled table is silently dropped.** Scheduled tables are forced
    private, which is why no frame can carry `ScheduleAt`. Ignoring the attribute without a
    diagnostic is surprising; the corpus covers the kind with vectors instead.

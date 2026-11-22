@@ -161,6 +161,11 @@ public sealed class MelangeSubscription
             // subscription gets a fresh one and replaces the old.
             if (chunk.Descriptor is { } descriptor)
                 _descriptor = descriptor;
+
+            // Chunk 0 starts a set. Rows still accumulated from a set that never completed (the
+            // server dropped it for backpressure, or re-issued the subscription) are not part of it.
+            if (chunk.ChunkIndex == 0)
+                _initialRows.Clear();
             _initialRows.AddRange(chunk.Rows);
             if (!chunk.IsLast)
                 return;

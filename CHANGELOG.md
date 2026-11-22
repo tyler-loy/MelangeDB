@@ -24,8 +24,9 @@ All packages ship together at one version; there is no per-package versioning. S
 - **The live conformance suite** (phase 23, step 2). `MelangeDB.Conformance run -- <adapter>`
   drives any client through a small newline-delimited JSON adapter against a real server. It
   covers the corpus, the encoding vectors, the handshake, calls, the merged cache, re-scoping,
-  and column masks, each scenario naming the obligations it checks. The C# client's adapter
-  passes it on every build.
+  column masks, the anchor boundary under concurrent writes, resume against the same and a new
+  log, backpressure, reauthentication, and the heartbeat. Each scenario names the obligations it
+  checks. The C# client's adapter passes it on every build.
 
 - **`MelangeDB.Mcp`, the agent endpoint** (road-to-0.4 phase 29). A new, optional package:
   `AddMelangeMcp()` and `app.MapMelangeMcp()` put a Model Context Protocol endpoint (stateless
@@ -161,6 +162,11 @@ All packages ship together at one version; there is no per-package versioning. S
   rows.
 
 ### Fixed
+
+- **`MelangeClient` recovers from `overflow_resync`** (found writing the phase 23 conformance
+  contract). After the server dropped a slow connection's subscriptions, the client raised
+  `OnError` and nothing else, so every subscription looked live while its cache stopped changing.
+  It now re-subscribes each one at once and reconciles the new initial sets by diff.
 
 - **A large border reset took down the node link, and with it a healthy node.** A band reset was
   sent as one node-link frame, and a link drops any frame over 64 MiB. A million-row shard's band

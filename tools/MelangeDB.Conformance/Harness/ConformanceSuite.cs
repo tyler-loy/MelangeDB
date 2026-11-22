@@ -27,6 +27,14 @@ public static partial class ConformanceSuite
         new("merged-cache", "C8.1, C6.5", MergedCacheAsync),
         new("rescope", "C7.2, C8.1", RescopeAsync),
         new("column-masks", "C4.3, C4.4", ColumnMasksAsync),
+        new("anchor-boundary", "C6.2, C6.3, C7.3", AnchorBoundaryAsync),
+        new("resume-accepted", "C10.1-C10.3", ResumeAcceptedAsync),
+        new("reauthenticate", "C13.1, C13.2", ReauthenticateAsync),
+        new("resume-new-epoch", "C10.2, C10.4, C8.2", ResumeNewEpochAsync),
+        new("overflow-resync", "C11.1, C8.2", OverflowResyncAsync),
+
+        // Last: it moves the shared server's clock, which every later resume window would feel.
+        new("heartbeat", "C12.1", HeartbeatAsync),
     ];
 
     /// <summary>Runs every scenario whose name passes <paramref name="filter"/> and reports each.</summary>

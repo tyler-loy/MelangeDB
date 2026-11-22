@@ -296,3 +296,14 @@ from the conformance manifest. It passes in-process over pipes on every build
 (`LiveSuiteTests`) and as a subprocess through `run`. An adapter that raises an insert per
 subscription instead of per merged row fails three scenarios.
 
+**Step 2b** (2026-11-22). The scenarios that need time, failure, or a second server:
+`anchor-boundary` (a 600-row, many-chunk initial set with commits landing throughout; every event
+must follow from the one before it), `resume-accepted`, `resume-new-epoch` (the server restarts
+over a fresh log on the same port), `overflow-resync` (one delta larger than a 16 KiB
+`MaxBufferedBytes`), `reauthenticate`, and `heartbeat` (the server's manual clock runs through
+five intervals). Finding 1 is fixed: `MelangeClient` re-subscribes everything on
+`overflow_resync`, and chunk 0 now discards rows left from an initial set that never completed.
+A client without the delta buffer fails `anchor-boundary` (three runs of three). One without the
+re-subscribe fails `overflow-resync` and the new `BackpressureTests` case. Finding 2 still needs
+two builds of a module, so it stays a finding.
+

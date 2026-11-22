@@ -85,6 +85,18 @@ public sealed class ConformanceReducers
     public void PutSecret(ReducerContext ctx, string name, Identity owner, int visible, string hidden) =>
         ctx.Db.Secret.Insert(new Secret { Name = name, Owner = owner, Visible = visible, Hidden = hidden });
 
+    /// <summary>
+    /// A row too large for a small <c>Subscriptions:MaxBufferedBytes</c>: its one delta is enough
+    /// to trip backpressure, which is how the suite makes <c>overflow_resync</c> happen on purpose.
+    /// </summary>
+    [Reducer]
+    public void PutBlob(ReducerContext ctx, long id, int group, int size)
+    {
+        var row = SampleRows.Build(id, 0, group);
+        row.Blob = [.. Enumerable.Range(0, size).Select(static i => (byte)(i * 31))];
+        ctx.Db.Sample.Insert(row);
+    }
+
     /// <summary>Always refuses: the corpus's <c>rejected</c> result.</summary>
     [Reducer]
     public void Refuse(ReducerContext ctx, string reason) => throw new RejectedException(reason);

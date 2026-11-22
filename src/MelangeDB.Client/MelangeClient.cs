@@ -585,6 +585,33 @@ public sealed class MelangeClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Re-sends <c>Subscribe</c> for every subscription after an <c>overflow_resync</c>, with its
+    /// current query and parameters. Each new initial set replaces the subscription's rows by the
+    /// same path a server-driven re-issue takes, and a typed cache reconciles it by diff, so a row
+    /// that did not change raises nothing. The deltas the drop discarded are covered by the new
+    /// sets, which are consistent at their anchors. Abandoned if the connection is replaced
+    /// meanwhile: a reconnect re-establishes subscriptions itself.
+    /// </summary>
+    private async Task ResubscribeAfterOverflowAsync(int era)
+    {
+        foreach (var subscription in _subscriptions.Values)
+        {
+            if (Volatile.Read(ref _era) != era)
+                return;
+            try
+            {
+                await SendAsync(
+                    new SubscribeFrame(subscription.Id, subscription.Query, subscription.Parameters) { Channel = MelangeChannels.Data },
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is WebSocketException or ObjectDisposedException or InvalidOperationException)
+            {
+                return;
+            }
+        }
+    }
+
     private async Task SendAsync(Frame frame, CancellationToken cancellationToken)
     {
         var socket = _socket ?? throw new InvalidOperationException("Not connected.");
@@ -846,6 +873,12 @@ public sealed class MelangeClient : IAsyncDisposable
         }
 
         _pendingWelcome?.TrySetException(new MelangeCallException(error.Code, error.Message));
+
+        // Backpressure dropped this connection's delta stream and the server forgot every
+        // subscription (DropAndResync). Re-establish them at once — reporting the error alone
+        // would leave every subscription looking live while its cache silently stopped changing.
+        if (error.Code == MelangeErrorCodes.OverflowResync && error.SubscriptionId == 0)
+            _ = ResubscribeAfterOverflowAsync(era);
 
         // The event invocation defers with the frames it arrived among; failing the pending
         // handshake above stays immediate, because it completes an awaited Task.
