@@ -114,6 +114,7 @@ public sealed class FileCommitLog : ICommitLog
     // other's work away.
     private readonly Lock _truncateLock = new();
     private long _skippedFrames;
+    private long _failedSwaps;
 
     public FileCommitLog(CommitLogOptions options, ILogger<FileCommitLog>? logger = null)
         : this(options, (ILogger?)logger, null)
@@ -275,7 +276,8 @@ public sealed class FileCommitLog : ICommitLog
         {
             lock (_lock)
             {
-                return _stream.Length;
+                // A failed compaction swap can leave the log poisoned with its file closed.
+                return _stream.CanSeek ? _stream.Length : 0;
             }
         }
     }
@@ -307,6 +309,18 @@ public sealed class FileCommitLog : ICommitLog
     /// carried across.
     /// </summary>
     internal Action? BetweenCompactionPhases { get; set; }
+
+    /// <summary>
+    /// Test-only fault injection, invoked by a truncation immediately before it renames the
+    /// compacted file over the log. The log's file is closed at that point, and a throw here stands
+    /// in for a rename the OS refuses.
+    /// </summary>
+    internal Action? SwapFaultInjection { get; set; }
+
+    /// <summary>
+    /// Compactions whose rename failed and that kept the old file, over this log's lifetime.
+    /// </summary>
+    internal long FailedSwaps => Interlocked.Read(ref _failedSwaps);
 
     /// <summary>
     /// Test-only fault injection, invoked by the group flusher and the interval flusher immediately
@@ -419,8 +433,9 @@ public sealed class FileCommitLog : ICommitLog
             {
                 throw new InvalidOperationException(
                     "The commit log is in a failed state: a partially written record could not be " +
-                    "rolled back, so further appends would corrupt the log. Restart the process; " +
-                    "recovery truncates the torn tail. See the inner exception for the original failure.",
+                    "rolled back, or a compaction could not reopen the log's file, so further appends " +
+                    "could corrupt the log or go unrecorded. Restart the process; recovery truncates " +
+                    "any torn tail. See the inner exception for the original failure.",
                     _failure);
             }
 
@@ -743,8 +758,15 @@ public sealed class FileCommitLog : ICommitLog
         LogSegments.Manifest manifest;
         lock (_lock)
         {
-            _stream.Flush(); // Make buffered appends visible to the read handle.
+            // A log whose compaction swap failed closed its file; nothing is buffered in it.
+            if (_failure is null || _stream.CanWrite)
+                _stream.Flush(); // Make buffered appends visible to the read handle.
             manifest = _manifest;
+
+            // Records at or below the base are truncated even where their bytes are still on
+            // disk: a crash between a compaction's two steps, or a rename that failed, leaves
+            // them there, and the base is what says they are gone.
+            firstLsn = Math.Max(firstLsn, _baseLsn + 1);
         }
 
         // The sealed segments first, each up to its cut. Every record in them is at or below the
@@ -814,7 +836,8 @@ public sealed class FileCommitLog : ICommitLog
         {
             if (_disposed)
                 return null;
-            _stream.Flush();
+            if (_failure is null || _stream.CanWrite)
+                _stream.Flush();
             manifest = _manifest;
         }
 
@@ -1426,6 +1449,7 @@ public sealed class FileCommitLog : ICommitLog
             // copy, not to the log.
             ulong head;
             long newLength;
+            SwapOutcome outcome;
             lock (_fsyncLock)
             {
                 lock (_lock)
@@ -1454,23 +1478,131 @@ public sealed class FileCommitLog : ICommitLog
                     }
 
                     WriteBaseLsn(upToLsn);
-                    _flushHandle.Dispose();
-                    _stream.Dispose();
-                    // Durable, not merely atomic: appends acknowledged after this point land in the
-                    // new file, and a rename that power loss reverts would orphan them.
-                    DurableFile.Replace(tempPath, FilePath);
-                    _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
-                    _stream.Seek(0, SeekOrigin.End);
-                    _flushHandle = OpenFlushHandle();
-                    _baseLsn = upToLsn;
-                    _index.Rebase(upToLsn, firstSurviving - HeaderSize);
+                    outcome = SwapInCompactedFile(tempPath, upToLsn, firstSurviving);
                     head = _headLsn;
-                    newLength = _stream.Length;
+                    newLength = outcome == SwapOutcome.Swapped ? _stream.Length : 0;
                 }
             }
 
-            AdvanceDurable(head, newLength);
+            if (outcome == SwapOutcome.Swapped)
+            {
+                AdvanceDurable(head, newLength);
+            }
+            else if (outcome == SwapOutcome.Poisoned)
+            {
+                // Parked durability waiters wake to find the log failed, as after a failed fsync.
+                lock (_flushGate)
+                {
+                    Monitor.PulseAll(_flushGate);
+                }
+            }
         }
+    }
+
+    private enum SwapOutcome
+    {
+        Swapped,
+        KeptOldFile,
+        Poisoned,
+    }
+
+    /// <summary>
+    /// Renames the compacted file over the log and reopens it: the compaction's last step. Call
+    /// under both locks, with the compacted file flushed and the base sidecar already written.
+    /// </summary>
+    private SwapOutcome SwapInCompactedFile(string tempPath, ulong upToLsn, long firstSurviving)
+    {
+        _flushHandle.Dispose();
+        _stream.Dispose();
+        try
+        {
+            // Durable, not merely atomic: appends acknowledged after this point land in the new
+            // file, and a rename that power loss reverts would orphan them.
+            SwapFaultInjection?.Invoke();
+            DurableFile.Replace(tempPath, FilePath);
+        }
+        catch (Exception failure) when (File.Exists(tempPath))
+        {
+            // The rename did not happen. Where Windows cannot rename with POSIX semantics (FAT),
+            // any other handle open on the log refuses a replace, and the log's own readers open
+            // one each, so this is a race with a read, not a failing disk.
+            return KeepOldFileAfterFailedSwap(tempPath, upToLsn, failure) ? SwapOutcome.KeptOldFile : SwapOutcome.Poisoned;
+        }
+        catch (Exception failure)
+        {
+            // The compacted file is in place but its rename may not be durable. Power loss could
+            // bring the old file back, without the appends acknowledged into the new one, so the
+            // log must stop acknowledging.
+            PoisonAfterFailedSwap(failure);
+            return SwapOutcome.Poisoned;
+        }
+
+        try
+        {
+            ReopenStream();
+        }
+        catch (Exception failure)
+        {
+            PoisonAfterFailedSwap(failure);
+            return SwapOutcome.Poisoned;
+        }
+
+        _baseLsn = upToLsn;
+        _index.Rebase(upToLsn, firstSurviving - HeaderSize);
+        return SwapOutcome.Swapped;
+    }
+
+    private void ReopenStream()
+    {
+        _stream = new FileStream(FilePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+        _stream.Seek(0, SeekOrigin.End);
+        _flushHandle = OpenFlushHandle();
+    }
+
+    /// <summary>
+    /// The compaction's rename failed and the old file is still the log. The base sidecar already
+    /// says <paramref name="upToLsn"/>, which is the state a crash between the two steps leaves,
+    /// and recovery and reads already treat it as truncated. So the truncation stands: the base
+    /// moves, the old file is reopened with its index unchanged, and its records at or below the
+    /// base wait for the next compaction to remove them. Call under both locks.
+    /// </summary>
+    private bool KeepOldFileAfterFailedSwap(string tempPath, ulong upToLsn, Exception failure)
+    {
+        try
+        {
+            File.Delete(tempPath);
+        }
+        catch (IOException)
+        {
+            // Litter: the next compaction creates the temp file over it.
+        }
+
+        try
+        {
+            ReopenStream();
+        }
+        catch (Exception reopenFailure)
+        {
+            PoisonAfterFailedSwap(new AggregateException(failure, reopenFailure));
+            return false;
+        }
+
+        _baseLsn = upToLsn;
+        Interlocked.Increment(ref _failedSwaps);
+        LogMessages.CompactionSwapFailed(_logger, FilePath, upToLsn, failure);
+        return true;
+    }
+
+    /// <summary>
+    /// The compaction closed the log's file and could not give it a working one back. Poison the
+    /// log: appends are refused until restart, and recovery at the next open reads whichever file
+    /// is in place against the base sidecar, which is consistent with either. Call under both
+    /// locks; the caller wakes parked durability waiters once it has released them.
+    /// </summary>
+    private void PoisonAfterFailedSwap(Exception failure)
+    {
+        _failure = failure;
+        LogMessages.CompactionSwapPoisoned(_logger, FilePath, failure);
     }
 
     /// <summary>
@@ -1687,5 +1819,23 @@ public sealed class FileCommitLog : ICommitLog
 
         public static void GroupFlushFailed(ILogger logger, string path, Exception failure) =>
             GroupFlushFailedMessage(logger, path, failure);
+
+        private static readonly Action<ILogger, string, ulong, Exception?> CompactionSwapFailedMessage =
+            LoggerMessage.Define<string, ulong>(
+                LogLevel.Warning,
+                new EventId(1016, "CompactionSwapFailed"),
+                "Commit log '{Path}': the compacted file could not replace the log, so the log keeps its old file; records through LSN {Lsn} are truncated but stay on disk until the next compaction.");
+
+        public static void CompactionSwapFailed(ILogger logger, string path, ulong lsn, Exception failure) =>
+            CompactionSwapFailedMessage(logger, path, lsn, failure);
+
+        private static readonly Action<ILogger, string, Exception?> CompactionSwapPoisonedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Critical,
+                new EventId(1017, "CompactionSwapPoisoned"),
+                "Commit log '{Path}': a compaction closed the log's file and could not reopen it, or could not make its rename durable; the log rejects further appends until restart.");
+
+        public static void CompactionSwapPoisoned(ILogger logger, string path, Exception failure) =>
+            CompactionSwapPoisonedMessage(logger, path, failure);
     }
 }

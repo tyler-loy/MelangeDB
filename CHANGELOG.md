@@ -211,6 +211,24 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A log compaction whose final rename failed left the commit log unusable until restart.**
+  The compaction closes the log's file, renames the compacted file over it, and reopens it. If
+  the rename threw, the log kept the closed file: appends failed with `ObjectDisposedException`,
+  and so did closing the log. On Windows this is a race with any read of the log, not a disk
+  fault: a replace is refused while another handle has the file open, and each read opens one. It
+  showed up as an intermittent teardown failure in the cluster tests. Now a refused rename keeps
+  the old file and the log stays writable. The truncation still stands, since the base sidecar
+  already records it, and the next compaction removes the bytes. Warning `1016
+  CompactionSwapFailed` reports it. A rename that happened but may not be durable, or a file that
+  cannot be reopened, poisons the log as a failed fsync does (Critical `1017
+  CompactionSwapPoisoned`). Reads no longer return records at or below the base that are still
+  on disk, which a crash between a compaction's two steps could also leave behind.
+- **On Windows, a read of the commit log no longer blocks its compaction.** The compaction's
+  rename (and every other durable file replace) now uses POSIX semantics, as Linux always had: the
+  replaced file's name goes at once, and a reader already holding it open finishes on the old
+  file. The rename is still made durable by a write-through flush. Filesystems without POSIX
+  renames (FAT, Windows before 10 1709) fall back to the previous replace, where a concurrent
+  read makes the rename fail and the log keeps its old file until the next compaction.
 - **The gateway could stall a player for tens of seconds around a handoff** (found measuring
   road-to-0.4 phase 31's game shape). Four things, fixed together:
   - Routing a call or a subscription to a shard held the connection's attachment lock while it

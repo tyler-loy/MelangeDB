@@ -6,8 +6,8 @@ namespace MelangeDB.Core.Tests;
 /// <see cref="DurableFile"/>: replacement that survives power loss. Power loss itself cannot be
 /// simulated here, so these hold the observable contract — the replacement happens, nothing is left
 /// behind, and a failure throws rather than passing for durable — on whichever OS runs the suite.
-/// CI runs Linux, so the directory-fsync path is exercised there; a Windows run exercises
-/// <c>MOVEFILE_WRITE_THROUGH</c>.
+/// CI runs Linux, so the directory-fsync path is exercised there; a Windows run exercises the
+/// POSIX-semantics rename and its flush.
 /// </summary>
 public class DurableFileTests : IDisposable
 {
@@ -69,6 +69,30 @@ public class DurableFileTests : IDisposable
         DurableFile.Replace(source, destination);
 
         Assert.Equal([1, 2], File.ReadAllBytes(destination));
+        Assert.False(File.Exists(source));
+    }
+
+    [Fact]
+    public void Replace_succeeds_while_a_reader_holds_the_destination_open()
+    {
+        // The commit log's readers each open the log, and its compaction replaces it. A plain
+        // Windows replace is refused while any handle is open; a POSIX rename is not, and the
+        // reader keeps the file it opened, as on Linux.
+        var source = Path.Combine(_root, "log.compact");
+        var destination = Path.Combine(_root, "log");
+        File.WriteAllBytes(source, [1, 2]);
+        File.WriteAllBytes(destination, [3, 4, 5]);
+
+        using (var reader = new FileStream(destination, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+        {
+            DurableFile.Replace(source, destination);
+
+            Assert.Equal([1, 2], File.ReadAllBytes(destination));
+            var old = new byte[3];
+            reader.ReadExactly(old);
+            Assert.Equal([3, 4, 5], old);
+        }
+
         Assert.False(File.Exists(source));
     }
 
