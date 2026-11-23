@@ -4,7 +4,7 @@ A C# alternative to [SpacetimeDB](https://spacetimedb.com). Your application log
 the transaction boundary, and connected clients subscribe to live query results instead of polling
 an API.
 
-> **Status: 0.4.0, on nuget.org and npm, pre-1.0.** Everything listed under
+> **Status: 0.4.1, on nuget.org and npm, pre-1.0.** Everything listed under
 > [What's in it](#whats-in-it) is implemented and tested.
 >
 > **The public API may break in any release.** What 1.0 requires is
