@@ -593,6 +593,13 @@ from its key on the first transfer. The shard id is its own column.
   because a pure upsert bootstrap would resurrect rows the hub deleted during the gap. The same rigor the
   Postgres tier's phase 08 bootstrap established; silently resuming past a truncated gap is the bug class
   both exist to kill.
+- **A shard serves only once its `Replicated` tables have caught up** ([#283](https://github.com/tyler-loy/MelangeDB/issues/283)).
+  Opening a shard, its node pulls the hub's `Replicated` records from the shard's own cursor up to the hub's
+  head (or a reset, as above, when the hub has truncated past it) before the shard joins the node's shard
+  set. So when a shard appears in the load view, takes a routed call, or accepts a handoff import, it holds
+  every `Replicated` row the hub had committed when it opened. Writes after that reach it by the stream, one
+  hop behind the hub, like every other shard. EventId 1763 records each catch-up and how long the open
+  waited for it.
 - **Policies evaluate where the subscription fans out, and may read only tables present there** (settled,
   phase 09). Subscription fan-out for a `Partitioned` table runs on its shard node, so a row policy there may
   read `Replicated`, `Partitioned`, and `Local` tables; a read of a hub-only `Global` table fails loudly with

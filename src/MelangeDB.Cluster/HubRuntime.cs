@@ -1581,6 +1581,8 @@ internal sealed partial class HubRuntime : IDisposable
                 var subscribe = body!.Value.Deserialize<ReplicaSubscribe>()!;
                 StartReplicaPump(link, session, subscribe.FromLsn);
                 return null;
+            case "replica-read":
+                return ReadReplicaForOpen(body!.Value.Deserialize<ReplicaRead>()!.FromLsn);
             case "events-forward":
                 var forward = body!.Value.Deserialize<EventsForward>()!;
                 RequireOwnedBy(session, forward.ShardValue, type);
@@ -1843,27 +1845,7 @@ internal sealed partial class HubRuntime : IDisposable
                     var head = _engine.Log.DurableLsn;
                     if (cursor < head)
                     {
-                        var lsns = new List<ulong>();
-                        var records = new List<WireOp[]>();
-                        var scanned = cursor;
-                        foreach (var record in _engine.Log.ReadFrom(cursor + 1))
-                        {
-                            scanned = record.Lsn;
-
-                            // A node whose replica cursor lagged across an additive schema
-                            // migration must receive current-shape rows — its engine stores what
-                            // this stream sends verbatim.
-                            var replicated = ReplicatedOps(_engine.TransformToCurrentShape(record));
-                            if (replicated.Length > 0)
-                            {
-                                lsns.Add(record.Lsn);
-                                records.Add(replicated);
-                            }
-
-                            if (records.Count >= 128)
-                                break;
-                        }
-
+                        var (lsns, records, scanned) = ReadReplicatedSlice(cursor);
                         if (records.Count > 0)
                         {
                             await link.RequestAsync("replica-batch", new ReplicaBatch([.. lsns], [.. records], PrevLsn: prev), ct)
@@ -1907,6 +1889,73 @@ internal sealed partial class HubRuntime : IDisposable
     /// </summary>
     private async Task BootstrapReplicaAsync(NodeLink link, NodeSession session, ulong staleCursor, CancellationToken ct)
     {
+        var reset = CaptureReplicaReset();
+        await link.RequestAsync("replica-reset", reset, ct).ConfigureAwait(false);
+        LogReplicaBootstrapped(
+            _logger,
+            (link.Tag as NodeSession)?.NodeName ?? "?",
+            staleCursor,
+            _engine.Log.BaseLsn,
+            reset.Lsn,
+            reset.Tables.Sum(static t => t.Rows.Length));
+        // Every shard that took the reset sits at its LSN, which is therefore the predecessor.
+        session.AdvanceReplica(staleCursor, reset.Lsn, reset.Lsn);
+    }
+
+    /// <summary>
+    /// Up to 128 records carrying a Replicated op after <paramref name="cursor"/>, read from the
+    /// log up to its durability watermark, and the last LSN the read scanned (which can be past
+    /// the last record returned, over records with no Replicated op).
+    /// </summary>
+    private (List<ulong> Lsns, List<WireOp[]> Records, ulong Scanned) ReadReplicatedSlice(ulong cursor)
+    {
+        var lsns = new List<ulong>();
+        var records = new List<WireOp[]>();
+        var scanned = cursor;
+        foreach (var record in _engine.Log.ReadFrom(cursor + 1))
+        {
+            scanned = record.Lsn;
+
+            // A node whose replica cursor lagged across an additive schema migration must
+            // receive current-shape rows — its engine stores what this stream sends verbatim.
+            var replicated = ReplicatedOps(_engine.TransformToCurrentShape(record));
+            if (replicated.Length > 0)
+            {
+                lsns.Add(record.Lsn);
+                records.Add(replicated);
+            }
+
+            if (records.Count >= 128)
+                break;
+        }
+
+        return (lsns, records, scanned);
+    }
+
+    /// <summary>
+    /// One slice of the Replicated stream, pulled by a node catching a shard up before it serves
+    /// (#283; see <see cref="ReplicaRead"/>). The reply's head is this hub's head when the request
+    /// arrived, made durable first: every Replicated row committed by then is what the shard must
+    /// hold before it takes a call. A cursor below the truncation base gets a full reset instead,
+    /// as the pushed stream does.
+    /// </summary>
+    private ReplicaReadReply ReadReplicaForOpen(ulong cursor)
+    {
+        var head = _engine.Log.HeadLsn;
+        _engine.Log.WaitDurable(head);
+        if (cursor < _engine.Log.BaseLsn)
+        {
+            var reset = CaptureReplicaReset();
+            return new ReplicaReadReply(Math.Max(head, reset.Lsn), reset.Lsn, [], [], reset);
+        }
+
+        var (lsns, records, scanned) = ReadReplicatedSlice(cursor);
+        return new ReplicaReadReply(head, scanned, [.. lsns], [.. records]);
+    }
+
+    /// <summary>The full current Replicated table set at one durable LSN, for a reset.</summary>
+    private ReplicaReset CaptureReplicaReset()
+    {
         ulong resetLsn = 0;
         var tables = new List<ReplicaTableSnapshot>();
         // Off the write lock, against a view pinned at the reset LSN: a whole-table scan under it
@@ -1929,16 +1978,7 @@ internal sealed partial class HubRuntime : IDisposable
         // The reset names an LSN the replica's cursor will count from, so it must be durable
         // before the state leaves this hub — the same untellable-LSN rule as every egress gate.
         _engine.Log.WaitDurable(resetLsn);
-        await link.RequestAsync("replica-reset", new ReplicaReset(resetLsn, [.. tables]), ct).ConfigureAwait(false);
-        LogReplicaBootstrapped(
-            _logger,
-            (link.Tag as NodeSession)?.NodeName ?? "?",
-            staleCursor,
-            _engine.Log.BaseLsn,
-            resetLsn,
-            tables.Sum(static t => t.Rows.Length));
-        // Every shard that took the reset sits at resetLsn, which is therefore the predecessor.
-        session.AdvanceReplica(staleCursor, resetLsn, resetLsn);
+        return new ReplicaReset(resetLsn, [.. tables]);
     }
 
     private WireOp[] ReplicatedOps(CommitRecord record)
