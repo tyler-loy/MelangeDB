@@ -10,6 +10,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.0] — 2026-11-22
+
 ### Breaking
 
 - **`Public = true` on a scheduled table is a build error** (`MELANGE0032`). A scheduled table is
