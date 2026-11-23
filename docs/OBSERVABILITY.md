@@ -567,7 +567,12 @@ never ticks.
 
 Since phase 26: `1107 UnpolicedProducers`, the unpoliced report's producer half — producers with no
 `[Producer(Policy = ...)]`, each an open read of whatever it returns. It is logged beside `1104` under the same
-`Policies:UnpolicedReducerReport` setting, and `Fail` refuses to start naming reducers and producers together. `1206 ProducerCallFailed`
+`Policies:UnpolicedReducerReport` setting, and `Fail` refuses to start naming reducers and producers together. `1207 ParameterOutsideContract`
+— a subscription bound a parameter outside the client contract's value shapes (a float into an integer column,
+a string into an integer, bytes or identity column, an identity that is not 32 bytes;
+[CLIENT-CONFORMANCE.md](CLIENT-CONFORMANCE.md) C15.2). Warning, once per table, column and shape per process;
+the value was coerced and the subscription works, but 0.5 refuses it, so the line names the caller to fix
+(road-to-0.4). `1206 ProducerCallFailed`
 is `1204`'s producer twin: a producer threw something other than a rejection, a timeout, or an oversized
 result during a socket or HTTP call, and the caller was told only to see the logs.
 

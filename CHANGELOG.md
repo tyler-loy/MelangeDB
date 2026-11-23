@@ -20,6 +20,15 @@ All packages ship together at one version; there is no per-package versioning. S
   state clients need in a public table of its own beside the timer table, created and deleted with
   the timer row.
 
+### Deprecated
+
+- **Subscription parameters outside the client contract's value shapes** (C15.2 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md)). The server still coerces a float into
+  an integer column, a decimal string into an integer or timestamp, a base64 string into bytes, and
+  a hex string into an identity, so these subscriptions work in 0.4. It now logs a warning naming
+  the table, column and shape (EventId `1207 ParameterOutsideContract`, once per combination).
+  **0.5 refuses them.** The C# and TypeScript clients already send the contract's shapes.
+
 ### Added
 
 - **The client conformance contract** (road-to-0.4 phase 23, step 1).

@@ -455,7 +455,8 @@ value is a protocol error that closes the connection.
 **C15.3 — The server's acceptance is wider than the set, and that is not contract.** Today the
 server's coercion also turns a float into an integer column's value (by rounding), a decimal string
 into an integer, a base64 string into bytes, and a hex string into an identity. A client that relies
-on any of those is relying on an accident a later server may refuse.
+on any of those is relying on an accident a later server will refuse: 0.4 logs a warning naming the
+table, column and shape (EventId 1207, once per combination), and **0.5 refuses** them.
 
 ## 16. Identity
 
@@ -613,7 +614,8 @@ Writing the contract down found these, as the phase plan said it would.
    why no frame can carry `ScheduleAt`; the corpus covers the kind with vectors instead.
 4. **The server accepts parameter shapes wider than the closed set** (C15.3). That is harmless while
    there is one client. It becomes a compatibility promise nobody made the moment a second client
-   leans on it.
+   leans on it. **Owner's decision: warn in 0.4, refuse in 0.5.** The server logs EventId 1207 for
+   each table, column and shape it coerces.
 5. **`/melange/sql` writes 64-bit integers as plain JSON numbers.** Found building the TypeScript
    client's SQL reader. `JSON.parse` rounds anything past 2^53, so an `Int64` id, a `UInt64`
    counter, or a microsecond timestamp comes back wrong with no error in a JavaScript consumer.
