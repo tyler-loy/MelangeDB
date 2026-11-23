@@ -10,6 +10,16 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Breaking
+
+- **`Public = true` on a scheduled table is a build error** (`MELANGE0032`). A scheduled table is
+  always private, so the flag was silently dropped: a client subscribed to it saw no rows, and no
+  frame ever carried its `ScheduleAt` column (found writing the client contract, finding 3 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md#findings)). Modules ported from
+  SpacetimeDB, which allows public timer tables, are the likely case. Drop `Public`, and put the
+  state clients need in a public table of its own beside the timer table, created and deleted with
+  the timer row.
+
 ### Added
 
 - **The client conformance contract** (road-to-0.4 phase 23, step 1).

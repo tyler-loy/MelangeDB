@@ -36,3 +36,4 @@ MELANGE0028 | MelangeDB | Error | Producer signature is invalid
 MELANGE0029 | MelangeDB | Error | Producer result type is not serializable
 MELANGE0030 | MelangeDB | Error | Producer names must be unique across producers and reducers
 MELANGE0031 | MelangeDB | Error | Producer result types must have unique client names
+MELANGE0032 | MelangeDB | Error | Scheduled tables cannot be Public

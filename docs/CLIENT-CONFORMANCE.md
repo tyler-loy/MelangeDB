@@ -608,9 +608,9 @@ Writing the contract down found these, as the phase plan said it would.
    probably to refuse a resume whose subscriptions' shapes changed since the cursor, which falls
    back to a full resync with fresh descriptors. The live suite cannot stage it yet: a column
    added between restarts needs two builds of the module, and the conformance tool has one.
-3. **`Public = true` on a scheduled table is silently dropped.** Scheduled tables are forced
-   private, which is why no frame can carry `ScheduleAt`. Ignoring the attribute without a
-   diagnostic is surprising; the corpus covers the kind with vectors instead.
+3. **`Public = true` on a scheduled table was silently dropped.** **Fixed for 0.4: it is now a
+   build error, `MELANGE0032`** (owner's decision). Scheduled tables are always private, which is
+   why no frame can carry `ScheduleAt`; the corpus covers the kind with vectors instead.
 4. **The server accepts parameter shapes wider than the closed set** (C15.3). That is harmless while
    there is one client. It becomes a compatibility promise nobody made the moment a second client
    leans on it.

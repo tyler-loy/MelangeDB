@@ -521,6 +521,58 @@ public class DiagnosticTests
     }
 
     [Fact]
+    public void Melange0032_fires_when_a_scheduled_table_is_public()
+    {
+        // SpacetimeDB allows a public timer table, and ports bring it along. It used to compile
+        // clean and leave the client subscribed to a table that never had rows on the wire.
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "Tick", Public = true)]
+            public partial struct WorkTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Tick(ReducerContext ctx, WorkTick timer)
+                {
+                }
+            }
+            """);
+        var diagnostic = Assert.Single(result.MelangeDiagnostics, d => d.Id == "MELANGE0032");
+        Assert.Equal(Microsoft.CodeAnalysis.DiagnosticSeverity.Error, diagnostic.Severity);
+        Assert.Contains("WorkTick", diagnostic.GetMessage(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
+    public void Melange0032_is_silent_for_a_private_scheduled_table()
+    {
+        var result = GeneratorTestHost.RunGenerator("""
+            using MelangeDB;
+
+            [Table(Scheduled = "Tick")]
+            public partial struct WorkTick
+            {
+                [PrimaryKey][AutoInc] public ulong Id;
+                public ScheduleAt ScheduledAt;
+            }
+
+            public sealed class Reducers
+            {
+                [Reducer]
+                public void Tick(ReducerContext ctx, WorkTick timer)
+                {
+                }
+            }
+            """);
+        Assert.DoesNotContain(result.MelangeDiagnostics, d => d.Id == "MELANGE0032");
+    }
+
+    [Fact]
     public void Melange0022_is_silent_when_the_scheduled_table_states_the_placement_it_has()
     {
         var result = GeneratorTestHost.RunGenerator("""

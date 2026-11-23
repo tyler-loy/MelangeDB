@@ -79,6 +79,8 @@ adding `[Unique]`.
 
 ## Decisions to settle
 
+**All three settled by the owner on 2026-11-22, as built.**
+
 ### Check on every rebuild, or only at a recorded migration
 
 Without uniqueness in the shape, the only safe place to check is every unique-index build. That is
