@@ -471,6 +471,14 @@ public sealed partial class MelangeEngine : IDisposable
     public CommitRecord TransformToCurrentShape(CommitRecord record) => _shapes.TransformRecord(record);
 
     /// <summary>
+    /// Whether <paramref name="table"/>'s columns changed in a migration after
+    /// <paramref name="lsn"/>. A client whose resume cursor is that LSN decodes with the
+    /// descriptor it was given before the migration, so its rows would be misread; the resume
+    /// path refuses it and the client resyncs with fresh descriptors.
+    /// </summary>
+    public bool TableShapeChangedSince(ulong lsn, TableId table) => _shapes.ShapeChangedSince(lsn, table);
+
+    /// <summary>
     /// Loads the snapshot if a valid one exists, returning the LSN log replay resumes from. A
     /// snapshot from another log epoch is stale and ignored — unless the log has been truncated,
     /// in which case state below the base is gone and recovery must fail loudly rather than

@@ -55,10 +55,10 @@ internal static partial class ModelExtractor
             }
         }
 
-        // A table declaring Scheduled holds timer rows: implicitly private, and always Local —
-        // which is per-shard, because a shard node runs one engine per shard and timers are rows
-        // in that engine's log. A conflicting declaration is MELANGE0022 below, not a silent
-        // override.
+        // A table declaring Scheduled holds timer rows: private, and always Local — which is
+        // per-shard, because a shard node runs one engine per shard and timers are rows in that
+        // engine's log. A conflicting declaration is an error below (MELANGE0022 for placement,
+        // MELANGE0032 for Public), not a silent override.
         var typeLocation = LocationInfo.From(
             (context.TargetNode as StructDeclarationSyntax)?.Identifier.GetLocation() ?? context.TargetNode.GetLocation());
         var diagnostics = new List<DiagnosticInfo>();
@@ -71,6 +71,9 @@ internal static partial class ModelExtractor
                     typeLocation,
                     new EquatableArray<string>([tableName, $"Placement.{declaredPlacement}"])));
             }
+
+            if (isPublic)
+                diagnostics.Add(new DiagnosticInfo("MELANGE0032", typeLocation, new EquatableArray<string>([tableName])));
 
             if (shardBy is not null)
             {

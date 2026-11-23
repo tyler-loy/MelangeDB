@@ -624,11 +624,27 @@ internal sealed class MelangeSocketConnection : IDeltaSink
         }
     }
 
+    /// <summary>
+    /// Warns, once per table, column and shape, when a subscription parameter is outside the
+    /// contract's closed set (C15.2). The server still coerces it; 0.5 refuses it.
+    /// </summary>
+    private void WarnOnWidenedParameters(SubscriptionQuery query, IReadOnlyDictionary<string, object?>? parameters)
+    {
+        if (query.ParameterNames.Count == 0 || !_transport.Engine.Schema.TryGetByName(query.Table, out var schema))
+            return;
+        if (ParameterShapes.FindWidened(schema, query, parameters) is { } widened
+            && ParameterShapes.FirstReport(_transport.ReportedParameterShapes, schema, query.Column!, widened.Shape))
+        {
+            LogMessages.ParameterOutsideContract(_logger, schema.Name, query.Column!, widened.Name, widened.Shape);
+        }
+    }
+
     private void HandleSubscribe(SubscribeFrame subscribe)
     {
         try
         {
             var query = SqlSubsetParser.Parse(subscribe.Query, subscribe.Parameters);
+            WarnOnWidenedParameters(query, subscribe.Parameters);
             var limits = _transport.Options.Subscriptions;
 
             // The live-or-fresh decision runs under the engine lock because a backpressure drop —
@@ -830,6 +846,17 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             }
         }
 
+        if (TableReshapedSince(resume) is { } reshaped)
+        {
+            // The client decodes with descriptors from before a migration that changed this
+            // table's columns, and a resume sends none: every row after an inserted column would
+            // be misread with no error. A full resync hands it fresh descriptors.
+            EnqueuePriority(new ResumeResultFrame(
+                false,
+                $"The columns of '{reshaped}' changed in a migration after the resume cursor; a full resync is required."));
+            return;
+        }
+
         ulong resumeHead = 0;
         var registered = new List<ServerSubscription>(resume.Subscriptions.Count);
         try
@@ -841,6 +868,7 @@ internal sealed class MelangeSocketConnection : IDeltaSink
                 foreach (var request in resume.Subscriptions)
                 {
                     var query = SqlSubsetParser.Parse(request.Query, request.Parameters);
+                    WarnOnWidenedParameters(query, request.Parameters);
                     var (subscription, _) = _transport.Subscriptions.Register(
                         this, request.SubscriptionId, query, _transport.Options.Subscriptions, head,
                         computeInitialSet: false, _transport.Policies, _policyContext);
@@ -896,6 +924,39 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _resumeBuffering = false;
         });
         _sendSignal.Release();
+    }
+
+    /// <summary>
+    /// The first table a resumed subscription reads whose columns changed after the cursor, or
+    /// null. Shapes change only at boot, so this needs no lock. A query that does not parse is
+    /// left for the registration below to refuse with its own message.
+    /// </summary>
+    private string? TableReshapedSince(ResumeFrame resume)
+    {
+        var engine = _transport.Engine;
+        foreach (var request in resume.Subscriptions)
+        {
+            SubscriptionQuery query;
+            try
+            {
+                query = SqlSubsetParser.Parse(request.Query, request.Parameters);
+            }
+            catch (SqlParseException)
+            {
+                continue;
+            }
+
+            // Public tables only: a private one is refused at registration with the same message
+            // as an unknown name, and this answer must not reveal that it exists.
+            if (engine.Schema.TryGetByName(query.Table, out var schema)
+                && schema.IsPublic
+                && engine.TableShapeChangedSince(resume.LastAckedLsn, schema.Id))
+            {
+                return schema.Name;
+            }
+        }
+
+        return null;
     }
 
     private void StartHeartbeat()
@@ -1157,5 +1218,16 @@ internal sealed class MelangeSocketConnection : IDeltaSink
 
         public static void HeartbeatTimeout(ILogger logger, string connectionId, int timeoutMs) =>
             HeartbeatTimeoutMessage(logger, connectionId, timeoutMs, null);
+
+        private static readonly Action<ILogger, string, string, string, string, Exception?> ParameterOutsideContractMessage =
+            LoggerMessage.Define<string, string, string, string>(
+                LogLevel.Warning,
+                new EventId(1207, "ParameterOutsideContract"),
+                "A subscription on '{Table}.{Column}' bound :{Parameter} as a {Shape}, outside the client contract's value shapes " +
+                "(docs/CLIENT-CONFORMANCE.md, C15.2). It was coerced and the subscription works, but MelangeDB 0.5 refuses it: " +
+                "send the column's own shape. Logged once per table, column and shape.");
+
+        public static void ParameterOutsideContract(ILogger logger, string table, string column, string parameter, string shape) =>
+            ParameterOutsideContractMessage(logger, table, column, parameter, shape, null);
     }
 }

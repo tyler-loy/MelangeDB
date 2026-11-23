@@ -46,7 +46,7 @@ The endpoint is stateless streamable HTTP: each call is one authenticated POST.
 | Tool | What it does |
 | --- | --- |
 | `describe_schema` | The schema manifest, the same document `/melange/schema` serves: tables, columns, keys, indexes, visibility, and every client-callable reducer with its parameters. |
-| `query` | One ad-hoc SQL query under **exactly** the rules `/melange/sql` applies to the same caller: `Sql:AdHocEnabled`, `Sql:AdHocMode`, row and column policies in policy-enforced mode, the row and byte ceilings, and the cluster's `partitioned_elsewhere` refusal. Holding `Mcp:OwnerRole` does not grant owner SQL; that is still `Sql:OwnerRole`. Returns `{"columns":[...],"rows":[[...]]}`. |
+| `query` | One ad-hoc SQL query under **exactly** the rules `/melange/sql` applies to the same caller: `Sql:AdHocEnabled`, `Sql:AdHocMode`, row and column policies in policy-enforced mode, the row and byte ceilings, and the cluster's `partitioned_elsewhere` refusal. Holding `Mcp:OwnerRole` does not grant owner SQL; that is still `Sql:OwnerRole`. Returns `{"columns":[...],"rows":[[...]]}`, with 64-bit integers, timestamps and `COUNT`s as decimal strings, as `/melange/sql` writes them. |
 | `health` | Head, durable and base LSN, each applier's lag, and the governing truncation floor with every floor's position, on the node that answered. |
 | `signals` | A bounded read (at most 1,000 series) of the instruments [OBSERVABILITY.md](OBSERVABILITY.md) names: gauges at their current value, counters summed and histograms as count/sum/max since the endpoint started. Filter by name prefix. |
 | `call_reducer` | Present only when you named reducers. Calls one of them; see below. |
@@ -86,11 +86,19 @@ would over HTTP. Stdout carries only the protocol; diagnostics go to stderr.
 
 ## Clusters
 
-Each tool answers for the node it reached, as the HTTP surfaces do: on the hub, `query` reads the
-hub's Global and Replicated tables and refuses Partitioned ones with `partitioned_elsewhere`;
-`health` and `signals` describe that node. A reducer call runs on that node's engine, so in a
-cluster it reaches hub-site reducers only. Routing calls to the shard that owns their rows is not
-built yet (see the phase 29 plan).
+Map the endpoint on the hub. The read tools answer for the node they reached, as the HTTP surfaces
+do: `query` reads the hub's Global and Replicated tables and refuses Partitioned ones with
+`partitioned_elsewhere`; `health` and `signals` describe the hub.
+
+**A reducer call names its shard.** On a cluster hub `call_reducer` requires `shard`, and the hub
+sends the call to the node that owns it. It arrives there as the client call it is: the agent's
+identity, its token's claims and guest flag travel with it, so argument validation, the
+reducer's policy and `RateLimit:*` apply on that node, and a refusal comes back with its own code
+(`denied:`, `rate_limited:`, `outcome_unknown:` when the link to the node failed mid-call). The
+`lsn` returned is that shard's. A shard that does not exist is refused (`invalid_args:`) and never
+created. A call without `shard` is refused rather than run on the hub's engine, which is not
+where a shard's reducers commit; hub-site reducers are therefore not callable from the agent
+endpoint on a cluster. On a single node `shard` is ignored.
 
 ## Threat model
 

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using MelangeDB.Mcp;
+using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using Xunit;
@@ -94,7 +95,7 @@ public class McpEndpointTests
 
         var rows = JsonDocument.Parse(Text(await CallAsync(client, "query", new() { ["sql"] = "SELECT * FROM Chunk WHERE Id = :id", ["parameters"] = new Dictionary<string, object?> { ["id"] = 7 } })));
         Assert.Equal(["Id", "X", "Data"], rows.RootElement.GetProperty("columns").EnumerateArray().Select(static c => c.GetString()));
-        Assert.Equal(7, Assert.Single(rows.RootElement.GetProperty("rows").EnumerateArray())[0].GetInt64());
+        Assert.Equal("7", Assert.Single(rows.RootElement.GetProperty("rows").EnumerateArray())[0].GetString());
 
         var health = JsonDocument.Parse(Text(await CallAsync(client, "health"))).RootElement;
         Assert.Equal(host.Engine.Log.HeadLsn, health.GetProperty("headLsn").GetUInt64());
@@ -140,6 +141,72 @@ public class McpEndpointTests
         var badArgs = await CallAsync(client, "call_reducer", new() { ["reducer"] = "SetChunk", ["arguments"] = new object[] { "nine" } });
         Assert.True(badArgs.IsError);
         Assert.Contains("invalid_args:", Text(badArgs));
+    }
+
+    [Fact]
+    public async Task On_a_cluster_hub_a_reducer_call_names_its_shard_and_is_routed_there()
+    {
+        var router = new RecordingRouter();
+        await using var host = await TransportTestHost.StartAsync(
+            new Dictionary<string, string?> { ["MelangeDb:Mcp:Enabled"] = "true", ["MelangeDb:Mcp:AllowReducersInProduction"] = "true" },
+            services: services =>
+            {
+                services.AddMelangeMcp(mcp => mcp.AllowReducers("SetChunk"));
+                services.AddSingleton<MelangeDB.Server.IShardCallRouter>(router);
+            },
+            endpoints: app => app.MapMelangeMcp());
+        await using var client = await ConnectAsync(host, Agent());
+        var head = host.Engine.Log.HeadLsn;
+        var arguments = new object[] { 9, 4, new Dictionary<string, object?> { ["$bytes"] = "AQI=" } };
+
+        // The hub's own engine is not where a shard's reducers commit, so a call without a shard
+        // is refused rather than run there.
+        var unnamed = await CallAsync(client, "call_reducer", new() { ["reducer"] = "SetChunk", ["arguments"] = arguments });
+        Assert.True(unnamed.IsError);
+        Assert.Contains("invalid_args:", Text(unnamed));
+        Assert.Contains("shard", Text(unnamed));
+        Assert.Empty(router.Calls);
+
+        var routed = await CallAsync(client, "call_reducer", new() { ["reducer"] = "SetChunk", ["arguments"] = arguments, ["shard"] = 61 });
+        Assert.True(routed.IsError is not true, Text(routed));
+        Assert.Equal(42UL, JsonDocument.Parse(Text(routed)).RootElement.GetProperty("lsn").GetUInt64());
+        var call = Assert.Single(router.Calls);
+        Assert.Equal(61UL, call.Shard);
+        Assert.Equal("SetChunk", call.Reducer);
+        Assert.Equal(TestTokens.IdentityOf("agent"), call.Caller);
+        Assert.Equal(MelangeDB.Core.CallSource.Client(), call.Source);
+        Assert.Equal(head, host.Engine.Log.HeadLsn);
+
+        // The node's failures keep their codes.
+        router.Failure = new MelangeDB.Core.ReducerDeniedException("SetChunk is not yours to call.");
+        var denied = await CallAsync(client, "call_reducer", new() { ["reducer"] = "SetChunk", ["arguments"] = arguments, ["shard"] = 61 });
+        Assert.Contains("denied:", Text(denied));
+        router.Failure = new ArgumentException("Shard 9999 does not exist; a call never creates one.", "shard");
+        var missing = await CallAsync(client, "call_reducer", new() { ["reducer"] = "SetChunk", ["arguments"] = arguments, ["shard"] = 9999 });
+        Assert.Contains("invalid_args:", Text(missing));
+        Assert.Contains("9999", Text(missing));
+    }
+
+    private sealed class RecordingRouter : MelangeDB.Server.IShardCallRouter
+    {
+        public List<(ulong Shard, string Reducer, Identity Caller, MelangeDB.Core.CallSource Source)> Calls { get; } = [];
+
+        public Exception? Failure { get; set; }
+
+        public bool RoutesByShard => true;
+
+        public Task<ulong> CallAsync(
+            ulong shard, string reducer, Identity caller, ReadOnlyMemory<byte> arguments, MelangeDB.Core.CallSource source, CallerClaims claims, CancellationToken cancellationToken)
+        {
+            if (Failure is { } failure)
+                throw failure;
+            lock (Calls)
+            {
+                Calls.Add((shard, reducer, caller, source));
+            }
+
+            return Task.FromResult(42UL);
+        }
     }
 
     [Fact]

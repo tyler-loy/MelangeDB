@@ -722,7 +722,9 @@ rather than persisted per fire — which is what keeps an idle tick from appendi
 
 **Scheduled reducer** — A reducer fired by a timer row rather than by a client, with signature
 `void Name(ReducerContext ctx, TimerTable timer)` — the timer row is the argument. Not client-callable
-(clients are told "unknown"), and excluded from the unpoliced-reducer report for the same reason.
+(clients are told "unknown"), and excluded from the unpoliced-reducer report for the same reason. Its
+timer table is always private and `Local`: declaring it `Public` (MELANGE0032) or with another placement
+(MELANGE0022) is a build error.
 
 **Scheduler** — The component that fires timer rows: a projection consumer rebuilt from current rows at
 startup and maintained through the commit-observer seam, dispatching from a single-threaded loop over one

@@ -214,7 +214,21 @@ internal sealed record HandoffResolved(string HandoffId, string PlayerHex, ulong
 /// encodes with the same registry the node decodes with); the fencing token makes a step against
 /// a stale owner fail loudly instead of executing on the wrong term.
 /// </summary>
-internal sealed record ShardExecute(ulong Shard, long FencingToken, string Reducer, string CallerHex, string ArgsB64);
+/// <summary>
+/// One reducer call on a shard's node. <see cref="ClientOriginated"/>, <see cref="CallerIsGuest"/>
+/// and <see cref="Claims"/> carry a client call's source and token claims, so the node rate
+/// limits it and applies the reducer's policy as it would to a call made there; absent (a
+/// server-side saga step, or a hub from before they existed) the call is in-process and trusted.
+/// </summary>
+internal sealed record ShardExecute(
+    ulong Shard,
+    long FencingToken,
+    string Reducer,
+    string CallerHex,
+    string ArgsB64,
+    bool ClientOriginated = false,
+    bool CallerIsGuest = false,
+    IReadOnlyList<KeyValuePair<string, string>>? Claims = null);
 
 internal sealed record ShardExecuteReply(ulong Lsn);
 

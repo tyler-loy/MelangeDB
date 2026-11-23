@@ -615,20 +615,42 @@ internal sealed partial class HubRuntime : IDisposable
     /// compensate). Throws when the owner is unreachable or the reducer rejects; a
     /// <see cref="NodeLinkException.IsPeerError"/> means the step definitively did not commit.
     /// </summary>
-    public async Task<ulong> ExecuteOnShardAsync(
+    public Task<ulong> ExecuteOnShardAsync(
         ShardKey shard, string reducer, Identity caller, object?[] arguments, CancellationToken ct = default)
     {
         var (assignment, _) = ResolveShard(shard);
+        return ExecuteOnShardAsync(assignment, reducer, caller, ReducerArguments.Encode(arguments), CallSource.InProcess, CallerClaims.Empty, ct);
+    }
+
+    /// <summary>
+    /// <see cref="ExecuteOnShardAsync(ShardKey, string, Identity, object?[], CancellationToken)"/>
+    /// for an existing assignment, as a call from <paramref name="source"/> with
+    /// <paramref name="claims"/>: the node rate limits a client call and applies the reducer's
+    /// policy to it. A reducer failure on the node arrives as a <see cref="NodeLinkException"/>
+    /// whose <see cref="NodeLinkException.Code"/> names it.
+    /// </summary>
+    internal async Task<ulong> ExecuteOnShardAsync(
+        ShardAssignment assignment,
+        string reducer,
+        Identity caller,
+        ReadOnlyMemory<byte> arguments,
+        CallSource source,
+        CallerClaims claims,
+        CancellationToken ct)
+    {
         var link = LinkOf(assignment.NodeName!)
-            ?? throw new InvalidOperationException($"No live link to '{assignment.NodeName}', the owner of {shard}.");
+            ?? throw new InvalidOperationException($"No live link to '{assignment.NodeName}', the owner of {assignment.Shard}.");
         var reply = await link.RequestAsync(
             "shard-execute",
             new ShardExecute(
-                shard.Value,
+                assignment.Shard.Value,
                 assignment.FencingToken,
                 reducer,
                 caller.ToString(),
-                Convert.ToBase64String(ReducerArguments.Encode(arguments))),
+                Convert.ToBase64String(arguments.Span),
+                source.ClientOriginated,
+                source.CallerIsGuest,
+                claims.Count == 0 ? null : [.. claims.AsPairs()]),
             ct).ConfigureAwait(false);
         return reply!.Value.Deserialize<ShardExecuteReply>()!.Lsn;
     }

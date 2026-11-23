@@ -1,6 +1,6 @@
 # Phase 29 — The agent surface
 
-**Status: Built for a single node** (2026-11-21); cluster routing of reducer calls is the one deliverable left. See [MCP.md](../MCP.md) and the as-built notes at the end.
+**Status: Built** (single node 2026-11-21; cluster routing of reducer calls 2026-11-22). See [MCP.md](../MCP.md) and the as-built notes at the end.
 
 **Goal:** an opt-in package, `MelangeDB.Mcp`, that exposes a [Model Context
 Protocol](https://modelcontextprotocol.io) endpoint from the developer's own host. A coding agent
@@ -131,10 +131,16 @@ the CLI bridge, and nothing else** (owner, 2026-11-21).
   their latest value, counters summed and histograms as count/sum/max since the endpoint started.
 - **The stdio bridge** is `melange mcp <url>`: the SDK's client toward the host and its stdio server
   toward the agent, forwarding tool listings and calls and deciding nothing.
-- **Not built: cluster routing for reducer calls.** Every tool answers for the node it reached, as
-  the HTTP surfaces do. Routing a call to the owning shard needs the hub's shard-execute path to
-  carry the caller's claims and client-call source, which it does not today (it passes neither,
-  so a routed call would skip the reducer's policy). That change is the follow-up.
+- **Cluster routing for reducer calls (built 2026-11-22; owner chose an explicit shard).**
+  `call_reducer` takes `shard`, required on a cluster hub and ignored on a single node. The hub's
+  `IShardCallRouter` sends the call over the node link's `shard-execute`, which now carries the
+  call source (client, guest) and the caller's claims, so the node applies the reducer's policy
+  and rate limit as it would to a call made there. Node-link error replies carry the call
+  failure's code, so the agent sees `denied`, `rate_limited` and the rest rather than a generic
+  error; a timeout or dead link is `outcome_unknown`, and a shard that moved is `transient`. A
+  shard that does not exist is refused without being created. Tests: `RoutedCallTests` (cluster
+  suite: commit, guest flag through a policy, claims through a reducer, error codes, unknown
+  shard) and `McpEndpointTests` (the tool's shard rule over a recording router).
 - **Tests** (in the transport suite, over the real HTTP transport with the SDK's own client): the
   three gates, every read tool, the SQL refusal, the allowlist, the production flag, a bad
   allowlist failing at startup, and the stdio bridge end to end over in-memory pipes.

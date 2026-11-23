@@ -89,7 +89,7 @@ public class SqlPolicyTests
 
         using var asOwner = host.CreateHttp(TestTokens.For("alice", role: OwnerRole));
         var body = await QueryAsync(asOwner, "SELECT Metric, Value FROM WorldStat");
-        Assert.Equal(41, body.GetProperty("rows")[0][1].GetInt64());
+        Assert.Equal("41", body.GetProperty("rows")[0][1].GetString());
 
         await using var enforced = await TransportTestHost.StartAsync(Enabled);
         enforced.Call("RecordStat", "creatures", 41L);

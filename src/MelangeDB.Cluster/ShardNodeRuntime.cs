@@ -1372,12 +1372,26 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             case "shard-execute":
             {
                 var execute = body!.Value.Deserialize<ShardExecute>()!;
-                var runtime = RequireShard(new ShardKey(execute.Shard), execute.FencingToken);
+                ShardRuntime runtime;
+                try
+                {
+                    runtime = RequireShard(new ShardKey(execute.Shard), execute.FencingToken);
+                }
+                catch (InvalidOperationException exception) when (execute.ClientOriginated)
+                {
+                    // The shard moved, or this owner's term ended, since the hub resolved it: the
+                    // call did nothing and a retry resolves afresh. Said as transient so a routed
+                    // client call is told to retry rather than that the server failed.
+                    throw new TransientRejectionException(exception.Message);
+                }
+
                 var lsn = runtime.ReducerHost.Call(
                     execute.Reducer,
                     new Identity(Convert.FromHexString(execute.CallerHex)),
                     ConnectionId.None,
-                    Convert.FromBase64String(execute.ArgsB64));
+                    Convert.FromBase64String(execute.ArgsB64),
+                    source: new CallSource(execute.ClientOriginated, execute.CallerIsGuest),
+                    claims: execute.Claims is { Count: > 0 } claims ? CallerClaims.From(claims) : CallerClaims.Empty);
                 return Task.FromResult<object?>(new ShardExecuteReply(lsn));
             }
 

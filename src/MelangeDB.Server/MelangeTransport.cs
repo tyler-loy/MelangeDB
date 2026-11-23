@@ -85,6 +85,12 @@ internal sealed class MelangeTransport : ICommitObserver, IDisposable
 
     public ILogger Logger { get; }
 
+    /// <summary>
+    /// The (table, column, shape) combinations already warned about as outside the subscription
+    /// parameter contract (EventId 1207); see <see cref="ParameterShapes"/>.
+    /// </summary>
+    internal System.Collections.Concurrent.ConcurrentDictionary<(string Table, string Column, string Shape), byte> ReportedParameterShapes { get; } = new();
+
     public IMelangeSerializer Serializer { get; }
 
     public SubscriptionEngine Subscriptions { get; }

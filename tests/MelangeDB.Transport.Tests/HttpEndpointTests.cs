@@ -129,7 +129,7 @@ public class HttpEndpointTests
         var resultRows = body.GetProperty("rows").EnumerateArray().ToList();
         Assert.Equal(2, resultRows.Count);
         Assert.Equal("mining", resultRows[0][0].GetString());
-        Assert.Equal(10, resultRows[0][1].GetInt64());
+        Assert.Equal("10", resultRows[0][1].GetString()); // 64-bit integers are strings on the SQL endpoint.
 
         var whole = await http.PostAsync("/melange/sql", Json("""{"query": "SELECT * FROM Skill"}"""), TestContext.Current.CancellationToken);
         Assert.Equal(3, (await ReadJsonAsync(whole)).GetProperty("rows").GetArrayLength());

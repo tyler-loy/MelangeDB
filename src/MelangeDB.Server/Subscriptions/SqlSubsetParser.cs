@@ -37,7 +37,15 @@ internal sealed record SubscriptionQuery(
     string? Column,
     object? EqualsValue,
     object? RangeLow,
-    object? RangeHigh);
+    object? RangeHigh)
+{
+    /// <summary>
+    /// The <c>:name</c> placeholders the predicate bound, in order. Operands bound from the
+    /// parameter map are held to the contract's closed set of value shapes (C15.2); literals in
+    /// the query text are not.
+    /// </summary>
+    public IReadOnlyList<string> ParameterNames { get; init; } = [];
+}
 
 /// <summary>One item of an aggregate query's select or group-by list.</summary>
 internal sealed record AggregateItem(
@@ -167,7 +175,10 @@ internal static class SqlSubsetParser
                 new SubscriptionQuery(
                     table,
                     star ? null : items.Select(i => i.Column!).ToList(),
-                    predicate, column, equalsValue, rangeLow, rangeHigh),
+                    predicate, column, equalsValue, rangeLow, rangeHigh)
+                {
+                    ParameterNames = tokens.BoundParameters,
+                },
                 Aggregate: null);
         }
 
@@ -242,6 +253,10 @@ internal static class SqlSubsetParser
     {
         private readonly string _text = text;
         private int _position;
+        private List<string>? _bound;
+
+        /// <summary>The placeholders <see cref="ExpectOperand"/> has bound so far, in order.</summary>
+        public readonly IReadOnlyList<string> BoundParameters => (IReadOnlyList<string>?)_bound ?? [];
 
         public void ExpectKeyword(string keyword)
         {
@@ -335,6 +350,7 @@ internal static class SqlSubsetParser
                 var name = ExpectIdentifier("a parameter name");
                 if (parameters is null || !parameters.TryGetValue(name, out var value))
                     throw new SqlParseException($"Query names parameter :{name} but no value for it was supplied.");
+                (_bound ??= []).Add(name);
                 return value;
             }
 

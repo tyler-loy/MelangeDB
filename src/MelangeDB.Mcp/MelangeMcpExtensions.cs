@@ -69,7 +69,11 @@ public static class MelangeMcpExtensions
             ?? throw new InvalidOperationException(
                 "MapMelangeMcp shares MapMelangeSocket's authentication and call path; call app.MapMelangeSocket() first.");
         var options = services.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>();
-        host.Attach(transport, services.GetService<IHostEnvironment>(), services.GetRequiredService<ReducerRegistry>());
+        host.Attach(
+            transport,
+            services.GetService<IHostEnvironment>(),
+            services.GetRequiredService<ReducerRegistry>(),
+            services.GetService<IShardCallRouter>());
 
         var pattern = path ?? options.CurrentValue.Transport.Path.TrimEnd('/') + "/mcp";
         var mapped = endpoints.MapMcp(pattern);
@@ -122,10 +126,16 @@ internal sealed class McpHost(IReadOnlyDictionary<string, Identity?> reducers) :
 
     public IHostEnvironment? Environment { get; private set; }
 
+    /// <summary>
+    /// The cluster's route for reducer calls, when this process is a cluster hub; null or
+    /// non-routing on a single node, where calls run on the local engine.
+    /// </summary>
+    public IShardCallRouter? Router { get; private set; }
+
     public MelangeTransport Transport => _transport
         ?? throw new InvalidOperationException("The MCP endpoint is not mapped; call app.MapMelangeMcp().");
 
-    public void Attach(MelangeTransport transport, IHostEnvironment? environment, ReducerRegistry registry)
+    public void Attach(MelangeTransport transport, IHostEnvironment? environment, ReducerRegistry registry, IShardCallRouter? router = null)
     {
         // Fail at startup, not at an agent's first call: a misspelled or uncallable name in the
         // allowlist is a deployment bug.
@@ -142,6 +152,7 @@ internal sealed class McpHost(IReadOnlyDictionary<string, Identity?> reducers) :
 
         _transport = transport;
         Environment = environment;
+        Router = router;
     }
 
     /// <summary>The caller the gate authenticated for this request.</summary>

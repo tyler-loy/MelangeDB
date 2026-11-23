@@ -192,6 +192,16 @@ public static class Diagnostics
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor ScheduledTablePublic = new(
+        "MELANGE0032",
+        "Scheduled tables cannot be Public",
+        "Table '{0}' declares Scheduled and Public. A scheduled table holds timer rows and is always private, so no " +
+        "client would ever see it, and a ScheduleAt column is never sent. To let clients see the state the timer " +
+        "drives, put it in a public table of its own beside the timer table, created and deleted with the timer row.",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor SnapshotReadModifyWrite = new(
         "MELANGE0023",
         "Read-modify-write inside a snapshot-isolated reducer",

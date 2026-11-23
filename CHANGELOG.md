@@ -10,7 +10,43 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Breaking
+
+- **`Public = true` on a scheduled table is a build error** (`MELANGE0032`). A scheduled table is
+  always private, so the flag was silently dropped: a client subscribed to it saw no rows, and no
+  frame ever carried its `ScheduleAt` column (found writing the client contract, finding 3 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md#findings)). Modules ported from
+  SpacetimeDB, which allows public timer tables, are the likely case. Drop `Public`, and put the
+  state clients need in a public table of its own beside the timer table, created and deleted with
+  the timer row.
+- **`/melange/sql` writes 64-bit integers and timestamps as JSON strings.** `Int64` and `UInt64`
+  values, `Timestamp` microseconds, `COUNT`s, and `MIN`/`MAX`/`DATE_TRUNC` over them are decimal
+  strings (`"9007199254740993"`), not numbers; integers of 32 bits and less, floats, and a `SUM`'s
+  `numeric` stay numbers. A JavaScript consumer's `JSON.parse` rounded any integer past 2^53 with
+  no error, so an id, a counter or a timestamp could come back wrong (finding 5 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md#findings)). The MCP `query` tool returns
+  the same form. `@melangedb/client`'s `queryTable` reads both forms; a consumer of the raw JSON
+  that called `GetInt64()` or treated these as numbers must parse the string.
+
+### Deprecated
+
+- **Subscription parameters outside the client contract's value shapes** (C15.2 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md)). The server still coerces a float into
+  an integer column, a decimal string into an integer or timestamp, a base64 string into bytes, and
+  a hex string into an identity, so these subscriptions work in 0.4. It now logs a warning naming
+  the table, column and shape (EventId `1207 ParameterOutsideContract`, once per combination).
+  **0.5 refuses them.** The C# and TypeScript clients already send the contract's shapes.
+
 ### Added
+
+- **MCP reducer calls on a cluster** (road-to-0.4 phase 29's last deliverable). On a cluster hub,
+  `call_reducer` takes a `shard` and the hub sends the call to that shard's node, where it
+  commits as the client call it is: the agent's identity, token claims and guest flag travel with
+  it, so the reducer's policy and `RateLimit:*` apply there. Node-link error replies now carry the
+  call failure's code, so a refusal on the node reaches the agent as `denied`, `rate_limited`,
+  `rejected` and so on; a lost link is `outcome_unknown`. A shard that does not exist is refused
+  and never created. A call without `shard` on a hub is refused, so hub-site reducers are not
+  callable from the agent endpoint on a cluster. On a single node `shard` is ignored.
 
 - **The client conformance contract** (road-to-0.4 phase 23, step 1).
   [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md) states every rule a MelangeDB client
@@ -211,6 +247,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A client resumed across a deploy that changed a table's columns misread its rows.** An
+  additive migration keeps the log's epoch, so the resume was accepted, and the client went on
+  decoding with the descriptors it held while the server encoded with the new shape: a column
+  added mid-table shifted every column after it, with no error (finding 2 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md#findings)). The server now refuses a
+  resume whose subscriptions read a table whose columns changed after the cursor, and the client
+  resyncs with fresh descriptors, as it does for any refused resume. Both clients already handle
+  the refusal. A tier or `[Unique]` change alone changes no row and does not refuse.
 - **The rebalance loop could move a shard with almost no load.** A move only had to lower the
   pair of nodes' maximum load by any amount, so once two nodes were level, a shard nobody wrote to
   qualified as soon as it read any load at all. Every 10 s a shard's own load sampling holds its
