@@ -10,6 +10,10 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.1] — 2026-11-23
+
 ### Fixed
 
 - **A newly opened shard served calls before the hub's `Replicated` rows reached it**
