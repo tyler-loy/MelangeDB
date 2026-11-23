@@ -72,9 +72,12 @@ public sealed class RebalanceLoopTests
                 "the loop split the two busy shards across the nodes",
                 timeoutSeconds: 40);
 
-            // Load stays on; the world is now balanced (u vs u), so the strict-improvement rule
-            // has nothing left to move — a second drain within the window would be a flap.
-            await Task.Delay(TestTime.Dilated(TimeSpan.FromSeconds(3)), TestContext.Current.CancellationToken);
+            // Load stays on; the world is now balanced (u vs u), so the rule has nothing left
+            // worth moving — a second drain within the window would be a flap. The watch spans
+            // more than the 10 s between a shard's statistics passes: the idle third shard reads
+            // a few microseconds of load after one, and before the minimum gain the loop moved
+            // it for that. A 3 s watch caught it only on runners slow enough to reach the pass.
+            await Task.Delay(TestTime.Dilated(TimeSpan.FromSeconds(12)), TestContext.Current.CancellationToken);
             Assert.Equal(1, fixture.Hub.Metrics.DrainsCompleted);
             Assert.Equal(0, fixture.Hub.Metrics.DrainsFailed);
         }

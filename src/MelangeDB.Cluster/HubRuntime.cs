@@ -888,14 +888,14 @@ internal sealed partial class HubRuntime : IDisposable
     /// the sum of its shards' sustained write-lock utilizations over
     /// <c>Cluster:RebalanceWindowSeconds</c> exceeds <c>Cluster:RebalanceHotUtilization</c> — and
     /// only shards whose history covers the whole window count, so a spike is never mistaken for
-    /// sustained. The move is the largest-load shard on the hottest node for which
-    /// <c>target + shard &lt; origin</c> — the pair's maximum strictly improves — sent to the
-    /// least-loaded live node. That strict inequality is the anti-flap core: relocating a whole
-    /// hotspot to an emptier node fails it, so the loop refuses moves that merely shuffle. Layered
-    /// on top: the per-shard move floor (<c>Cluster:ShardMoveMinIntervalMs</c>), one automatic
-    /// move in flight at a time, and a hot node the rule cannot help is logged (rate-limited),
-    /// never churned — the single-shard case being the granularity ceiling the design record
-    /// warns about.
+    /// sustained. The move is the largest-load shard on the hottest node that lowers the pair's
+    /// maximum by at least <c>Cluster:RebalanceMinGain</c> of the origin's load, sent to the
+    /// least-loaded live node (see <see cref="ChooseRebalanceMove"/>). That rule is the anti-flap
+    /// core: relocating a whole hotspot to an emptier node gains nothing, so the loop refuses
+    /// moves that merely shuffle. Layered on top: the per-shard move floor
+    /// (<c>Cluster:ShardMoveMinIntervalMs</c>), one automatic move in flight at a time, and a hot
+    /// node the rule cannot help is logged (rate-limited), never churned — the single-shard case
+    /// being the granularity ceiling the design record warns about.
     /// </summary>
     private void EvaluateRebalance()
     {
@@ -978,13 +978,13 @@ internal sealed partial class HubRuntime : IDisposable
                 && LeastLoadedObservedTarget(nodeUtilization, origin, partiallyObserved) is { } target)
             {
                 var floorTicks = TimeSpan.TicksPerMillisecond * Math.Max(0, cluster.ShardMoveMinIntervalMs);
-                var candidate = originShards
-                    .Where(shard => shardUtilization.GetValueOrDefault(shard) > 0)
-                    .Where(shard => !_lastShardMoveTicks.TryGetValue(shard, out var moved) || now.UtcTicks - moved >= floorTicks)
-                    .Where(shard => target.Value + shardUtilization[shard] < hottest.Value)
-                    .OrderByDescending(shard => shardUtilization[shard])
-                    .Select(static shard => (ShardKey?)shard)
-                    .FirstOrDefault();
+                var candidate = ChooseRebalanceMove(
+                    originShards,
+                    shardUtilization,
+                    hottest.Value,
+                    target.Value,
+                    cluster.RebalanceMinGain,
+                    shard => !_lastShardMoveTicks.TryGetValue(shard, out var moved) || now.UtcTicks - moved >= floorTicks);
                 if (candidate is { } moving)
                 {
                     LogRebalanceMoving(
@@ -1024,6 +1024,42 @@ internal sealed partial class HubRuntime : IDisposable
         {
             LogRebalanceEvaluationFailed(_logger, exception.Message);
         }
+    }
+
+    /// <summary>
+    /// Which of the hot node's shards to send to the target, or null for none. Moving a shard of
+    /// load <c>s</c> leaves the pair's maximum at <c>max(origin - s, target + s)</c>; the move must
+    /// lower it by at least <paramref name="minGain"/> of <paramref name="origin"/>. Of the shards
+    /// that qualify, outside their move floor, the largest goes.
+    /// <para>
+    /// A strict improvement alone is not enough. Once two nodes are near level, a shard with
+    /// almost no load still improves the maximum by a sliver, and loads that small are noise: a
+    /// shard nobody writes to holds its write lock for its own load sampling, and that reads as a
+    /// few microseconds of utilization. The loop moved such shards for a gain of 0.004%, paying a
+    /// drain for nothing.
+    /// </para>
+    /// </summary>
+    internal static ShardKey? ChooseRebalanceMove(
+        IEnumerable<ShardKey> originShards,
+        IReadOnlyDictionary<ShardKey, double> shardUtilization,
+        double origin,
+        double target,
+        double minGain,
+        Func<ShardKey, bool> outsideMoveFloor)
+    {
+        var required = Math.Max(0, minGain) * origin;
+        return originShards
+            .Where(shard => shardUtilization.GetValueOrDefault(shard) > 0)
+            .Where(outsideMoveFloor)
+            .Where(shard =>
+            {
+                var load = shardUtilization[shard];
+                var after = Math.Max(origin - load, target + load);
+                return after < origin && origin - after >= required;
+            })
+            .OrderByDescending(shard => shardUtilization[shard])
+            .Select(static shard => (ShardKey?)shard)
+            .FirstOrDefault();
     }
 
     /// <summary>
@@ -2212,8 +2248,8 @@ internal sealed partial class HubRuntime : IDisposable
 
     [LoggerMessage(EventId = 1733, EventName = "RebalanceNoFit", Level = LogLevel.Warning,
         Message = "Node '{Node}' is sustained-hot ({Utilization:P0}) but no move helps: every candidate shard is inside its move floor, has no sustained " +
-            "load of its own, or would leave the pair's maximum no better against '{Target}' ({TargetUtilization:P0}) — relocating a whole hotspot is not " +
-            "a rebalance. Logged at most once per Cluster:ShardMoveMinIntervalMs.")]
+            "load of its own, or would not lower the pair's maximum against '{Target}' ({TargetUtilization:P0}) by Cluster:RebalanceMinGain — relocating a " +
+            "whole hotspot, or a shard too small to matter, is not a rebalance. Logged at most once per Cluster:ShardMoveMinIntervalMs.")]
     private static partial void LogRebalanceNoFit(ILogger logger, string node, double utilization, string target, double targetUtilization);
 
     [LoggerMessage(EventId = 1735, EventName = "ProvisionTicketIssued", Level = LogLevel.Information,

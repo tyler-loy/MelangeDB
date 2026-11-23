@@ -118,8 +118,9 @@ drain the emptiest node's shards onto the rest and decommission it.
 The lesson to import wholesale is handoff's: **hysteresis at every layer.** Provisioning has minutes
 of latency and real money attached, and a drain has a player-visible hitch, so the loop acts on
 *sustained* load (a window, not a sample), rate-limits moves per shard (a shard that just moved does
-not move again for a long interval), and keeps a wide dead zone between the scale-out and scale-in
-thresholds. Flapping here is not jitter — it is orphaned cloud instances and a world that hitches on
+not move again for a long interval), refuses a move whose gain is too small to be worth a hitch
+(`Cluster:RebalanceMinGain`, added in road-to-0.4 phase 31 after the loop moved an idle shard for a
+0.004% gain), and keeps a wide dead zone between the scale-out and scale-in thresholds. Flapping here is not jitter — it is orphaned cloud instances and a world that hitches on
 a timer. Scale-in is the genuinely harder half (drain everything, confirm, decommission, do not
 oscillate against the scale-out threshold) and may ship a phase behind scale-out without weakening
 it; a cluster that only grows still solves the 2 p.m. problem, just not the 2 a.m. bill.

@@ -258,6 +258,15 @@ public sealed class ClusterOptions
     public double RebalanceHotUtilization { get; set; } = 0.75;
 
     /// <summary>
+    /// The least a move must lower the pair's maximum by, as a fraction of the hot node's sustained
+    /// load. Without it any strict improvement justifies a drain, so once two nodes are near
+    /// level, a shard with almost no load (one whose only write-lock time is its own load sampling)
+    /// gets moved for a gain inside the measurement's noise. A drain pauses that shard's players;
+    /// the gain has to be worth it.
+    /// </summary>
+    public double RebalanceMinGain { get; set; } = 0.1;
+
+    /// <summary>
     /// The floor of the dead zone between scaling out and consolidating. In phase 13 nothing acts
     /// on cold — the gap between the two thresholds exists so the loop never chases its own wake;
     /// phase 14's scale-in is what eventually consumes it.
