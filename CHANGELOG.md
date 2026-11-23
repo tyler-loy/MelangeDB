@@ -211,6 +211,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **The rebalance loop could move a shard with almost no load.** A move only had to lower the
+  pair of nodes' maximum load by any amount, so once two nodes were level, a shard nobody wrote to
+  qualified as soon as it read any load at all. Every 10 s a shard's own load sampling holds its
+  write lock for a statistics pass, and that reads as a few microseconds of utilization: the loop
+  then drained the shard, pausing its players, for a gain of 0.004%. A move must now lower the
+  maximum by at least `Cluster:RebalanceMinGain` of the hot node's load (default `0.1`). This
+  was the intermittent `RebalanceLoopTests` failure on CI, which only slow runners reached; the
+  test now watches past a sampling pass and failed 5 runs in 6 without the fix.
 - **A log compaction whose final rename failed left the commit log unusable until restart.**
   The compaction closes the log's file, renames the compacted file over it, and reopens it. If
   the rename threw, the log kept the closed file: appends failed with `ObjectDisposedException`,
