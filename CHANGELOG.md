@@ -19,6 +19,14 @@ All packages ship together at one version; there is no per-package versioning. S
   SpacetimeDB, which allows public timer tables, are the likely case. Drop `Public`, and put the
   state clients need in a public table of its own beside the timer table, created and deleted with
   the timer row.
+- **`/melange/sql` writes 64-bit integers and timestamps as JSON strings.** `Int64` and `UInt64`
+  values, `Timestamp` microseconds, `COUNT`s, and `MIN`/`MAX`/`DATE_TRUNC` over them are decimal
+  strings (`"9007199254740993"`), not numbers; integers of 32 bits and less, floats, and a `SUM`'s
+  `numeric` stay numbers. A JavaScript consumer's `JSON.parse` rounded any integer past 2^53 with
+  no error, so an id, a counter or a timestamp could come back wrong (finding 5 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md#findings)). The MCP `query` tool returns
+  the same form. `@melangedb/client`'s `queryTable` reads both forms; a consumer of the raw JSON
+  that called `GetInt64()` or treated these as numbers must parse the string.
 
 ### Deprecated
 

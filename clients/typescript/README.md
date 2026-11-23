@@ -88,7 +88,9 @@ because a JavaScript `number` does not say which integer or float kind it is.
 `new MelangeSql({ url: "https://game.example.com/melange", token }).query("SELECT COUNT(*) FROM
 Creature")` runs one-shot queries, aggregates included, against `/melange/sql` (owner mode needs
 the server's `Sql:OwnerRole` claim). `queryTable(CreatureCodec, "SELECT * FROM Creature WHERE
-...")` returns typed rows. Integers past 2^53 come back as exact `bigint`.
+...")` returns typed rows, with 64-bit and timestamp columns as exact `bigint`. `query()` returns
+values as the endpoint writes them: 64-bit integers, timestamps and `COUNT`s are decimal strings
+(so they never round), smaller integers are numbers.
 
 ## Developing this package
 

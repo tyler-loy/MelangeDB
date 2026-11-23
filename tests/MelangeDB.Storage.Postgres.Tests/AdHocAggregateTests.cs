@@ -68,7 +68,7 @@ public class AdHocAggregateTests
         // COUNT(*): the simplest thing the admin console needs.
         var count = await QueryAsync(http, """{"query": "SELECT COUNT(*) FROM Stat"}""");
         Assert.Equal(["count"], Columns(count));
-        Assert.Equal(5, count.GetProperty("rows")[0][0].GetInt64());
+        Assert.Equal("5", count.GetProperty("rows")[0][0].GetString()); // 64-bit integers are strings on the SQL endpoint.
 
         // GROUP BY metric with the full aggregate set.
         var grouped = await QueryAsync(
@@ -76,24 +76,24 @@ public class AdHocAggregateTests
         Assert.Equal(["Metric", "count", "sum_Value", "avg_Value", "min_Value", "max_Value"], Columns(grouped));
         var creatures = grouped.GetProperty("rows")[0];
         Assert.Equal("creatures", creatures[0].GetString());
-        Assert.Equal(3, creatures[1].GetInt64());
-        Assert.Equal(70, creatures[2].GetInt64());
-        Assert.Equal(10, creatures[4].GetInt64());
-        Assert.Equal(40, creatures[5].GetInt64());
+        Assert.Equal("3", creatures[1].GetString());
+        Assert.Equal(70, creatures[2].GetInt64()); // SUM over bigint is numeric, a JSON number.
+        Assert.Equal("10", creatures[4].GetString());
+        Assert.Equal("40", creatures[5].GetString());
 
         // Hourly bucketing — the date_trunc query the ScrapeWorker existed for.
         var buckets = await QueryAsync(
             http, """{"query": "SELECT DATE_TRUNC('hour', At), COUNT(*) FROM Stat GROUP BY DATE_TRUNC('hour', At)"}""");
         var bucketRows = buckets.GetProperty("rows");
         Assert.Equal(2, bucketRows.GetArrayLength());
-        Assert.Equal(3, bucketRows[0][1].GetInt64());
-        Assert.Equal(2, bucketRows[1][1].GetInt64());
-        Assert.Equal(3_600_000_000, bucketRows[1][0].GetInt64() - bucketRows[0][0].GetInt64());
+        Assert.Equal("3", bucketRows[0][1].GetString());
+        Assert.Equal("2", bucketRows[1][1].GetString());
+        Assert.Equal(3_600_000_000, long.Parse(bucketRows[1][0].GetString()!, System.Globalization.CultureInfo.InvariantCulture) - long.Parse(bucketRows[0][0].GetString()!, System.Globalization.CultureInfo.InvariantCulture));
 
         // A predicate narrows the aggregate; parameters bind, never concatenate.
         var filtered = await QueryAsync(
             http, """{"query": "SELECT COUNT(*) FROM Stat WHERE Metric = :m", "params": {"m": "players"}}""");
-        Assert.Equal(2, filtered.GetProperty("rows")[0][0].GetInt64());
+        Assert.Equal("2", filtered.GetProperty("rows")[0][0].GetString());
 
         // Owner-mode row shapes on the same (private, relational) table serve from the hot store.
         var rows = await QueryAsync(http, """{"query": "SELECT Metric, Value FROM Stat WHERE Metric = :m", "params": {"m": "creatures"}}""");

@@ -94,7 +94,7 @@ public class McpEndpointTests
 
         var rows = JsonDocument.Parse(Text(await CallAsync(client, "query", new() { ["sql"] = "SELECT * FROM Chunk WHERE Id = :id", ["parameters"] = new Dictionary<string, object?> { ["id"] = 7 } })));
         Assert.Equal(["Id", "X", "Data"], rows.RootElement.GetProperty("columns").EnumerateArray().Select(static c => c.GetString()));
-        Assert.Equal(7, Assert.Single(rows.RootElement.GetProperty("rows").EnumerateArray())[0].GetInt64());
+        Assert.Equal("7", Assert.Single(rows.RootElement.GetProperty("rows").EnumerateArray())[0].GetString());
 
         var health = JsonDocument.Parse(Text(await CallAsync(client, "health"))).RootElement;
         Assert.Equal(host.Engine.Log.HeadLsn, health.GetProperty("headLsn").GetUInt64());

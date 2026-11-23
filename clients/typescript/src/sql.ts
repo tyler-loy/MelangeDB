@@ -3,7 +3,12 @@ import type { TableCodec } from "./cache.js";
 import { MelangeError } from "./subscription.js";
 import { ColumnKind, Identity, toHex, type ColumnValue } from "./values.js";
 
-/** A value in a SQL result row: JSON's types, with integers past 2^53 kept exact as `bigint`. */
+/**
+ * A value in a SQL result row, as the endpoint writes it: 64-bit integers, timestamps (Unix
+ * microseconds) and `COUNT`s are decimal strings, so they arrive exact; integers of 32 bits and
+ * less are numbers; bytes are base64 and identities hex strings. A `numeric` aggregate (a `SUM`
+ * over a 64-bit column) is a JSON number, kept exact as a `bigint` past 2^53.
+ */
 export type SqlValue = string | number | bigint | boolean | null;
 
 export interface SqlResult {
@@ -77,7 +82,8 @@ function fromJson(kind: number, value: SqlValue, where: string): ColumnValue {
     case ColumnKind.Int64:
     case ColumnKind.UInt64:
     case ColumnKind.Timestamp:
-      return BigInt(value as number | bigint);
+      // Decimal strings from the endpoint; BigInt also takes the number a pre-0.4 server sent.
+      return BigInt(value as string | number | bigint);
     case ColumnKind.Bytes:
       return Uint8Array.from(atob(String(value)), (c) => c.charCodeAt(0));
     case ColumnKind.Identity:

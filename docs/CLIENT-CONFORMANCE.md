@@ -616,7 +616,9 @@ Writing the contract down found these, as the phase plan said it would.
    there is one client. It becomes a compatibility promise nobody made the moment a second client
    leans on it. **Owner's decision: warn in 0.4, refuse in 0.5.** The server logs EventId 1207 for
    each table, column and shape it coerces.
-5. **`/melange/sql` writes 64-bit integers as plain JSON numbers.** Found building the TypeScript
+5. **`/melange/sql` wrote 64-bit integers as plain JSON numbers.** **Fixed for 0.4 (owner's
+   decision, a breaking change): 64-bit integers, timestamps and `COUNT`s are now decimal
+   strings**; integers of 32 bits and less stay numbers. Found building the TypeScript
    client's SQL reader. `JSON.parse` rounds anything past 2^53, so an `Int64` id, a `UInt64`
    counter, or a microsecond timestamp comes back wrong with no error in a JavaScript consumer.
    `MelangeSql` reads such numbers from the source text (`JSON.parse`'s source access, in Node 21+

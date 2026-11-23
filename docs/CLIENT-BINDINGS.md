@@ -298,7 +298,9 @@ conn.identity;
   ticket goes in the URL.
 - **Ad-hoc SQL.** `MelangeSql.query()` reads `/melange/sql` results as untyped rows, aggregates
   included, which neither client covered before. `queryTable(codec, "SELECT * FROM ...")`
-  returns typed rows for the one shape the manifest describes. Integers past 2^53 stay exact.
+  returns typed rows for the one shape the manifest describes. The endpoint writes 64-bit
+  integers, timestamps and `COUNT`s as decimal strings (0.4), so they stay exact in any JSON
+  reader; `queryTable` turns them into `bigint`.
 
 The package's [README](../clients/typescript/README.md) has the rest.
 

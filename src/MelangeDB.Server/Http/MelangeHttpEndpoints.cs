@@ -436,6 +436,13 @@ internal static class MelangeHttpEndpoints
         _ => throw new JsonException($"JSON value of kind {element.ValueKind} is not a valid argument."),
     };
 
+    /// <summary>
+    /// A SQL result value as JSON. 64-bit integers and timestamps are decimal strings: JSON has
+    /// one number type, and a JavaScript consumer's <c>JSON.parse</c> rounds an integer past 2^53
+    /// without an error, so an <c>Int64</c> id, a <c>UInt64</c> counter or a <c>COUNT</c> would
+    /// come back wrong. Integers of 32 bits and less stay numbers, since every consumer reads them
+    /// exactly.
+    /// </summary>
     internal static void WriteJsonValue(Utf8JsonWriter writer, object? value)
     {
         switch (value)
@@ -446,10 +453,16 @@ internal static class MelangeHttpEndpoints
             case bool b:
                 writer.WriteBooleanValue(b);
                 break;
-            case sbyte or short or int or long:
+            case long signed:
+                writer.WriteStringValue(signed.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                break;
+            case ulong unsigned:
+                writer.WriteStringValue(unsigned.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                break;
+            case sbyte or short or int:
                 writer.WriteNumberValue(Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture));
                 break;
-            case byte or ushort or uint or ulong:
+            case byte or ushort or uint:
                 writer.WriteNumberValue(Convert.ToUInt64(value, System.Globalization.CultureInfo.InvariantCulture));
                 break;
             case float f:
@@ -471,7 +484,7 @@ internal static class MelangeHttpEndpoints
                 writer.WriteStringValue(identity.ToString());
                 break;
             case Timestamp timestamp:
-                writer.WriteNumberValue(timestamp.UnixTimeMicroseconds);
+                writer.WriteStringValue(timestamp.UnixTimeMicroseconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 break;
             default:
                 writer.WriteStringValue(value.ToString());
