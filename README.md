@@ -143,6 +143,13 @@ A runnable version of all of this lives in [`samples/`](samples).
 | Validation against a live game | Shipped (11) — its measurement pass is outstanding |
 | Archive tier: Postgres-only tables for unbounded history | Shipped (25) |
 | Producers: typed, read-only calls a client makes for data | Shipped (26) |
+| `MelangeDB.Testing`: the reducer test kit | Shipped (22) |
+| TypeScript client, client conformance suite, `melange generate` | Shipped (23) |
+| Constraint changes are migrations: `[Unique]` over existing rows is checked | Shipped (27) |
+| Clients that outlive a deploy: additive schema changes, automatic reconnect | Shipped (28) |
+| Agent endpoint (MCP): schema, SQL, signals, allowlisted reducer calls | Shipped (29) |
+| Shard HA: fencing, failure detection, warm replica and promotion | Shipped (30) |
+| Shared subscription fan-out and the re-measured capacity ceiling | Shipped (31) |
 
 Deliberately out of scope: joins in subscriptions, an unreliable/UDP transport, a sandbox for
 reducer code, and a stock admin console. Each is argued in [docs/DESIGN.md](docs/DESIGN.md) or

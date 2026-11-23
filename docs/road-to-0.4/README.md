@@ -45,6 +45,8 @@ that still hold. Its shape is a warm replica under the existing fencing, plus fa
 
 ## The phases
 
+**0.4.0 shipped on 2026-11-22** with every phase below as its status reads.
+
 | | Phase | Status |
 | --- | --- | --- |
 | [20](../road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half. **Carried from 0.3** | **Measured** 2026-11-20; findings [#198](https://github.com/tyler-loy/MelangeDB/issues/198)–[#204](https://github.com/tyler-loy/MelangeDB/issues/204) |
