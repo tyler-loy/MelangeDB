@@ -307,6 +307,13 @@ internal sealed class ShapeResolution
         };
     }
 
+    /// <summary>
+    /// Whether <paramref name="table"/>'s columns or key under the shape that governed
+    /// <paramref name="lsn"/> differ from the current ones: whether a row written then needs
+    /// re-encoding now. A tier or uniqueness change alone does not count, since it changes no row.
+    /// </summary>
+    public bool ShapeChangedSince(ulong lsn, TableId table) => MapperFor(lsn, table) is not null;
+
     /// <summary>Re-encodes snapshot rows captured at <paramref name="snapshotLsn"/>; pass-through per table when nothing differs.</summary>
     public IEnumerable<SnapshotRow> TransformSnapshotRows(ulong snapshotLsn, IEnumerable<SnapshotRow> rows)
     {

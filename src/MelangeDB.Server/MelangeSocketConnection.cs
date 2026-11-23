@@ -846,6 +846,17 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             }
         }
 
+        if (TableReshapedSince(resume) is { } reshaped)
+        {
+            // The client decodes with descriptors from before a migration that changed this
+            // table's columns, and a resume sends none: every row after an inserted column would
+            // be misread with no error. A full resync hands it fresh descriptors.
+            EnqueuePriority(new ResumeResultFrame(
+                false,
+                $"The columns of '{reshaped}' changed in a migration after the resume cursor; a full resync is required."));
+            return;
+        }
+
         ulong resumeHead = 0;
         var registered = new List<ServerSubscription>(resume.Subscriptions.Count);
         try
@@ -913,6 +924,39 @@ internal sealed class MelangeSocketConnection : IDeltaSink
             _resumeBuffering = false;
         });
         _sendSignal.Release();
+    }
+
+    /// <summary>
+    /// The first table a resumed subscription reads whose columns changed after the cursor, or
+    /// null. Shapes change only at boot, so this needs no lock. A query that does not parse is
+    /// left for the registration below to refuse with its own message.
+    /// </summary>
+    private string? TableReshapedSince(ResumeFrame resume)
+    {
+        var engine = _transport.Engine;
+        foreach (var request in resume.Subscriptions)
+        {
+            SubscriptionQuery query;
+            try
+            {
+                query = SqlSubsetParser.Parse(request.Query, request.Parameters);
+            }
+            catch (SqlParseException)
+            {
+                continue;
+            }
+
+            // Public tables only: a private one is refused at registration with the same message
+            // as an unknown name, and this answer must not reveal that it exists.
+            if (engine.Schema.TryGetByName(query.Table, out var schema)
+                && schema.IsPublic
+                && engine.TableShapeChangedSince(resume.LastAckedLsn, schema.Id))
+            {
+                return schema.Name;
+            }
+        }
+
+        return null;
     }
 
     private void StartHeartbeat()

@@ -368,7 +368,9 @@ the subscriptions carry on live.
 
 <a id="c104"></a>**C10.4 — Rejected means a full resync.** The server rejects a resume against
 another epoch, a cursor beyond its head, a gap older than `Resume:RetentionWindowSeconds`
-(default 300), a subscription that no longer validates, or a resume after a subscribe. A rejected
+(default 300), a subscription that no longer validates, a subscription to a table whose columns
+changed in a migration after the cursor (the descriptors C10.3 keeps would misread its rows), or
+a resume after a subscribe. A rejected
 resume holds nothing on the server. Reset the cursor, re-establish every subscription with
 `Subscribe`, and reconcile each new initial set by diff (C8.2). Drop anything still queued from the
 old connection: a frame from the dead era must never apply to the rebuilt caches.
@@ -599,16 +601,17 @@ Writing the contract down found these, as the phase plan said it would.
    noticed. The client now re-establishes every subscription itself. The `overflow-resync`
    scenario and a `BackpressureTests` case through the real client both fail without the fix.
    The same change makes chunk 0 discard rows left from an initial set that never completed.
-2. **Resume across an additive migration may decode with a stale descriptor.** Found by reading;
-   not yet reproduced. An additive migration keeps the log's epoch
-   (`SchemaShapeResumeTests` relies on that), so a client that reconnects after a deploy which
-   added a column is resumed. It keeps the descriptor it held (C10.3), while the server encodes the
-   gap and every later delta with the new one. A trailing column would be read past harmlessly; a
-   column added mid-table would shift every column after it. `SchemaShapeResumeTests` reorders
-   stored history without changing the live descriptor, so it does not cover this. The fix is
-   probably to refuse a resume whose subscriptions' shapes changed since the cursor, which falls
-   back to a full resync with fresh descriptors. The live suite cannot stage it yet: a column
-   added between restarts needs two builds of the module, and the conformance tool has one.
+2. **Resume across an additive migration decoded with a stale descriptor.** Found by reading.
+   **Fixed for 0.4 (owner's decision): the server refuses the resume** (C10.4). An additive
+   migration keeps the log's epoch, so a client that reconnected after a deploy which added a
+   column was resumed. It kept the descriptor it held (C10.3), while the server encoded the gap
+   and every later delta with the new one. A trailing column would be read past harmlessly; a
+   column added mid-table would shift every column after it. Now a resume whose subscriptions
+   read a table whose columns or key changed after the cursor is refused, and the client's full
+   resync gets fresh descriptors. A tier or uniqueness change alone changes no row and does not
+   refuse. `SchemaShapeResumeTests` covers the refusal, a cursor after the migration, and an
+   untouched table. The live suite still cannot stage it: a column added between restarts needs
+   two builds of the module, and the conformance tool has one.
 3. **`Public = true` on a scheduled table was silently dropped.** **Fixed for 0.4: it is now a
    build error, `MELANGE0032`** (owner's decision). Scheduled tables are always private, which is
    why no frame can carry `ScheduleAt`; the corpus covers the kind with vectors instead.

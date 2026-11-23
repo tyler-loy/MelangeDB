@@ -238,6 +238,14 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A client resumed across a deploy that changed a table's columns misread its rows.** An
+  additive migration keeps the log's epoch, so the resume was accepted, and the client went on
+  decoding with the descriptors it held while the server encoded with the new shape: a column
+  added mid-table shifted every column after it, with no error (finding 2 in
+  [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md#findings)). The server now refuses a
+  resume whose subscriptions read a table whose columns changed after the cursor, and the client
+  resyncs with fresh descriptors, as it does for any refused resume. Both clients already handle
+  the refusal. A tier or `[Unique]` change alone changes no row and does not refuse.
 - **The rebalance loop could move a shard with almost no load.** A move only had to lower the
   pair of nodes' maximum load by any amount, so once two nodes were level, a shard nobody wrote to
   qualified as soon as it read any load at all. Every 10 s a shard's own load sampling holds its
