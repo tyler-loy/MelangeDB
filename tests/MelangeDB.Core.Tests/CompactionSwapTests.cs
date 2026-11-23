@@ -114,18 +114,22 @@ public class CompactionSwapTests : IDisposable
     }
 
     [Fact]
-    public void A_compaction_during_an_open_read_leaves_the_log_working()
+    public void A_compaction_during_an_open_read_swaps_and_leaves_the_log_working()
     {
         // The real cause, not an injected one. A read is lazy and holds its file handle open
-        // between records; a compaction that lands meanwhile is what a busy node does.
+        // between records; a compaction that lands meanwhile is what a busy node does. The rename
+        // goes through it on every OS: POSIX semantics on Windows, as Linux always had.
         var options = new CommitLogOptions { Path = _root };
         using (var log = new FileCommitLog(options))
         {
             Append(log, 1, 1_000);
+            var full = log.FileLengthBytes;
 
             using var read = log.ReadFrom(1).GetEnumerator();
             Assert.True(read.MoveNext());
             log.TruncateBefore(400);
+            Assert.Equal(0, log.FailedSwaps);
+            Assert.True(log.FileLengthBytes < full, $"the log is {log.FileLengthBytes} bytes of {full}: the compaction did not swap");
 
             // The open read finishes on the file it started with.
             var seen = 1;

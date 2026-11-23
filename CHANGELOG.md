@@ -223,6 +223,12 @@ All packages ship together at one version; there is no per-package versioning. S
   cannot be reopened, poisons the log as a failed fsync does (Critical `1017
   CompactionSwapPoisoned`). Reads no longer return records at or below the base that are still
   on disk, which a crash between a compaction's two steps could also leave behind.
+- **On Windows, a read of the commit log no longer blocks its compaction.** The compaction's
+  rename (and every other durable file replace) now uses POSIX semantics, as Linux always had: the
+  replaced file's name goes at once, and a reader already holding it open finishes on the old
+  file. The rename is still made durable by a write-through flush. Filesystems without POSIX
+  renames (FAT, Windows before 10 1709) fall back to the previous replace, where a concurrent
+  read makes the rename fail and the log keeps its old file until the next compaction.
 - **The gateway could stall a player for tens of seconds around a handoff** (found measuring
   road-to-0.4 phase 31's game shape). Four things, fixed together:
   - Routing a call or a subscription to a shard held the connection's attachment lock while it

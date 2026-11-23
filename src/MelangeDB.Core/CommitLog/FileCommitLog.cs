@@ -1523,9 +1523,9 @@ public sealed class FileCommitLog : ICommitLog
         }
         catch (Exception failure) when (File.Exists(tempPath))
         {
-            // The rename did not happen. On Windows any other handle open on the log refuses a
-            // replace, and the log's own readers open one each, so this is a race with a read, not
-            // a failing disk.
+            // The rename did not happen. Where Windows cannot rename with POSIX semantics (FAT),
+            // any other handle open on the log refuses a replace, and the log's own readers open
+            // one each, so this is a race with a read, not a failing disk.
             return KeepOldFileAfterFailedSwap(tempPath, upToLsn, failure) ? SwapOutcome.KeptOldFile : SwapOutcome.Poisoned;
         }
         catch (Exception failure)

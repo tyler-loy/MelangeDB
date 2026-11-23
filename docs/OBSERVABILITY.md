@@ -434,10 +434,11 @@ Stable ids so far: `1001 TornRecordTruncated`, `1002 AppendRollbackFailed` (01);
 `1007 GroupFlushFailed` — a group fsync failed, every commit it covered is failed and rolled back,
 and the log rejects appends until restart; Critical, and the `melange-log` health check goes
 unhealthy with it (road-to-0.2 phase 17); `1016 CompactionSwapFailed` — a log compaction's
-rename was refused (on Windows, another handle open on the log, usually a read), so the log kept
-its old file: the truncation stands and the next compaction removes the bytes; Warning, and the
-log stays writable. One now and then is a race with a reader; every compaction failing means
-something holds the file open. `1017 CompactionSwapPoisoned` — a compaction closed the log's file
+rename was refused, so the log kept its old file: the truncation stands and the next compaction
+removes the bytes; Warning, and the log stays writable. Windows renames with POSIX semantics, so
+an open reader does not refuse it; on a filesystem without them (FAT), another handle open on the
+log does, and one now and then is a race with a read. Every compaction failing means something
+holds the file open without sharing delete. `1017 CompactionSwapPoisoned` — a compaction closed the log's file
 and could not reopen it, or its rename happened but could not be made durable; Critical, the log
 rejects appends until restart like `1007`, and `melange-log` goes unhealthy; `1003 SlowReducer` —
 also emitted as `SlowReducerDeferredFsync` when the fsync policy defers the flush, and

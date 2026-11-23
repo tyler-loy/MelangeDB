@@ -1,5 +1,7 @@
+using System.Buffers.Binary;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace MelangeDB.Core;
 
@@ -13,8 +15,11 @@ namespace MelangeDB.Core;
 /// </summary>
 /// <remarks>
 /// <para>On Linux and macOS, <see cref="Replace"/> renames and then fsyncs the containing
-/// directory. On Windows it renames with <c>MOVEFILE_WRITE_THROUGH</c>, which does not return
-/// until the move is on disk; Windows has no directory fsync to call.</para>
+/// directory. On Windows it renames with POSIX semantics, so handles open on the destination do
+/// not refuse the replace, and flushes the renamed file's handle, which is what
+/// <c>MOVEFILE_WRITE_THROUGH</c> does; Windows has no directory fsync to call. Where POSIX
+/// renames are unsupported it falls back to <c>MoveFileEx</c> with <c>MOVEFILE_WRITE_THROUGH</c>,
+/// which a reader holding the destination open makes fail.</para>
 /// <para>Filesystems that cannot fsync a directory report <c>EINVAL</c>; that is treated as nothing
 /// to do, as PostgreSQL treats it, since such a filesystem gives the guarantee another way or not
 /// at all. Every other failure throws: a rename that may not be durable must not be reported as
@@ -47,13 +52,8 @@ internal static class DurableFile
     {
         if (OperatingSystem.IsWindows())
         {
-            if (!Windows.MoveFileExW(source, destination, Windows.MoveFileReplaceExisting | Windows.MoveFileWriteThrough))
-            {
-                var error = Marshal.GetLastPInvokeError();
-                throw new IOException(
-                    $"Could not replace '{destination}' with '{source}': {new Win32Exception(error).Message}", error);
-            }
-
+            if (!Windows.TryReplaceAsPosix(source, destination))
+                Windows.ReplaceWithMoveFile(source, destination);
             return;
         }
 
@@ -94,12 +94,83 @@ internal static class DurableFile
 
     private static class Windows
     {
-        public const uint MoveFileReplaceExisting = 0x1;
-        public const uint MoveFileWriteThrough = 0x8;
+        private const uint MoveFileReplaceExisting = 0x1;
+        private const uint MoveFileWriteThrough = 0x8;
+
+        private const uint Delete = 0x0001_0000;
+        private const uint Synchronize = 0x0010_0000;
+        private const uint GenericWrite = 0x4000_0000;
+        private const uint ShareAll = 0x7; // read, write, delete
+        private const uint OpenExisting = 3;
+
+        private const int FileRenameInfoEx = 22;
+        private const uint RenameReplaceIfExists = 0x1;
+        private const uint RenamePosixSemantics = 0x2;
+
+        private const int ErrorInvalidFunction = 1;
+        private const int ErrorNotSupported = 50;
+        private const int ErrorInvalidParameter = 87;
+
+        /// <summary>
+        /// Renames with POSIX semantics: the replaced file's name goes at once, and handles still
+        /// open on it keep reading the old file, as on Linux. A plain replace is refused while any
+        /// other handle has the destination open, and the commit log's readers each hold one. The
+        /// rename is made durable by flushing the renamed file's handle, which is how
+        /// <c>MOVEFILE_WRITE_THROUGH</c> does it. Returns false when the filesystem or Windows
+        /// version has no POSIX rename (FAT, or before Windows 10 1709), for the caller to fall back.
+        /// </summary>
+        public static bool TryReplaceAsPosix(string source, string destination)
+        {
+            using var handle = CreateFileW(Path.GetFullPath(source), Delete | Synchronize | GenericWrite, ShareAll, 0, OpenExisting, 0, 0);
+            if (handle.IsInvalid)
+                throw Failed(Marshal.GetLastPInvokeError(), source, destination);
+
+            // FILE_RENAME_INFO: a flags word, the root directory handle at pointer alignment, the
+            // name's length in bytes, then the name inline.
+            var name = Path.GetFullPath(destination);
+            var nameOffset = (2 * IntPtr.Size) + sizeof(uint);
+            var size = nameOffset + ((name.Length + 1) * sizeof(char));
+            var buffer = new byte[Math.Max(size, 3 * IntPtr.Size)];
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer, RenameReplaceIfExists | RenamePosixSemantics);
+            BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(2 * IntPtr.Size), (uint)(name.Length * sizeof(char)));
+            MemoryMarshal.AsBytes(name.AsSpan()).CopyTo(buffer.AsSpan(nameOffset));
+
+            if (!SetFileInformationByHandle(handle, FileRenameInfoEx, buffer, (uint)buffer.Length))
+            {
+                var error = Marshal.GetLastPInvokeError();
+                if (error is ErrorInvalidParameter or ErrorNotSupported or ErrorInvalidFunction)
+                    return false;
+                throw Failed(error, source, destination);
+            }
+
+            if (!FlushFileBuffers(handle))
+                throw Failed(Marshal.GetLastPInvokeError(), source, destination);
+            return true;
+        }
+
+        public static void ReplaceWithMoveFile(string source, string destination)
+        {
+            if (!MoveFileExW(source, destination, MoveFileReplaceExisting | MoveFileWriteThrough))
+                throw Failed(Marshal.GetLastPInvokeError(), source, destination);
+        }
+
+        private static IOException Failed(int error, string source, string destination) =>
+            new($"Could not replace '{destination}' with '{source}': {new Win32Exception(error).Message}", error);
 
         [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool MoveFileExW(string existingFileName, string newFileName, uint flags);
+        private static extern bool MoveFileExW(string existingFileName, string newFileName, uint flags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string fileName, uint desiredAccess, uint shareMode, nint securityAttributes, uint creationDisposition, uint flagsAndAttributes, nint templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(SafeFileHandle file, int fileInformationClass, byte[] fileInformation, uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool FlushFileBuffers(SafeFileHandle file);
     }
 
     private static class Posix
