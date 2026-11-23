@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text.Json;
+using MelangeDB.Server;
 
 namespace MelangeDB.Cluster;
 
@@ -11,10 +12,17 @@ namespace MelangeDB.Cluster;
 /// did not perform the request) versus a timeout or link death (the peer may or may not have —
 /// the request's effect is unknown, and only reconciliation can say).
 /// </summary>
-public sealed class NodeLinkException(string message, bool isPeerError = false) : InvalidOperationException(message)
+public sealed class NodeLinkException(string message, bool isPeerError = false, string? code = null) : InvalidOperationException(message)
 {
     /// <summary>True when the peer answered with an error reply — the request definitively did not happen.</summary>
     public bool IsPeerError { get; } = isPeerError;
+
+    /// <summary>
+    /// The error code of a reducer call that failed on the peer (<c>denied</c>,
+    /// <c>rate_limited</c>, <c>outcome_unknown</c>, ...), or null for any other failure. An
+    /// <c>outcome_unknown</c> reply is the one peer error whose request may have committed.
+    /// </summary>
+    public string? Code { get; } = code;
 }
 
 /// <summary>
@@ -584,7 +592,11 @@ internal sealed class NodeLink : IDisposable
                         if (frame.Type == "error")
                         {
                             tcs.TrySetException(new NodeLinkException(
-                                frame.Body?.GetProperty("Message").GetString() ?? "error", isPeerError: true));
+                                frame.Body?.GetProperty("Message").GetString() ?? "error",
+                                isPeerError: true,
+                                frame.Body is { } body && body.TryGetProperty("Code", out var code) && code.ValueKind == JsonValueKind.String
+                                    ? code.GetString()
+                                    : null));
                         }
                         else
                         {
@@ -629,7 +641,7 @@ internal sealed class NodeLink : IDisposable
         }
         catch (Exception exception)
         {
-            reply = new WireFrame(0, frame.Id, "error", ToElement(new { Message = exception.Message }));
+            reply = new WireFrame(0, frame.Id, "error", ToElement(new { Message = exception.Message, Code = ReducerCallErrors.CodeOf(exception) }));
         }
 
         Send(reply);
@@ -639,6 +651,7 @@ internal sealed class NodeLink : IDisposable
     {
         object? result = null;
         string? error = null;
+        string? code = null;
         try
         {
             if (Handler is { } handler)
@@ -649,6 +662,7 @@ internal sealed class NodeLink : IDisposable
         catch (Exception exception)
         {
             error = exception.Message;
+            code = ReducerCallErrors.CodeOf(exception);
         }
 
         if (frame.Id == 0)
@@ -658,7 +672,7 @@ internal sealed class NodeLink : IDisposable
             await SendAsync(
                 error is null
                     ? new WireFrame(0, frame.Id, frame.Type + "-ok", ToElement(result))
-                    : new WireFrame(0, frame.Id, "error", ToElement(new { Message = error })),
+                    : new WireFrame(0, frame.Id, "error", ToElement(new { Message = error, Code = code })),
                 _closed.Token).ConfigureAwait(false);
         }
         catch (Exception)

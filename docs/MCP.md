@@ -86,11 +86,19 @@ would over HTTP. Stdout carries only the protocol; diagnostics go to stderr.
 
 ## Clusters
 
-Each tool answers for the node it reached, as the HTTP surfaces do: on the hub, `query` reads the
-hub's Global and Replicated tables and refuses Partitioned ones with `partitioned_elsewhere`;
-`health` and `signals` describe that node. A reducer call runs on that node's engine, so in a
-cluster it reaches hub-site reducers only. Routing calls to the shard that owns their rows is not
-built yet (see the phase 29 plan).
+Map the endpoint on the hub. The read tools answer for the node they reached, as the HTTP surfaces
+do: `query` reads the hub's Global and Replicated tables and refuses Partitioned ones with
+`partitioned_elsewhere`; `health` and `signals` describe the hub.
+
+**A reducer call names its shard.** On a cluster hub `call_reducer` requires `shard`, and the hub
+sends the call to the node that owns it. It arrives there as the client call it is: the agent's
+identity, its token's claims and guest flag travel with it, so argument validation, the
+reducer's policy and `RateLimit:*` apply on that node, and a refusal comes back with its own code
+(`denied:`, `rate_limited:`, `outcome_unknown:` when the link to the node failed mid-call). The
+`lsn` returned is that shard's. A shard that does not exist is refused (`invalid_args:`) and never
+created. A call without `shard` is refused rather than run on the hub's engine, which is not
+where a shard's reducers commit; hub-site reducers are therefore not callable from the agent
+endpoint on a cluster. On a single node `shard` is ignored.
 
 ## Threat model
 

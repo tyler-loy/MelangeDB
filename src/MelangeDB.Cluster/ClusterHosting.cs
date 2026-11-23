@@ -131,6 +131,10 @@ public static class MelangeClusterServiceCollectionExtensions
         // resolves its HubRuntime lazily so being constructed on a shard node costs nothing.
         services.TryAddSingleton<IBulkRouter>(static provider =>
             new HubBulkRouter(provider, provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>()));
+
+        // The MCP endpoint's route for reducer calls, on the same terms: routing only on the hub.
+        services.TryAddSingleton<IShardCallRouter>(static provider =>
+            new HubShardCallRouter(provider, provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>()));
         services.Configure<Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckServiceOptions>(static options =>
         {
             if (options.Registrations.All(static r => r.Name != "melange-shard"))

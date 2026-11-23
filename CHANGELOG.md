@@ -39,6 +39,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **MCP reducer calls on a cluster** (road-to-0.4 phase 29's last deliverable). On a cluster hub,
+  `call_reducer` takes a `shard` and the hub sends the call to that shard's node, where it
+  commits as the client call it is: the agent's identity, token claims and guest flag travel with
+  it, so the reducer's policy and `RateLimit:*` apply there. Node-link error replies now carry the
+  call failure's code, so a refusal on the node reaches the agent as `denied`, `rate_limited`,
+  `rejected` and so on; a lost link is `outcome_unknown`. A shard that does not exist is refused
+  and never created. A call without `shard` on a hub is refused, so hub-site reducers are not
+  callable from the agent endpoint on a cluster. On a single node `shard` is ignored.
+
 - **The client conformance contract** (road-to-0.4 phase 23, step 1).
   [docs/CLIENT-CONFORMANCE.md](docs/CLIENT-CONFORMANCE.md) states every rule a MelangeDB client
   must keep as a numbered obligation with the failure it prevents: framing, the handshake, rows and

@@ -200,11 +200,12 @@ internal sealed class MelangeMcpTools(McpHost host, IHttpContextAccessor accesso
 internal sealed class MelangeReducerTools(McpHost host, IHttpContextAccessor accessor)
 {
     [McpServerTool(Name = "call_reducer", Destructive = true)]
-    [Description("Calls one reducer this server allows agents to call (see the allowed list in this tool's error when you name another, and describe_schema for parameters). The call commits like any client's: policies and rate limits apply, and it is recorded in the log. Returns {\"ok\":true,\"lsn\":N}.")]
+    [Description("Calls one reducer this server allows agents to call (see the allowed list in this tool's error when you name another, and describe_schema for parameters). The call commits like any client's: policies and rate limits apply, and it is recorded in the log. On a cluster, name the shard it runs on. Returns {\"ok\":true,\"lsn\":N}.")]
     public Task<string> CallReducer(
         [Description("The reducer's name, exactly as describe_schema lists it.")] string reducer,
-        [Description("The arguments, as a JSON array in parameter order. Values that are not plain JSON are objects: {\"$identity\":\"<hex>\"}, {\"$bytes\":\"<base64>\"}, {\"$timestamp\":<unix micros>}, {\"$interval\":<micros>}.")] JsonElement? arguments = null) =>
-        McpToolRun.RunAsync("call_reducer", McpHost.SessionOf(accessor), () =>
+        [Description("The arguments, as a JSON array in parameter order. Values that are not plain JSON are objects: {\"$identity\":\"<hex>\"}, {\"$bytes\":\"<base64>\"}, {\"$timestamp\":<unix micros>}, {\"$interval\":<micros>}.")] JsonElement? arguments = null,
+        [Description("On a cluster, the shard the call runs on: required there, and the lsn returned is that shard's. Ignored on a single node.")] ulong? shard = null) =>
+        McpToolRun.RunAsync("call_reducer", McpHost.SessionOf(accessor), async () =>
         {
             var session = McpHost.SessionOf(accessor);
             Activity.Current?.SetTag("melange.reducer", reducer);
@@ -239,16 +240,37 @@ internal sealed class MelangeReducerTools(McpHost host, IHttpContextAccessor acc
                 throw new McpToolRefusal(MelangeErrorCodes.InvalidArguments, exception.Message);
             }
 
+            var router = host.Router is { RoutesByShard: true } routing ? routing : null;
+            if (router is not null && shard is null)
+            {
+                throw new McpToolRefusal(
+                    MelangeErrorCodes.InvalidArguments,
+                    "This server is a cluster hub: name the shard the call runs on with the shard argument.");
+            }
+
+            var caller = runAs ?? session.Identity;
+            var source = CallSource.Client(session.IsGuest);
+            var claims = runAs is null ? session.CapturedClaims : CallerClaims.Empty;
             ulong lsn;
             try
             {
-                lsn = transport.Reducers.Call(
-                    reducer,
-                    runAs ?? session.Identity,
-                    ConnectionId.None,
-                    ReducerArguments.Encode(values),
-                    source: CallSource.Client(session.IsGuest),
-                    claims: runAs is null ? session.CapturedClaims : CallerClaims.Empty);
+                if (router is not null)
+                {
+                    Activity.Current?.SetTag("melange.shard", shard!.Value);
+                    lsn = await router.CallAsync(
+                        shard!.Value, reducer, caller, ReducerArguments.Encode(values), source, claims, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    lsn = transport.Reducers.Call(
+                        reducer, caller, ConnectionId.None, ReducerArguments.Encode(values), source: source, claims: claims);
+                }
+            }
+            catch (ArgumentException exception) when (router is not null && exception.ParamName == "shard")
+            {
+                // A shard that does not exist: the router refuses before sending anything.
+                throw new McpToolRefusal(MelangeErrorCodes.InvalidArguments, exception.Message);
             }
             catch (ReducerArgumentException exception)
             {
@@ -284,10 +306,10 @@ internal sealed class MelangeReducerTools(McpHost host, IHttpContextAccessor acc
                 throw new McpToolRefusal(MelangeErrorCodes.Internal, "The reducer failed; see the server logs.");
             }
 
-            return Task.FromResult(McpToolRun.Json(writer =>
+            return McpToolRun.Json(writer =>
             {
                 writer.WriteBoolean("ok", true);
                 writer.WriteNumber("lsn", lsn);
-            }));
+            });
         });
 }

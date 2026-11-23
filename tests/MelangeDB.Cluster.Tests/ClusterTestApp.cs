@@ -221,6 +221,28 @@ public sealed class ClusterReducers
 }
 
 /// <summary>The rows that follow a player between instances: their PlayerState.</summary>
+/// <summary>Refuses guest callers: how a test sees that a routed call kept its guest flag.</summary>
+public sealed class NoGuests : IReducerPolicy
+{
+    public bool MayCall(string reducer, PolicyContext ctx) => !ctx.IsGuest;
+}
+
+/// <summary>Reducers that make a routed call's source and claims observable on the shard's node.</summary>
+public sealed class RoutedCallReducers
+{
+    [Reducer(Policy = typeof(NoGuests))]
+    public void SpawnMobAsMember(ReducerContext ctx, uint instanceId) =>
+        ctx.Db.Mob.Insert(new Mob { InstanceId = instanceId, Hp = 1 });
+
+    [Reducer]
+    public void SpawnMobWithClaim(ReducerContext ctx, uint instanceId, string claimType)
+    {
+        if (!ctx.Claims.Contains(claimType))
+            throw new RejectedException($"the call carries no '{claimType}' claim");
+        ctx.Db.Mob.Insert(new Mob { InstanceId = instanceId, Hp = 1 });
+    }
+}
+
 public sealed class PlayerStateHandoffSet : IHandoffSet
 {
     public void Collect(Identity player, ShardKey shard, IDbView shardDb, IHandoffCollector rows)
