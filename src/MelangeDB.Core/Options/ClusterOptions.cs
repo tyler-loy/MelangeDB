@@ -160,6 +160,12 @@ public sealed class ClusterOptions
     public GatewayUpstreamMode GatewayUpstream { get; set; } = GatewayUpstreamMode.Shared;
 
     /// <summary>
+    /// Hub only, with <see cref="GatewayUpstream"/> <c>Shared</c>: links to each shard node, new
+    /// sessions taking them in turn. Clamped to 1-64. Read per session open.
+    /// </summary>
+    public int GatewayLinksPerNode { get; set; } = 4;
+
+    /// <summary>
     /// Shard only: the directory per-shard engines root their commit logs and hot stores under;
     /// shard <c>k</c> lives in <c>{ShardDataPath}/shard-k</c>. On reassignment the new owner
     /// opens the same directory, so it must be storage reachable from every shard node (phase 09

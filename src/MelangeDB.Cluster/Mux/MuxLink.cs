@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Threading.Channels;
@@ -12,7 +13,10 @@ namespace MelangeDB.Cluster;
 /// host's ephemeral ports in TIME_WAIT and made connects at swap time take seconds. Over a link,
 /// opening a session is one message.
 /// <para>
-/// Wire format: one binary websocket message per envelope, <c>[kind:1][session:4 LE][payload]</c>.
+/// Wire format: each binary websocket message is a batch of envelopes, each prefixed by its length
+/// (4 bytes LE); an envelope is <c>[kind:1][session:4 LE][payload]</c>. The writer packs whatever is
+/// queued, up to <see cref="MaxBatch"/>, into one message: a frame per envelope made the link's one
+/// writer the limit for a node's few hundred sessions of small deltas (phase 31).
 /// <c>Open</c> carries the shard key (8 bytes LE) and is sent by the gateway, which numbers its
 /// sessions. <c>Data</c> carries a flags byte (bit 0: end of message) and a chunk of at most
 /// <see cref="MaxChunk"/> bytes. <c>Close</c> carries a status (2 bytes LE) and a UTF-8
@@ -44,6 +48,9 @@ internal sealed class MuxLink : IAsyncDisposable
     }
 
     private const int HeaderBytes = 5;
+
+    /// <summary>The most envelope bytes the writer packs into one websocket message.</summary>
+    public const int MaxBatch = 64 * 1024;
 
     private readonly WebSocket _socket;
     private readonly Func<MuxSocket, ulong, Task>? _accept;
@@ -144,10 +151,50 @@ internal sealed class MuxLink : IAsyncDisposable
     private async Task WriteLoopAsync()
     {
         var ct = _closed.Token;
+        var batch = new byte[MaxBatch + MaxChunk + 256];
+        byte[]? carry = null;
         try
         {
-            await foreach (var envelope in _outbound.Reader.ReadAllAsync(ct).ConfigureAwait(false))
-                await _socket.SendAsync(envelope, WebSocketMessageType.Binary, endOfMessage: true, ct).ConfigureAwait(false);
+            while (!ct.IsCancellationRequested)
+            {
+                byte[]? first = carry;
+                carry = null;
+                if (first is null)
+                {
+                    if (!await _outbound.Reader.WaitToReadAsync(ct).ConfigureAwait(false))
+                        return;
+                    if (!_outbound.Reader.TryRead(out first))
+                        continue;
+                }
+
+                var started = Stopwatch.GetTimestamp();
+                var length = 0;
+                var envelopes = 0;
+                var message = batch;
+                if (4 + first.Length > batch.Length)
+                {
+                    // Larger than any batch (a long close reason, say): alone, in a buffer of its own.
+                    message = new byte[4 + first.Length];
+                }
+
+                Append(message, ref length, first);
+                envelopes++;
+                while (length < MaxBatch && _outbound.Reader.TryRead(out var next))
+                {
+                    if (message != batch || length + 4 + next.Length > batch.Length)
+                    {
+                        carry = next;
+                        break;
+                    }
+
+                    Append(batch, ref length, next);
+                    envelopes++;
+                }
+
+                await _socket.SendAsync(message.AsMemory(0, length), WebSocketMessageType.Binary, endOfMessage: true, ct)
+                    .ConfigureAwait(false);
+                MuxLinkStats.Wrote(envelopes, length, Stopwatch.GetTimestamp() - started);
+            }
         }
         catch (Exception)
         {
@@ -159,27 +206,48 @@ internal sealed class MuxLink : IAsyncDisposable
         }
     }
 
+    private static void Append(byte[] message, ref int length, byte[] envelope)
+    {
+        BinaryPrimitives.WriteInt32LittleEndian(message.AsSpan(length), envelope.Length);
+        envelope.CopyTo(message, length + 4);
+        length += 4 + envelope.Length;
+    }
+
     private async Task ReadLoopAsync()
     {
         var ct = _closed.Token;
-        var buffer = new byte[MaxChunk + HeaderBytes + 64];
+        var buffer = new byte[MaxBatch + MaxChunk + 256];
         using var message = new MemoryStream();
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                message.SetLength(0);
-                WebSocketReceiveResult result;
-                do
+                var result = await _socket.ReceiveAsync(buffer, ct).ConfigureAwait(false);
+                if (result.MessageType == WebSocketMessageType.Close)
+                    return;
+                var started = Stopwatch.GetTimestamp();
+                if (result.EndOfMessage)
                 {
-                    result = await _socket.ReceiveAsync(buffer, ct).ConfigureAwait(false);
-                    if (result.MessageType == WebSocketMessageType.Close)
-                        return;
-                    message.Write(buffer, 0, result.Count);
+                    // The usual case: the whole batch arrived in one read, parsed in place.
+                    DispatchBatch(buffer.AsSpan(0, result.Count));
                 }
-                while (!result.EndOfMessage);
+                else
+                {
+                    message.SetLength(0);
+                    message.Write(buffer, 0, result.Count);
+                    do
+                    {
+                        result = await _socket.ReceiveAsync(buffer, ct).ConfigureAwait(false);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                            return;
+                        message.Write(buffer, 0, result.Count);
+                    }
+                    while (!result.EndOfMessage);
+                    started = Stopwatch.GetTimestamp();
+                    DispatchBatch(message.GetBuffer().AsSpan(0, (int)message.Length));
+                }
 
-                Dispatch(message.GetBuffer().AsSpan(0, (int)message.Length));
+                MuxLinkStats.Read(Stopwatch.GetTimestamp() - started);
             }
         }
         catch (Exception)
@@ -189,6 +257,20 @@ internal sealed class MuxLink : IAsyncDisposable
         finally
         {
             End();
+        }
+    }
+
+    private void DispatchBatch(ReadOnlySpan<byte> batch)
+    {
+        while (batch.Length > 0)
+        {
+            if (batch.Length < 4)
+                throw new InvalidDataException("A link batch ending inside an envelope's length.");
+            var length = BinaryPrimitives.ReadInt32LittleEndian(batch);
+            if (length < HeaderBytes || length > batch.Length - 4)
+                throw new InvalidDataException("A link envelope whose length overruns its batch.");
+            Dispatch(batch.Slice(4, length));
+            batch = batch[(4 + length)..];
         }
     }
 
@@ -282,4 +364,39 @@ internal sealed class MuxLink : IAsyncDisposable
         _socket.Dispose();
         _closed.Dispose();
     }
+}
+
+/// <summary>
+/// Process-wide counters over every link's loops (both ends, when gateway and nodes share a
+/// process, as in the load test): envelopes and websocket messages written, and the time each
+/// writer and reader spent working rather than waiting. A writer busy most of the wall clock is the
+/// link's ceiling.
+/// </summary>
+internal static class MuxLinkStats
+{
+    private static long _envelopes;
+    private static long _messages;
+    private static long _bytes;
+    private static long _writerBusyTicks;
+    private static long _readerBusyTicks;
+
+    public static long Envelopes => Interlocked.Read(ref _envelopes);
+
+    public static long Messages => Interlocked.Read(ref _messages);
+
+    public static long Bytes => Interlocked.Read(ref _bytes);
+
+    public static TimeSpan WriterBusy => Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _writerBusyTicks));
+
+    public static TimeSpan ReaderBusy => Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _readerBusyTicks));
+
+    public static void Wrote(int envelopes, int bytes, long ticks)
+    {
+        Interlocked.Add(ref _envelopes, envelopes);
+        Interlocked.Increment(ref _messages);
+        Interlocked.Add(ref _bytes, bytes);
+        Interlocked.Add(ref _writerBusyTicks, ticks);
+    }
+
+    public static void Read(long ticks) => Interlocked.Add(ref _readerBusyTicks, ticks);
 }

@@ -157,6 +157,10 @@ All packages ship together at one version; there is no per-package versioning. S
   of a gateway host's ephemeral ports in TIME_WAIT. Sessions authenticate as before, and a slow
   client backs up only its own session. `PerSession` restores the old shape; nodes serve both
   endpoints, so either setting works against any node of this release.
+  The link packs whatever is queued into one websocket message (up to 64 KiB) rather than one
+  message per envelope, and the gateway keeps `Cluster:GatewayLinksPerNode` (default 4) links to
+  each node, sessions taking them in turn: at 1,600 players these took delivery from 398k to about
+  740k rows a second and rejected calls from 222,710 to about 200.
 
 - **Shared subscription fan-out** (road-to-0.4 phase 31). Subscriptions that are one query (same
   table, projection, predicate and operands, on a table with no row or column policies) are

@@ -492,6 +492,30 @@ understood yet. A 2,000-player run could not start: the driver, on the same mach
 socket buffer space connecting its clients (`WSAENOBUFS`), which is this harness's ceiling rather
 than the server's.
 
+**Batched link messages and four links per node, 2026-11-22.** The 1,600-player symptom was swaps
+waiting for their destination session behind other sessions' traffic. Counters on the link's writer
+and reader (now in the driver's `Upstream links` line) showed the writers were the limit: one
+websocket message per envelope, about 546,000 sends a second, with the node-to-gateway writers
+busy all the time. Two changes, measured at 1,600 players in order:
+
+| Link | Envelopes per message | Delta rows/s | Rejected | p50 / p99 call-to-delta | Swap wait, mean |
+| --- | --- | --- | --- | --- | --- |
+| One per node, one envelope per message | 1 | 398k | 222,710 | 3.9 s / 14.1 s | 2.8 s |
+| One per node, batched (up to 64 KiB) | 347 | 619k | 24,451 | 1.4 s / 8.0 s | 0.66 s |
+| Four per node, batched (three runs) | 214-296 | 680k-743k | 173-1,357 | 0.19-0.71 s / 5.1-5.7 s | 39-201 ms |
+
+Every run had zero resync errors and zero cache inconsistencies; the remaining rejections are
+`rate_limited`. At 1,200 players the same build delivers 462k rows/s with 30 transient refusals,
+p50 42 ms and p99 1.6 s. **The game's shape now carries 1,600 players on one machine with a tail of
+about 5 s,** where phase 31's first measurement of this shape put its knee at 600-800 players.
+
+**Not kept: fewer relay allocations.** Pooling the link's envelopes and delivered chunks and
+forwarding relayed frames from the receive buffer instead of a copy measured far worse at 1,600
+players in two interleaved runs against the same build without it: 392k-393k rows/s against
+741k-743k, about 254,000 rejected calls against about 200, and swaps waiting 2.4 s against
+39-64 ms. GC pauses barely moved (9.7-10.2% against 8.7-8.9%), so allocation was no longer the
+limit anyway. Which half caused the slowdown was not isolated.
+
 ### Relating to the in-process hotspot ceiling
 
 CLUSTERING.md publishes the *commit loop's* ceilings, measured in-process on one crowded shard:

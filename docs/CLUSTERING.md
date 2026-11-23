@@ -468,7 +468,9 @@ because each is the answer to a specific failure mode:
   gateway host's ephemeral ports and made swaps wait seconds for a connect. Each session has its own flow
   control (a 256 KiB window per direction), so a slow client backs up only its own session and the node's
   slow-consumer handling applies to it as before; no player can stall the link. A link that drops reads as
-  every session on it dropping, the same as the node dying. `PerSession` keeps the old one-socket-per-player
+  every session on it dropping, the same as the node dying. A link batches what is queued into one
+  websocket message, and the gateway keeps `Cluster:GatewayLinksPerNode` (default 4) links per node, new
+  sessions taking them in turn, so no node's traffic waits on a single writer. `PerSession` keeps the old one-socket-per-player
   shape (`{Transport:Path}/shard/{shardKey}`) as a fallback; nodes serve both.
 - **Expected refusals are typed `transient`, never `internal`** (settled: [#22](https://github.com/tyler-loy/MelangeDB/issues/22)).
   The guards that fire for conditions the cluster itself designed — a row frozen mid-handoff, a write routed
