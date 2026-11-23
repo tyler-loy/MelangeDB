@@ -124,6 +124,27 @@ internal sealed record ReplicaSubscribe(ulong FromLsn);
 /// </summary>
 internal sealed record ReplicaBatch(ulong[] Lsns, WireOp[][] Records, ulong PrevLsn = 0);
 
+/// <summary>
+/// A node pulling one slice of the Replicated stream for a shard it is opening, before the shard
+/// is published (#283). The pushed stream only reaches a shard once it is in service, so without
+/// this a newly opened shard served its first calls with empty or partly applied Replicated
+/// tables. <see cref="FromLsn"/> is the shard's own replica cursor.
+/// </summary>
+internal sealed record ReplicaRead(ulong FromLsn);
+
+/// <summary>
+/// The hub's answer to <see cref="ReplicaRead"/>. <see cref="HeadLsn"/> is the hub's head when the
+/// request arrived, already durable: the node pulls until <see cref="ScannedTo"/> reaches the head
+/// its first request was answered with. <see cref="Reset"/> replaces the records when the cursor
+/// fell below the hub log's truncation base.
+/// </summary>
+internal sealed record ReplicaReadReply(
+    ulong HeadLsn,
+    ulong ScannedTo,
+    ulong[] Lsns,
+    WireOp[][] Records,
+    ReplicaReset? Reset = null);
+
 internal sealed record ReplicaTableSnapshot(uint Table, WireOp[] Rows);
 
 /// <summary>

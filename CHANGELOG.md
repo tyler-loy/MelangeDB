@@ -10,7 +10,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **A newly opened shard served calls before the hub's `Replicated` rows reached it**
+  ([#283](https://github.com/tyler-loy/MelangeDB/issues/283)). A node published a shard as soon as
+  recovery finished, and the `Replicated` stream reached it only from the next heartbeat on, from
+  the shard's cursor: for a new shard, the whole history. Until then a reducer reading a `Replicated`
+  reference table found nothing and refused as if the row did not exist, on the first calls into a new
+  shard and on the first handoff into one. The window was a heartbeat plus the catch-up, so slow hosts
+  with a large seed hit it most. A shard now pulls its `Replicated` tables up to the hub's head before it
+  is published, so being in the load view means it is ready; EventId 1763 logs each catch-up. A hub
+  older than its nodes cannot answer the pull, and the node logs EventId 1764 and opens shards as
+  before. The marker-row workaround is no longer needed.
 
 ## [0.4.0] — 2026-11-22
 

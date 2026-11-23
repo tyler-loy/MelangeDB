@@ -188,7 +188,9 @@ public class TruncationRecoveryTests
         var reopened = node.Runtime.TryGetShard(new ShardKey(1))!;
         Assert.Null(reopened.Engine.CommittedView.Find<ItemDef>(2L));
         Assert.Equal("alpha-2", reopened.Engine.CommittedView.Find<ItemDef>(1L)!.Value.Name);
-        Assert.True(node.Metrics.ReceivedByType.GetValueOrDefault("replica-reset") >= 1,
+        // Bootstrapped, by the reopening shard's catch-up pulling a reset (#283) or by the pushed
+        // stream: either way not silently resumed past the gap.
+        Assert.True(node.Runtime.ReplicaResetsApplied >= 1,
             "the stream must have been bootstrapped, not silently resumed past the gap");
     }
 

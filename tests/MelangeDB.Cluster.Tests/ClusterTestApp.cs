@@ -153,6 +153,22 @@ public sealed class ClusterReducers
     [Reducer]
     public void DeleteItemDef(ReducerContext ctx, long id) => ctx.Db.ItemDef.Id.Delete(id);
 
+    /// <summary>
+    /// A shard reducer that reads the Replicated <see cref="ItemDef"/> table and refuses unless
+    /// ids 1 to <paramref name="count"/> are all there: what a shard's first call sees (#283).
+    /// </summary>
+    [Reducer]
+    public void SpawnMobIfItemDefs(ReducerContext ctx, uint instanceId, long count)
+    {
+        for (var id = 1L; id <= count; id++)
+        {
+            if (ctx.Db.ItemDef.Id.Find(id) is null)
+                throw new RejectedException($"ItemDef {id} of {count} is missing");
+        }
+
+        ctx.Db.Mob.Insert(new Mob { InstanceId = instanceId, Hp = 1 });
+    }
+
     [Reducer]
     public void SpawnMob(ReducerContext ctx, uint instanceId, int hp) =>
         ctx.Db.Mob.Insert(new Mob { InstanceId = instanceId, Hp = hp });

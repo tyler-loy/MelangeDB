@@ -160,6 +160,12 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// </summary>
     internal Action<ShardKey>? BeforeOpen { get; set; }
 
+    /// <summary>
+    /// Test hook: runs before every slice of Replicated records this node applies, pushed or
+    /// pulled, on the applying thread. Slow replication without a seed big enough to be slow.
+    /// </summary>
+    internal Action? BeforeReplicaSlice { get; set; }
+
     /// <summary>Test hook: the estimated bytes per border-reset part this node's publishers send, so a test band splits.</summary>
     internal int BorderResetPartBytes { get; set; } = BorderPublisher.DefaultResetPartBytes;
 
@@ -813,6 +819,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 _authenticator,
                 _sessions,
                 () => TakeReplica(shard));
+            CatchUpReplicated(shard, runtime);
             var openMs = _time.GetElapsedTime(started).TotalMilliseconds;
 
             lock (_shardsLock)
@@ -852,6 +859,86 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Brings an opened, not yet published shard's Replicated tables up to the hub's head before
+    /// it serves anything (#283). The pushed stream only reaches shards in service, and a newly
+    /// published shard waited a heartbeat for its re-subscribe and then the whole history from
+    /// its cursor, so its first calls read empty or partly applied Replicated tables. Pulling here
+    /// means that once the shard is in the shard set (and so in the hub's load view), it holds
+    /// every Replicated row the hub had committed when the open asked. Later writes reach it by
+    /// the stream, one hop behind, as on every other shard.
+    /// <para>
+    /// A failure throws, and the open fails and is retried on the next heartbeat like a failed
+    /// recovery. A hub too old to answer is logged once and the shard opens as before. A shard
+    /// unassigned while this runs stops pulling; the publish check after it abandons the open.
+    /// </para>
+    /// </summary>
+    private void CatchUpReplicated(ShardKey shard, ShardRuntime runtime)
+    {
+        if (!runtime.Engine.Schema.Tables.Any(static t => t.Placement == Placement.Replicated))
+            return;
+        var link = _link
+            ?? throw new InvalidOperationException($"No hub link to catch {shard}'s Replicated tables up from.");
+        var started = _time.GetTimestamp();
+        var from = ReadReplicaCursor(runtime.Directory);
+        var cursor = from;
+        ulong? target = null;
+        var records = 0;
+        while (true)
+        {
+            ReplicaReadReply reply;
+            try
+            {
+                reply = link.Request("replica-read", new ReplicaRead(cursor), ReplicaReadTimeoutMs)!.Value
+                    .Deserialize<ReplicaReadReply>()!;
+            }
+            catch (NodeLinkException failure)
+                when (failure.IsPeerError && failure.Message.StartsWith("Unknown node-link message", StringComparison.Ordinal))
+            {
+                if (!_replicaReadUnsupportedLogged)
+                {
+                    _replicaReadUnsupportedLogged = true;
+                    LogReplicaCatchUpUnsupported(_logger, NodeName);
+                }
+
+                return;
+            }
+
+            target ??= reply.HeadLsn;
+            BeforeReplicaSlice?.Invoke();
+            if (reply.Reset is { } reset)
+                ApplyReplicaReset(runtime, cursor, reset);
+            var applied = ApplyReplicaRecords(runtime, Math.Max(cursor, reply.Reset?.Lsn ?? 0), reply.Lsns, reply.Records);
+            records += reply.Lsns.Count(lsn => lsn > cursor);
+
+            // The scan position, not only the last Replicated record: a cursor at the head is what
+            // makes the stream's next re-subscribe start there, rather than re-reading every record
+            // since the last one that carried a Replicated op.
+            var next = Math.Max(applied, reply.ScannedTo);
+            if (next > cursor)
+                WriteReplicaCursor(runtime.Directory, next);
+            if (next >= target)
+                break;
+            if (next == cursor)
+                throw new InvalidOperationException(
+                    $"The hub's Replicated stream made no progress past LSN {cursor} toward {target} while opening {shard}.");
+            cursor = next;
+
+            lock (_shardsLock)
+            {
+                if (_stopped.IsCancellationRequested || !_assigned.ContainsKey(shard))
+                    return;
+            }
+        }
+
+        LogShardReplicaCaughtUp(_logger, shard.Value, NodeName, records, from, target!.Value, _time.GetElapsedTime(started).TotalMilliseconds);
+    }
+
+    /// <summary>One <c>replica-read</c>'s timeout: a reset carries every Replicated row, so it gets longer than an ordinary request.</summary>
+    private const int ReplicaReadTimeoutMs = 60_000;
+
+    private bool _replicaReadUnsupportedLogged;
 
     /// <summary>Applies an assignment list and completes when every shard it put into opening has finished (opened, failed, or abandoned).</summary>
     private async Task<object?> ApplyAndAwaitOpensAsync(ShardAssignmentDto[] assignments)
@@ -1518,6 +1605,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             shards = [.. _shards.Values.Select(r => (r, ReadReplicaCursor(r.Directory)))];
         }
 
+        BeforeReplicaSlice?.Invoke();
         foreach (var (runtime, cursor) in shards)
         {
             // A shard that has not applied everything up to the slice's predecessor would take
@@ -1528,22 +1616,32 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             // cursor and the stream comes back for it.
             if (cursor < batch.PrevLsn)
                 continue;
-            var applied = cursor;
-            for (var i = 0; i < batch.Lsns.Length; i++)
-            {
-                if (batch.Lsns[i] <= applied)
-                    continue;
-                runtime.Engine.ApplyInternal(
-                    ClusterRecordNames.Replica,
-                    ReplicaCaller,
-                    [.. batch.Records[i].Select(static op => op.ToRowOp())],
-                    reconcile: true);
-                applied = batch.Lsns[i];
-            }
-
+            var applied = ApplyReplicaRecords(runtime, cursor, batch.Lsns, batch.Records);
             if (applied > cursor)
                 WriteReplicaCursor(runtime.Directory, applied);
         }
+    }
+
+    /// <summary>
+    /// Applies the records after <paramref name="cursor"/> to one shard engine and returns the
+    /// last LSN applied (<paramref name="cursor"/> if none was new). The caller persists it.
+    /// </summary>
+    private static ulong ApplyReplicaRecords(ShardRuntime runtime, ulong cursor, ulong[] lsns, WireOp[][] records)
+    {
+        var applied = cursor;
+        for (var i = 0; i < lsns.Length; i++)
+        {
+            if (lsns[i] <= applied)
+                continue;
+            runtime.Engine.ApplyInternal(
+                ClusterRecordNames.Replica,
+                ReplicaCaller,
+                [.. records[i].Select(static op => op.ToRowOp())],
+                reconcile: true);
+            applied = lsns[i];
+        }
+
+        return applied;
     }
 
     /// <summary>
@@ -1561,30 +1659,40 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         }
 
         foreach (var (runtime, cursor) in shards)
-        {
-            if (cursor >= reset.Lsn)
-                continue;
-            var ops = new List<RowOp>();
-            foreach (var table in reset.Tables)
-            {
-                var tableId = new TableId(table.Table);
-                var snapshotKeys = new HashSet<RowKey>();
-                foreach (var row in table.Rows)
-                {
-                    snapshotKeys.Add(new RowKey(row.Key));
-                    ops.Add(row.ToRowOp());
-                }
+            ApplyReplicaReset(runtime, cursor, reset);
+    }
 
-                foreach (var (key, _) in runtime.Engine.HotStore.Scan(tableId).ToList())
-                {
-                    if (!snapshotKeys.Contains(key))
-                        ops.Add(new RowOp(RowOpKind.Delete, tableId, key));
-                }
+    /// <summary>Test hook: how many full Replicated resets this node applied to a shard, pushed or pulled.</summary>
+    internal int ReplicaResetsApplied => Volatile.Read(ref _replicaResetsApplied);
+
+    private int _replicaResetsApplied;
+
+    /// <summary>Applies a reset to one shard engine whose cursor is behind it, and persists the cursor.</summary>
+    private void ApplyReplicaReset(ShardRuntime runtime, ulong cursor, ReplicaReset reset)
+    {
+        if (cursor >= reset.Lsn)
+            return;
+        Interlocked.Increment(ref _replicaResetsApplied);
+        var ops = new List<RowOp>();
+        foreach (var table in reset.Tables)
+        {
+            var tableId = new TableId(table.Table);
+            var snapshotKeys = new HashSet<RowKey>();
+            foreach (var row in table.Rows)
+            {
+                snapshotKeys.Add(new RowKey(row.Key));
+                ops.Add(row.ToRowOp());
             }
 
-            runtime.Engine.ApplyInternal(ClusterRecordNames.Replica, ReplicaCaller, ops, reconcile: true);
-            WriteReplicaCursor(runtime.Directory, reset.Lsn);
+            foreach (var (key, _) in runtime.Engine.HotStore.Scan(tableId).ToList())
+            {
+                if (!snapshotKeys.Contains(key))
+                    ops.Add(new RowOp(RowOpKind.Delete, tableId, key));
+            }
         }
+
+        runtime.Engine.ApplyInternal(ClusterRecordNames.Replica, ReplicaCaller, ops, reconcile: true);
+        WriteReplicaCursor(runtime.Directory, reset.Lsn);
     }
 
     private static readonly Identity ReplicaCaller = Identity.Hash("melange/replica");
@@ -1862,4 +1970,13 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         Message = "Shard {Shard}'s reap mark on node '{NodeName}' outlived 2x Cluster:FailureTimeoutMs — the hub likely died between the close and the " +
             "delete. The mark expired; the directory was never touched, so the shard reopens on the next assignment and the reap simply did not happen.")]
     private static partial void LogReapMarkExpired(ILogger logger, ulong shard, string nodeName);
+
+    [LoggerMessage(EventId = 1763, EventName = "ShardReplicaCaughtUp", Level = LogLevel.Information,
+        Message = "Shard {Shard} on node '{NodeName}' caught its Replicated tables up before serving: {Records} records, from LSN {FromLsn} to the hub's {HeadLsn}, in {ElapsedMs:F0} ms.")]
+    private static partial void LogShardReplicaCaughtUp(ILogger logger, ulong shard, string nodeName, int records, ulong fromLsn, ulong headLsn, double elapsedMs);
+
+    [LoggerMessage(EventId = 1764, EventName = "ReplicaCatchUpUnsupported", Level = LogLevel.Warning,
+        Message = "The hub does not answer replica-read, so node '{NodeName}' opens shards without catching their Replicated tables up first: a newly opened shard's " +
+            "first calls can read Replicated tables the stream has not filled yet. Upgrade the hub to match its nodes.")]
+    private static partial void LogReplicaCatchUpUnsupported(ILogger logger, string nodeName);
 }
