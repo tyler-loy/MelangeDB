@@ -3,7 +3,7 @@
 Where MelangeDB is, how it got here, and what's left.
 
 0.1 was sequenced as twelve phases and all twelve have shipped; 0.2 added seven more, also shipped;
-0.3.0 shipped two of 0.3's phases, and 0.4 carries three of the rest forward and adds four. Each
+0.3.0 shipped two of 0.3's phases, and 0.4.0 shipped three of the rest alongside five of its own. Each
 phase's full plan — deliverables, what was explicitly out of scope, and the reasoning behind every
 decision it settled — lives in [road-to-0.1/](road-to-0.1/), [road-to-0.2/](road-to-0.2/),
 [road-to-0.3/](road-to-0.3/), and [road-to-0.4/](road-to-0.4/). Those are the authoritative record
@@ -96,7 +96,7 @@ deferred — mutually independent, in any order.
 | [18](road-to-0.2/plan-phase-18.md) | Truncation-floor observability: named floors, the governing-floor gauge and log line, the `melange-retention` health check | Shipped |
 | [19](road-to-0.2/plan-phase-19.md) | Backup, second pass: `restore --check` (the boot-proof), `melange clone` (explicitly a different world), `restore --at-lsn` | **Shipped** |
 
-## M5 — 0.3: the day-to-day surface · 0.3.0 shipped; 20–23 still planned
+## M5 — 0.3: the day-to-day surface · 0.3.0 shipped; 20, 22 and 23 finished in 0.4
 
 Post-0.2 work, planned in [road-to-0.3/](road-to-0.3/). 0.1 built the engine and 0.2 was capacity
 and operations; both made the database do more. 0.3 is the surface a team building on this every day
@@ -106,10 +106,10 @@ the measurement debt below, and three separate decisions are waiting on it.
 
 | Phase | Title | Status |
 | --- | --- | --- |
-| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half: the reassignment window and the per-tick cost of scheduled reducers. The head-to-head comparison is split out and undecided | Planned; carried into [0.4](road-to-0.4/README.md) |
+| [20](road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half: the reassignment window and the per-tick cost of scheduled reducers. The head-to-head comparison is split out and undecided | Carried into [0.4](road-to-0.4/README.md); **measured** there |
 | [21](road-to-0.3/plan-phase-21.md) | `melange inspect`: time-travel over the commit log — jump to an LSN, see the world, the reducer that produced it, and its write set | Planned |
-| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Planned; carried into [0.4](road-to-0.4/README.md) |
-| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Planned; carried into [0.4](road-to-0.4/README.md) |
+| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Carried into [0.4](road-to-0.4/README.md); **shipped** in 0.4.0 |
+| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Carried into [0.4](road-to-0.4/README.md); **shipped** in 0.4.0 |
 | 24 | Scheduler lane: simulation work yields to client-initiated work when they contend | [Design record](design/scheduler-lanes.md) written; conditional on a phase 20 measurement, and may close as a refusal |
 | [25](road-to-0.3/plan-phase-25.md) | The archive tier: tables that live in Postgres only — reducers append, everything else reads — so unbounded history leaves the hot store, snapshots, and backups. **Breaking:** `StorageTier.Relational` is renamed to say what it is — hot with a relational backplane | **Shipped** in 0.3.0 |
 | [26](road-to-0.3/plan-phase-26.md) | Producers: typed, read-only calls a client makes for data — `List<WalletLine> History(int page)` — which is how archived history reaches a client. Protocol version 3 | **Shipped** in 0.3.0 |
@@ -119,23 +119,25 @@ and gets a design record before a plan, the way
 [design/elastic-rebalancing.md](design/elastic-rebalancing.md) preceded 13–14 — it is the only one
 of the set that changes engine semantics.
 
-## M6 — 0.4: closing the gaps SpacetimeDB opened · planned
+## M6 — 0.4: closing the gaps SpacetimeDB opened · shipped
 
 Planned in [road-to-0.4/](road-to-0.4/README.md), after a review on 2026-11-20 of every SpacetimeDB
 release from 2.7.0, the version this project was started against, to 2.16.1. On the three
 complaints MelangeDB exists to fix it is still ahead. But SpacetimeDB shipped six things in that
 time a team would expect and not find here, and planning found a seventh. 0.4 answers each in this
-project's own terms, and not by copying.
+project's own terms, and not by copying. 0.4.0 shipped all of it on 2026-11-22, along with
+phase 31, throughput.
 
 | Phase | Title | Status |
 | --- | --- | --- |
 | [20](road-to-0.3/plan-phase-20.md) | The measurement pass, carried from 0.3 — the decision-gating half: scheduled-reducer cost, fan-out share, the reassignment window, the 20 km world | **Measured**; findings [#198](https://github.com/tyler-loy/MelangeDB/issues/198)–[#204](https://github.com/tyler-loy/MelangeDB/issues/204) |
-| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`, carried from 0.3 — SpacetimeDB has had module unit testing since 2.12 | Planned |
-| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client and client conformance, carried from 0.3 | Planned |
-| [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) | **Built** |
-| [28](road-to-0.4/plan-phase-28.md) | Clients that outlive a deploy: old bindings survive added columns at any position, and reconnect is automatic with backoff and token refresh. Lands before 23 | **Built** |
-| [29](road-to-0.4/plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, SQL, and published signals; reducer calls by name only. A protocol, not the refused admin console | Planned |
-| 30 | Shard HA — [design record](design/shard-ha.md) | **Committed** (2026-11-20: production systems get HA). Design settled 2026-11-21: fence fixes first ([#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), then detection, then a warm replica over the shared log |
+| [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`, carried from 0.3 — SpacetimeDB has had module unit testing since 2.12 | **Shipped.** See [TESTING.md](TESTING.md) |
+| [23](road-to-0.3/plan-phase-23.md) | The TypeScript client and client conformance, carried from 0.3 | **Shipped.** `@melangedb/client` on npm, the contract and its suite in [CLIENT-CONFORMANCE.md](CLIENT-CONFORMANCE.md), and `melange generate --lang ts\|cs` |
+| [27](road-to-0.4/plan-phase-27.md) | Constraint changes are migrations: a `[Unique]` added over existing rows is checked, not assumed — fixes [#192](https://github.com/tyler-loy/MelangeDB/issues/192) | **Shipped** |
+| [28](road-to-0.4/plan-phase-28.md) | Clients that outlive a deploy: old bindings survive added columns at any position, and reconnect is automatic with backoff and token refresh. Lands before 23 | **Shipped** |
+| [29](road-to-0.4/plan-phase-29.md) | The agent surface: an opt-in MCP endpoint over the schema, SQL, and published signals; reducer calls by name only. A protocol, not the refused admin console | **Shipped.** See [MCP.md](MCP.md). On a cluster, a reducer call names its shard and is routed to that shard's node |
+| [30](road-to-0.4/plan-phase-30.md) | Shard HA — [design record](design/shard-ha.md) | **Shipped.** Committed 2026-11-20, on the rule that production systems get HA. It landed in three parts: the fence fixes ([#214](https://github.com/tyler-loy/MelangeDB/issues/214)–[#218](https://github.com/tyler-loy/MelangeDB/issues/218)), failure detection, then warm replicas over the shared log with promotion. Fast failover stays opt-in |
+| [31](road-to-0.4/plan-phase-31.md) | Throughput: the capacity ceiling re-measured, then shared fan-out | **Steps 1 and 2 shipped.** Shared subscription fan-out, plus gateway fixes that moved the 4-shard knee from about 150 players to about 600. The reference game's shape (16 shards) runs 1,200 players cleanly. Leads past that are recorded in the plan |
 
 ## What's left
 
@@ -190,7 +192,7 @@ Known deferrals, each recorded with its reasoning rather than left as an omissio
   manual, both tiers one rule. See [MIGRATION.md](MIGRATION.md).
 - **Epoch-qualified subscription anchors.** Closed behaviourally in phase 10 by the first-chunk rule;
   the protocol-level hardening is deferred, with the record kept in [plan-phase-10.md](road-to-0.1/plan-phase-10.md).
-- **Dynamic *assignment* is no longer deferred** — it is M4 above, planned as phases 13–14.
+- **Dynamic *assignment* is no longer deferred.** It shipped in M4 above, as phases 13–14.
   What stays deferred: dynamic boundary *splitting* (the quadtree; its narrowed customer and
   reopening trigger are recorded in [design/elastic-rebalancing.md](design/elastic-rebalancing.md)),
   and [sharding the hub](idea-bin/identity-sharded-hub.md) (likewise: an identity-sharded shape and its
@@ -210,15 +212,15 @@ break in any release ([RELEASING.md](RELEASING.md), and the caveat at the top of
 [CHANGELOG.md](../CHANGELOG.md)), and that has been cheap so far because the only consumer tracks
 prereleases from `main` and absorbs breaks as they land.
 
-0.3 is where it stops being free. That milestone adds a second public package
-(`MelangeDB.Testing`), a package in a second ecosystem, and — most binding of all — a **written
-client-conformance contract**, which is the kind of commitment that gets expensive to walk back once
-anyone has implemented against it.
+0.4 is where it stopped being free. Planned for 0.3 and shipped in 0.4.0, the work added a second
+public package (`MelangeDB.Testing`) and a package in a second ecosystem. Most binding of all, it
+added a **written client-conformance contract**. That is the kind of commitment that gets expensive
+to walk back once anyone has implemented against it.
 
 **The trigger for deciding: the reference workload reaching alpha.** An API freeze argued in the
 abstract produces a list nobody can check; the same question asked by a product with players has
-concrete answers about which breaks actually hurt. Revisit then, with 0.3's numbers and its
-conformance document both in hand.
+concrete answers about which breaks actually hurt. Revisit then, with phase 20's numbers and the conformance
+document both in hand.
 
 ## Ideas that are neither planned nor refused
 
