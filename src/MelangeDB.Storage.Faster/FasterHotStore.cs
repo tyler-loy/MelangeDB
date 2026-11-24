@@ -108,7 +108,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         if (context.Options.HotStore.NativeDirectory)
         {
-            _directoryPool = new NativePagePool();
+            _directoryPool = new NativePagePool(NativeDirectoryPageBytes);
             _emptyTrees = NativeTableTrees.Create(_directoryPool, 0);
         }
         else
@@ -141,6 +141,16 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     /// <summary>The kind of ordered bookkeeping tables start with (see <see cref="TableTrees"/>).</summary>
     private readonly TableTrees _emptyTrees;
+
+    /// <summary>
+    /// The native directory's page size. Copy-on-write copies a page per tree level on each commit
+    /// and re-references every child of each internal page it copies, so a write's cost grows with
+    /// the page. The bake-off (1M rows, 1 GiB cap) measured hot single-row updates at 95k/s with
+    /// 8 KiB pages, 146k with 4 KiB, 161k with 2 KiB and 234–242k with 1 KiB, against 239k for the
+    /// managed trees; 512 B gained 8% more for 9% more memory and half the inline entry size.
+    /// At 1 KiB entries up to about 240 bytes stay inline; longer ones move out of line.
+    /// </summary>
+    private const int NativeDirectoryPageBytes = 1024;
 
     /// <summary>The native pages of every table's directory and indexes, under <c>HotStore:NativeDirectory</c>.</summary>
     private readonly NativePagePool? _directoryPool;

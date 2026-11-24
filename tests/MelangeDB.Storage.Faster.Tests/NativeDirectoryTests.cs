@@ -168,6 +168,67 @@ public sealed class NativeDirectoryTests
         Assert.Equal(61, harness.Engine.HotStore.ScanIndex(Creatures, "ChunkId", ChunkKey(harness, 3)).Count());
     }
 
+    /// <summary>
+    /// Keys and index values far longer than a directory page holds inline (1 KiB pages keep
+    /// entries up to about 240 bytes in the page): they move out of line, and every lookup, index
+    /// scan, update, delete and the restart must still agree with the managed directory.
+    /// </summary>
+    [Fact]
+    public void Long_keys_and_index_values_live_out_of_line_and_answer_the_same()
+    {
+        using var native = Harness(native: true, typeof(LongKeyed));
+        using var managed = Harness(native: false, typeof(LongKeyed));
+        var table = TableId.FromName("LongKeyed");
+        var random = new Random(11);
+        string Text(int length, int seed) => new string((char)('a' + seed % 26), length) + seed;
+        // Row keys stay under MelangeLog's 1 KiB key limit; index values are directory data only, so may run longer.
+        var keys = Enumerable.Range(0, 150).Select(i => Text(300 + random.Next(500), i)).ToArray();
+        var tags = Enumerable.Range(0, 6).Select(i => Text(250 + random.Next(1_000), 1_000 + i)).ToArray();
+
+        foreach (var harness in new[] { native, managed })
+        {
+            var r = new Random(3);
+            for (var i = 0; i < keys.Length; i++)
+            {
+                var (key, tag) = (keys[i], tags[r.Next(tags.Length)]);
+                harness.Invoke("insert", ctx => ctx.Db.Insert(new LongKeyed { Key = key, Tag = tag, Version = 0 }));
+            }
+
+            for (var i = 0; i < keys.Length; i += 3)
+            {
+                var (key, tag) = (keys[i], tags[r.Next(tags.Length)]);
+                harness.Invoke("retag", ctx => ctx.Db.Update(new LongKeyed { Key = key, Tag = tag, Version = 1 }));
+            }
+
+            for (var i = 1; i < keys.Length; i += 7)
+            {
+                var key = keys[i];
+                harness.Invoke("delete", ctx => ctx.Db.Delete<LongKeyed>(key));
+            }
+        }
+
+        void Agree()
+        {
+            var schema = native.Engine.Schema.Get(typeof(LongKeyed));
+            Assert.Equal(managed.Engine.HotStore.Count(table), native.Engine.HotStore.Count(table));
+            Assert.Equal(managed.Engine.HotStore.ScanKeys(table), native.Engine.HotStore.ScanKeys(table));
+            foreach (var tag in tags)
+            {
+                var value = SchemaKeyCodec.Encode(schema.Column("Tag"), tag);
+                Assert.Equal(
+                    managed.Engine.HotStore.ScanIndex(table, "Tag", value).Select(static r => r.Key),
+                    native.Engine.HotStore.ScanIndex(table, "Tag", value).Select(static r => r.Key));
+            }
+
+            foreach (var key in keys)
+                Assert.Equal(managed.Engine.HotStore.ContainsKey(table, SchemaKeyCodec.Encode(schema.PrimaryKey, key)), native.Engine.HotStore.ContainsKey(table, SchemaKeyCodec.Encode(schema.PrimaryKey, key)));
+        }
+
+        Agree();
+        native.Restart();
+        Agree();
+    }
+
     private static void AssertSame(StoreHarness native, StoreHarness managed)
     {
         var a = native.Engine.HotStore;
@@ -192,7 +253,7 @@ public sealed class NativeDirectoryTests
     private static RowKey ChunkKey(StoreHarness harness, int chunk) =>
         SchemaKeyCodec.Encode(harness.Engine.Schema.Get(typeof(Creature)).Column("ChunkId"), chunk);
 
-    private static StoreHarness Harness(bool native) =>
+    private static StoreHarness Harness(bool native, Type? table = null) =>
         new(
             StoreKind.Faster,
             options =>
@@ -200,5 +261,5 @@ public sealed class NativeDirectoryTests
                 options.Residency.Default = Residency.Paged;
                 options.HotStore.NativeDirectory = native;
             },
-            tables: [typeof(Creature)]);
+            tables: [table ?? typeof(Creature)]);
 }

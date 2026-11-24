@@ -57,3 +57,16 @@ public partial struct NamedThing
     [Unique]
     public string Name;
 }
+
+/// <summary>Long string keys and a long indexed string: entries too big to sit inline in a native directory page.</summary>
+[Table]
+public partial struct LongKeyed
+{
+    [PrimaryKey]
+    public string Key;
+
+    [Index]
+    public string Tag;
+
+    public int Version;
+}

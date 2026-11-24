@@ -12,6 +12,20 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`HotStore:NativeDirectory` keeps the paged store's key directory and secondary indexes off
+  the managed heap**, in native copy-on-write B+trees (1 KiB pages). Off by default for now.
+  - **Why:** a paged row kept about 300 bytes and five GC objects resident in persistent managed
+    trees, so memory and full-collection marking grew with row count whatever the budget.
+  - **Measured** (bake-off, 1M rows + 200k blobs, 1 GiB cap):
+    - bookkeeping memory falls from 279 MiB managed to 50 MiB managed plus 39.5 MiB native;
+    - rebuild is 40% faster;
+    - point reads are 40–70% faster and index window scans 44% faster;
+    - updates, deletes and churn are at or above the managed trees (hot updates 234–242k/s
+      against 239k/s).
+  - **Reclamation:** a superseded version's pages go back as soon as its last reader is done; read
+    views and lazy key walks hold their version until they finish.
+  - **Reporting:** `HotStoreStatistics.NativeDirectoryBytes` and the
+    `melange.store.directory.native_bytes` gauge.
 - **The load tool can soak a paged store that really pages.** `--ballast-rows` seeds paged rows
   larger than the memory budget and `--ballast-churn` keeps rewriting them, so a soak exercises
   appends, flushing and compaction; the serve console reports the hot store's log, live and
