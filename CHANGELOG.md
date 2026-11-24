@@ -12,6 +12,11 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **The load tool can soak a paged store that really pages.** `--ballast-rows` seeds paged rows
+  larger than the memory budget and `--ballast-churn` keeps rewriting them, so a soak exercises
+  appends, flushing and compaction; the serve console reports the hot store's log, live and
+  reclaimed bytes. `all` now passes `--data` to its serve process. Results:
+  [docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#paging-soak--melangelog-against-faster-under-constant-rewrites-2026-11-24).
 - **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default,
   and two preview engines join it.
   - **Why:** FASTER has been unmaintained upstream since August 2026.

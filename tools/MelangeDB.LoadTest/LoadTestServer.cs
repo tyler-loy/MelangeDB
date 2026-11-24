@@ -181,6 +181,36 @@ internal sealed class LoadTestServer : IAsyncDisposable
         _nodeApps[index] = (name, app);
     }
 
+    /// <summary>
+    /// The paged logs of every live primary shard engine, summed: log, live and reclaimed bytes,
+    /// segment files and compaction steps. An engine that does not report a figure (-1) adds nothing.
+    /// </summary>
+    public (long LogBytes, long LiveBytes, long ReclaimedBytes, long SegmentFiles, long CompactionSteps) HotStoreTotals()
+    {
+        long log = 0, live = 0, reclaimed = 0, segments = 0, steps = 0;
+        foreach (var (_, app) in _nodeApps)
+        {
+            if (app is null)
+                continue;
+            var node = app.Services.GetRequiredService<ShardNodeRuntime>();
+            foreach (var shard in node.OwnedShards)
+            {
+                if (node.TryGetShard(shard) is not { } runtime)
+                    continue;
+                foreach (var space in runtime.Engine.HotStore.Statistics().Logs)
+                {
+                    log += Math.Max(0, space.LogBytes);
+                    live += Math.Max(0, space.LiveBytes);
+                    reclaimed += Math.Max(0, space.ReclaimedBytes);
+                    segments += Math.Max(0, space.SegmentFiles);
+                    steps += Math.Max(0, space.CompactionSteps);
+                }
+            }
+        }
+
+        return (log, live, reclaimed, segments, steps);
+    }
+
     /// <summary>The same counters the stats endpoint serves, for the serve console's periodic line.</summary>
     public ServerStats Stats() => CollectStats();
 

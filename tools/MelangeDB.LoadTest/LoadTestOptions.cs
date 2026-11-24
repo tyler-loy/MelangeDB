@@ -102,6 +102,14 @@ public sealed class LoadTestOptions
     /// <summary>Payload bytes per ballast row.</summary>
     public int RowBytes { get; set; } = 256;
 
+    // ---- serve/all: a paged working set larger than the memory budget, rewritten throughout ----
+
+    /// <summary><c>--ballast-rows</c>: ballast rows seeded across every block at serve start; 0 seeds none.</summary>
+    public int BallastRows { get; set; }
+
+    /// <summary><c>--ballast-churn</c>: ballast rows rewritten per second while serving, so a paged log accrues garbage to compact.</summary>
+    public int BallastChurnPerSecond { get; set; }
+
     /// <summary>
     /// <c>--replicas 0|1</c>: <c>Cluster:ShardReplicas</c> for the failover measurement. With 1 (the
     /// library default) the survivor keeps a warm replica and promotes it; 0 measures the cold
@@ -308,6 +316,8 @@ public sealed class LoadTestOptions
                             .Select(static v => int.Parse(v, CultureInfo.InvariantCulture)).ToArray();
                         break;
                     case "--row-bytes": options.RowBytes = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--ballast-rows": options.BallastRows = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--ballast-churn": options.BallastChurnPerSecond = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--tail": options.TailRecords = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--replicas": options.Replicas = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--repeat": options.Repeat = int.Parse(value, CultureInfo.InvariantCulture); break;

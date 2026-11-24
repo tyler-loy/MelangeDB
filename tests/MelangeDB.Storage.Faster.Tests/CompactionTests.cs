@@ -48,6 +48,24 @@ public sealed class CompactionTests
         AssertRows(harness, Rounds);
     }
 
+    /// <summary>
+    /// Live bytes are what compaction's trigger ratio divides by: each row counts once, as its main
+    /// record plus its blob record, header and alignment included, and a freshly written log is all live.
+    /// </summary>
+    [Fact]
+    public void Live_bytes_count_each_row_once()
+    {
+        using var harness = MelangeLogHarness(compaction: false);
+        Rewrite(harness, 1);
+
+        var logs = harness.Engine.HotStore.Statistics().Logs;
+        var blob = logs.Single(l => l.Space == "blob");
+        var main = logs.Single(l => l.Space == "main");
+        Assert.InRange(blob.LiveBytes, (long)Rows * BlobBytes, (long)Rows * (BlobBytes + 64));
+        Assert.Equal(main.LogBytes, main.LiveBytes);
+        Assert.InRange(blob.LogBytes - blob.LiveBytes, 0, SegmentBytes);
+    }
+
     [Fact]
     public void With_compaction_off_the_log_keeps_every_version()
     {
