@@ -43,6 +43,12 @@ the built exe (`all` re-launches its own executable as the serve child, so run t
 A fourth, `failover`, is a different measurement: it kills the node that owns a crowded shard and
 times the reassignment window. See [The reassignment window](#the-reassignment-window).
 
+A fifth, `link-bench`, measures the node link alone over loopback: per message shape (a border batch
+of 500 rows of 1 KiB, one of 50 rows of 64 B, a heartbeat), from one sender and from 32, in both
+frame formats, it reports the round trip, bytes allocated across both ends, gen-0 collections,
+payload bytes on the wire, and managed heap still held after a full collection. `--repeat` sets the
+rounds. See [The node link's framing](#the-node-links-framing--json-against-binary-2026-11-24).
+
 ```
 # Small and fast (under 30 s, 2 nodes, 8 players):
 MelangeDB.LoadTest all --smoke
@@ -105,7 +111,7 @@ noted.
 | `--row-bytes` | 256 | `failover`: payload bytes per ballast row (minimum 8). |
 | `--tail` | 10000 | `failover`: records committed after the pre-kill snapshot, which recovery replays. |
 | `--replicas` | 1 | `failover`: `Cluster:ShardReplicas`. With 1 the survivor promotes its warm replica, and the run reports how many kills promoted and how far behind the replica was; 0 measures the cold reopen. |
-| `--repeat` | 3 | `failover`: kills per sweep entry. |
+| `--repeat` | 3 | `failover`: kills per sweep entry. `link-bench`: rounds of every shape. |
 | `--clients` | 20 | `failover`: gateway clients on the measured shard, each calling Move at `--tick-hz`. |
 
 ## What each metric means
@@ -835,6 +841,49 @@ reader thread) and synchronous link sends under a plain lock, the same sweep:
 - **The first pass found two gateway bugs** that refused 11% of calls at 100 players: shards for
   negative-x blocks were unreachable, and the retries exhausted the port range; and a failed swap
   wedged its client. Fixed in #228 before these numbers were taken.
+
+### The node link's framing — JSON against binary, 2026-11-24
+
+Node links carried row data as base64 inside JSON, serialized twice and staged in the shared
+`ArrayPool`. A dotMemory snapshot of a paging soak put 322 MB of the server's 647 MB in that pool's
+per-thread caches: 700 arrays averaging 435 KB across about 380 threads. Row data now rides in a
+binary attachment after the JSON (see the glossary's *Node link*).
+
+`link-bench --repeat 3`, best and worst of three where they differ:
+
+| Shape | | Before | After, binary | After, JSON (a mixed-version link) |
+|---|---|---|---|---|
+| Border batch, 500 × 1 KiB | Round trip, 1 sender | 4.29–4.72 ms | **0.46–0.52 ms** | 1.73–1.95 ms |
+| | Per message, 32 senders | 2.28–2.65 ms | **0.56–0.57 ms** | 1.63–1.68 ms |
+| | Allocated per message | 4.51 MB | **1.13 MB** | 4.72 MB |
+| | Wire bytes per message | 763 KB | **520 KB** | 710 KB |
+| | Held after a full collection | 1–64 MiB | **0–1.5 MiB** | 0–3 MiB |
+| Border batch, 50 × 64 B | Round trip, 1 sender | 115–121 µs | **31–39 µs** | 82–85 µs |
+| | Allocated / wire per message | 67 KB / 7.4 KB | **20 KB / 4.1 KB** | 37 KB / 7.1 KB |
+| Heartbeat | Round trip, 1 sender | 40–46 µs | 37–39 µs | 33–40 µs |
+| | Allocated per message | 9.8 KB | **6.8 KB** | 6.6 KB |
+
+In a cluster: `all --players 100 --nodes 4 --hot-store faster --paged-engine melangelog --budget-mb 8
+--ballast-rows 400000 --row-bytes 1024 --ballast-churn 1000 --duration-seconds 360`, before (A) and
+after (B) alternated twice, then the 200-walker capacity run alternated twice, then the paging run
+once each under `DOTNET_GCHeapHardLimit=2 GiB`:
+
+| | A, JSON link | B, binary link |
+|---|---|---|
+| Paging soak, call → delta p99 | 224 / 210 ms | 196 / 194 ms |
+| Paging soak, GC heap / working set at the end | 3.30 / 8.25 GiB, 3.99 / 8.69 GiB | 2.87 / 7.46 GiB, 3.63 / 8.05 GiB |
+| Walker run, p99 (no row batches to speak of) | 261 / 362 ms | 728 / 363 ms |
+| Walker run, GC heap at the end | 275 / 275 MiB | 164 / 219 MiB |
+| Paging soak under a 2 GiB heap limit | **out of memory while seeding; 0 calls acked** | seeds, serves 218k calls, then runs out in the key directory |
+
+- **Where the batches are, the link was the cost.** The paging soak's tail fell ~10% and its heap
+  ~10%; the walker runs, whose link traffic is small batches, moved within their own noise (one
+  728 ms p99 against 363 ms on the repeat).
+- **Under the heap limit the bottleneck moved.** The old link could not seed 400k rows in 2 GiB; the
+  new one seeds them, and what then runs out is the paged tables' key directory: about 320 bytes
+  per stored row copy, times about three border copies, times two for the replica. That cost is
+  documented in [the bake-off](design/hot-store-bakeoff.md) with its follow-up, moving the
+  directory off the managed heap.
 
 ### Soak — memory over five minutes
 
