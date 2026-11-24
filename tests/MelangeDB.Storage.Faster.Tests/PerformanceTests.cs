@@ -12,6 +12,7 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// measured numbers land in the test output.
 /// </summary>
 [Trait("Category", "Slow")]
+[Collection(nameof(TimingCollection))]
 public class PerformanceTests(Xunit.ITestOutputHelper output)
 {
     [Fact]
@@ -123,3 +124,12 @@ public class PerformanceTests(Xunit.ITestOutputHelper output)
         return best;
     }
 }
+
+/// <summary>
+/// Tests that assert timings run alone. xUnit runs test classes in parallel, and a timing ratio of
+/// two one-millisecond scans measured on a 4-vCPU runner next to the compaction and model tests (and
+/// their background threads) measured the neighbours: 5-7x against a floor of 5, on the Windows and
+/// arm64 jobs, for an engine whose code the scan never touches.
+/// </summary>
+[CollectionDefinition(nameof(TimingCollection), DisableParallelization = true)]
+public sealed class TimingCollection;
