@@ -28,16 +28,19 @@ internal sealed class StoreHarness : IDisposable
 
     private readonly Type[] _tables;
     private readonly TimeProvider? _timeProvider;
+    private readonly IHotStoreProvider? _provider;
 
     public StoreHarness(
         StoreKind kind,
         Action<MelangeDbOptions>? configure = null,
         Type[]? tables = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IHotStoreProvider? provider = null)
     {
         Kind = kind;
         _tables = tables ?? DefaultTables;
         _timeProvider = timeProvider;
+        _provider = provider;
         Root = Directory.CreateTempSubdirectory("melange-faster-test-").FullName;
         Options = new MelangeDbOptions
         {
@@ -108,5 +111,5 @@ internal sealed class StoreHarness : IDisposable
             new SchemaRegistry(new MelangeDB.Generated.MelangeModel().Tables().Where(t => _tables.Contains(t.RowType))),
             loggerFactory: null,
             _timeProvider,
-            Kind == StoreKind.Faster ? TestEngine.Provider() : null);
+            Kind == StoreKind.Faster ? _provider ?? TestEngine.Provider() : null);
 }

@@ -109,6 +109,16 @@ internal sealed class EngineTelemetry : IDisposable
             () => LogMeasurements(static l => l.LiveBytes),
             "By",
             "Bytes of each paged log space that current records occupy; absent for an engine that cannot tell.");
+        _meter.CreateObservableCounter(
+            "melange.store.compaction.reclaimed_bytes",
+            () => LogMeasurements(static l => l.ReclaimedBytes),
+            "By",
+            "Log bytes compaction has given back, per paged log space.");
+        _meter.CreateObservableCounter(
+            "melange.store.compaction.relocated_bytes",
+            () => LogMeasurements(static l => l.RelocatedBytes),
+            "By",
+            "Live bytes compaction copied forward to reclaim space, per paged log space: its write cost.");
     }
 
     /// <summary>One measurement per paged log space, skipping values the engine reports as unknown (-1).</summary>

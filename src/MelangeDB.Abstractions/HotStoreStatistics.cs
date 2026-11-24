@@ -31,7 +31,9 @@ public sealed class HotStoreStatistics
 /// <param name="Space">The space: <c>main</c> or <c>blob</c>.</param>
 /// <param name="LogBytes">The log's extent, in memory and on disk.</param>
 /// <param name="LiveBytes">The bytes of that log current records occupy, or -1 when the engine cannot tell.</param>
-public readonly record struct HotStoreLogStatistics(string Space, long LogBytes, long LiveBytes);
+/// <param name="ReclaimedBytes">Cumulative log bytes compaction has given back.</param>
+/// <param name="RelocatedBytes">Cumulative live bytes compaction copied forward to do it.</param>
+public readonly record struct HotStoreLogStatistics(string Space, long LogBytes, long LiveBytes, long ReclaimedBytes = 0, long RelocatedBytes = 0);
 
 /// <summary>One table's store-side statistics.</summary>
 /// <param name="Table">The table's id.</param>

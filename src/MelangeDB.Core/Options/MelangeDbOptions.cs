@@ -793,6 +793,34 @@ public sealed class HotStoreOptions
     /// </para>
     /// </summary>
     public long HashBuckets { get; set; }
+
+    /// <summary>Reclaiming the paged tier's log space while the store runs (<c>HotStore:Compaction:*</c>).</summary>
+    public HotStoreCompactionOptions Compaction { get; set; } = new();
+}
+
+/// <summary>
+/// Options for reclaiming paged log space (<c>MelangeDb:HotStore:Compaction:*</c>). An engine that
+/// appends a record per update keeps the superseded ones until they are reclaimed; compaction copies
+/// a segment's live records forward and deletes the segment, in short steps on a background thread
+/// that interleave with writes. Only the <see cref="PagedEngine.MelangeLog"/> engine compacts today.
+/// </summary>
+public sealed class HotStoreCompactionOptions
+{
+    /// <summary>Whether to compact at all. Off, the log grows with write volume until a restart.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Compact while a space's log is more than this many times its live bytes. Lower keeps disk
+    /// closer to the data's size and copies more to do it: at 2, a record is copied about once for
+    /// each segment of garbage reclaimed. At least 1.1.
+    /// </summary>
+    public double TriggerRatio { get; set; } = 2.0;
+
+    /// <summary>
+    /// Cap on bytes compaction copies per second, across spaces; zero is uncapped, which still
+    /// yields the store lock between steps of about a megabyte.
+    /// </summary>
+    public long MaxBytesPerSecond { get; set; }
 }
 
 /// <summary>When the commit log forces appended records to stable storage.</summary>

@@ -34,7 +34,14 @@ All packages ship together at one version; there is no per-package versioning. S
     record carries a checksum.
   - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on
     writes.
-  - **Likely the future default,** once it can reclaim log space (#287) and flush in the background.
+  - **Reclaims log space as it runs** (#287): `HotStore:Compaction:Enabled` (default on),
+    `TriggerRatio` (default 2: compact while the log is over twice its live bytes) and
+    `MaxBytesPerSecond`. A background thread copies the live records out of the segment with the
+    least live data, in steps of about 1 MiB under the store lock, and deletes the segment. A store
+    rewriting its 1M-row table three times over ends with its log at about twice its live data.
+    EventIds 1514–1516 log it; `melange.store.compaction.reclaimed_bytes` and `relocated_bytes`
+    count it. FASTER and Tsavorite still do not reclaim.
+  - **Likely the future default,** once it flushes in the background.
   - **Exact without reads:** its index keys each record by a 128-bit hash and records its size, so a
     delete reads nothing, and the log knows which bytes are live without reading them back.
 

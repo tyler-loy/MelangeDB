@@ -12,16 +12,18 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// </summary>
 public sealed class MelangeLogModelTests
 {
-    public static TheoryData<string, bool> Modes => new()
+    public static TheoryData<string, bool, bool> Modes => new()
     {
-        { "Mmap", false },
-        { "Mmap", true },
-        { "Pread", false },
+        { "Mmap", false, false },
+        { "Mmap", false, true },
+        { "Mmap", true, true },
+        { "Pread", false, false },
+        { "Pread", false, true },
     };
 
     [Theory]
     [MemberData(nameof(Modes))]
-    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread)
+    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread, bool compact)
     {
         var mode = Enum.Parse<MelangeLogReadMode>(readMode);
         const int keySpace = 600;
@@ -36,6 +38,16 @@ public sealed class MelangeLogModelTests
         {
             for (var n = 0; n < ops; n++)
             {
+                // Compaction as hard as it goes: any garbage past 10% triggers it, a few KiB a step,
+                // so segments are walked and dropped while every other path runs around them.
+                if (compact && n % 25 == 0)
+                {
+                    kv.PrepareCompactionStep();
+                    kv.Compact(1.1, 4096);
+                    if (n % 1000 == 0)
+                        AssertAccounting(kv);
+                }
+
                 var id = random.Next(keySpace);
                 var key = Key(id);
                 switch (random.Next(10))
@@ -76,6 +88,20 @@ public sealed class MelangeLogModelTests
             AssertAccounting(kv);
             Assert.Equal(0, kv.Usage.LiveBytes);
             Assert.All(kv.SegmentAccounting, static segment => Assert.Equal(0, segment.Live));
+
+            // Nothing live: compaction drops every segment that has been flushed.
+            if (compact)
+            {
+                while (kv.Compact(1.1, 1 << 20).MoreWork)
+                {
+                }
+
+                var flushed = kv.Addresses.Head >> 14;
+                Assert.All(kv.SegmentAccounting.Take((int)flushed), static segment => Assert.True(segment.Dropped));
+                Assert.True(kv.Usage.ReclaimedBytes > 0);
+                Assert.True(kv.Usage.RelocatedBytes > 0);
+                Assert.True(kv.Usage.LogBytes <= kv.Addresses.Tail - (flushed << 14));
+            }
         }
 
         Assert.Empty(Directory.EnumerateFiles(directory));

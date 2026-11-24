@@ -132,12 +132,20 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
 /// has to reclaim (#287), and a segment whose live count reaches zero holds nothing current.
 /// </para>
 /// <para>
+/// <b>Compaction.</b> <see cref="Compact"/> deletes a flushed segment once nothing in it is live,
+/// and, while the log is more than a given multiple of its live bytes, picks the flushed segment
+/// with the fewest live bytes, walks it record by record, copies each record the index still points
+/// at to the tail (repointing the slot), and deletes it. Liveness is the index probe, exact because
+/// the hash is the key's identity. A record that spans into the segment from the previous one is
+/// checked too, since the segment holds part of it.
+/// </para>
+/// <para>
 /// Every call arrives under the store's lock, one at a time, so nothing here is thread-safe, except
 /// <see cref="Usage"/>, which statistics read without the lock. Nothing is durable: the store is
 /// rebuilt from the commit log on every start.
 /// </para>
 /// </summary>
-internal sealed unsafe class MelangeLogPagedKv : IPagedKv
+internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 {
     internal const int HeaderSize = 16;
 
@@ -170,7 +178,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     private readonly int _readGuess;
     private readonly long _hashSeed;
     private readonly ulong _hashMask;
-    private readonly List<Segment> _segments = [];
+    private readonly List<Segment?> _segments = [];
     private readonly List<SegmentInfo> _segmentInfo = [];
     private readonly byte[] _scratch;
     private readonly bool _batchPread;
@@ -182,6 +190,17 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     private long _headAddress;
     private long _tailPage;
     private long _liveBytes;
+    private long _reclaimedBytes;
+    private long _relocatedBytes;
+
+    // Compaction's place: the segment being compacted (-1 for none), the next address to read in it,
+    // whether the record spanning into it from before still needs checking, and the segment itself,
+    // which PrepareCompactionStep reads off the lock (on the compaction thread, which alone drops it).
+    private long _victim = -1;
+    private long _victimCursor;
+    private bool _victimSpanPending;
+    private Segment? _victimSegment;
+    private long _prepareBytes = 1 << 20;
 
     private IndexEntry* _index;
     private long _indexMask;
@@ -230,14 +249,18 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     public long CapacityBytes { get; }
 
     /// <summary>The log's extent, and the bytes of it current records occupy. Plain 64-bit reads, safe off the lock.</summary>
-    public PagedKvUsage Usage => new(Volatile.Read(ref _tail) - FirstAddress, Volatile.Read(ref _liveBytes));
+    public PagedKvUsage Usage => new(
+        Volatile.Read(ref _tail) - FirstAddress - Volatile.Read(ref _reclaimedBytes),
+        Volatile.Read(ref _liveBytes),
+        Volatile.Read(ref _reclaimedBytes),
+        Volatile.Read(ref _relocatedBytes));
 
     /// <summary>Diagnostics: the log tail, the lowest in-memory address, and the live index entries.</summary>
     internal (long Tail, long Head, long IndexEntries) Addresses => (_tail, _headAddress, _indexCount);
 
-    /// <summary>Diagnostics: each segment's live bytes and first record address, by segment number.</summary>
-    internal IReadOnlyList<(long Live, long FirstRecord)> SegmentAccounting =>
-        _segmentInfo.Select(static info => (info.Live, info.FirstRecord)).ToArray();
+    /// <summary>Diagnostics: each segment's live bytes, first record address, and whether it was dropped, by segment number.</summary>
+    internal IReadOnlyList<(long Live, long FirstRecord, bool Dropped)> SegmentAccounting =>
+        _segmentInfo.Select(static info => (info.Live, info.FirstRecord, info.Dropped)).ToArray();
 
     public byte[]? Read(ReadOnlySpan<byte> key, out bool faulted)
     {
@@ -380,8 +403,219 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         NativeMemory.Free(_index);
         _index = null;
         foreach (var segment in _segments)
-            segment.Dispose();
+            segment?.Dispose();
         _segments.Clear();
+        _victimSegment = null;
+    }
+
+    // ---- Compaction ---------------------------------------------------------------------------
+
+    public void PrepareCompactionStep()
+    {
+        var segment = _victimSegment;
+        if (segment is null || segment.Base == null)
+            return;
+
+        var start = _victimCursor & _segmentOffsetMask & ~(OsPage - 1);
+        var end = Math.Min(_segmentSize, start + _prepareBytes);
+        if (end <= start)
+            return;
+
+        // Ask for the range, then fault it in here, off the lock: a step's reads are then copies.
+        MelangeLogNative.WillNeed((nint)(segment.Base + start), (nint)(end - start));
+        var sum = 0;
+        for (var offset = start; offset < end; offset += OsPage)
+            sum += Volatile.Read(ref segment.Base[offset]);
+        GC.KeepAlive(sum);
+    }
+
+    public CompactionStep Compact(double triggerRatio, long byteBudget)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _prepareBytes = Math.Max(OsPage, byteBudget * 2);
+        if (_victim < 0)
+        {
+            // Free first: a flushed segment with nothing live goes without a byte copied.
+            var reclaimed = 0L;
+            var dropped = 0;
+            var sealedSegments = Math.Min(_segmentInfo.Count, _headAddress >> _segmentBits);
+            for (var n = 0; n < sealedSegments; n++)
+            {
+                var info = _segmentInfo[n];
+                if (!info.Dropped && info.Live == 0)
+                {
+                    reclaimed += Drop(n);
+                    dropped++;
+                }
+            }
+
+            if (dropped > 0)
+                return new CompactionStep(true, 0, reclaimed, dropped);
+
+            // Picking a victim is a step of its own, so the next one can prepare its pages first.
+            return new CompactionStep(PickVictim(triggerRatio, sealedSegments), 0, 0, 0);
+        }
+
+        var victim = _victim;
+        var victimInfo = _segmentInfo[(int)victim];
+        try
+        {
+            var relocated = 0L;
+            var scanned = 0L;
+            if (_victimSpanPending)
+            {
+                _victimSpanPending = false;
+                var from = victimInfo.SpanningFrom;
+                if (from != 0 && !_segmentInfo[(int)(from >> _segmentBits)].Dropped)
+                    relocated += RelocateIfLive(from);
+                _victimCursor = victimInfo.FirstRecord;
+            }
+
+            var segmentEnd = (victim + 1) << _segmentBits;
+            while (_victimCursor < segmentEnd && relocated < byteBudget && scanned < byteBudget * 4)
+            {
+                var address = _victimCursor;
+                var inPage = _pageSize - (address & _pageOffsetMask);
+                if (inPage < HeaderSize)
+                {
+                    _victimCursor = address + inPage;
+                    continue;
+                }
+
+                var faulted = false;
+                var header = MemoryMarshal.Read<RecordHeader>(RecordView(address, _batchPread, ref faulted));
+                if (header.KeyLength == PadKeyLength)
+                {
+                    if (header.Capacity != inPage - HeaderSize)
+                        throw new InvalidDataException($"melangelog: corrupt pad marker at {address} ({_basePath}).");
+                    _victimCursor = address + inPage;
+                    continue;
+                }
+
+                ValidateHeader(address, header);
+                var size = HeaderSize + header.KeyLength + (long)header.Capacity;
+                relocated += RelocateIfLive(address);
+                scanned += size;
+                _victimCursor = address + size;
+            }
+
+            if (_victimCursor < segmentEnd)
+                return new CompactionStep(true, relocated, 0, 0);
+
+            _victim = -1;
+            _victimSegment = null;
+            if (victimInfo.Live != 0)
+            {
+                victimInfo.Skipped = true;
+                throw new InvalidDataException(
+                    $"melangelog: segment {victim} still counts {victimInfo.Live} live bytes after compaction copied out every live record it found ({_basePath}).");
+            }
+
+            return new CompactionStep(true, relocated, Drop(victim), 1);
+        }
+        catch (InvalidDataException)
+        {
+            // A segment that cannot be walked is left in place, for good: dropping it could lose a
+            // live record. The log is a projection, so a restart rebuilds it clean.
+            victimInfo.Skipped = true;
+            _victim = -1;
+            _victimSegment = null;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Starts compacting the flushed segment with the fewest live bytes, if the log is over
+    /// <paramref name="triggerRatio"/> times its live bytes, at least two segments' worth of it is
+    /// garbage, and the candidate is not nearly all live.
+    /// </summary>
+    private bool PickVictim(double triggerRatio, long sealedSegments)
+    {
+        var logBytes = _tail - FirstAddress - _reclaimedBytes;
+        var garbage = logBytes - _liveBytes;
+        if (garbage < 2 * _segmentSize || logBytes <= triggerRatio * _liveBytes)
+            return false;
+
+        var best = -1;
+        for (var n = 0; n < sealedSegments; n++)
+        {
+            var info = _segmentInfo[n];
+            if (!info.Dropped && !info.Skipped && (best < 0 || info.Live < _segmentInfo[best].Live))
+                best = n;
+        }
+
+        if (best < 0 || _segmentInfo[best].Live > _segmentSize / 10 * 9)
+            return false;
+
+        var start = Math.Max((long)best << _segmentBits, FirstAddress);
+        _victim = best;
+        _victimSegment = _segments[best];
+        _victimCursor = start;
+        _victimSpanPending = _segmentInfo[best].FirstRecord > start;
+        if (!_victimSpanPending)
+            _victimCursor = _segmentInfo[best].FirstRecord;
+        return true;
+    }
+
+    /// <summary>
+    /// Copies the record at <paramref name="address"/> to the tail if its slot still points at it,
+    /// and repoints the slot. Returns the bytes copied, 0 for a record that is no longer current.
+    /// </summary>
+    private long RelocateIfLive(long address)
+    {
+        var faulted = false;
+        var view = RecordView(address, _batchPread, ref faulted);
+        var header = MemoryMarshal.Read<RecordHeader>(view);
+        ValidateHeader(address, header);
+
+        Span<byte> key = stackalloc byte[header.KeyLength];
+        view.Slice(HeaderSize, header.KeyLength).CopyTo(key);
+        var hash = Hash(key);
+        var slot = FindSlot(hash);
+        if (slot < 0 || AddressOf(_index[slot].Packed) != address)
+            return 0;
+
+        var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(header.ValueLength);
+        try
+        {
+            var value = rented.AsSpan(0, header.ValueLength);
+            var valueOffset = HeaderSize + header.KeyLength;
+            if (view.Length >= valueOffset + value.Length)
+                view.Slice(valueOffset, value.Length).CopyTo(value);
+            else
+                CopyOut(address + valueOffset, value, _batchPread, ref faulted);
+            if (Checksum(hash, header.ValueLength, header.Capacity, value) != header.Checksum)
+                throw new InvalidDataException($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
+
+            AddLive(address, SizeOf(_index[slot].Packed, address), -1);
+            var (moved, size) = Append(key, value, hash);
+            _index[slot].Packed = Pack(moved, size);
+            Volatile.Write(ref _relocatedBytes, _relocatedBytes + size);
+            return size;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Unmaps, closes and deletes a segment's file. Returns the log bytes that gives back.</summary>
+    private long Drop(long number)
+    {
+        var info = _segmentInfo[(int)number];
+        info.Dropped = true;
+        var segment = number < _segments.Count ? _segments[(int)number] : null;
+        if (segment is not null)
+        {
+            _segments[(int)number] = null;
+            if (ReferenceEquals(_victimSegment, segment))
+                _victimSegment = null;
+            segment.Dispose();
+        }
+
+        var bytes = ((number + 1) << _segmentBits) - Math.Max(number << _segmentBits, FirstAddress);
+        Volatile.Write(ref _reclaimedBytes, _reclaimedBytes + bytes);
+        return bytes;
     }
 
     // ---- Reads ------------------------------------------------------------------------------
@@ -455,7 +689,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     /// <summary>A read within one page (so within one segment) through the file, for pread mode.</summary>
     private void ReadFromFile(long address, Span<byte> buffer)
     {
-        var segment = _segments[(int)(address >> _segmentBits)];
+        var segment = _segments[(int)(address >> _segmentBits)] ?? throw DroppedSegment(address);
         var offset = address & _segmentOffsetMask;
         while (!buffer.IsEmpty)
         {
@@ -571,7 +805,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         var end = address + size;
         var last = (end - 1) >> _segmentBits;
         for (var segment = first + 1; segment <= last; segment++)
-            Info(segment).FirstRecord = Math.Min(end, (segment + 1) << _segmentBits);
+        {
+            var info = Info(segment);
+            info.FirstRecord = Math.Min(end, (segment + 1) << _segmentBits);
+            info.SpanningFrom = address;
+        }
     }
 
     /// <summary>Adds (or, with -1, removes) a record's bytes to the live count of each segment it touches.</summary>
@@ -643,7 +881,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
                 randomAdvice: _tuning.RandomAdvice));
         }
 
-        return _segments[(int)number];
+        return _segments[(int)number] ?? throw DroppedSegment(number << _segmentBits);
     }
 
     // ---- Index ------------------------------------------------------------------------------
@@ -764,6 +1002,9 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         }
     }
 
+    private InvalidDataException DroppedSegment(long address) =>
+        new($"melangelog: address {address} is in a segment compaction deleted ({_basePath}).");
+
     private InvalidDataException Collision(long address) =>
         new($"melangelog: the record at {address} holds a different key with the same 128-bit hash ({_basePath}).");
 
@@ -780,7 +1021,8 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     private byte* RingPointer(long address) => RingSlot(address >> _pageBits) + (address & _pageOffsetMask);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private byte* MappedPointer(long address) => _segments[(int)(address >> _segmentBits)].Base + (address & _segmentOffsetMask);
+    private byte* MappedPointer(long address) =>
+        (_segments[(int)(address >> _segmentBits)] ?? throw DroppedSegment(address)).Base + (address & _segmentOffsetMask);
 
     /// <summary>
     /// A record's fixed header. <see cref="Capacity"/> is the value room the record was laid out with
@@ -809,11 +1051,18 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         public ulong Packed;
     }
 
-    /// <summary>Per segment: the bytes of current records in it, and where its first record starts.</summary>
+    /// <summary>
+    /// Per segment: the bytes of current records in it; where its first record starts, and the
+    /// address of the record before it that runs into it (0 for none); whether compaction deleted it,
+    /// or found it unreadable and left it.
+    /// </summary>
     private sealed class SegmentInfo(long firstRecord)
     {
         public long Live;
         public long FirstRecord = firstRecord;
+        public long SpanningFrom;
+        public bool Dropped;
+        public bool Skipped;
     }
 
     /// <summary>

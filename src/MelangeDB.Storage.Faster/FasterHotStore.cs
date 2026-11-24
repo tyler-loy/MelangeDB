@@ -49,6 +49,16 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private readonly IPagedKv? _blob;
     private readonly long _bufferPoolCapacityBytes;
 
+    /// <summary>Bytes a compaction step may copy before it gives the store lock back.</summary>
+    private const long CompactionStepBytes = 1 << 20;
+
+    /// <summary>How long the compaction thread sleeps when no space has anything to reclaim.</summary>
+    private static readonly TimeSpan CompactionIdle = TimeSpan.FromMilliseconds(100);
+
+    private readonly HotStoreCompactionOptions _compaction;
+    private readonly CancellationTokenSource _compactionStop = new();
+    private readonly Thread? _compactor;
+
     /// <summary>Reused buffer for composed store and blob keys; see <see cref="StoreKey"/>.</summary>
     private byte[] _keyScratch = new byte[64];
     private bool _disposed;
@@ -92,6 +102,17 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             var declared = context.Residency.GetValueOrDefault(table.Id, table.Residency);
             _tables.Add(table.Id, new TableState(table, declared));
+        }
+
+        _compaction = context.Options.HotStore.Compaction;
+        if (!(_compaction.TriggerRatio >= 1.1))
+            throw new ArgumentOutOfRangeException(nameof(context), _compaction.TriggerRatio, "HotStore:Compaction:TriggerRatio must be at least 1.1.");
+        if (_compaction.MaxBytesPerSecond < 0)
+            throw new ArgumentOutOfRangeException(nameof(context), _compaction.MaxBytesPerSecond, "HotStore:Compaction:MaxBytesPerSecond must not be negative.");
+        if (_compaction.Enabled && (_main is ICompactingPagedKv || _blob is ICompactingPagedKv))
+        {
+            _compactor = new Thread(CompactionLoop) { IsBackground = true, Name = "melange-hotstore-compaction" };
+            _compactor.Start();
         }
     }
 
@@ -325,12 +346,14 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 state.RowsScanned));
         }
 
-        var main = _main.Usage;
         HotStoreLogStatistics[] logs = _blob is null
-            ? [new("main", main.LogBytes, main.LiveBytes)]
-            : [new("main", main.LogBytes, main.LiveBytes), new("blob", _blob.Usage.LogBytes, _blob.Usage.LiveBytes)];
+            ? [LogStatistics("main", _main.Usage)]
+            : [LogStatistics("main", _main.Usage), LogStatistics("blob", _blob.Usage)];
         return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes, Logs = logs };
     }
+
+    private static HotStoreLogStatistics LogStatistics(string space, PagedKvUsage usage) =>
+        new(space, usage.LogBytes, usage.LiveBytes, usage.ReclaimedBytes, usage.RelocatedBytes);
 
     public void ApplyResidency(string tableName, Residency residency)
     {
@@ -355,6 +378,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     public void Dispose()
     {
+        // The compaction thread reads a segment's mapped pages off the lock, so it must be gone
+        // before the spaces unmap them. It takes the lock itself, so it is joined outside it. The
+        // token source is never disposed: it has no timer, and a second Dispose cancels it again.
+        _compactionStop.Cancel();
+        if (_compactor is not null && Thread.CurrentThread != _compactor)
+            _compactor.Join();
+
         lock (_lock)
         {
             if (_disposed)
@@ -362,6 +392,79 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _disposed = true;
             _main.Dispose();
             _blob?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The compaction thread (#287): for each space that compacts, warm the next step's pages off the
+    /// lock, then run one bounded step under it, so writers and readers wait at most one step. Sleeps
+    /// while nothing is due. A segment it cannot read is logged and left; anything else stops
+    /// compaction (logged) rather than the process, and the store carries on without it.
+    /// </summary>
+    private void CompactionLoop()
+    {
+        var spaces = new List<(string Name, ICompactingPagedKv Space)>(2);
+        if (_main is ICompactingPagedKv main)
+            spaces.Add(("main", main));
+        if (_blob is ICompactingPagedKv blob)
+            spaces.Add(("blob", blob));
+
+        var token = _compactionStop.Token;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var copied = 0L;
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                var busy = false;
+                foreach (var (name, space) in spaces)
+                {
+                    space.PrepareCompactionStep();
+                    CompactionStep step;
+                    lock (_lock)
+                    {
+                        if (_disposed)
+                            return;
+                        try
+                        {
+                            step = space.Compact(_compaction.TriggerRatio, CompactionStepBytes);
+                        }
+                        catch (InvalidDataException fault)
+                        {
+                            LogMessages.CompactionSkippedSegment(_logger, name, fault.Message);
+                            busy = true;
+                            continue;
+                        }
+                    }
+
+                    if (step.SegmentsDropped > 0)
+                        LogMessages.LogSpaceReclaimed(_logger, name, step.ReclaimedBytes, step.SegmentsDropped);
+                    busy |= step.MoreWork;
+                    copied += step.RelocatedBytes;
+                }
+
+                if (!busy)
+                {
+                    token.WaitHandle.WaitOne(CompactionIdle);
+                    continue;
+                }
+
+                // Under a cap, run no faster than it allows; uncapped, still let a waiting writer in.
+                if (_compaction.MaxBytesPerSecond > 0)
+                {
+                    var ahead = TimeSpan.FromSeconds((double)copied / _compaction.MaxBytesPerSecond) - clock.Elapsed;
+                    if (ahead > TimeSpan.Zero && token.WaitHandle.WaitOne(ahead))
+                        return;
+                }
+                else
+                {
+                    Thread.Yield();
+                }
+            }
+        }
+        catch (Exception exception) when (!token.IsCancellationRequested)
+        {
+            LogMessages.CompactionStopped(_logger, exception);
         }
     }
 
@@ -1613,5 +1716,34 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public static void UnreadableRowSkipped(ILogger logger, string table, string key, string reason) =>
             UnreadableRowSkippedMessage(logger, table, key, reason, null);
+
+        private static readonly Action<ILogger, long, string, int, Exception?> LogSpaceReclaimedMessage =
+            LoggerMessage.Define<long, string, int>(
+                LogLevel.Debug,
+                new EventId(1514, "PagedLogSpaceReclaimed"),
+                "Compaction gave back {Bytes} bytes of the paged {Space} log ({Segments} segment(s) deleted).");
+
+        public static void LogSpaceReclaimed(ILogger logger, string space, long bytes, int segments) =>
+            LogSpaceReclaimedMessage(logger, bytes, space, segments, null);
+
+        private static readonly Action<ILogger, string, string, Exception?> CompactionSkippedSegmentMessage =
+            LoggerMessage.Define<string, string>(
+                LogLevel.Warning,
+                new EventId(1515, "PagedCompactionSkippedSegment"),
+                "Compaction could not read a segment of the paged {Space} log and will leave it in place ({Reason}). "
+                + "Its disk space is not reclaimed until a restart, which rebuilds the store from the commit log.");
+
+        public static void CompactionSkippedSegment(ILogger logger, string space, string reason) =>
+            CompactionSkippedSegmentMessage(logger, space, reason, null);
+
+        private static readonly Action<ILogger, Exception?> CompactionStoppedMessage =
+            LoggerMessage.Define(
+                LogLevel.Error,
+                new EventId(1516, "PagedCompactionStopped"),
+                "Paged log compaction failed and has stopped for this store; its disk use now grows with write volume "
+                + "until a restart. The store itself carries on.");
+
+        public static void CompactionStopped(ILogger logger, Exception exception) =>
+            CompactionStoppedMessage(logger, exception);
     }
 }

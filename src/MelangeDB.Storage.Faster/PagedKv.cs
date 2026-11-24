@@ -58,8 +58,37 @@ internal interface IPagedKv : IDisposable
 /// One space's log footprint. <see cref="LogBytes"/> is the log's extent (in memory and on disk);
 /// <see cref="LiveBytes"/> is the part of it that current records occupy, or -1 when the engine
 /// cannot tell. The gap between them is superseded and deleted records waiting to be reclaimed.
+/// <see cref="ReclaimedBytes"/> and <see cref="RelocatedBytes"/> are compaction's running totals:
+/// log space given back, and live records copied forward to do it.
 /// </summary>
-internal readonly record struct PagedKvUsage(long LogBytes, long LiveBytes);
+internal readonly record struct PagedKvUsage(long LogBytes, long LiveBytes, long ReclaimedBytes = 0, long RelocatedBytes = 0);
+
+/// <summary>
+/// A space that reclaims its own log while the store runs (#287): superseded and deleted records are
+/// dropped by copying a segment's live records forward and deleting the segment. The store drives it
+/// from one background thread, in bounded steps under the store lock, so writers and readers
+/// interleave between steps.
+/// </summary>
+internal interface ICompactingPagedKv
+{
+    /// <summary>
+    /// <b>Off</b> the store lock, on the compaction thread only: brings the pages the next step will
+    /// read into memory, so that step's reads under the lock are copies, not disk waits. Touches only
+    /// the segment being compacted, which nothing but a step on this same thread can delete.
+    /// </summary>
+    void PrepareCompactionStep();
+
+    /// <summary>
+    /// Under the store lock: one step of at most about <paramref name="byteBudget"/> bytes copied.
+    /// Compacts only while the log exceeds <paramref name="triggerRatio"/> times its live bytes (a
+    /// segment with nothing live is deleted regardless). Throws <see cref="InvalidDataException"/>
+    /// for a segment it cannot read, which it then leaves alone for good.
+    /// </summary>
+    CompactionStep Compact(double triggerRatio, long byteBudget);
+}
+
+/// <summary>What one <see cref="ICompactingPagedKv.Compact"/> step did, and whether there is more to do now.</summary>
+internal readonly record struct CompactionStep(bool MoreWork, long RelocatedBytes, long ReclaimedBytes, int SegmentsDropped);
 
 /// <summary>
 /// Opens the key-value spaces of one store. The store is a projection rebuilt from the commit log
