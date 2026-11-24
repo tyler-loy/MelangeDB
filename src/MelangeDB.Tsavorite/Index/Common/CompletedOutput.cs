@@ -1,0 +1,157 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics.CodeAnalysis;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// A list of <see cref="CompletedOutputIterator{TInput, TOutput, TContext}"/> for completed outputs from a pending operation.
+    /// </summary>
+    /// <remarks>The session holds this list and returns an enumeration to the caller of an appropriate CompletePending overload. The session will handle
+    /// disposing and clearing this list, but it is best if the caller calls Dispose() after processing the results, so the key, input, and heap containers
+    /// are released as soon as possible.</remarks>
+    public sealed class CompletedOutputIterator<TInput, TOutput, TContext> : IDisposable
+    {
+        internal const int kInitialAlloc = 32;
+        internal const int kReallocMultuple = 2;
+        internal CompletedOutput<TInput, TOutput, TContext>[] vector = new CompletedOutput<TInput, TOutput, TContext>[kInitialAlloc];
+        internal int maxIndex = -1;
+        internal int currentIndex = -1;
+
+        internal void TransferFrom<TStoreFunctions, TAllocator>(
+                ref TsavoriteKV<TStoreFunctions, TAllocator>.OperationState<TInput, TOutput, TContext> operationState,
+                ref TsavoriteKV<TStoreFunctions, TAllocator>.PendingState<TInput, TOutput, TContext> pendingState,
+                Status status)
+            where TStoreFunctions : IStoreFunctions
+            where TAllocator : IAllocator<TStoreFunctions>
+        {
+            // Note: vector is never null
+            if (maxIndex >= vector.Length - 1)
+                Array.Resize(ref vector, vector.Length * kReallocMultuple);
+            ++maxIndex;
+            vector[maxIndex].TransferFrom(ref operationState, ref pendingState, status);
+        }
+
+        /// <summary>
+        /// Advance the iterator to the next element.
+        /// </summary>
+        /// <returns>False if this advances past the last element of the array, else true</returns>
+        public bool Next()
+        {
+            if (currentIndex < maxIndex)
+            {
+                ++currentIndex;
+                return true;
+            }
+            currentIndex = vector.Length;
+            return false;
+        }
+
+        /// <summary>
+        /// Returns a reference to the current element of the enumeration.
+        /// </summary>
+        /// <returns>A reference to the current element of the enumeration</returns>
+        /// <exception cref="IndexOutOfRangeException"> if there is no current element, either because Next() has not been called or it has advanced
+        ///     past the last element of the array
+        /// </exception>
+        public ref CompletedOutput<TInput, TOutput, TContext> Current => ref vector[currentIndex];
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            for (; maxIndex >= 0; --maxIndex)
+                vector[maxIndex].Dispose();
+            currentIndex = -1;
+        }
+    }
+
+    /// <summary>
+    /// Structure to hold a key and its output for a pending operation.
+    /// </summary>
+    /// <remarks>The session holds a list of these that it returns to the caller of an appropriate CompletePending overload. The session will handle disposing
+    /// and clearing, and will manage Dispose(), but it is best if the caller calls Dispose() after processing the results, so the key, input, and heap containers
+    /// are released as soon as possible.</remarks>
+    public struct CompletedOutput<TInput, TOutput, TContext>
+    {
+        private ConditionallyHoistedKey keyContainer;
+        private IHeapContainer<TInput> inputContainer;
+
+        /// <summary>
+        /// The key for this pending operation.
+        /// </summary>
+        /// <remarks>
+        /// Returned by <c>ref readonly</c> (via <see cref="UnscopedRefAttribute"/>) because
+        /// <see cref="ConditionallyHoistedKey"/> may carry its key bytes inline; a by-value
+        /// copy would alias the temp's stack location and any
+        /// <see cref="ConditionallyHoistedKey.KeyBytes"/> span derived from it would dangle
+        /// as soon as the expression returns. The ref aliases the containing
+        /// <see cref="CompletedOutput{TInput,TOutput,TContext}"/>'s storage; the caller must
+        /// not retain the ref or any derived span past the receiver's lifetime.
+        /// </remarks>
+        [UnscopedRef]
+        public readonly ref readonly ConditionallyHoistedKey Key => ref keyContainer;
+
+        /// <summary>
+        /// The input for this pending operation.
+        /// </summary>
+        public readonly ref TInput Input => ref inputContainer.Get();
+
+        /// <summary>
+        /// The output for this pending operation. It is the caller's responsibility to dispose this if necessary; <see cref="Dispose()"/> will not try to dispose this member.
+        /// </summary>
+        public TOutput Output;
+
+        /// <summary>
+        /// The context for this pending operation.
+        /// </summary>
+        public TContext Context;
+
+        /// <summary>
+        /// The record metadata for this operation
+        /// </summary>
+        public RecordMetadata RecordMetadata;
+
+        /// <summary>
+        /// The status of the operation
+        /// </summary>
+        public Status Status;
+
+        internal void TransferFrom<TStoreFunctions, TAllocator>(
+                ref TsavoriteKV<TStoreFunctions, TAllocator>.OperationState<TInput, TOutput, TContext> operationState,
+                ref TsavoriteKV<TStoreFunctions, TAllocator>.PendingState<TInput, TOutput, TContext> pendingState,
+                Status status)
+            where TStoreFunctions : IStoreFunctions
+            where TAllocator : IAllocator<TStoreFunctions>
+        {
+            // Transfers the containers from the pending pendingState, then nulls them; this is called before pendingState.Dispose().
+            keyContainer = pendingState.requestKey;
+            pendingState.requestKey = default;
+            inputContainer = pendingState.input;
+            pendingState.input = default;
+
+            Output = pendingState.output;
+            Context = pendingState.userContext;
+            RecordMetadata = new(operationState.logicalAddress);
+            Status = status;
+        }
+
+        internal void Dispose()
+        {
+            var tempKeyContainer = keyContainer;
+            keyContainer = default;
+            tempKeyContainer.Dispose();
+
+            var tempInputContainer = inputContainer;
+            inputContainer = default;
+            tempInputContainer?.Dispose();
+
+            Output = default;
+            Context = default;
+
+            RecordMetadata = default;
+            Status = default;
+        }
+    }
+}

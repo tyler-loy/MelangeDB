@@ -13,6 +13,7 @@
     <Project Path="src/MelangeDB.Storage.Faster/MelangeDB.Storage.Faster.csproj" />
     <Project Path="src/MelangeDB.Storage.Postgres/MelangeDB.Storage.Postgres.csproj" />
     <Project Path="src/MelangeDB.Testing/MelangeDB.Testing.csproj" />
+    <Project Path="src/MelangeDB.Tsavorite/MelangeDB.Tsavorite.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/MelangeDB.Cluster.Tests/MelangeDB.Cluster.Tests.csproj" />

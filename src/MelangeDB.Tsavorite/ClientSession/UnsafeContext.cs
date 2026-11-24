@@ -1,0 +1,388 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// Tsavorite Operations implementation that allows manual control of epoch management. For advanced use only.
+    /// </summary>
+    public readonly struct UnsafeContext<TKey, TInput, TOutput, TContext, TFunctions, TStoreFunctions, TAllocator>
+        : ITsavoriteContext<TKey, TInput, TOutput, TContext, TFunctions, TStoreFunctions, TAllocator>, IUnsafeContext
+        where TKey : IKey, allows ref struct
+        where TFunctions : ISessionFunctions<TInput, TOutput, TContext>
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        readonly ClientSession<TKey, TInput, TOutput, TContext, TFunctions, TStoreFunctions, TAllocator> clientSession;
+        internal readonly SessionFunctionsWrapper<TKey, TInput, TOutput, TContext, TFunctions, BasicSessionLocker<TStoreFunctions, TAllocator>, TStoreFunctions, TAllocator> sessionFunctions;
+
+        /// <inheritdoc/>
+        public bool IsNull => clientSession is null;
+
+        internal UnsafeContext(ClientSession<TKey, TInput, TOutput, TContext, TFunctions, TStoreFunctions, TAllocator> clientSession)
+        {
+            this.clientSession = clientSession;
+            sessionFunctions = new(clientSession);
+        }
+
+        #region Begin/EndUnsafe
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void BeginUnsafe() => clientSession.UnsafeResumeThread(sessionFunctions);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void EndUnsafe() => clientSession.UnsafeSuspendThread();
+
+        #endregion Begin/EndUnsafe
+
+        #region ITsavoriteContext
+
+        /// <inheritdoc/>
+        public ClientSession<TKey, TInput, TOutput, TContext, TFunctions, TStoreFunctions, TAllocator> Session => clientSession;
+
+        /// <inheritdoc/>
+        public long GetKeyHash<TOpKey>(TOpKey key)
+            where TOpKey : IKey, allows ref struct
+            => clientSession.store.GetKeyHash(key);
+
+        /// <inheritdoc/>
+        public bool CompletePending(bool wait = false, bool spinWaitForCommit = false)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.UnsafeCompletePending(sessionFunctions, false, wait, spinWaitForCommit);
+        }
+
+        /// <inheritdoc/>
+        public bool CompletePendingWithOutputs(out CompletedOutputIterator<TInput, TOutput, TContext> completedOutputs, bool wait = false, bool spinWaitForCommit = false)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.UnsafeCompletePendingWithOutputs(sessionFunctions, out completedOutputs, wait, spinWaitForCommit);
+        }
+
+        /// <inheritdoc/>
+        public ValueTask CompletePendingAsync(bool waitForCommit = false, CancellationToken token = default)
+            => clientSession.CompletePendingAsync(sessionFunctions, waitForCommit, token);
+
+        /// <inheritdoc/>
+        public ValueTask<CompletedOutputIterator<TInput, TOutput, TContext>> CompletePendingWithOutputsAsync(bool waitForCommit = false, CancellationToken token = default)
+            => clientSession.CompletePendingWithOutputsAsync(sessionFunctions, waitForCommit, token);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Read(TKey key, ref TInput input, ref TOutput output, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextRead(key, ref input, ref output, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Read(TKey key, ref TInput input, ref TOutput output, ref ReadOptions readOptions, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextRead(key, ref input, ref output, ref readOptions, out _, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Read(TKey key, ref TOutput output, TContext userContext = default)
+        {
+            TInput input = default;
+            return Read(key, ref input, ref output, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Read(TKey key, ref TOutput output, ref ReadOptions readOptions, TContext userContext = default)
+        {
+            TInput input = default;
+            return Read(key, ref input, ref output, ref readOptions, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public (Status status, TOutput output) Read(TKey key, TContext userContext = default)
+        {
+            TInput input = default;
+            TOutput output = default;
+            return (Read(key, ref input, ref output, userContext), output);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public (Status status, TOutput output) Read(TKey key, ref ReadOptions readOptions, TContext userContext = default)
+        {
+            TInput input = default;
+            TOutput output = default;
+            return (Read(key, ref input, ref output, ref readOptions, userContext), output);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Read(TKey key, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextRead(key, ref input, ref output, ref readOptions, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ReadWithPrefetch<TBatch>(ref TBatch batch, TContext userContext)
+            where TBatch : IReadArgBatch<TKey, TInput, TOutput>, allows ref struct
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            clientSession.store.ContextReadWithPrefetch<TKey, TBatch, TInput, TOutput, TContext, SessionFunctionsWrapper<TKey, TInput, TOutput, TContext, TFunctions, BasicSessionLocker<TStoreFunctions, TAllocator>, TStoreFunctions, TAllocator>>(ref batch, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status ReadAtAddress(long address, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextReadAtAddress<TKey, TInput, TOutput, TContext, SessionFunctionsWrapper<TKey, TInput, TOutput, TContext, TFunctions, BasicSessionLocker<TStoreFunctions, TAllocator>, TStoreFunctions, TAllocator>>(address, ref input, ref output, ref readOptions, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status ReadAtAddress(long address, TKey key, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextReadAtAddress(address, key, ref input, ref output, ref readOptions, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ReadOnlySpan<byte> desiredValue, TContext userContext = default)
+        {
+            TInput input = default;
+            TOutput output = default;
+            return Upsert(key, clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ReadOnlySpan<byte> desiredValue, ref UpsertOptions upsertOptions, TContext userContext = default)
+        {
+            TInput input = default;
+            TOutput output = default;
+            return Upsert(key, upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ref TInput input, ReadOnlySpan<byte> desiredValue, ref TOutput output, TContext userContext = default)
+            => Upsert(key, clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ref TInput input, ReadOnlySpan<byte> desiredValue, ref TOutput output, ref UpsertOptions upsertOptions, TContext userContext = default)
+            => Upsert(key, upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Status Upsert(TKey key, long keyHash, ref TInput input, ReadOnlySpan<byte> desiredValue, ref TOutput output, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextUpsert(key, keyHash, ref input, srcStringValue: desiredValue, ref output, out _, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ref TInput input, ReadOnlySpan<byte> desiredValue, ref TOutput output, ref UpsertOptions upsertOptions, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            var keyHash = upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key);
+            return clientSession.store.ContextUpsert(key, keyHash, ref input, srcStringValue: desiredValue, ref output, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, IHeapObject desiredValue, TContext userContext = default)
+        {
+            TInput input = default;
+            TOutput output = default;
+            return Upsert(key, clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, IHeapObject desiredValue, ref UpsertOptions upsertOptions, TContext userContext = default)
+        {
+            TInput input = default;
+            TOutput output = default;
+            return Upsert(key, upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ref TInput input, IHeapObject desiredValue, ref TOutput output, TContext userContext = default)
+            => Upsert(key, clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ref TInput input, IHeapObject desiredValue, ref TOutput output, ref UpsertOptions upsertOptions, TContext userContext = default)
+            => Upsert(key, upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, desiredValue, ref output, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Status Upsert(TKey key, long keyHash, ref TInput input, IHeapObject desiredValue, ref TOutput output, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextUpsert(key, keyHash, ref input, srcObjectValue: desiredValue, ref output, out _, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert(TKey key, ref TInput input, IHeapObject desiredValue, ref TOutput output, ref UpsertOptions upsertOptions, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            var keyHash = upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key);
+            return clientSession.store.ContextUpsert(key, keyHash, ref input, srcObjectValue: desiredValue, ref output, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert<TSourceLogRecord>(in TSourceLogRecord diskLogRecord)
+            where TSourceLogRecord : ISourceLogRecord
+            => Upsert(diskLogRecord, in diskLogRecord);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert<TOpKey, TSourceLogRecord>(TOpKey key, in TSourceLogRecord diskLogRecord)
+            where TOpKey : IKey, allows ref struct
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            TInput input = default;
+            TOutput output = default;
+            UpsertOptions upsertOptions = default;
+            return Upsert(key, ref input, in diskLogRecord, ref output, ref upsertOptions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert<TOpKey, TSourceLogRecord>(TOpKey key, ref TInput input, in TSourceLogRecord diskLogRecord)
+            where TOpKey : IKey, allows ref struct
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            TOutput output = default;
+            UpsertOptions upsertOptions = default;
+            return Upsert(key, ref input, in diskLogRecord, ref output, ref upsertOptions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert<TSourceLogRecord>(ref TInput input, in TSourceLogRecord inputLogRecord, ref TOutput output, ref UpsertOptions upsertOptions, TContext userContext = default)
+            where TSourceLogRecord : ISourceLogRecord
+            => Upsert(inputLogRecord, ref input, in inputLogRecord, ref output, ref upsertOptions, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Upsert<TOpKey, TSourceLogRecord>(TOpKey key, ref TInput input, in TSourceLogRecord inputLogRecord, ref TOutput output, ref UpsertOptions upsertOptions, TContext userContext = default)
+            where TOpKey : IKey, allows ref struct
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            var keyHash = upsertOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key);
+            return clientSession.store.ContextUpsert(key, keyHash, ref input, inputLogRecord: in inputLogRecord, ref output, out _, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, ref TInput input, ref TOutput output, TContext userContext = default)
+            => RMW(key, ref input, ref output, out _, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, ref TInput input, ref TOutput output, ref RMWOptions rmwOptions, TContext userContext = default)
+            => RMW(key, rmwOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, ref output, rmwOptions.InitialIORecordSize, out _, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, ref TInput input, ref TOutput output, out RecordMetadata recordMetadata, TContext userContext = default)
+            => RMW(key, clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, ref output, out recordMetadata, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, ref TInput input, ref TOutput output, ref RMWOptions rmwOptions, out RecordMetadata recordMetadata, TContext userContext = default)
+            => RMW(key, rmwOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), ref input, ref output, rmwOptions.InitialIORecordSize, out recordMetadata, userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, long keyHash, ref TInput input, ref TOutput output, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextRMW(key, keyHash, ref input, ref output, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <summary>
+        /// RMW path that carries a per-operation <c>initialIORecordSize</c> override (from <see cref="RMWOptions.InitialIORecordSize"/>).
+        /// The no-options overloads call the variant without this parameter to keep the hot path free of any RMWOptions handling.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Status RMW(TKey key, long keyHash, ref TInput input, ref TOutput output, int initialIORecordSize, out RecordMetadata recordMetadata, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextRMW(key, keyHash, ref input, ref output, initialIORecordSize, out recordMetadata, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, ref TInput input, TContext userContext = default)
+        {
+            TOutput output = default;
+            return RMW(key, ref input, ref output, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status RMW(TKey key, ref TInput input, ref RMWOptions rmwOptions, TContext userContext = default)
+        {
+            TOutput output = default;
+            return RMW(key, ref input, ref output, ref rmwOptions, userContext);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Delete(TKey key, TContext userContext = default)
+            => Delete(key, clientSession.store.storeFunctions.GetKeyHashCode64(key), userContext);
+
+        /// <inheritdoc/>
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Delete(TKey key, ref DeleteOptions deleteOptions, TContext userContext = default)
+            => Delete(key, deleteOptions.KeyHash ?? clientSession.store.storeFunctions.GetKeyHashCode64(key), userContext);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Status Delete(TKey key, long keyHash, TContext userContext = default)
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            return clientSession.store.ContextDelete<TKey, TInput, TOutput, TContext, SessionFunctionsWrapper<TKey, TInput, TOutput, TContext, TFunctions, BasicSessionLocker<TStoreFunctions, TAllocator>, TStoreFunctions, TAllocator>>(
+                    key, keyHash, userContext, sessionFunctions);
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ResetModified(TKey key)
+            => clientSession.UnsafeResetModified(sessionFunctions, key);
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool IsModified(TKey key)
+            => clientSession.UnsafeIsModified(sessionFunctions, key);
+
+        /// <inheritdoc/>
+        public void Refresh()
+        {
+            Debug.Assert(clientSession.store.epoch.ThisInstanceProtected());
+            clientSession.store.InternalRefresh<TInput, TOutput, TContext, SessionFunctionsWrapper<TKey, TInput, TOutput, TContext, TFunctions, BasicSessionLocker<TStoreFunctions, TAllocator>, TStoreFunctions, TAllocator>>(sessionFunctions);
+        }
+        #endregion ITsavoriteContext
+    }
+}

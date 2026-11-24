@@ -245,6 +245,13 @@ public enum PagedEngine
     /// of flushed records through memory-mapped segments. Preview; the likely successor to FASTER.
     /// </summary>
     MelangeLog,
+    /// <summary>
+    /// Tsavorite, microsoft/garnet's maintained fork of FASTER: the same design, vendored (it is not
+    /// on NuGet) and carried inside MelangeDB.Storage.Faster. On Linux it writes through Garnet's
+    /// native libaio device and needs libaio installed (Debian/Ubuntu: <c>libaio1t64</c>), falling back
+    /// to a managed device with a warning (EventId 1513) without it. Preview.
+    /// </summary>
+    Tsavorite,
 }
 
 /// <summary>Options for the event bus (<c>MelangeDb:Events:*</c>).</summary>

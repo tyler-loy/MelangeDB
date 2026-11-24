@@ -1,0 +1,192 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// Interface for users to control creation and retrieval of checkpoint-related data
+    /// Tsavorite calls this interface during checkpoint/recovery in this sequence:
+    /// 
+    /// Checkpoint:
+    ///   InitializeIndexCheckpoint (for index checkpoints) -> 
+    ///   GetIndexDevice (for index checkpoints) ->
+    ///   InitializeLogCheckpoint (for log checkpoints) ->
+    ///   GetSnapshotLogDevice (for log checkpoints in snapshot mode) ->
+    ///   GetSnapshotObjectLogDevice (for log checkpoints in snapshot mode with objects) ->
+    ///   CommitLogCheckpoint (for log checkpoints) ->
+    ///   CommitIndexCheckpoint (for index checkpoints) ->
+    /// 
+    /// Recovery:
+    ///   GetIndexCommitMetadata ->
+    ///   GetLogCommitMetadata ->
+    ///   GetIndexDevice ->
+    ///   GetSnapshotLogDevice (for recovery in snapshot mode) ->
+    ///   GetSnapshotObjectLogDevice (for recovery in snapshot mode with objects)
+    /// 
+    /// Provided devices will be closed directly by Tsavorite when done.
+    /// </summary>
+    public interface ICheckpointManager : IDisposable
+    {
+        /// <summary>
+        /// Whether Tsavorite should perform internal cleanup of checkpoint snapshot files and hybrid log segments
+        /// during the checkpoint state machine. When false, cleanup of hlog segments is avoided and the external
+        /// layer is responsible for managing checkpoint lifecycle (e.g., cluster mode with reader-safe deletion).
+        /// </summary>
+        bool PerformAutomaticCleanup { get; }
+
+        /// <summary>
+        /// Get current cookie
+        /// </summary>
+        /// <returns></returns>
+        byte[] GetCookie();
+
+        /// <summary>
+        /// Initialize index checkpoint
+        /// </summary>
+        /// <param name="indexToken"></param>
+        void InitializeIndexCheckpoint(Guid indexToken);
+
+        /// <summary>
+        /// Initialize log checkpoint (snapshot and fold-over)
+        /// </summary>
+        /// <param name="logToken"></param>
+        void InitializeLogCheckpoint(Guid logToken);
+
+        /// <summary>
+        /// Commit index checkpoint
+        /// </summary>
+        /// <param name="indexToken"></param>
+        /// <param name="commitMetadata"></param>
+        /// <returns></returns>
+        void CommitIndexCheckpoint(Guid indexToken, byte[] commitMetadata);
+
+        /// <summary>
+        /// Cleanup index checkpoint
+        /// </summary>
+        /// <param name="indexToken"></param>
+        void CleanupIndexCheckpoint(Guid indexToken);
+
+        /// <summary>
+        /// Commit log checkpoint (snapshot and fold-over)
+        /// </summary>
+        /// <param name="logToken"></param>
+        /// <param name="commitMetadata"></param>
+        void CommitLogCheckpointMetadata(Guid logToken, byte[] commitMetadata);
+
+        /// <summary>
+        /// Cleanup log checkpoint
+        /// </summary>
+        /// <param name="logToken"></param>
+        void CleanupLogCheckpoint(Guid logToken);
+
+        /// <summary>
+        /// Callback to indicate start of version shift during checkpoint
+        /// </summary>
+        /// <param name="oldVersion"></param>
+        /// <param name="newVersion"></param>
+        /// <param name="isStreaming"></param>
+        void CheckpointVersionShiftStart(long oldVersion, long newVersion, bool isStreaming);
+
+        /// <summary>
+        /// Callback to indicate end of version shift during checkpoint
+        /// </summary>
+        /// <param name="oldVersion"></param>
+        /// <param name="newVersion"></param>
+        /// <param name="isStreaming"></param>
+        void CheckpointVersionShiftEnd(long oldVersion, long newVersion, bool isStreaming);
+
+        /// <summary>
+        /// Retrieve commit metadata for specified index checkpoint
+        /// </summary>
+        /// <param name="indexToken">Token</param>
+        /// <returns>Metadata, or null if invalid</returns>
+        byte[] GetIndexCheckpointMetadata(Guid indexToken);
+
+        /// <summary>
+        /// Retrieve commit metadata for specified log checkpoint
+        /// </summary>
+        /// <param name="logToken">Token</param>
+        /// <returns>Metadata, or null if invalid</returns>
+        byte[] GetLogCheckpointMetadata(Guid logToken);
+
+        /// <summary>
+        /// Read index metadata for inspection without creating storage. Missing metadata throws
+        /// <see cref="System.IO.FileNotFoundException"/>; other read failures remain errors.
+        /// </summary>
+        /// <param name="indexToken">Token to inspect.</param>
+        /// <returns>The metadata payload without its length prefix or sector padding.</returns>
+        byte[] ReadIndexCheckpointMetadata(Guid indexToken)
+            => throw new NotSupportedException("This checkpoint manager does not support non-creating metadata inspection");
+
+        /// <summary>
+        /// Read HybridLog metadata for inspection without creating storage. Missing metadata throws
+        /// <see cref="System.IO.FileNotFoundException"/>; other read failures remain errors.
+        /// </summary>
+        /// <param name="logToken">Token to inspect.</param>
+        /// <returns>The metadata payload without its length prefix or sector padding.</returns>
+        byte[] ReadLogCheckpointMetadata(Guid logToken)
+            => throw new NotSupportedException("This checkpoint manager does not support non-creating metadata inspection");
+
+        /// <summary>
+        /// Get list of index checkpoint tokens, in order of usage preference
+        /// </summary>
+        /// <returns></returns>
+        public IEnumerable<Guid> GetIndexCheckpointTokens();
+
+        /// <summary>
+        /// Get list of log checkpoint tokens, in order of usage preference
+        /// </summary>
+        /// <returns></returns>
+        public IEnumerable<Guid> GetLogCheckpointTokens();
+
+        /// <summary>
+        /// Provide device to store index checkpoint (including overflow buckets)
+        /// </summary>
+        /// <param name="indexToken"></param>
+        /// <returns></returns>
+        IDevice GetIndexDevice(Guid indexToken);
+
+        /// <summary>
+        /// Provide device to store snapshot of log (required only for snapshot checkpoints)
+        /// </summary>
+        /// <param name="token"></param>
+        /// <returns></returns>
+        IDevice GetSnapshotLogDevice(Guid token);
+
+        /// <summary>
+        /// Provide device to store snapshot of object log (required only for snapshot checkpoints)
+        /// </summary>
+        /// <param name="token"></param>
+        /// <returns></returns>
+        IDevice GetSnapshotObjectLogDevice(Guid token);
+
+        /// <summary>
+        /// Get the largest sector size, in bytes, of the devices returned by <see cref="GetIndexDevice(Guid)"/>,
+        /// <see cref="GetSnapshotLogDevice(Guid)"/> and <see cref="GetSnapshotObjectLogDevice(Guid)"/>, without creating
+        /// any of them. A store calls this once, when it is created, and aligns its log pages, hash index and overflow
+        /// buckets to at least this size so that its checkpoints can be written to and recovered from those devices.
+        /// </summary>
+        /// <returns>The sector size; the default implementation returns <see cref="IDevice.MinDeviceSectorSize"/>.</returns>
+        uint GetCheckpointDeviceSectorSize() => IDevice.MinDeviceSectorSize;
+
+        /// <summary>
+        /// Cleanup all data (subfolder) related to the given guid by this manager
+        /// </summary>
+        public void Purge(Guid token);
+
+        /// <summary>
+        /// Cleanup all data (subfolder) related to checkpoints by this manager
+        /// </summary>
+        public void PurgeAll();
+
+        /// <summary>
+        /// Initiatize manager on recovery (e.g., deleting other checkpoints)
+        /// </summary>
+        /// <param name="indexToken"></param>
+        /// <param name="logToken"></param>
+        public void OnRecovery(Guid indexToken, Guid logToken);
+    }
+}

@@ -4,7 +4,8 @@ How MelangeDB packages are versioned, where they are published, and how a consum
 
 ## What ships
 
-Every library under `src/` is a NuGet package — thirteen of them:
+Every library under `src/` is a NuGet package, thirteen of them, except `MelangeDB.Tsavorite`, which ships
+inside `MelangeDB.Storage.Faster` (below):
 
 `MelangeDB.Abstractions`, `MelangeDB.Core`, `MelangeDB.Protocol`, `MelangeDB.Client`,
 `MelangeDB.Server`, `MelangeDB.CodeGen`, `MelangeDB.Storage.Faster`, `MelangeDB.Storage.Postgres`,
@@ -18,7 +19,7 @@ Tests, samples, and the load-test tool are never packed (`IsPackable=false`). Sh
 lives in `Directory.Build.props` at the repo root; a project's `.csproj` only adds what is specific to
 it.
 
-Three packages are not plain class libraries:
+Four packages are not plain class libraries:
 
 - **`MelangeDB.CodeGen`** ships as a Roslyn analyzer: the assembly lands in `analyzers/dotnet/cs`,
   there is no `lib/` output, and the package declares no dependencies (Roslyn comes from the
@@ -29,6 +30,19 @@ Three packages are not plain class libraries:
   the `melange` command: `schema` exports a schema manifest, and `backup` / `backup verify` /
   `restore` are the operational verbs over the `.mbak` archive (docs/BACKUP.md). See
   [CLIENT-BINDINGS.md](CLIENT-BINDINGS.md).
+- **`MelangeDB.Storage.Faster`** carries a vendored engine. Tsavorite, microsoft/garnet's fork of
+  FASTER, is not on NuGet, so `src/MelangeDB.Tsavorite` compiles its source (unmodified, from the
+  commit in that folder's README) as `MelangeDB.Tsavorite.dll`.
+  - **What the package carries:**
+    - that assembly, in `lib/`;
+    - Garnet's prebuilt Linux native devices, in `runtimes/{linux,linux-musl}-{x64,arm64}/native/`;
+    - Garnet's MIT licence, in `third-party/Tsavorite/`.
+  - **Size:** the natives take the package from about 100 KB to about 5.6 MB.
+  - **No package dependency.** The project reference is private only while packing (`_IsPacking`),
+    so the nuspec declares no dependency on `MelangeDB.Tsavorite`. Private everywhere, it would also
+    drop the assembly from in-repo projects' `deps.json`.
+  - **Refreshing it:** run `tools/vendor-tsavorite.sh <commit>`, then run the store suite with
+    `MELANGE_TEST_PAGED_ENGINE=tsavorite`.
 - **Symbols are embedded** in every assembly rather than shipped as separate `.snupkg` packages, so
   there is no symbol server to be reachable and nothing to publish twice. SourceLink is on (it ships
   in the .NET SDK), so stepping into MelangeDB from a consumer resolves sources from GitHub.

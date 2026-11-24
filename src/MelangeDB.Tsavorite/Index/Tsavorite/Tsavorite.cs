@@ -1,0 +1,1078 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics.X86;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using static Tsavorite.core.LogAddress;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// The Tsavorite Key/Value store class
+    /// </summary>
+    public partial class TsavoriteKV<TStoreFunctions, TAllocator> : TsavoriteBase, IDisposable
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        internal readonly TAllocator hlog;
+        internal readonly AllocatorBase<TStoreFunctions, TAllocator> hlogBase;
+        internal readonly TAllocator readcache;
+        internal readonly AllocatorBase<TStoreFunctions, TAllocator> readcacheBase;
+
+        internal readonly TStoreFunctions storeFunctions;
+
+        internal readonly bool UseReadCache;
+        private readonly ReadCopyOptions ReadCopyOptions;
+        /// <summary>Initial IO record size from <see cref="KVSettings"/>; <see cref="KVSettings.UseDefaultInitialIORecordSize"/> means unset.</summary>
+        internal readonly int InitialIORecordSize;
+        internal readonly StateMachineDriver stateMachineDriver;
+
+        /// <summary>
+        /// ObjectIdMap to be used by operations that map it transiently, such as RENAME
+        /// </summary>
+        public ObjectIdMap TransientObjectIdMap => hlogBase.transientObjectIdMap;
+
+        /// <summary>
+        /// Number of active entries in hash index (does not correspond to total records, due to hash collisions)
+        /// </summary>
+        public long EntryCount => GetEntryCount();
+
+        /// <summary>
+        /// High-water mark of the number of memory pages that were allocated in the circular buffer
+        /// </summary>
+        public long HighWaterAllocatedPageCount => hlogBase.HighWaterAllocatedPageCount;
+
+        /// <summary>
+        /// Size of index in #cache lines (64 bytes each)
+        /// </summary>
+        public long IndexSize => state[resizeInfo.version].size;
+
+        /// <summary>
+        /// Size of index in bytes (#cache lines * 64)
+        /// </summary>
+        public long IndexSizeBytes => state[resizeInfo.version].size * Constants.kCacheLineBytes;
+
+        /// <summary>
+        /// Size of a single hash bucket (one cache line), in bytes. Applies to both main and overflow buckets,
+        /// which share the same layout.
+        /// </summary>
+        public long IndexBucketSizeBytes => Constants.kCacheLineBytes;
+
+        /// <summary>
+        /// Number of overflow buckets in use (64 bytes each), across every live generation: during an index resize the
+        /// superseded generation is still allocated until the split completes, so both are counted.
+        /// </summary>
+        public long OverflowBucketCount
+        {
+            get
+            {
+                // The resize generation is nulled concurrently once the split completes, so read it once.
+                // GetMaxValidAddress reads a counter field and stays valid on an allocator that was just disposed.
+                var resizeAllocator = overflowBucketsAllocatorResize;
+                return (long)overflowBucketsAllocator.GetMaxValidAddress() + (resizeAllocator?.GetMaxValidAddress() ?? 0);
+            }
+        }
+
+        /// <summary>
+        /// Ceiling on overflow-bucket memory for the live generation, in bytes, derived from
+        /// <see cref="KVSettings.IndexOverflowThreshold"/> and that generation's main bucket count. Allocation beyond
+        /// it throws. Read from the allocator rather than recomputed, so the installed ceiling is what is reported.
+        /// </summary>
+        public long IndexOverflowMaxSizeBytes => overflowBucketsAllocator.MaxMemorySize;
+
+        /// <summary>
+        /// Ceiling on overflow buckets as a percentage of the main bucket count, applied to every index generation.
+        /// </summary>
+        public int IndexOverflowThreshold => overflowThreshold;
+
+        /// <summary>
+        /// Memory committed by the overflow-bucket allocators, including the resize generation while a grow is in
+        /// progress. The allocator commits whole pages ahead of the buckets it hands out, so this exceeds
+        /// <see cref="OverflowBucketCount"/> * <see cref="IndexBucketSizeBytes"/> and is what the process pays.
+        /// </summary>
+        public long IndexOverflowSizeBytes
+        {
+            get
+            {
+                // The resize generation is nulled concurrently once the split completes, so read it once.
+                var resizeAllocator = overflowBucketsAllocatorResize;
+                return overflowBucketsAllocator.AllocatedSizeBytes + (resizeAllocator?.AllocatedSizeBytes ?? 0);
+            }
+        }
+
+        /// <summary>
+        /// Memory an overflow-bucket generation of this store commits as soon as it exists, before it hands out a bucket:
+        /// whole pages, each over-allocated by a sector so it can be aligned to the sector size of the store's devices.
+        /// This much is inherent to having an index, so a budget for index memory includes it.
+        /// </summary>
+        public long IndexOverflowFloorSizeBytes => MallocFixedPageSize<HashBucket>.GetMinCommittedMemorySize(sectorSize);
+
+        /// <summary>
+        /// Total index memory in bytes: the main hash table (<see cref="IndexSizeBytes"/>) plus the memory committed
+        /// by the overflow-bucket allocators (<see cref="IndexOverflowSizeBytes"/>). During an index resize this also
+        /// includes the superseded hash table, which stays allocated until the split completes and makes the resize the
+        /// peak of index memory use.
+        /// </summary>
+        public long IndexTotalSizeBytes
+        {
+            get
+            {
+                var version = resizeInfo.version;
+                var tableSize = state[version].size + state[1 - version].size;
+                return (tableSize * Constants.kCacheLineBytes) + IndexOverflowSizeBytes;
+            }
+        }
+
+        /// <summary>
+        /// Index memory in bytes excluding the generation an index resize is replacing: the main hash table
+        /// (<see cref="IndexSizeBytes"/>) plus the memory committed by the current overflow-bucket generation. Equal to
+        /// <see cref="IndexTotalSizeBytes"/> except during an index resize, when it omits the superseded hash table and
+        /// overflow buckets, which the resize frees when its split completes.
+        /// </summary>
+        public long IndexSettledSizeBytes => IndexSizeBytes + overflowBucketsAllocator.AllocatedSizeBytes;
+
+        /// <summary>Number of allocations performed</summary>
+        public long OverflowBucketAllocations => overflowBucketsAllocator.NumAllocations;
+
+        /// <summary>
+        /// Resample the log size tracker's external memory (see
+        /// <see cref="LogSizeTracker{TStoreFunctions, TAllocator}.ExternalMemorySizeProvider"/>), waking the resizer if it grew.
+        /// Called where index memory steps by a whole generation at once, so the log is not left over budget until the
+        /// resizer's next periodic sample.
+        /// </summary>
+        internal void RefreshIndexMemoryCharge()
+        {
+            var sizeTracker = hlogBase.logSizeTracker;
+            if (sizeTracker is not null && sizeTracker.RefreshExternalMemorySize())
+                sizeTracker.Signal();
+        }
+
+        /// <summary>
+        /// Hybrid log used by this Tsavorite instance
+        /// </summary>
+        public LogAccessor<TStoreFunctions, TAllocator> Log { get; }
+
+        /// <summary>
+        /// Readonly accessor for StoreFunctions
+        /// </summary>
+        public TStoreFunctions StoreFunctions => storeFunctions;
+
+        /// <summary>
+        /// Read cache used by this Tsavorite instance
+        /// </summary>
+        public LogAccessor<TStoreFunctions, TAllocator> ReadCache { get; }
+
+        int maxSessionID;
+
+        internal readonly OverflowBucketLockTable<TStoreFunctions, TAllocator> LockTable;
+
+        internal readonly int ThrottleCheckpointFlushDelayMs = -1;
+
+        internal RevivificationManager<TStoreFunctions, TAllocator> RevivificationManager;
+
+        internal Func<AllocatorSettings, TStoreFunctions, TAllocator> allocatorFactory;
+
+        internal readonly ManualResetEventSlim pauseRevivEvent = new(false);
+        private readonly object pauseRevivLock = new();
+
+        /// <summary>
+        /// Pause Revivification
+        /// </summary>
+        /// <param name="timeout"></param>
+        /// /// <param name="token"></param>
+        public void PauseRevivification(TimeSpan timeout, CancellationToken token)
+        {
+            lock (pauseRevivLock)
+            {
+                try
+                {
+                    epoch.Resume();
+                    // Pause Reviv
+                    RevivificationManager.PauseRevivification();
+                    // Reset event to be used for signaling that everyone has observed the pause signal
+                    pauseRevivEvent.Reset();
+                    // BumpEpoch with Set signal
+                    epoch.BumpCurrentEpoch(() => pauseRevivEvent.Set());
+                }
+                finally
+                {
+                    epoch.Suspend();
+                }
+
+                // Wait for everyone to observe the reviv suspend signal
+                pauseRevivEvent.Wait(timeout, token);
+            }
+        }
+
+        /// <summary>
+        /// Resume Revivification
+        /// </summary>
+        public void ResumeRevivification()
+            => RevivificationManager.ResumeRevivification();
+
+        /// <summary>
+        /// Create TsavoriteKV instance
+        /// </summary>
+        /// <param name="kvSettings">Config settings</param>
+        /// <param name="storeFunctions">Store-level user function implementations</param>
+        /// <param name="allocatorFactory">Func to call to create the allocator(s, if doing readcache)</param>
+        public TsavoriteKV(KVSettings kvSettings, TStoreFunctions storeFunctions, Func<AllocatorSettings, TStoreFunctions, TAllocator> allocatorFactory)
+            : base(kvSettings.Epoch, kvSettings.GetIndexSizeCacheLines(), kvSettings.GetOverflowThreshold(), kvSettings.logger ?? kvSettings.loggerFactory?.CreateLogger("TsavoriteKV Index Overflow buckets"))
+        {
+            try
+            {
+                this.allocatorFactory = allocatorFactory;
+                loggerFactory = kvSettings.loggerFactory;
+                logger = kvSettings.logger ?? kvSettings.loggerFactory?.CreateLogger("TsavoriteKV");
+
+                this.storeFunctions = storeFunctions;
+
+                var checkpointSettings = kvSettings.GetCheckpointSettings() ?? new CheckpointSettings();
+
+                ThrottleCheckpointFlushDelayMs = checkpointSettings.ThrottleCheckpointFlushDelayMs;
+
+                if (checkpointSettings.CheckpointDir != null && checkpointSettings.CheckpointManager != null)
+                    logger?.LogInformation("CheckpointManager and CheckpointDir specified, ignoring CheckpointDir");
+
+                checkpointManager = checkpointSettings.CheckpointManager ??
+                    new DeviceLogCommitCheckpointManager
+                    (new LocalStorageNamedDeviceFactoryCreator(),
+                        new DefaultCheckpointNamingScheme(
+                            new DirectoryInfo(checkpointSettings.CheckpointDir ?? ".").FullName), removeOutdated: checkpointSettings.RemoveOutdated);
+
+                if (checkpointSettings.CheckpointManager is null)
+                    disposeCheckpointManager = true;
+
+                var logSettings = kvSettings.GetLogSettings();
+
+                // Size the log pages, hash index and overflow buckets for the checkpoint devices as well as the log
+                // devices, since checkpoints write from and recovery reads into them directly.
+                logSettings.CheckpointSectorSize = (int)checkpointManager.GetCheckpointDeviceSectorSize();
+
+                UseReadCache = kvSettings.ReadCacheEnabled;
+
+                ReadCopyOptions = logSettings.ReadCopyOptions;
+                if (ReadCopyOptions.CopyTo == ReadCopyTo.Inherit)
+                    ReadCopyOptions.CopyTo = UseReadCache ? ReadCopyTo.ReadCache : ReadCopyTo.None;
+                else if (ReadCopyOptions.CopyTo == ReadCopyTo.ReadCache && !UseReadCache)
+                    ReadCopyOptions.CopyTo = ReadCopyTo.None;
+
+                if (ReadCopyOptions.CopyFrom == ReadCopyFrom.Inherit)
+                    ReadCopyOptions.CopyFrom = ReadCopyFrom.Device;
+
+                // Create the allocator
+                var allocatorSettings = new AllocatorSettings(logSettings, epoch, kvSettings.logger ?? kvSettings.loggerFactory?.CreateLogger(typeof(TAllocator).Name));
+                hlog = allocatorFactory(allocatorSettings, storeFunctions);
+                hlogBase = hlog.GetBase<TAllocator>();
+                hlogBase.Initialize();
+                Log = new(this, hlog);
+
+                if (UseReadCache)
+                {
+                    allocatorSettings.LogSettings = new()
+                    {
+                        LogDevice = new NullDevice(),
+                        ObjectLogDevice = hlog.HasObjectLog ? new NullDevice() : null,
+                        MemorySize = logSettings.ReadCacheSettings.MemorySize,
+                        PageSizeBits = logSettings.ReadCacheSettings.PageSizeBits,
+                        PageCount = logSettings.ReadCacheSettings.PageCount,
+                        SegmentSizeBits = logSettings.ReadCacheSettings.PageSizeBits + 1,   // Not used by readcache but make sure it passes validation
+                        MutableFraction = 1 - logSettings.ReadCacheSettings.SecondChanceFraction
+                    };
+                    allocatorSettings.logger = kvSettings.logger ?? kvSettings.loggerFactory?.CreateLogger($"{typeof(TAllocator).Name} ReadCache");
+                    allocatorSettings.evictCallback = ReadCacheEvict;
+                    allocatorSettings.IsReadCache = true;
+                    readcache = allocatorFactory(allocatorSettings, storeFunctions);
+                    readcacheBase = readcache.GetBase<TAllocator>();
+                    readcacheBase.Initialize();
+                    ReadCache = new(this, readcache);
+                }
+
+                InitialIORecordSize = kvSettings.InitialIORecordSize;
+                Initialize(kvSettings.GetIndexSizeCacheLines(), hlogBase.GetDeviceSectorSize());
+
+                LockTable = new OverflowBucketLockTable<TStoreFunctions, TAllocator>(this);
+                RevivificationManager = new(this, kvSettings.RevivificationSettings, logSettings);
+
+                stateMachineDriver = kvSettings.StateMachineDriver ?? new(epoch, kvSettings.logger ?? kvSettings.loggerFactory?.CreateLogger($"StateMachineDriver"));
+
+                if (kvSettings.TryRecoverLatest)
+                {
+                    try
+                    {
+                        RecoverAsync().AsTask().GetAwaiter().GetResult();
+                    }
+                    catch { }
+                }
+            }
+            catch
+            {
+                // A throw after allocating resources would otherwise leak them: the direct-VM (native) log-page and
+                // hash-index regions are invisible to the GC, and a partially-constructed store gets neither a
+                // Dispose nor a finalizer. Best-effort free the allocators and hand any native index tables to the
+                // finalization registry, and dispose the store-owned epoch — mirroring normal teardown. Construction
+                // has issued no device IO yet, so this is safe.
+                DisposeOnConstructionFailure();
+                throw;
+            }
+        }
+
+        /// <summary>Best-effort cleanup when the constructor throws after allocating resources: disposes the
+        /// allocators (freeing/recycling their native log pages) and calls <see cref="TsavoriteBase.Free"/> to
+        /// dispose the store-owned epoch and overflow-bucket allocator and hand any native hash-index tables to the
+        /// finalization registry. Each step is guarded so a cleanup fault cannot mask the original exception. No-op
+        /// for anything not yet constructed.</summary>
+        private void DisposeOnConstructionFailure()
+        {
+            try { hlogBase?.Dispose(); } catch { }
+            try { readcacheBase?.Dispose(); } catch { }
+            try { Free(); } catch { }
+        }
+
+        /// <summary>Get the hashcode for a key.</summary>
+        public long GetKeyHash<TKey>(TKey key)
+            where TKey : IKey, allows ref struct
+            => storeFunctions.GetKeyHashCode64(key);
+
+        /// <summary>
+        /// Initiate full checkpoint
+        /// </summary>
+        /// <param name="token">Checkpoint token</param>
+        /// <param name="checkpointType">Checkpoint type</param>
+        /// <param name="streamingSnapshotIteratorFunctions">Iterator for streaming snapshot records</param>
+        /// <param name="cancellationToken">Caller's cancellation token</param>
+        /// <returns>
+        /// Whether we successfully initiated the checkpoint (initiation may
+        /// fail if we are already taking a checkpoint or performing some other
+        /// operation such as growing the index). Use CompleteCheckpointAsync to wait completion.
+        /// </returns>
+        public bool TryInitiateFullCheckpoint(out Guid token, CheckpointType checkpointType, IStreamingSnapshotIteratorFunctions streamingSnapshotIteratorFunctions = null, CancellationToken cancellationToken = default)
+        {
+            IStateMachine stateMachine;
+
+            if (checkpointType == CheckpointType.StreamingSnapshot)
+            {
+                if (streamingSnapshotIteratorFunctions is null)
+                    throw new TsavoriteException("StreamingSnapshot checkpoint requires a streaming snapshot iterator");
+                this.streamingSnapshotIteratorFunctions = streamingSnapshotIteratorFunctions;
+                stateMachine = Checkpoint.Streaming(this, out token);
+            }
+            else
+            {
+                stateMachine = Checkpoint.Full(this, checkpointType, out token);
+            }
+            return stateMachineDriver.Register(stateMachine, cancellationToken);
+        }
+
+        /// <summary>
+        /// Take full (index + log) checkpoint
+        /// </summary>
+        /// <param name="checkpointType">Checkpoint type</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <param name="streamingSnapshotIteratorFunctions">Iterator for streaming snapshot records</param>
+        /// <returns>
+        /// (bool success, Guid token)
+        /// success: Whether we successfully initiated the checkpoint (initiation may
+        /// fail if we are already taking a checkpoint or performing some other
+        /// operation such as growing the index).
+        /// token: Token for taken checkpoint
+        /// Await task to complete checkpoint, if initiated successfully
+        /// </returns>
+        public async ValueTask<(bool success, Guid token)> TakeFullCheckpointAsync(CheckpointType checkpointType,
+            CancellationToken cancellationToken = default, IStreamingSnapshotIteratorFunctions streamingSnapshotIteratorFunctions = null)
+        {
+            var success = TryInitiateFullCheckpoint(out Guid token, checkpointType, streamingSnapshotIteratorFunctions, cancellationToken);
+
+            if (success)
+                await CompleteCheckpointAsync(cancellationToken).ConfigureAwait(false);
+
+            return (success, token);
+        }
+
+        /// <summary>
+        /// Initiate index-only checkpoint
+        /// </summary>
+        /// <param name="token">Checkpoint token</param>
+        /// <param name="cancellationToken">Caller's cancellation token</param>
+        /// <returns>Whether we could initiate the checkpoint. Use CompleteCheckpointAsync to wait completion.</returns>
+        public bool TryInitiateIndexCheckpoint(out Guid token, CancellationToken cancellationToken = default)
+        {
+            var stateMachine = Checkpoint.IndexOnly(this, out token);
+            return stateMachineDriver.Register(stateMachine, cancellationToken);
+        }
+
+        /// <summary>
+        /// Take index-only checkpoint
+        /// </summary>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>
+        /// (bool success, Guid token)
+        /// success: Whether we successfully initiated the checkpoint (initiation may
+        /// fail if we are already taking a checkpoint or performing some other
+        /// operation such as growing the index).
+        /// token: Token for taken checkpoint
+        /// Await task to complete checkpoint, if initiated successfully
+        /// </returns>
+        public async ValueTask<(bool success, Guid token)> TakeIndexCheckpointAsync(CancellationToken cancellationToken = default)
+        {
+            var success = TryInitiateIndexCheckpoint(out Guid token, cancellationToken);
+
+            if (success)
+                await CompleteCheckpointAsync(cancellationToken).ConfigureAwait(false);
+
+            return (success, token);
+        }
+
+        /// <summary>
+        /// Initiate log-only checkpoint
+        /// </summary>
+        /// <param name="token">Checkpoint token</param>
+        /// <param name="checkpointType">Checkpoint type</param>
+        /// <param name="streamingSnapshotIteratorFunctions">Iterator functions</param>
+        /// <param name="cancellationToken">Caller's cancellation token</param>
+        /// <returns>Whether we could initiate the checkpoint. Use CompleteCheckpointAsync to wait completion.</returns>
+        public bool TryInitiateHybridLogCheckpoint(out Guid token, CheckpointType checkpointType,
+            IStreamingSnapshotIteratorFunctions streamingSnapshotIteratorFunctions = null, CancellationToken cancellationToken = default)
+        {
+            IStateMachine stateMachine;
+
+            if (checkpointType == CheckpointType.StreamingSnapshot)
+            {
+                if (streamingSnapshotIteratorFunctions is null)
+                    throw new TsavoriteException("StreamingSnapshot checkpoint requires a streaming snapshot iterator");
+                this.streamingSnapshotIteratorFunctions = streamingSnapshotIteratorFunctions;
+                stateMachine = Checkpoint.Streaming(this, out token);
+            }
+            else
+            {
+                stateMachine = Checkpoint.HybridLogOnly(this, checkpointType, out token);
+            }
+            return stateMachineDriver.Register(stateMachine, cancellationToken);
+        }
+
+        /// <summary>
+        /// Take log-only checkpoint
+        /// </summary>
+        /// <param name="checkpointType">Checkpoint type</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>
+        /// (bool success, Guid token)
+        /// success: Whether we successfully initiated the checkpoint (initiation may
+        /// fail if we are already taking a checkpoint or performing some other
+        /// operation such as growing the index).
+        /// token: Token for taken checkpoint
+        /// Await task to complete checkpoint, if initiated successfully
+        /// </returns>
+        public async ValueTask<(bool success, Guid token)> TakeHybridLogCheckpointAsync(CheckpointType checkpointType,
+            CancellationToken cancellationToken = default)
+        {
+            var success = TryInitiateHybridLogCheckpoint(out Guid token, checkpointType, cancellationToken: cancellationToken);
+
+            if (success)
+                await CompleteCheckpointAsync(cancellationToken).ConfigureAwait(false);
+
+            return (success, token);
+        }
+
+        /// <summary>
+        /// Get the version we would recover to if we were to request recovery the specified version
+        /// </summary>
+        /// <param name="recoverTo">Specified version</param>
+        /// <returns></returns>
+        public long GetRecoverVersion(long recoverTo = -1)
+        {
+            try
+            {
+                FindRecoveryInfo(recoverTo, out var recoveredHlcInfo, out var recoveredIcInfo);
+                return recoveredHlcInfo.info.version;
+            }
+            catch
+            {
+                // Do not recover
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously recover from the latest valid checkpoint (blocking operation)
+        /// </summary>
+        /// <param name="numPagesToPreload">Number of pages to preload into memory (beyond what needs to be read for recovery)</param>
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Version we actually recovered to</returns>
+        public ValueTask<long> RecoverAsync(int numPagesToPreload = -1, bool undoNextVersion = true,
+            CancellationToken cancellationToken = default)
+        {
+            FindRecoveryInfo(-1, out var recoveredHlcInfo, out var recoveredIcInfo);
+            return InternalRecoverAsync(recoveredIcInfo, recoveredHlcInfo, numPagesToPreload, undoNextVersion, cancellationToken);
+        }
+
+        /// <summary>
+        /// Asynchronously recover from specific token (blocking operation)
+        /// </summary>
+        /// <param name="fullCheckpointToken">Token</param>
+        /// <param name="numPagesToPreload">Number of pages to preload into memory after recovery</param>
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Version we actually recovered to</returns>
+        public ValueTask<long> RecoverAsync(Guid fullCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default)
+            => InternalRecoverAsync(fullCheckpointToken, fullCheckpointToken, numPagesToPreload, undoNextVersion, cancellationToken);
+
+        /// <summary>
+        /// Asynchronously recover from specific index and log token (blocking operation)
+        /// </summary>
+        /// <param name="indexCheckpointToken"></param>
+        /// <param name="hybridLogCheckpointToken"></param>
+        /// <param name="numPagesToPreload">Number of pages to preload into memory after recovery</param>
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Version we actually recovered to</returns>
+        public ValueTask<long> RecoverAsync(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default)
+            => InternalRecoverAsync(indexCheckpointToken, hybridLogCheckpointToken, numPagesToPreload, undoNextVersion, cancellationToken);
+
+        /// <summary>
+        /// Wait for ongoing checkpoint to complete
+        /// </summary>
+        /// <returns></returns>
+        public async ValueTask CompleteCheckpointAsync(CancellationToken token = default)
+        {
+            if (epoch.ThisInstanceProtected())
+                throw new TsavoriteException("Cannot use CompleteCheckpointAsync when using non-async sessions");
+
+            token.ThrowIfCancellationRequested();
+            try
+            {
+                await stateMachineDriver.CompleteAsync(token).ConfigureAwait(false);
+            }
+            catch
+            {
+                _indexCheckpoint.Reset();
+                _hybridLogCheckpoint.Dispose();
+                throw;
+            }
+            return;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextRead<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, ref TInput input, ref TOutput output, TContext context, TSessionFunctionsWrapper sessionFunctions)
+            where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            // Keep OperationState on the stack: the overwhelmingly common in-memory read never goes pending,
+            // so it must not pay any heap cost. Only when the read goes pending (RECORD_ON_DISK) does
+            // HandleOperationStatus copy this context onto the per-session pending op it rents (a holder /
+            // reference wrapper was measured net-slower, so the struct is carried directly on the op).
+            var operationState = new OperationState<TInput, TOutput, TContext>(sessionFunctions.Ctx.ReadCopyOptions);
+            OperationStatus internalStatus;
+            var keyHash = storeFunctions.GetKeyHashCode64(key);
+
+            do
+                internalStatus = InternalRead(key, keyHash, ref input, ref output, context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [SkipLocalsInit] // Span<long> in here can be sizeable, so 0-init'ing isn't free
+        internal unsafe void ContextReadWithPrefetch<TKey, TBatch, TInput, TOutput, TContext, TSessionFunctionsWrapper>(ref TBatch batch, TContext context, TSessionFunctionsWrapper sessionFunctions)
+            where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+            where TBatch : IReadArgBatch<TKey, TInput, TOutput>, allows ref struct
+        {
+            // Per-batch read-copy options, with each Inherit field resolved against the session/store default so a
+            // batch can override CopyFrom and/or CopyTo independently (e.g. copy small, frequently-read vector-index
+            // records to the main-log tail on disk read while leaving others on disk).
+            var batchReadCopyOptions = ReadCopyOptions.Merge(sessionFunctions.Ctx.ReadCopyOptions, batch.ReadCopyOptions);
+
+            if (batch.Count == 1)
+            {
+                // Not actually a batch, no point prefetching
+
+                batch.GetKey(0, out var key);
+                batch.GetInput(0, out var input);
+                batch.GetOutput(0, out var output);
+
+                var hash = storeFunctions.GetKeyHashCode64(key);
+
+                var operationState = new OperationState<TInput, TOutput, TContext>(batchReadCopyOptions);
+                operationState.initialIORecordSize = batch.InitialIORecordSize;
+                OperationStatus internalStatus;
+
+                do
+                    internalStatus = InternalRead(key, hash, ref input, ref output, context, ref operationState, sessionFunctions);
+                while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+                batch.SetStatus(0, HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus));
+                batch.SetOutput(0, output);
+            }
+            else
+            {
+                // Prefetch if we can
+
+                if (Sse.IsSupported)
+                {
+                    const int PrefetchSize = 12;
+
+                    var hashes = stackalloc long[PrefetchSize];
+
+                    // Prefetch the hash table entries for all keys
+                    var tableAligned = state[resizeInfo.version].tableAligned;
+                    var sizeMask = state[resizeInfo.version].size_mask;
+
+                    var batchCount = batch.Count;
+
+                    var nextBatchIx = 0;
+                    while (nextBatchIx < batchCount)
+                    {
+                        // First level prefetch
+                        var hashIx = 0;
+                        for (; hashIx < PrefetchSize && nextBatchIx < batchCount; hashIx++)
+                        {
+                            batch.GetKey(nextBatchIx, out var key);
+                            var hash = hashes[hashIx] = storeFunctions.GetKeyHashCode64(key);
+
+                            Sse.Prefetch0(tableAligned + (hash & sizeMask));
+
+                            nextBatchIx++;
+                        }
+
+                        // Second level prefetch
+                        for (var i = 0; i < hashIx; i++)
+                        {
+                            var keyHash = hashes[i];
+                            var hei = new HashEntryInfo(keyHash);
+
+                            // If the hash entry exists in the table, points to main memory in the main log (not read cache), also prefetch the record header address
+                            if (FindTag(ref hei) && !hei.IsReadCache && hei.Address >= hlogBase.HeadAddress)
+                            {
+                                Sse.Prefetch0((void*)hlogBase.GetPhysicalAddress(hei.Address));
+                            }
+                        }
+
+                        nextBatchIx -= hashIx;
+
+                        // Perform the reads
+                        for (var i = 0; i < hashIx; i++)
+                        {
+                            batch.GetKey(nextBatchIx, out var key);
+                            batch.GetInput(nextBatchIx, out var input);
+                            batch.GetOutput(nextBatchIx, out var output);
+
+                            var hash = hashes[i];
+
+                            var operationState = new OperationState<TInput, TOutput, TContext>(batchReadCopyOptions);
+                            operationState.initialIORecordSize = batch.InitialIORecordSize;
+                            OperationStatus internalStatus;
+
+                            do
+                                internalStatus = InternalRead(key, hash, ref input, ref output, context, ref operationState, sessionFunctions);
+                            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+                            batch.SetStatus(nextBatchIx, HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus));
+                            batch.SetOutput(nextBatchIx, output);
+
+                            nextBatchIx++;
+                        }
+                    }
+                }
+                else
+                {
+                    // Perform the reads
+                    for (var i = 0; i < batch.Count; i++)
+                    {
+                        batch.GetKey(i, out var key);
+                        batch.GetInput(i, out var input);
+                        batch.GetOutput(i, out var output);
+
+                        var hash = storeFunctions.GetKeyHashCode64(key);
+
+                        var operationState = new OperationState<TInput, TOutput, TContext>(batchReadCopyOptions);
+                        operationState.initialIORecordSize = batch.InitialIORecordSize;
+                        OperationStatus internalStatus;
+
+                        do
+                            internalStatus = InternalRead(key, hash, ref input, ref output, context, ref operationState, sessionFunctions);
+                        while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+                        batch.SetStatus(i, HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus));
+                        batch.SetOutput(i, output);
+                    }
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextRead<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata, TContext context,
+                TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = new OperationState<TInput, TOutput, TContext>(sessionFunctions.Ctx.ReadCopyOptions, ref readOptions);
+            OperationStatus internalStatus;
+            var keyHash = readOptions.KeyHash ?? storeFunctions.GetKeyHashCode64(key);
+
+            do
+                internalStatus = InternalRead(key, keyHash, ref input, ref output, context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextReadAtAddress<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(long address, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = new OperationState<TInput, TOutput, TContext>(sessionFunctions.Ctx.ReadCopyOptions, ref readOptions);
+            operationState.SetIsNoKey();
+            return ContextReadAtAddress(address, key: default(TKey), ref input, ref output, ref readOptions, out recordMetadata, context, ref operationState, sessionFunctions);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextReadAtAddress<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(long address, TKey key, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = new OperationState<TInput, TOutput, TContext>(sessionFunctions.Ctx.ReadCopyOptions, ref readOptions);
+            return ContextReadAtAddress(address, key, ref input, ref output, ref readOptions, out recordMetadata, context, ref operationState, sessionFunctions);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private Status ContextReadAtAddress<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(long address, TKey key, ref TInput input, ref TOutput output, ref ReadOptions readOptions, out RecordMetadata recordMetadata,
+                TContext context, ref OperationState<TInput, TOutput, TContext> operationState, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            OperationStatus internalStatus;
+            do
+                internalStatus = InternalReadAtAddress(address, key, ref input, ref output, ref readOptions, context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextUpsert<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, long keyHash, ref TInput input,
+                ReadOnlySpan<byte> srcStringValue, ref TOutput output, out RecordMetadata recordMetadata, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = default(OperationState<TInput, TOutput, TContext>);
+            OperationStatus internalStatus;
+            DiskLogRecord emptyLogRecord = default;
+
+            do
+                internalStatus = InternalUpsert<TKey, SpanUpsertValueSelector, TInput, TOutput, TContext, TSessionFunctionsWrapper, DiskLogRecord>(
+                        key, keyHash, ref input, srcStringValue, srcObjectValue: null, in emptyLogRecord, ref output, ref context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextUpsert<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, long keyHash, ref TInput input,
+                IHeapObject srcObjectValue, ref TOutput output, out RecordMetadata recordMetadata, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = default(OperationState<TInput, TOutput, TContext>);
+            OperationStatus internalStatus;
+            DiskLogRecord emptyLogRecord = default;
+
+            do
+                internalStatus = InternalUpsert<TKey, ObjectUpsertValueSelector, TInput, TOutput, TContext, TSessionFunctionsWrapper, DiskLogRecord>(
+                        key, keyHash, ref input, srcStringValue: default, srcObjectValue, in emptyLogRecord, ref output, ref context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextUpsert<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper, TSourceLogRecord>(TKey key, long keyHash, ref TInput input,
+                in TSourceLogRecord inputLogRecord, ref TOutput output, out RecordMetadata recordMetadata, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            var operationState = default(OperationState<TInput, TOutput, TContext>);
+            OperationStatus internalStatus;
+
+            do
+                internalStatus = InternalUpsert<TKey, LogRecordUpsertValueSelector, TInput, TOutput, TContext, TSessionFunctionsWrapper, TSourceLogRecord>(
+                        key, keyHash, ref input, srcStringValue: default, srcObjectValue: default, in inputLogRecord, ref output, ref context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextRMW<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, long keyHash, ref TInput input, ref TOutput output, out RecordMetadata recordMetadata,
+                                                                          TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = default(OperationState<TInput, TOutput, TContext>);
+            OperationStatus internalStatus;
+
+            do
+                internalStatus = InternalRMW(key, keyHash, ref input, ref output, ref context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        /// <summary>
+        /// RMW overload that carries a per-operation <paramref name="initialIORecordSize"/> override. Used by the
+        /// <see cref="RMWOptions"/>-taking client-context overloads; the no-options overloads call the other
+        /// <see cref="ContextRMW{TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper}(TKey, long, ref TInput, ref TOutput, out RecordMetadata, TContext, TSessionFunctionsWrapper)"/>
+        /// to keep the hot path free of any RMWOptions handling.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextRMW<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, long keyHash, ref TInput input, ref TOutput output, int initialIORecordSize,
+                                                                          out RecordMetadata recordMetadata, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = default(OperationState<TInput, TOutput, TContext>);
+            operationState.initialIORecordSize = initialIORecordSize;
+            OperationStatus internalStatus;
+
+            do
+                internalStatus = InternalRMW(key, keyHash, ref input, ref output, ref context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            recordMetadata = new(operationState.logicalAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status ContextDelete<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, long keyHash, TContext context, TSessionFunctionsWrapper sessionFunctions)
+             where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            var operationState = default(OperationState<TInput, TOutput, TContext>);
+            OperationStatus internalStatus;
+
+            do
+                internalStatus = InternalDelete(key, keyHash, ref context, ref operationState, sessionFunctions);
+            while (HandleImmediateRetryStatus(internalStatus, sessionFunctions, ref operationState));
+
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, internalStatus);
+        }
+
+        /// <summary>
+        /// Grow the hash index by a factor of two. Caller should take a full checkpoint after growth, for persistence.
+        /// </summary>
+        /// <returns>Whether the grow completed successfully</returns>
+        public async Task<bool> GrowIndexAsync()
+        {
+            if (epoch.ThisInstanceProtected())
+                throw new TsavoriteException("Cannot use GrowIndex when using non-async sessions");
+
+            var indexResizeTask = new IndexResizeSMTask<TStoreFunctions, TAllocator>(this);
+            var indexResizeSM = new IndexResizeSM(indexResizeTask);
+            return await stateMachineDriver.RunAsync(indexResizeSM).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Dispose Tsavorite instance
+        /// </summary>
+        public void Dispose()
+        {
+            hlogBase.Dispose();
+            readcacheBase?.Dispose();
+            LockTable.Dispose();
+            if (disposeCheckpointManager)
+                checkpointManager?.Dispose();
+            RevivificationManager.Dispose();
+            pauseRevivEvent?.Dispose();
+
+            // Currently this doesn't do much, but for future safety make sure it's called after its contained objects are disposed.
+            Free();
+        }
+
+        /// <summary>
+        /// Total number of valid entries in hash table
+        /// </summary>
+        /// <returns></returns>
+        private unsafe long GetEntryCount()
+        {
+            var version = resizeInfo.version;
+            var table_size_ = state[version].size;
+            var ptable_ = state[version].tableAligned;
+            long total_entry_count = 0;
+            long beginAddress = hlogBase.BeginAddress;
+
+            for (long bucket = 0; bucket < table_size_; bucket++)
+            {
+                HashBucket b = *(ptable_ + bucket);
+                while (true)
+                {
+                    for (int bucket_entry = 0; bucket_entry < Constants.kOverflowBucketIndex; bucket_entry++)
+                        if (b.bucket_entries[bucket_entry] >= beginAddress)
+                            ++total_entry_count;
+                    if ((b.bucket_entries[Constants.kOverflowBucketIndex] & kAddressBitMask) == 0) break;
+                    b = *(HashBucket*)overflowBucketsAllocator.GetPhysicalAddress(b.bucket_entries[Constants.kOverflowBucketIndex] & kAddressBitMask);
+                }
+            }
+            return total_entry_count;
+        }
+
+        private unsafe string DumpDistributionInternal(int version)
+        {
+            var table_size_ = state[version].size;
+            var ptable_ = state[version].tableAligned;
+            long total_record_count = 0;
+            long beginAddress = hlogBase.BeginAddress;
+            Dictionary<int, long> histogram = new();
+
+            Dictionary<int, long> ofb_chaining_histogram = new();
+            long total_entries_in_ofb = 0;
+            long total_zeroed_out_slots = 0;
+            long total_entries_below_begin_address = 0;
+            long total_entries_in_ofb_below_begin_address = 0;
+            long total_entries_with_tentative_bit_set = 0;
+            Dictionary<int, long> slots_unused_by_nonofb_buckets_histogram = new();
+            Dictionary<int, long> slots_unused_by_ofb_buckets_histogram = new();
+
+            for (long bucket = 0; bucket < table_size_; bucket++)
+            {
+                bool is_bucket_in_ofb_table = false;
+                List<int> tags = new();
+                int total_valid_records_in_this_bucket_cnt = 0;
+                int total_valid_entries_in_ofb_in_this_bucket_cnt = 0;
+                HashBucket b = *(ptable_ + bucket);
+                while (true)
+                {
+                    // per bucket calculate the number of zero'd out slots
+                    int zeroed_out_slots = 0;
+                    for (int bucket_entry = 0; bucket_entry < Constants.kOverflowBucketIndex; bucket_entry++)
+                    {
+                        var x = default(HashBucketEntry);
+                        x.word = b.bucket_entries[bucket_entry];
+
+                        if (x.Tentative)
+                            ++total_entries_with_tentative_bit_set;
+
+                        if (((!x.IsReadCache) && (x.Address >= beginAddress)) || (x.IsReadCache && (x.Address >= readcacheBase.HeadAddress)))
+                        {
+                            if (tags.Contains(x.Tag) && !x.Tentative)
+                                throw new TsavoriteException("Duplicate tag found in index");
+                            tags.Add(x.Tag);
+                            ++total_valid_records_in_this_bucket_cnt;
+                            ++total_record_count;
+                        }
+                        else if (x.word != default)
+                        {
+                            if (is_bucket_in_ofb_table)
+                                ++total_entries_in_ofb_below_begin_address;
+
+                            ++total_entries_below_begin_address;
+                        }
+                        else
+                        {
+                            ++zeroed_out_slots;
+                        }
+
+                        if (is_bucket_in_ofb_table)
+                            total_valid_entries_in_ofb_in_this_bucket_cnt++;
+                    }
+
+                    total_zeroed_out_slots += zeroed_out_slots;
+
+                    if (is_bucket_in_ofb_table)
+                    {
+                        if (!slots_unused_by_ofb_buckets_histogram.ContainsKey(zeroed_out_slots))
+                            slots_unused_by_ofb_buckets_histogram[zeroed_out_slots] = 0;
+                        slots_unused_by_ofb_buckets_histogram[zeroed_out_slots]++;
+                    }
+                    else
+                    {
+                        if (!slots_unused_by_nonofb_buckets_histogram.ContainsKey(zeroed_out_slots))
+                            slots_unused_by_nonofb_buckets_histogram[zeroed_out_slots] = 0;
+                        slots_unused_by_nonofb_buckets_histogram[zeroed_out_slots]++;
+                    }
+
+                    if ((b.bucket_entries[Constants.kOverflowBucketIndex] & kAddressBitMask) == 0)
+                        break;
+
+                    b = *(HashBucket*)overflowBucketsAllocator.GetPhysicalAddress(b.bucket_entries[Constants.kOverflowBucketIndex] & kAddressBitMask);
+                    is_bucket_in_ofb_table = true;
+                }
+
+                if (!histogram.ContainsKey(total_valid_records_in_this_bucket_cnt))
+                    histogram[total_valid_records_in_this_bucket_cnt] = 1;
+                else
+                    histogram[total_valid_records_in_this_bucket_cnt]++;
+
+                total_valid_entries_in_ofb_in_this_bucket_cnt /= (int)Constants.kOverflowBucketIndex;
+                if (!ofb_chaining_histogram.ContainsKey(total_valid_entries_in_ofb_in_this_bucket_cnt)) ofb_chaining_histogram[total_valid_entries_in_ofb_in_this_bucket_cnt] = 0;
+                ofb_chaining_histogram[total_valid_entries_in_ofb_in_this_bucket_cnt]++;
+
+                total_entries_in_ofb += total_valid_entries_in_ofb_in_this_bucket_cnt;
+            }
+
+            var distribution =
+                $"Number of hash buckets: {table_size_}\r\n" +
+                $"Number of overflow buckets: {OverflowBucketCount}\r\n" +
+                $"Size of each bucket: {Constants.kEntriesPerBucket * sizeof(HashBucketEntry)} bytes\r\n" +
+                $"Hash-table size: {Constants.kEntriesPerBucket * sizeof(HashBucketEntry) * table_size_} bytes\r\n" +
+                $"Total distinct hash-table entry count: {{{total_record_count}}}\r\n" +
+                $"Average #entries per hash bucket: {{{total_record_count / (double)table_size_:0.00}}}\r\n" +
+                $"Total zeroed out slots: {total_zeroed_out_slots} \r\n" +
+                $"Total entries below begin addr: {total_entries_below_begin_address} \r\n" +
+                $"Total entries in overflow buckets: {total_entries_in_ofb} \r\n" +
+                $"Total entries in overflow buckets below begin addr: {total_entries_in_ofb_below_begin_address} \r\n" +
+                $"Total entries with tentative bit set: {total_entries_with_tentative_bit_set} \r\n" +
+                $"Histogram of #entries per bucket:\r\n";
+
+            foreach (var kvp in histogram.OrderBy(e => e.Key))
+            {
+                distribution += $"  {kvp.Key} : {kvp.Value}\r\n";
+            }
+
+            distribution += $"Histogram of #buckets per OFB chain and their frequencies: \r\n";
+            foreach (var kvp in ofb_chaining_histogram.OrderBy(e => e.Key))
+            {
+                distribution += $"  {kvp.Key} : {kvp.Value}\r\n";
+            }
+
+            // Histogram of slots unused per bucket in OFB and non-OFB
+            distribution += $"Histogram of #unused slots per bucket in main hash index:\r\n";
+            foreach (var kvp in slots_unused_by_nonofb_buckets_histogram.OrderBy(e => e.Key))
+            {
+                distribution += $"  {kvp.Key} : {kvp.Value}\r\n";
+            }
+
+            distribution += $"Histogram of #unused slots per bucket in overflow buckets:\r\n";
+            foreach (var kvp in slots_unused_by_ofb_buckets_histogram.OrderBy(e => e.Key))
+            {
+                distribution += $"  {kvp.Key} : {kvp.Value}\r\n";
+            }
+
+            return distribution;
+        }
+
+        /// <summary>
+        /// Dumps the distribution of each non-empty bucket in the hash table.
+        /// </summary>
+        public string DumpDistribution()
+        {
+            return DumpDistributionInternal(resizeInfo.version);
+        }
+    }
+}

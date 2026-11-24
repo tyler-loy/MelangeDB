@@ -1,0 +1,3136 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using static Tsavorite.core.Utility;
+
+namespace Tsavorite.core
+{
+#pragma warning disable IDE0065 // Misplaced using directive
+    using static LogAddress;
+
+    /// <summary>
+    /// Type-free base class for hybrid log memory allocator. Contains utility methods that do not need type args and are not performance-critical
+    /// so can be virtual.
+    /// </summary>
+    public abstract class AllocatorBase
+    {
+        /// <summary>Create the circular buffers for <see cref="LogRecord"/> flushing to device. Only implemented by ObjectAllocator.</summary>
+        internal virtual CircularDiskWriteBuffer CreateCircularFlushBuffers(IDevice objectLogDevice, ILogger logger) => default;
+        /// <summary>Create the circular flush buffers for object deserialization from device. Only implemented by ObjectAllocator.</summary>
+        internal virtual CircularDiskReadBuffer CreateCircularReadBuffers(IDevice objectLogDevice, ILogger logger) => default;
+        /// <summary>Create the circular flush buffers for object deserialization from device. Only implemented by ObjectAllocator.</summary>
+        internal virtual CircularDiskReadBuffer CreateCircularReadBuffers() => default;
+
+        /// <summary>Returns the lowest segment in use in the object log; will be zero unless the database has been truncated.</summary>
+        internal virtual int LowestObjectLogSegmentInUse => 0;
+        /// <summary>Get the ObjectLog tail position, if this is ObjectAllocator.</summary>
+        internal virtual ObjectLogFilePositionInfo GetObjectLogTail() => new();  // This marks it as "unset"
+        /// <summary>Set the ObjectLog tail position, if this is ObjectAllocator.</summary>
+        internal virtual void SetObjectLogTail(ObjectLogFilePositionInfo tail) { }
+        /// <summary>For recovery: where the objects of the valid records below <paramref name="untilAddress"/> on its page end in the object log, aligned up to
+        ///     the object log's sector size; not set if none of them has objects, or there is no object log. Call only while that page is resident and its
+        ///     objects are not loaded, so its records still hold their object-log positions. Only implemented by ObjectAllocator.</summary>
+        /// <param name="untilAddress">The end of the records to consider; the page holding it is the one examined</param>
+        internal virtual ObjectLogFilePositionInfo GetObjectLogEndOfKeptRecordsOnPage(long untilAddress) => new();
+        /// <summary>Calculate the total serialized object size on a loaded page. Only implemented by ObjectAllocator.</summary>
+        internal virtual long CalculatePageObjectSizes(long page, long startAddress, long untilAddress) => 0;
+        /// <summary>Load objects for records on an already-loaded page for recovery pass 2; records at or above <paramref name="snapshotFromAddress"/> read theirs
+        ///     from <paramref name="snapshotObjectLogDevice"/>, and records below it from the main object log.</summary>
+        /// <param name="page">The page whose records' objects are loaded</param>
+        /// <param name="fromAddress">The lowest address whose record's objects are needed</param>
+        /// <param name="untilAddress">The end of the records whose objects are loaded</param>
+        /// <param name="snapshotObjectLogDevice">The object-log device for records at or above <paramref name="snapshotFromAddress"/></param>
+        /// <param name="snapshotFromAddress">The lowest address whose record is the snapshot file's copy; long.MaxValue when no record is</param>
+        internal virtual void LoadObjectsForRecoveryPass2(long page, long fromAddress, long untilAddress, IDevice snapshotObjectLogDevice, long snapshotFromAddress) { }
+    }
+
+    /// <summary>
+    /// Base class for hybrid log memory allocator. Contains utility methods, some of which are not performance-critical so can be virtual.
+    /// </summary>
+    public abstract unsafe partial class AllocatorBase<TStoreFunctions, TAllocator> : AllocatorBase, IDisposable
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        /// <summary>The epoch we are operating with</summary>
+        internal readonly LightEpoch epoch;
+        /// <summary>Whether we own (and thus must dispose) <see cref="epoch"/></summary>
+        private readonly bool isEpochOwned;
+
+        /// <summary>The store functions for this instance of TsavoriteKV</summary>
+        internal readonly TStoreFunctions storeFunctions;
+
+        /// <summary>The fully-derived allocator struct wrapper (so calls on it are inlined rather than virtual) for this log.</summary>
+        internal readonly TAllocator _wrapper;
+
+        /// <summary>The <see cref="ObjectIdMap"/> to hold the objects for transient <see cref="LogRecord"/> instances.</summary>
+        internal ObjectIdMap transientObjectIdMap;
+
+        /// <summary>Sometimes it's useful to know this explicitly rather than rely on method overrides etc.</summary>
+        internal bool IsObjectAllocator => transientObjectIdMap is not null;
+
+        /// <summary>If true, then this allocator has <see cref="PageHeader"/> as the first bytes on a page, so allocating a logical address
+        ///     in <see cref="HandlePageOverflow"/> must skip these bytes.</summary>
+        internal int pageHeaderSize;
+
+        #region Protected size definitions
+        /// <summary>Buffer size</summary>
+        internal readonly int BufferSize;
+
+        /// <summary>Log page size</summary>
+        internal readonly int LogPageSizeBits;
+
+        /// <summary>Page size</summary>
+        internal readonly int PageSize;
+
+        /// <summary>Page size mask</summary>
+        internal readonly int PageSizeMask;
+
+        /// <summary>Buffer size mask</summary>
+        protected readonly int BufferSizeMask;
+
+        /// <summary>Aligned (to sector size) page size in bytes</summary>
+        protected readonly int AlignedPageSizeBytes;
+
+        /// <summary>Segment size in bits</summary>
+        protected readonly int LogSegmentSizeBits;
+
+        /// <summary>Segment size</summary>
+        protected readonly long SegmentSize;
+
+        /// <summary>Log mutable fraction</summary>
+        internal readonly double logMutableFraction;
+
+        /// <summary>Circular buffer definition</summary>
+        /// <remarks>The long is actually a byte*, but storing as 'long' makes going through logicalAddress/physicalAddress translation more easily</remarks>
+        protected long* pagePointers;
+
+        /// <summary>Array of longs which are actually the byte* of the parallel index in <see cref="pageArrays"/></summary>
+        private long[] pagePointersArray;
+
+        /// <summary>Array of pages kept to ensure the pinned pages are not garbage collected.</summary>
+        protected readonly byte[][] pageArrays;
+
+        /// <summary>Direct-VM ownership of this allocator's circular-buffer pages, indexed by page index, when
+        /// direct-VM log pages are in use; null for the managed backend, which is therefore what
+        /// <see cref="useNativeLogPages"/> tests. A page's block is freed deterministically in <c>ReturnPage</c> when
+        /// the page is evicted (post-flush, epoch-drained via OnPagesClosed — no MAIN-log IO), which bounds the
+        /// footprint; the parallel <see cref="pageArrays"/> entry is null. The outstanding-IO the owner tracks is
+        /// snapshot-checkpoint flush, which reads page pointers directly and is NOT gated by
+        /// <see cref="FlushedUntilAddress"/>, so a page evicted mid-snapshot is parked rather than unmapped. See
+        /// <see cref="DirectVmBlockOwner"/> for the protocol; <see cref="FreeNativeLogPage"/> and
+        /// <see cref="BeginNativeSnapshotFlush"/>/<see cref="EndNativeSnapshotFlush"/> are this allocator's uses of
+        /// it, and <see cref="RecycleOrFreeNativeBlock"/> is its allocator-specific terminal disposition.</summary>
+        readonly DirectVmBlockOwner nativeLog;
+
+        /// <summary>Whether this allocator's circular-buffer pages use the direct-VM backend, captured once at
+        /// construction by whether <see cref="nativeLog"/> was created. Read on the (possibly concurrent)
+        /// page-alloc/return hot paths instead of the process-global
+        /// <see cref="NativeAllocatorInitializer.Enabled"/>. Production sets that global once at startup
+        /// (GarnetServer.Initialize) and never changes it, but test fixtures do flip it between runs in a single
+        /// process, so capturing keeps this allocator on the backend that was in effect when it was built (and
+        /// never dereferences a null owner if the global is flipped afterwards).</summary>
+        protected bool useNativeLogPages => nativeLog is not null;
+
+        /// <summary>Bounded pool of evicted direct-VM page blocks kept for reuse by <see cref="AllocatePinnedPageArray"/>,
+        /// so the common free-head/alloc-tail churn reuses a still-mapped (THP-backed) block instead of
+        /// munmap+mmap+re-fault. A block enters the pool only when no snapshot IO references it (the fast path in
+        /// <see cref="FreeNativeLogPage"/>, or on snapshot completion in <see cref="EndNativeSnapshotFlush"/>), so a
+        /// reused block is never one a snapshot write is still reading; it was zeroed by ClearPage before being
+        /// freed, so no re-zero is needed on reuse. Overflow beyond the cap is munmap'd by the disposer. Null for the
+        /// managed backend. This recycling is what distinguishes the log's terminal disposition from the hash
+        /// index's, which unmaps a superseded table outright.</summary>
+        OverflowPool<DirectVmBlock> nativeFreePagePool;
+
+        /// <summary>Capacity of <see cref="nativeFreePagePool"/>.</summary>
+        const int NativeFreePagePoolSize = 4;
+
+        /// <summary>Set (under the owner's gate) when <see cref="Dispose"/> has disposed
+        /// <see cref="nativeFreePagePool"/>. A block offered for recycling after this must be munmap'd directly
+        /// rather than enqueued into the drained pool, which would silently leak it. See
+        /// <see cref="RecycleOrFreeNativeBlock"/>.</summary>
+        bool nativeFreePoolDisposed;
+
+        #endregion
+
+        #region Public addresses
+        /// <summary>The maximum address of the immutable in-memory log region</summary>
+        public long ReadOnlyAddress;
+
+        /// <summary>The lowest fuzzy mutable address. This is set by OnPagesMarkedReadOnly as the address to which we are setting the
+        /// <see cref="ReadOnlyAddress"/> prior to actually doing the flushes. If it is less than <see cref="ReadOnlyAddress"/> then it
+        /// is the low address of the "fuzzy region" (<see cref="ReadOnlyAddress"/> is the high address of the "fuzzy region").</summary>
+        public long SafeReadOnlyAddress;
+
+        /// <summary>
+        /// The lowest in-memory address in the log. While we hold the epoch this may be changed by other threads as part of ShiftHeadAddress,
+        /// but as long as an address was >= HeadAddress while we held the epoch, it cannot be actually evicted until we release the epoch.
+        /// </summary>
+        public long HeadAddress;
+
+        /// <summary>
+        /// The lowest reliable in-memory address. This is set by OnPagesClosed as the highest address of the range it is starting to close;
+        /// thus it leads <see cref="ClosedUntilAddress"/>. As long as we hold the epoch, records above this address will not be evicted.
+        /// </summary>
+        public long SafeHeadAddress;
+
+        /// <summary>Flushed until address</summary>
+        public long FlushedUntilAddress;
+
+        /// <summary>
+        /// The highest address that has been closed by <see cref="OnPagesClosed"/>. It will catch up to <see cref="SafeHeadAddress"/>
+        /// when a region is closed.
+        /// </summary>
+        public long ClosedUntilAddress;
+
+        /// <summary>The lowest valid address in the log</summary>
+        public long BeginAddress;
+
+        /// <summary>
+        /// Address until which we are currently closing. Used to coordinate linear closing of pages.
+        /// Only one thread will be closing pages at a time.
+        /// </summary>
+        long OngoingCloseUntilAddress;
+
+        /// <summary>
+        /// True while <see cref="Reset"/> is rebuilding allocator state (page free + per-allocator
+        /// <see cref="Initialize"/>). Operations that want to be resilient to a concurrent Reset
+        /// can observe this flag (after acquiring epoch protection) and bail out — Reset is a
+        /// wholesale wipe, so any pre-Reset work or cached state is no longer meaningful. Scan
+        /// iterators do exactly this: they terminate the iteration (return false from
+        /// <c>GetNext</c>) when this flag is set.
+        ///
+        /// IMPORTANT: this flag is opt-in defense. Tsavorite's hot-path RMW / Read / Upsert /
+        /// Delete do NOT consult it (cost on the hot path), so they remain unsafe to call
+        /// concurrently with Reset and can dereference freed pages mid-Initialize. Callers of
+        /// Reset must still quiesce all non-iterator operations on the store (per Reset's
+        /// docstring contract). For Garnet, <c>VectorManager.PauseCleanupAsync</c> serializes
+        /// the cleanup task — including its post-iterate RMWs — with Reset.
+        /// </summary>
+        internal volatile bool Initializing;
+
+        /// <inheritdoc/>
+        public override string ToString() => BaseToString();
+
+        protected string BaseToString(string fuaDetails = "")
+        {
+            var tailAddress = UnstableGetTailAddress(out var isUnstable);
+            var unstableTailStr = isUnstable ? "(u)" : "";
+            return $"TA {AddressString(tailAddress)}{unstableTailStr}, ROA {AddressString(ReadOnlyAddress)}, SafeROA {AddressString(SafeReadOnlyAddress)}, HA {AddressString(HeadAddress)},"
+                     + $" SafeHA {AddressString(SafeHeadAddress)}, CUA {AddressString(ClosedUntilAddress)},"
+                     + $" FUA {AddressString(FlushedUntilAddress)}{fuaDetails},"
+                     + $" BA {AddressString(BeginAddress)}, PgSz {PageSize}, BufSz {BufferSize}, APC {AllocatedPageCount}, MAPC {MaxAllocatedPageCount}";
+        }
+        #endregion
+
+        #region Protected device info
+        /// <summary>Log Device</summary>
+        protected readonly IDevice device;
+
+        /// <summary>Sector size</summary>
+        protected readonly int sectorSize;
+
+        /// <summary>
+        /// The number of times <see cref="Reset"/> has reset the device. A truncation records it when requested, and is skipped if
+        /// it has changed by the time the truncation runs: the reset device truncates from segment 0, so the truncation would remove
+        /// the new log's segments.
+        /// </summary>
+        long resetCount;
+
+        /// <summary>Held by a truncation from its check of <see cref="resetCount"/> through the device truncation, and by
+        /// <see cref="ResetCore"/> while it resets the device, so the device cannot be reset between the check and the truncation</summary>
+        readonly object truncationLock = new();
+        #endregion
+
+        #region Private page metadata
+
+        // Array that indicates the status of each buffer page
+        internal readonly FullPageStatus[] PageStatusIndicator;
+        internal readonly PendingFlushList[] PendingFlush;
+
+        /// <summary>Global address of the current tail (next element to be allocated from the circular buffer) </summary>
+        internal PageOffset TailPageOffset;
+
+        /// <summary>Whether log is disposed</summary>
+        private volatile bool disposed = false;
+
+        /// <summary>
+        /// Whether the allocator has begun disposal. Allocation retry loops test this because disposing
+        /// <see cref="flushEvent"/> leaves it permanently signaled, so their waits stop blocking and they would
+        /// otherwise spin on a flush or page close that can no longer happen.
+        /// </summary>
+        internal bool IsDisposed => disposed;
+
+        /// <summary>
+        /// Terminate an allocation retry loop waiting on a flush or page close that disposal has made
+        /// unreachable. By the time this throws, the buffer pool the allocation would have used is being freed,
+        /// so there is no outcome left to wait for.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void ThrowIfDisposed()
+        {
+            if (disposed)
+                ThrowDisposed();
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ThrowDisposed()
+            => throw new ObjectDisposedException(GetType().Name,
+                "The allocator was disposed while an allocation was waiting for a flush or page close to complete");
+
+        /// <summary>Whether device is a null device</summary>
+        internal readonly bool IsNullDevice;
+
+        #endregion
+
+        #region Contained classes and related
+        /// <summary>Buffer pool</summary>
+        internal SectorAlignedBufferPool bufferPool;
+
+        /// <summary>
+        /// Cached delegate for <see cref="AsyncGetFromDiskCallback"/>. The C# compiler does
+        /// not cache method-group conversions to delegates for <em>instance</em> methods
+        /// (only for static), so without this field every <see cref="AsyncGetFromDisk"/>
+        /// call would allocate a fresh ~48 B <see cref="DeviceIOCompletionCallback"/>
+        /// delegate. Pre-binding it once in the ctor removes that per-pending-op
+        /// allocation from the disk-read hot path.
+        /// </summary>
+        readonly DeviceIOCompletionCallback asyncGetFromDiskCallbackDelegate;
+
+        /// <summary>Address type for this hlog's records'</summary>
+        /// <summary>Read cache eviction callback</summary>
+        protected readonly Action<long, long> EvictCallback = null;
+
+        /// <summary>Flush callback</summary>
+        protected readonly Action<CommitInfo> FlushCallback = null;
+
+        /// <summary>Whether to preallocate log on initialization</summary>
+        private readonly bool PreallocateLog = false;
+
+        /// <summary>Error handling</summary>
+        private readonly ErrorList errorList = new();
+
+        /// <summary>Observer for records entering read-only region</summary>
+        internal IObserver<ITsavoriteScanIterator> onReadOnlyObserver;
+
+        /// <summary>Observer for records getting evicted from memory (page closed). May be the same object as <see cref="logSizeTracker"/>.</summary>
+        internal IObserver<ITsavoriteScanIterator> onEvictionObserver;
+
+        /// <summary>
+        /// Whether this allocator is the read cache (as opposed to the main hybrid log).
+        /// Set once at construction from <see cref="AllocatorSettings.IsReadCache"/>.
+        /// </summary>
+        internal readonly bool IsReadCache;
+
+        /// <summary>Log size tracker; called when an operation at the Tsavorite-internal level adds or removes heap memory size 
+        /// (e.g. copying to log tail or read cache, which do not call <see cref="ISessionFunctions{TInputOutput, TContext}"/>).
+        /// May be the same object as <see cref="onEvictionObserver"/>.</summary>
+        internal LogSizeTracker<TStoreFunctions, TAllocator> logSizeTracker;
+
+        /// <summary>The "event" to be waited on for flush completion by the initiator of an operation</summary>
+        internal CompletionEvent flushEvent;
+
+        /// <summary>If set, this is a function to call to determine whether the object size tracker reports maximum memory size has been exceeded.</summary>
+        public Func<bool> IsSizeBeyondLimit;
+        #endregion
+
+        #region Abstract and virtual methods
+        /// <summary>Write async to device for snapshot checkpoint</summary>
+        /// <typeparam name="TContext"></typeparam>
+        /// <param name="startPage"></param>
+        /// <param name="flushPage"></param>
+        /// <param name="pageSize"></param>
+        /// <param name="callback"></param>
+        /// <param name="result"></param>
+        /// <param name="device"></param>
+        /// <param name="objectLogDevice"></param>
+        /// <param name="fuzzyStartLogicalAddress">Start address of fuzzy region, which contains old and new version records (we use this to selectively flush only old-version records during snapshot checkpoint)</param>
+        protected abstract void WriteAsyncToDeviceForSnapshot<TContext>(long startPage, long flushPage, int pageSize, DeviceIOCompletionCallback callback,
+            PageAsyncFlushResult<TContext> result, IDevice device, IDevice objectLogDevice, long fuzzyStartLogicalAddress);
+
+        /// <summary>Read page from device (async)</summary>
+        protected abstract void ReadAsync<TContext>(ulong alignedSourceAddress, IntPtr destinationPtr, uint aligned_read_length,
+            DeviceIOCompletionCallback callback, PageAsyncReadResult<TContext> asyncResult, IDevice device);
+
+        /// <summary>Write page to device (async)</summary>
+        protected abstract void WriteAsync<TContext>(long flushPage, DeviceIOCompletionCallback callback, PageAsyncFlushResult<TContext> asyncResult);
+
+        /// <summary>
+        /// Reset the hybrid log to empty.
+        ///
+        /// Concurrent-safety contract:
+        ///   * SCAN ITERATORS are safe end-to-end. The two-phase epoch cascade below
+        ///     (PR #1765) protects the page-free section, and the <see cref="Initializing"/>
+        ///     flag (set across this whole method including the per-allocator
+        ///     <see cref="Initialize"/> rewind) lets iterators terminate cleanly during the
+        ///     post-Phase-2 non-monotonic Initialize that would otherwise expose freed
+        ///     pagePointers.
+        ///   * RMW / Read / Upsert / Delete are NOT safe — Tsavorite's hot paths do not
+        ///     consult <see cref="Initializing"/>. They can race with Initialize and
+        ///     dereference freed pages. Callers MUST quiesce all non-iterator operations
+        ///     on the store before invoking Reset (per the original docstring contract).
+        ///     For Garnet, <c>VectorManager.PauseCleanupAsync</c> serializes the cleanup
+        ///     task — including its post-iterate RMWs — with Reset.
+        ///
+        /// Phase breakdown (executed by <see cref="ResetCore"/>):
+        ///
+        ///   Phase 1: publish new ReadOnlyAddress synchronously, then under
+        ///            BumpCurrentEpoch — i.e. after writers caching the OLD ReadOnlyAddress
+        ///            have drained — publish SafeReadOnlyAddress and FlushedUntilAddress.
+        ///            Mirrors OnPagesMarkedReadOnly's invariant that "by the time
+        ///            SafeReadOnlyAddress advances, no thread is mutating below it".
+        ///
+        ///   Phase 2: publish new HeadAddress synchronously (now safe — writers have observed
+        ///            the new ReadOnlyAddress, so no writer holds a cached old ReadOnlyAddress
+        ///            that would leave HeadAddress > cached ReadOnlyAddress). Then under
+        ///            BumpCurrentEpoch — i.e. after readers caching the OLD HeadAddress have
+        ///            drained — close pages (advancing SafeHeadAddress and ClosedUntilAddress)
+        ///            and free pages. Mirrors OnPagesClosed's invariant.
+        ///
+        ///   Device:  reset the device, which forgets its open handles and truncated range,
+        ///            and skip any truncation requested before this (see <see cref="resetCount"/>).
+        ///
+        ///   Final:   publish new BeginAddress synchronously. Publishing it last (rather than
+        ///            up front) means an iterator with a stale nextAddress sees
+        ///            currentAddress &gt; OLD BeginAddress and does not snap forward into the
+        ///            just-freed in-memory range — instead the currentAddress &lt; NEW HeadAddress
+        ///            check routes it through LoadPageIfNeeded's disk-frame branch (frame is
+        ///            iterator-owned, disk segment is intact). The invariant
+        ///            BeginAddress &lt;= HeadAddress holds throughout.
+        ///
+        /// Then per-allocator <see cref="Initialize"/> runs (re-allocates pages 0/1, rewinds
+        /// addresses to FirstValidAddress). The whole sequence is wrapped in
+        /// <c>Initializing = true / false</c> so iterators that opt in to checking the flag
+        /// terminate during the rewind window.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public void Reset()
+        {
+            // Gate Initializing-aware operations (e.g., scan iterators) for the entire
+            // reset+initialize sequence. Cleared in finally so a throw cannot leave them
+            // permanently terminating their next call.
+            Initializing = true;
+            try
+            {
+                ResetCore();
+
+                // Per-allocator Initialize re-allocates pages 0/1, resets all addresses to
+                // FirstValidAddress, and resets TailPageOffset. This non-monotonically rewinds
+                // multiple fields and is unsafe for concurrent operations — that's exactly
+                // what the Initializing flag guards iterator-aware callers against.
+                Initialize();
+            }
+            finally
+            {
+                // Volatile.Write semantics (the field is volatile) ensure all our state
+                // mutations are visible BEFORE callers observe Initializing == false.
+                Initializing = false;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ResetCore()
+        {
+            var newBeginAddress = GetTailAddress();
+
+            // To use BumpCurrentEpoch we must be epoch-protected; conversely to wait for the
+            // queued action to drain we must NOT be holding the prior epoch. We toggle the
+            // protection per phase. If the caller arrived already protected, restore at the end.
+            var wasProtected = epoch.ThisInstanceProtected();
+            if (wasProtected)
+                epoch.Suspend();
+
+            // -------- Phase 1: ReadOnly -> wait for writer drain -> SafeReadOnly + FlushedUntil --------
+            _ = MonotonicUpdate(ref ReadOnlyAddress, newBeginAddress, out _);
+
+            using (var phase1Done = new ManualResetEventSlim(initialState: false))
+            {
+                epoch.Resume();
+                try
+                {
+                    epoch.BumpCurrentEpoch(() =>
+                    {
+                        try
+                        {
+                            _ = MonotonicUpdate(ref SafeReadOnlyAddress, newBeginAddress, out _);
+                            _ = MonotonicUpdate(ref FlushedUntilAddress, newBeginAddress, out _);
+                        }
+                        finally { phase1Done.Set(); }
+                    });
+                }
+                finally { epoch.Suspend(); }
+                phase1Done.Wait();
+            }
+
+            // -------- Phase 2: HeadAddress -> wait for reader drain -> OnPagesClosed + FreeAllPages --------
+            var headShifted = MonotonicUpdate(ref HeadAddress, newBeginAddress, out _);
+
+            using (var phase2Done = new ManualResetEventSlim(initialState: false))
+            {
+                epoch.Resume();
+                try
+                {
+                    epoch.BumpCurrentEpoch(() =>
+                    {
+                        try
+                        {
+                            if (headShifted)
+                                OnPagesClosed(newBeginAddress);
+
+                            // Wait for ClosedUntilAddress to catch up to newBeginAddress before
+                            // freeing remaining pages. Two scenarios make this necessary:
+                            //   (a) headShifted==true: OnPagesClosed may have returned immediately
+                            //       because another thread already owned OnPagesClosedWorker for our
+                            //       range — that worker is still freeing pages on the other thread.
+                            //   (b) headShifted==false: a concurrent Reset (or other ShiftHeadAddress
+                            //       caller) already advanced HeadAddress past newBeginAddress and its
+                            //       OnPagesClosedWorker may still be running.
+                            // In both cases, calling FreeAllAllocatedPages while the worker is mid-flight
+                            // would race with its FreePage calls and corrupt page state.
+                            while (ClosedUntilAddress < newBeginAddress)
+                                _ = Thread.Yield();
+
+                            FreeAllAllocatedPages();
+                        }
+                        finally { phase2Done.Set(); }
+                    });
+                }
+                finally { epoch.Suspend(); }
+                phase2Done.Wait();
+            }
+
+            // -------- Device: forget open handles and the truncated range --------
+            // The device then truncates from segment 0, so a truncation requested before this would remove the new log's segments.
+            // Advancing resetCount makes such a truncation skip, and taking the lock waits for one already past that check. The
+            // lock is taken with the epoch released: a truncation in progress waits for an epoch drain.
+            _ = Interlocked.Increment(ref resetCount);
+            lock (truncationLock)
+                device.Reset();
+
+            // Restore caller's epoch state if they were protected on entry.
+            if (wasProtected)
+                epoch.Resume();
+
+            // -------- Final: publish BeginAddress (see XML doc on Reset for why this happens last) --------
+            _ = MonotonicUpdate(ref BeginAddress, newBeginAddress, out _);
+
+            // Retire the current generation rather than installing a fresh event: Initialize() would overwrite
+            // the field without releasing the outgoing semaphore, stranding anyone parked on it, since every
+            // later Set() signals the new instance.
+            flushEvent.Set();
+            Array.Clear(PageStatusIndicator, 0, BufferSize);
+            if (PendingFlush != null)
+            {
+                for (int i = 0; i < BufferSize; i++)
+                    PendingFlush[i]?.list?.Clear();
+            }
+        }
+
+        /// <summary>
+        /// Free any pages still allocated after <see cref="OnPagesClosed"/> has run. Subclasses
+        /// override to call their per-allocator FreePage. Invoked from inside Reset's
+        /// epoch.BumpCurrentEpoch action so it is safe against concurrent iterators.
+        /// </summary>
+        protected virtual void FreeAllAllocatedPages() { }
+
+        /// <summary>Asynchronously wraps <see cref="TruncateUntilAddressBlocking(long)"/>; fires
+        /// <see cref="IRecordTriggers.OnTruncate(long)"/> AFTER the device truncation completes when
+        /// <see cref="IStoreFunctions.CallOnTruncate"/> is true.</summary>
+        /// <param name="toAddress">The address to truncate the log below</param>
+        /// <param name="requestResetCount">The value of <see cref="resetCount"/> when the truncation was requested. If a
+        /// <see cref="Reset"/> has happened since, the truncation and OnTruncate are skipped.</param>
+        internal void TruncateUntilAddress(long toAddress, long requestResetCount) => _ = Task.Run(() =>
+        {
+            lock (truncationLock)
+            {
+                if (requestResetCount != Volatile.Read(ref resetCount))
+                    return;
+                TruncateUntilAddressBlocking(toAddress);
+            }
+            if (storeFunctions.CallOnTruncate)
+                storeFunctions.OnTruncate(toAddress);
+        });
+
+        /// <summary>Synchronously (blocking) wraps <see cref="IDevice.TruncateUntilAddress(long)"/>; overridden when an allocator potentially has to interact with multiple devices</summary>
+        protected virtual void TruncateUntilAddressBlocking(long toAddress) => device.TruncateUntilAddress(toAddress);
+
+        internal virtual bool TryComplete() => device.TryComplete();
+
+        /// <summary>Drain only the calling thread's affine device completion context (see <see cref="IDevice.TryCompleteMine"/>).</summary>
+        internal virtual bool TryCompleteMine() => device.TryCompleteMine();
+
+        /// <summary>
+        /// Mark the allocator disposed, release anyone parked on <see cref="flushEvent"/>, and stop the size-tracker resizer,
+        /// waiting for it to exit, BEFORE tearing down the epoch, buffer pool (and, by the owner, the log device) that they use;
+        /// otherwise a still-running resizer or a woken allocation waiter can spin on or dereference these cleared resources.
+        /// Setting disposed = true first makes the resizer's eviction spin-waits bail out and makes the allocation retry loops
+        /// terminate, so this Stop(wait: true) cannot itself hang even if an in-flight eviction target is no longer reachable.
+        /// The device is still alive at this point, so any already-issued resizer flush completes and the resizer terminates
+        /// promptly.
+        /// <para>
+        /// <see cref="flushEvent"/> is released here rather than in <see cref="Dispose"/> because releasing it makes parked
+        /// waiters runnable, and a waiter's <c>epoch.Resume()</c> drains pending epoch actions -- including the page-close
+        /// callbacks that dereference allocator state. Waking them from here means that happens before any state is reclaimed,
+        /// including a derived allocator's: <c>ObjectAllocatorImpl.Dispose()</c> clears <c>objectPages</c> before calling
+        /// <c>base.Dispose()</c>, and a page-close callback drained against a null <c>objectPages</c> is escalated to FailFast.
+        /// </para>
+        /// <para>
+        /// This narrows that window rather than closing it: a thread may still begin a fresh allocation at any point during
+        /// teardown and drain a callback on its way in. Disposing an allocator with operations still in flight is unsafe by
+        /// contract and must be prevented by the owner, which is why the resizer -- the one actor this class does own -- is
+        /// stopped and waited for here.
+        /// </para>
+        /// <para>
+        /// Idempotent: disposed is already true on a second call, <see cref="CompletionEvent.Dispose"/> no-ops once its
+        /// tombstone is installed, and Stop() compare-exchanges runState from Running, so it takes neither the signal path nor
+        /// the wait loop once the resizer has stopped. A derived Dispose() that tears down its own resizer-visible state must
+        /// call this before doing so, then still call base.Dispose().
+        /// </para>
+        /// </summary>
+        protected void StopSizeTrackerForDispose()
+        {
+            disposed = true;
+
+            // Before Stop(wait: true): a resizer parked on flushEvent would otherwise keep that wait spinning.
+            flushEvent.Dispose();
+
+            logSizeTracker?.Stop(wait: true);
+        }
+
+        /// <summary>Dispose allocator</summary>
+        public virtual void Dispose()
+        {
+            // Publishes disposal, releases flushEvent waiters, and drains the resizer, all before anything below is reclaimed.
+            StopSizeTrackerForDispose();
+
+            if (isEpochOwned)
+                epoch.Dispose();
+            bufferPool.Free();
+
+            notifyFlushedUntilAddressTcs?.TrySetCanceled();
+            notifyFlushedUntilAddressTcs = null;
+
+            onReadOnlyObserver?.OnCompleted();
+            onEvictionObserver?.OnCompleted();
+
+            // Direct-VM log-page blocks that are STILL INSTALLED at Dispose, and any parked by an in-flight snapshot
+            // flush that has not completed, are not freed here: a device flush/read may still reference such a page,
+            // and the device is disposed by the owner AFTER this allocator. Hand them to the owner's finalization
+            // registry, which frees them once the store and device are unreachable. Pages that were already evicted
+            // were freed deterministically in ReturnPage (post-flush), so only the live tail pages reach here.
+            if (nativeLog is not null)
+            {
+                nativeLog.HandOffInstalledBlocks();
+                nativeLog.HandOffDeferredBlocks();
+
+                // Pooled blocks are evicted and IO-free (they only enter the pool once no snapshot references them and
+                // after the main-log flush), so they can be unmapped now rather than deferred to finalization; the
+                // pool's disposer munmaps each. Set nativeFreePoolDisposed and dispose under the owner's gate so a
+                // page eviction or snapshot completion racing this teardown (RecycleOrFreeNativeBlock) frees its
+                // block directly instead of enqueuing it into the just-drained pool (which would leak the mapping).
+                lock (nativeLog.Gate)
+                {
+                    nativeFreePoolDisposed = true;
+                    nativeFreePagePool.Dispose();
+                }
+            }
+        }
+
+        #endregion abstract and virtual methods
+
+        private protected void VerifyCompatibleSectorSize(IDevice device)
+        {
+            if (sectorSize % device.SectorSize != 0)
+                throw new TsavoriteException($"Allocator with sector size {sectorSize} cannot flush to device with sector size {device.SectorSize}");
+        }
+
+        /// <summary>
+        /// This writes data from a page (or pages) for allocators that support only inline data.
+        /// </summary>
+        /// <param name="alignedSourceAddress">The source address, aligned to start of allocator page</param>
+        /// <param name="alignedDestinationAddress">The destination address, aligned to start of allocator page</param>
+        /// <param name="numBytesToWrite">Number of bytes to be written, based on allocator page range</param>
+        /// <param name="callback">The callback for the operation</param>
+        /// <param name="asyncResult">The callback state information, including information for the flush operation</param>
+        /// <param name="device">The device to write to</param>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void WriteInlinePageAsync<TContext>(IntPtr alignedSourceAddress, ulong alignedDestinationAddress, uint numBytesToWrite,
+                DeviceIOCompletionCallback callback, PageAsyncFlushResult<TContext> asyncResult, IDevice device)
+        {
+            if (asyncResult.partial)
+            {
+                // Write only required bytes within the page
+                int aligned_start = (int)(asyncResult.fromAddress - GetLogicalAddressOfStartOfPage(asyncResult.page));
+                aligned_start = (aligned_start / sectorSize) * sectorSize;
+
+                int aligned_end = (int)(asyncResult.untilAddress - GetLogicalAddressOfStartOfPage(asyncResult.page));
+                aligned_end = (aligned_end + (sectorSize - 1)) & ~(sectorSize - 1);
+
+                numBytesToWrite = (uint)(aligned_end - aligned_start);
+                device.WriteAsync(alignedSourceAddress + aligned_start, alignedDestinationAddress + (ulong)aligned_start, numBytesToWrite, callback, asyncResult);
+            }
+            else
+            {
+                // Write the whole page
+                device.WriteAsync(alignedSourceAddress, alignedDestinationAddress, numBytesToWrite, callback, asyncResult);
+            }
+        }
+
+        internal readonly ILogger logger;
+
+        /// <summary>Instantiate base allocator implementation</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private protected AllocatorBase(AllocatorSettings allocatorSettings, TStoreFunctions storeFunctions, Func<object, TAllocator> wrapperCreator,
+                ILogger logger = null, ObjectIdMap transientObjectIdMap = null)
+        {
+            var logSettings = allocatorSettings.LogSettings;
+            var evictCallback = allocatorSettings.evictCallback;
+            var epoch = allocatorSettings.epoch;
+            var flushCallback = allocatorSettings.flushCallback;
+            IsReadCache = allocatorSettings.IsReadCache;
+
+            this.storeFunctions = storeFunctions;
+            _wrapper = wrapperCreator(this);
+
+            // Pre-bind the instance-method delegate once so the pending-IO hot path does
+            // not allocate a fresh DeviceIOCompletionCallback per AsyncGetFromDisk call.
+            asyncGetFromDiskCallbackDelegate = AsyncGetFromDiskCallback;
+
+            this.transientObjectIdMap = transientObjectIdMap;
+
+            // Validation
+            if (logSettings.PageCount == 0 && logSettings.MemorySize == 0)
+                throw new TsavoriteException($"{nameof(logSettings.PageCount)} or {nameof(logSettings.MemorySize)} must be specified");
+            if (logSettings.PageSizeBits < LogSettings.kMinPageSizeBits || logSettings.PageSizeBits > LogSettings.kMaxPageSizeBits)
+                throw new TsavoriteException($"{nameof(logSettings.PageSizeBits)} must be between {LogSettings.kMinPageSizeBits} and {LogSettings.kMaxPageSizeBits}");
+            if (logSettings.PageSizeBits < PageHeader.SizeBits)
+                throw new TsavoriteException($"{nameof(logSettings.PageSizeBits)} must be >= PageHeader.SizeBits {PageHeader.SizeBits}");
+            if (logSettings.PageCount > MemoryUtils.ArrayMaxLength)
+                throw new TsavoriteException($"{nameof(logSettings.PageCount)} must be less than or equal to the maximum array length ({MemoryUtils.ArrayMaxLength})");
+            if (logSettings.SegmentSizeBits < LogSettings.kMinMainLogSegmentSizeBits || logSettings.SegmentSizeBits > LogSettings.kMaxSegmentSizeBits)
+                throw new TsavoriteException($"{nameof(logSettings.SegmentSizeBits)} must be between {LogSettings.kMinMainLogSegmentSizeBits} and {LogSettings.kMaxSegmentSizeBits}");
+            if (logSettings.MemorySize != 0 && (logSettings.MemorySize < 1L << LogSettings.kMinMemorySizeBits || logSettings.MemorySize > 1L << LogSettings.kMaxMemorySizeBits))
+                throw new TsavoriteException($"{nameof(logSettings.MemorySize)} must be between {1L << LogSettings.kMinMemorySizeBits} and {1L << LogSettings.kMaxMemorySizeBits}, or may be 0 for ReadOnly TsavoriteLog");
+            if ((logSettings.MemorySize != 0) && (logSettings.MemorySize < (1L << logSettings.PageSizeBits) * LogSettings.kMinPageCount))
+                throw new TsavoriteException($"{nameof(logSettings.MemorySize)} must be at least {LogSettings.kMinPageCount}x the page size ({1L << logSettings.PageSizeBits})");
+            if (logSettings.MutableFraction < 0.0 || logSettings.MutableFraction > 1.0)
+                throw new TsavoriteException($"{nameof(logSettings.MutableFraction)} must be >= 0.0 and <= 1.0");
+            if (logSettings.ReadCacheSettings is not null)
+            {
+                var rcs = logSettings.ReadCacheSettings;
+                if (rcs.PageCount == 0 && rcs.MemorySize == 0)
+                    throw new TsavoriteException($"{nameof(rcs.PageCount)} or {nameof(rcs.MemorySize)} must be specified");
+                if (rcs.PageSizeBits < LogSettings.kMinPageSizeBits || rcs.PageSizeBits > LogSettings.kMaxPageSizeBits)
+                    throw new TsavoriteException($"{nameof(rcs.PageSizeBits)} must be between {LogSettings.kMinPageSizeBits} and {LogSettings.kMaxPageSizeBits}");
+                if (rcs.PageCount > MemoryUtils.ArrayMaxLength)
+                    throw new TsavoriteException($"{nameof(rcs.PageCount)} must be less than or equal to the maximum array length ({MemoryUtils.ArrayMaxLength})");
+                if (rcs.MemorySize != 0 && (rcs.MemorySize < 1L << LogSettings.kMinMemorySizeBits || rcs.MemorySize > 1L << LogSettings.kMaxMemorySizeBits))
+                    throw new TsavoriteException($"{nameof(rcs.MemorySize)} must be between {1L << LogSettings.kMinMemorySizeBits} and {1L << LogSettings.kMaxMemorySizeBits}");
+                if ((rcs.MemorySize != 0) && (rcs.MemorySize < (1L << rcs.PageSizeBits) * 2))
+                    throw new TsavoriteException($"{nameof(logSettings.MemorySize)} must be at least twice the page size ({1L << rcs.PageSizeBits})");
+                if (rcs.SecondChanceFraction < 0.0 || rcs.SecondChanceFraction > 1.0)
+                    throw new TsavoriteException($"{rcs.SecondChanceFraction} must be >= 0.0 and <= 1.0");
+            }
+
+            if (logSettings.MaxInlineKeySize < LogSettings.MinMaxInlineSize || logSettings.MaxInlineKeySize > LogSettings.MaxInlineKeySizeLimit)
+                throw new TsavoriteException($"{nameof(logSettings.MaxInlineKeySize)} must be between {LogSettings.MinMaxInlineSize} and {LogSettings.MaxInlineKeySizeLimit}");
+            if (logSettings.MaxInlineValueSize < LogSettings.MinMaxInlineSize || logSettings.MaxInlineValueSize > LogSettings.MaxInlineValueSizeLimit)
+                throw new TsavoriteException($"{nameof(logSettings.MaxInlineValueSize)} must be between {LogSettings.MinMaxInlineSize} and {LogSettings.MaxInlineValueSizeLimit}");
+
+            this.logger = logger;
+            if (logSettings.LogDevice == null)
+                throw new TsavoriteException("LogSettings.LogDevice needs to be specified (e.g., use Devices.CreateLogDevice, AzureStorageDevice, or NullDevice)");
+
+            EvictCallback = evictCallback;
+
+            FlushCallback = flushCallback;
+            PreallocateLog = logSettings.PreallocateLog;
+            flushEvent.Initialize();
+
+            IsNullDevice = logSettings.LogDevice is NullDevice;
+
+            if (epoch == null)
+            {
+                this.epoch = new LightEpoch();
+                isEpochOwned = true;
+            }
+            else
+                this.epoch = epoch;
+
+            logSettings.LogDevice.Initialize(1L << logSettings.SegmentSizeBits, epoch);
+            logSettings.ObjectLogDevice?.Initialize(1L << logSettings.ObjectLogSegmentSizeBits, epoch);
+
+            // Page size
+            LogPageSizeBits = logSettings.PageSizeBits;
+            PageSize = 1 << LogPageSizeBits;
+            PageSizeMask = PageSize - 1;
+
+            // Total HLOG size and MaxAllocatedPageCount. There are a couple ways MaxAllocatedPageCount can be set here; once set it
+            // will never be exceeded by AllocatedPageCount, even if memory usage falls below logSettings.MemorySize. Memory
+            // size tracking will be enforced only if this.logSizeTracker is set; otherwise, we set the MaxAllocatedPageCount here and
+            // do not control heap memory usage.
+            if (logSettings.MemorySize > 0)
+            {
+                // If LogSettings.PageCount is specified it becomes MaxAllocatedPageCount; otherwise MaxAllocatedPageCount will be
+                // MaxMemorySize divided by page size.
+                MaxAllocatedPageCount = logSettings.PageCount > 0 ? logSettings.PageCount : (int)(logSettings.MemorySize / PageSize);
+            }
+            else
+            {
+                if (logSettings.PageCount <= 0)
+                    throw new TsavoriteException($"Log Memory size or PageCount must be specified");
+                MaxAllocatedPageCount = logSettings.PageCount;
+            }
+            BufferSize = (int)NextPowerOf2(MaxAllocatedPageCount);
+
+            BufferSizeMask = BufferSize - 1;
+
+            logMutableFraction = logSettings.MutableFraction;
+
+            // Segment size
+            LogSegmentSizeBits = logSettings.SegmentSizeBits;
+            SegmentSize = 1L << LogSegmentSizeBits;
+            if (SegmentSize < PageSize)
+                throw new TsavoriteException($"Segment ({SegmentSize}) must be at least of page size ({PageSize})");
+
+            PageStatusIndicator = new FullPageStatus[BufferSize];
+
+            if (!IsNullDevice)
+            {
+                PendingFlush = new PendingFlushList[BufferSize];
+                for (int i = 0; i < BufferSize; i++)
+                    PendingFlush[i] = new PendingFlushList();
+            }
+            device = logSettings.LogDevice;
+            sectorSize = (int)Math.Max(device.SectorSize, logSettings.ObjectLogDevice?.SectorSize ?? 0u);
+
+            if (PageSize < sectorSize)
+                throw new TsavoriteException($"Page size must be at least of device sector size ({sectorSize} bytes). Set PageSizeBits accordingly.");
+
+            // Pages are snapshotted to, and recovered from, the checkpoint devices directly, so they must also be aligned
+            // and rounded for those devices. A checkpoint sector larger than a page cannot be served; leave startup working
+            // and let a checkpoint fail with the explicit sector-size error instead.
+            var checkpointSectorSize = logSettings.CheckpointSectorSize;
+            if (checkpointSectorSize > sectorSize)
+            {
+                if (!Utility.IsPowerOfTwo(checkpointSectorSize))
+                    throw new TsavoriteException($"Checkpoint sector size {checkpointSectorSize} must be a power of two");
+                if (checkpointSectorSize <= PageSize)
+                {
+                    sectorSize = checkpointSectorSize;
+                    logger?.LogInformation("Using sector size {sectorSize} for log pages and IO to match the checkpoint devices", sectorSize);
+                }
+                else
+                {
+                    logger?.LogWarning("Checkpoint devices require sector size {checkpointSectorSize}, which exceeds the page size {pageSize}; checkpoints will fail until the page size is at least the checkpoint sector size",
+                        checkpointSectorSize, PageSize);
+                }
+            }
+
+            AlignedPageSizeBytes = RoundUp(PageSize, sectorSize);
+
+            if (BufferSize > 0)
+            {
+                pageArrays = new byte[BufferSize][];
+                pagePointersArray = GC.AllocateArray<long>(BufferSize, pinned: true);
+                pagePointers = (long*)Unsafe.AsPointer(ref pagePointersArray[0]);
+
+                // Capture the backend decision once, up front (see useNativeLogPages), by creating the direct-VM
+                // block owner only when direct-VM log pages are in use. Doing this in the constructor (not lazily on
+                // the hot path) avoids a racing ??= publishing two owners.
+                if (NativeAllocatorInitializer.Enabled)
+                {
+                    nativeLog = new DirectVmBlockOwner(BufferSize);
+                    nativeFreePagePool = new OverflowPool<DirectVmBlock>(NativeFreePagePoolSize, static block => DirectVirtualMemory.Free(block));
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal long GetPhysicalAddress(long logicalAddress)
+        {
+            // if (disposed)    // TODO: Clean up dispose sequence
+            //     ThrowTsavoriteException("GetPhysicalAddress called when disposed");
+
+            // Index of page within the circular buffer, and offset on the page.
+            var pageIndex = GetPageIndexForAddress(logicalAddress);
+            var offset = GetOffsetOnPage(logicalAddress);
+            return *(pagePointers + pageIndex) + offset;
+        }
+        internal bool IsAllocated(int pageIndex) => pagePointers[pageIndex] != 0;
+
+        internal virtual void ClearPage(long page, int offset = 0)
+        {
+            var idx = page % BufferSize;
+            var pageArray = pageArrays[idx];
+            if (pageArray is not null)
+            {
+                // If the offset is 0, we can clear everything in the array including the cache-alignment padding.
+                // Otherwise, we have to adjust the offset for the initial cache alignment.
+                if (offset != 0)
+                    offset += (int)(pagePointers[idx] - (long)Unsafe.AsPointer(ref pageArray[0]));
+                Array.Clear(pageArray, offset, pageArray.Length - offset);
+            }
+            else
+            {
+                // Native-backed page (LogPages full mode): pagePointers[idx] is the aligned page start and the
+                // caller's offset is page-relative, so clear directly from there.
+                var len = AlignedPageSizeBytes - offset;
+                if (len > 0)
+                    DirectVirtualMemory.Clear((nint)(pagePointers[idx] + offset), len);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void VerifyRecoveryInfo(HybridLogCheckpointInfo recoveredHLCInfo, bool trimLog = false)
+        {
+            // Note: trimLog is unused right now. Can be used to trim the log to the minimum
+            // segment range necessary for recovery to given checkpoint
+
+            var diskBeginAddress = recoveredHLCInfo.info.beginAddress;
+            var diskFlushedUntilAddress = recoveredHLCInfo.info.useSnapshotFile == 0
+                ? recoveredHLCInfo.info.finalLogicalAddress
+                : recoveredHLCInfo.info.flushedLogicalAddress;
+
+            // Delete disk segments until specified disk begin address
+
+            // First valid disk segment required for recovery
+            long firstValidSegment = (int)GetSegment(diskBeginAddress);
+
+            // Last valid disk segment required for recovery
+            var lastValidSegment = (int)GetSegment(diskFlushedUntilAddress);
+            if (GetOffsetOnSegment(diskFlushedUntilAddress) == 0)
+                lastValidSegment--;
+
+            logger?.LogInformation("Recovery requires disk segments in range [{firstSegment}--{tailStartSegment}]", firstValidSegment, lastValidSegment);
+
+            var firstAvailSegment = device.StartSegment;
+            var lastAvailSegment = device.EndSegment;
+
+            if (FlushedUntilAddress > GetFirstValidLogicalAddressOnPage(0))
+            {
+                var flushedUntilAddress = FlushedUntilAddress;
+                int currTailSegment = (int)GetSegment(flushedUntilAddress);
+                if (GetOffsetOnSegment(flushedUntilAddress) == 0)
+                    currTailSegment--;
+
+                if (currTailSegment > lastAvailSegment)
+                    lastAvailSegment = currTailSegment;
+            }
+
+            logger?.LogInformation("Available segment range on device: [{firstAvailSegment}--{lastAvailSegment}]", firstAvailSegment, lastAvailSegment);
+
+            if (firstValidSegment < firstAvailSegment)
+                throw new TsavoriteException($"Unable to set first valid segment to {firstValidSegment}, first available segment on disk is {firstAvailSegment}");
+
+            if (lastAvailSegment >= 0 && lastValidSegment > lastAvailSegment)
+                throw new TsavoriteException($"Unable to set last valid segment to {lastValidSegment}, last available segment on disk is {lastAvailSegment}");
+
+            if (trimLog)
+            {
+                logger?.LogInformation("Trimming disk segments until (not including) {firstSegment}", firstValidSegment);
+                var toAddress = GetStartLogicalAddressOfSegment(firstValidSegment);
+                TruncateUntilAddressBlocking(toAddress);
+                if (storeFunctions.CallOnTruncate)
+                    storeFunctions.OnTruncate(toAddress);
+
+                logger?.LogInformation("Trimming disk segments above {lastSegment}", lastValidSegment);
+                TrimSegmentsAbove(recoveredHLCInfo, lastValidSegment, lastAvailSegment);
+            }
+        }
+
+        /// <summary>
+        /// Remove the log's segments above <paramref name="lastValidSegment"/>, which hold only data written after the checkpoint
+        /// being recovered
+        /// </summary>
+        /// <param name="recoveredHLCInfo">The checkpoint being recovered</param>
+        /// <param name="lastValidSegment">The highest segment that recovery needs</param>
+        /// <param name="lastAvailSegment">The highest segment the device is known to hold. Segments are removed one at a time up
+        /// to it only if the device cannot list its segments.</param>
+        private protected virtual void TrimSegmentsAbove(in HybridLogCheckpointInfo recoveredHLCInfo, int lastValidSegment, int lastAvailSegment)
+        {
+            if (device.TryRemoveSegmentsAbove(lastValidSegment, out _))
+                return;
+
+            // TryRemoveSegmentsAbove returns false only when the device cannot list its segments. So remove the segments known to
+            // exist, up to lastAvailSegment, one at a time, highest first, so that an interruption leaves the remaining segments
+            // contiguous. This relies on RemoveSegment removing only the segment named, as IDevice requires.
+            //
+            // A NativeStorageDevice with an older native library instead removes every open segment through the one named, valid
+            // ones included. It lists its own segments, and a composite device has each component remove its own, so it gets here
+            // only as a component of a composite device another of whose components cannot list its segments. That case is
+            // deliberately left unhandled: recovery itself never trims (it passes trimLog false; only tests pass true), Garnet
+            // builds no composite devices, and current native libraries remove only the segment named.
+            for (var segment = lastAvailSegment; segment > lastValidSegment; segment--)
+            {
+                logger?.LogInformation("Trimming tail segment {s} on disk", segment);
+                device.RemoveSegment(segment);
+            }
+        }
+
+        /// <summary>Allocate a pinned byte[] for the page at <paramref name="index"/></summary>
+        protected void AllocatePinnedPageArray(int index)
+        {
+            var adjustedSize = PageSize + 2 * sectorSize;
+            if (useNativeLogPages)
+            {
+                // Direct-VM (mmap/VirtualAlloc): demand-zero, first-touch-placed pages matching GC.AllocateArray.
+                // Reuse a still-mapped block from the recycle pool when available (the common free-head/alloc-tail
+                // case), avoiding munmap+mmap+re-fault; the block was zeroed by ClearPage before it was pooled, so no
+                // re-zero is needed. Otherwise allocate fresh. Track the block per-slot so ReturnPage can pool/free it
+                // deterministically on eviction (post-flush, epoch-drained, so no in-flight IO). Any block still
+                // installed at Dispose is handed to the nativeLog owner's finalization registry there (it may have an in-flight flush/read).
+                // useNativeLogPages is captured at construction, so this possibly-concurrent path never re-reads the
+                // process-global flag.
+                if (!nativeFreePagePool.TryGet(out var block))
+                    block = DirectVirtualMemory.Allocate(adjustedSize, sectorSize);
+                else
+                    _ = Interlocked.Increment(ref NativeLogPageReuseCount);
+                nativeLog.Blocks[index] = block;
+                pagePointersArray[index] = block.AlignedPtr;
+                pageArrays[index] = null;
+                return;
+            }
+            var tmp = GC.AllocateArray<byte>(adjustedSize, true);
+            var p = (long)Unsafe.AsPointer(ref tmp[0]);
+            pagePointersArray[index] = (p + (sectorSize - 1)) & ~((long)sectorSize - 1);
+            pageArrays[index] = tmp;
+        }
+
+        /// <summary>
+        /// Free the direct-VM block backing circular-buffer page <paramref name="index"/>, if any. Called from the
+        /// derived allocators' <c>ReturnPage</c> when a page is evicted: at that point the page has been closed by
+        /// OnPagesClosed (post main-log flush, after the epoch drain), so no MAIN-log IO references it. However a
+        /// snapshot-checkpoint write (which reads the page pointer directly and is NOT gated by FlushedUntilAddress)
+        /// may still be in flight, so if a snapshot flush is in progress we park the block and free it when the
+        /// snapshot's writes complete (<see cref="EndNativeSnapshotFlush"/>). No-op for the managed backend.
+        /// </summary>
+        protected void FreeNativeLogPage(int index)
+        {
+            if (nativeLog is null)
+                return;
+            _ = Interlocked.Increment(ref NativeLogPageFreeCount);
+            var block = nativeLog.Blocks[index];
+            nativeLog.Blocks[index] = default;
+
+            // A snapshot write may still reference the page -> park it and reclaim when the snapshot drains.
+            if (nativeLog.TryDeferFree(block))
+            {
+                _ = Interlocked.Increment(ref NativeLogPageDeferredCount);
+                return;
+            }
+
+            // Fast path: no snapshot IO outstanding -> recycle into the pool (reused by a future AllocatePinnedPageArray,
+            // avoiding munmap+mmap+re-fault; the block is IO-free here since the page was closed post main-log flush).
+            // Overflow beyond the pool cap is munmap'd by the pool's disposer.
+            RecycleOrFreeNativeBlock(block);
+        }
+
+        /// <summary>Recycle an evicted, IO-free direct-VM page block into <see cref="nativeFreePagePool"/> for reuse,
+        /// or munmap it directly if the pool is already disposed by teardown. Serialized with the pool's disposal via
+        /// the owner's gate so a block can never be enqueued into an already-drained pool (which would leak
+        /// the mapping). Cold path (page eviction, snapshot completion, teardown) — never the record read/write or
+        /// <see cref="AllocatePinnedPageArray"/> allocation path, which reads the pool lock-free via TryGet.</summary>
+        void RecycleOrFreeNativeBlock(in DirectVmBlock block)
+        {
+            lock (nativeLog.Gate)
+            {
+                if (!nativeFreePoolDisposed)
+                {
+                    // At capacity, TryAdd hands the block to the pool's disposer, which is DirectVirtualMemory.Free
+                    // (see the nativeFreePagePool construction) — so an overflow block is unmapped, never leaked.
+                    _ = nativeFreePagePool.TryAdd(block);
+                    return;
+                }
+            }
+            // Teardown already drained and disposed the pool: free directly rather than leak into a dead pool.
+            DirectVirtualMemory.Free(block);
+        }
+
+        /// <summary>Mark the start of a snapshot-checkpoint flush that issues device writes from native page
+        /// pointers (a producer sentinel held until issuance completes), so evicted pages are parked instead of
+        /// unmapped for the duration. No-op for the managed backend.</summary>
+        void BeginNativeSnapshotFlush()
+        {
+            nativeLog?.BeginIo();
+        }
+
+        /// <summary>Release one unit of outstanding snapshot IO (the producer sentinel when issuance ends, or one
+        /// issued page write when its completion callback fires — including the error path). When the last unit is
+        /// released, free any pages that were evicted while snapshot writes were in flight.</summary>
+        void EndNativeSnapshotFlush()
+        {
+            if (nativeLog is null || !nativeLog.EndIo())
+                return;
+            var toFree = nativeLog.TryDrainDeferred();
+            // Snapshot writes have all completed, so these evicted pages are now IO-free: recycle them into the pool
+            // for reuse (overflow beyond the cap is munmap'd by the pool's disposer) rather than unmapping outright.
+            // RecycleOrFreeNativeBlock serializes with pool teardown so a block completing here concurrently with
+            // Dispose is never lost into a drained pool.
+            if (toFree is not null)
+                foreach (var block in toFree)
+                    RecycleOrFreeNativeBlock(block);
+        }
+
+        /// <summary>Diagnostic counter of direct-VM log-page frees on eviction (see <see cref="FreeNativeLogPage"/>);
+        /// used by tests to assert the native eviction-unmap path is actually exercised.</summary>
+        internal static long NativeLogPageFreeCount;
+
+        /// <summary>Diagnostic counter of direct-VM log-page frees that were deferred because a snapshot flush was in
+        /// progress; used by tests to assert the snapshot-deferral path is actually exercised.</summary>
+        internal static long NativeLogPageDeferredCount;
+
+        /// <summary>Diagnostic counter of direct-VM log-page allocations satisfied by reusing a pooled block instead of
+        /// a fresh mmap (see <see cref="nativeFreePagePool"/>); used by tests to assert the recycle path is exercised.</summary>
+        internal static long NativeLogPageReuseCount;
+
+        /// <summary>Initialize allocator</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        protected internal virtual void Initialize()
+        {
+            bufferPool ??= new SectorAlignedBufferPool(1, sectorSize);
+            var firstValidAddress = FirstValidAddress;
+
+            if (BufferSize > 0)
+            {
+                long tailPage = GetPage(firstValidAddress);
+                int tailPageIndex = GetPageIndexForPage(tailPage);
+                if (!IsAllocated(tailPageIndex))
+                    _wrapper.AllocatePage(tailPageIndex);
+
+                // Allocate next page as well
+                int nextPageIndex = GetPageIndexForPage(tailPage + 1);
+                if (!IsAllocated(nextPageIndex))
+                    _wrapper.AllocatePage(nextPageIndex);
+            }
+
+            if (PreallocateLog)
+            {
+                for (int pageIndex = 0; pageIndex < BufferSize; pageIndex++)
+                {
+                    if (!IsAllocated(pageIndex))
+                        _wrapper.AllocatePage(pageIndex);
+                }
+            }
+
+            SafeReadOnlyAddress = firstValidAddress;
+            ReadOnlyAddress = firstValidAddress;
+            SafeHeadAddress = firstValidAddress;
+            HeadAddress = firstValidAddress;
+            ClosedUntilAddress = firstValidAddress;
+            FlushedUntilAddress = firstValidAddress;
+            BeginAddress = firstValidAddress;
+
+            // Initialize TailAddress (the address of the next allocaton); this will always be nonzero.
+            TailPageOffset.Page = (int)GetPage(firstValidAddress);
+            TailPageOffset.Offset = (int)GetOffsetOnPage(firstValidAddress);
+        }
+
+        /// <summary>
+        /// Max allocated page count; less than or equal to <see cref="BufferSize"/>. <see cref="AllocatedPageCount"/> will never exceed this,
+        /// even if <see cref="logSizeTracker"/> is set and memory usage falls below its TargetSize. This is also used to handle non-powerOf2
+        /// inline log sizes..
+        /// </summary>
+        internal int MaxAllocatedPageCount;
+
+        /// <summary>
+        /// The number of memory pages that are currently allocated in the circular buffer. Will never exceed <see cref="MaxAllocatedPageCount"/>.
+        /// If there is a <see cref="logSizeTracker"/> then it manages combined inline and heap memory, and <see cref="AllocatedPageCount"/>
+        /// may increase or decrease (but again, will never exceed <see cref="MaxAllocatedPageCount"/>).
+        /// </summary>
+        public int AllocatedPageCount;
+
+        /// <summary>High-water mark of the number of memory pages that were allocated in the circular buffer</summary>
+        public int HighWaterAllocatedPageCount;
+
+        /// <summary>Maximum memory size in bytes</summary>
+        // (long) cast required: MaxAllocatedPageCount and PageSize are both int, so the multiply would
+        // otherwise be evaluated in 32-bit and overflow (e.g. 2048 pages * 64 MiB = 128 GiB).
+        // Use MaxAllocatedPageCount (the actual page-count cap) rather than BufferSize, which is rounded
+        // up to the next power of 2 and so overestimates the real maximum.
+        public long MaxMemorySizeBytes => (long)MaxAllocatedPageCount * PageSize;
+
+        /// <summary>Increments AllocatedPageCount. Updates HighWaterAllocatedPageCount if a higher number of pages have been allocated.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        protected void IncrementAllocatedPageCount()
+        {
+            var newAllocatedPageCount = Interlocked.Increment(ref AllocatedPageCount);
+            var currHighWaterCount = HighWaterAllocatedPageCount;
+            while (currHighWaterCount < newAllocatedPageCount)
+            {
+                if (Interlocked.CompareExchange(ref HighWaterAllocatedPageCount, newAllocatedPageCount, currHighWaterCount) == currHighWaterCount)
+                    return;
+                currHighWaterCount = HighWaterAllocatedPageCount;
+            }
+        }
+
+        /// <summary>Main log segment size</summary>
+        public long GetMainLogSegmentSize() => SegmentSize;
+
+        /// <summary>Object log segment size</summary>
+        public virtual long GetObjectLogSegmentSize() => -1;
+
+        /// <summary>Get tail address</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetTailAddress()
+        {
+            var local = TailPageOffset;
+            if (local.Offset >= PageSize)
+                local = GetStableTailPageOffset(local);
+            return GetLogicalAddressOfStartOfPage(local.Page) | (uint)local.Offset;
+        }
+
+        /// <summary>Resolves a tail page offset observed during page overflow.</summary>
+        /// <remarks>
+        /// Kept out of line because <see cref="Thread.Yield"/> is a P/Invoke: a method that inlines it sets up a P/Invoke
+        /// frame, a thread-static lookup, on every call, whether or not it yields.
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        PageOffset GetStableTailPageOffset(PageOffset local)
+        {
+            // The while loop is guaranteed to terminate because HandlePageOverflow ensures that it fixes the unstable TailPageOffset immediately.
+            while (local.Offset >= PageSize)
+            {
+                if (local.Offset == PageSize)
+                {
+                    local.Page++;
+                    local.Offset = 0;
+                    break;
+                }
+                // Offset is being adjusted by overflow thread, spin-wait
+                _ = Thread.Yield();
+                local = TailPageOffset;
+            }
+            return local;
+        }
+
+        /// <summary>Get tail address without considering whether it is unstable; this is called during HandlePageOverflow as part of determining
+        /// whether we must evict, which we may not be able to do; if <see cref="GetTailAddress()"/> is called on the thread that owns the tail-address
+        /// stabilization, it will infinite-loop.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal long UnstableGetTailAddress(out bool isUnstable)
+        {
+            var local = TailPageOffset;
+            var address = GetLogicalAddressOfStartOfPage(local.Page);
+            isUnstable = local.Offset >= PageSize;
+            if (!isUnstable)
+                return address | (uint)local.Offset;
+
+            // It is unstable so stay on the same page, because we will likely restabilize before size tracker evictions commence.
+            return address | (uint)(PageSize - Constants.kRecordAlignment);
+        }
+
+        /// <summary>Get page index from <paramref name="logicalAddress"/></summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetPage(long logicalAddress) => _wrapper.GetPageOfAddress(logicalAddress, LogPageSizeBits);
+
+        /// <summary>Get page index for page</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int GetPageIndexForPage(long page) => (int)(page % BufferSize);
+
+        /// <summary>Get page index for address</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int GetPageIndexForAddress(long logicalAddress) => GetPageIndexForPage(_wrapper.GetPageOfAddress(logicalAddress, LogPageSizeBits));
+
+        /// <summary>Get page size</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetPageSize() => PageSize;
+
+        /// <summary>Get logical address of start of page</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetAddressOfStartOfPageOfAddress(long address) => address & ~PageSizeMask;
+
+        /// <summary>Get offset in page</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetOffsetOnPage(long address) => address & PageSizeMask;
+
+        /// <summary>Get start logical address; this is the 0'th byte on the page, i.e. the <see cref="PageHeader"/> start; it is *not* a valid record address
+        /// (for that see <see cref="GetFirstValidLogicalAddressOnPage"/>).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetLogicalAddressOfStartOfPage(long page) => page << LogPageSizeBits;
+
+        /// <summary>Get first valid address on a page (which is the start of the page plus sizeof(<see cref="PageHeader"/>)).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetFirstValidLogicalAddressOnPage(long page) => (page << LogPageSizeBits) + FirstValidAddress;
+
+        /// <summary>Get log segment index from <paramref name="logicalAddress"/></summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetSegment(long logicalAddress) => logicalAddress >> LogSegmentSizeBits;
+
+        /// <summary>Get offset in page</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetOffsetOnSegment(long address) => address & (SegmentSize - 1);
+
+        /// <summary>Get start logical address</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetStartLogicalAddressOfSegment(long segment) => segment << LogSegmentSizeBits;
+
+        /// <summary>Get sector size for main hlog device</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int GetDeviceSectorSize() => sectorSize;
+
+        /// <summary>Have the derived allocator allocate the current and next page, if needed.</summary>
+        /// <remarks>The derived allocator "owns" the actual memory for the pages in its circular buffer, as it knows the details of their use,
+        ///     although for efficiency we keep the <see cref="pagePointers"/> and some utility operations here in
+        ///     <see cref="AllocatorBase{TStoreFunctions, TAllocator}"/> (as well as manage <see cref="TailPageOffset"/>).</remarks>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void AllocatePagesWithException(int pageIndex, PageOffset localTailPageOffset, int numSlots)
+        {
+            try
+            {
+                AllocateCurrentAndNextPage(pageIndex);
+            }
+            catch
+            {
+                // Reset to previous tail
+                localTailPageOffset.PageAndOffset -= numSlots;
+                _ = Interlocked.Exchange(ref TailPageOffset.PageAndOffset, localTailPageOffset.PageAndOffset);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Allocate the page containing <paramref name="page"/> and, as the allocator's allocate-ahead invariant, the page following it, each only if it is
+        /// not already allocated.
+        /// </summary>
+        /// <param name="page">The page number whose page (and the next page) should be allocated.</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        void AllocateCurrentAndNextPage(long page)
+        {
+            // Allocate the current page, if needed.
+            var pageIndex = (int)(page % BufferSize);
+            if (!IsAllocated(pageIndex))
+                _wrapper.AllocatePage(pageIndex);
+
+            // Allocate the next page in advance (an invariant in the allocator), if needed.
+            var nextPageIndex = (pageIndex + 1) % BufferSize;
+            if (!IsAllocated(nextPageIndex))
+                _wrapper.AllocatePage(nextPageIndex);
+        }
+
+        /// <summary>
+        /// Shift log read-only address, with an optional wait
+        /// </summary>
+        /// <param name="newReadOnlyAddress">Address to shift read-only until</param>
+        /// <param name="wait">Wait to ensure shift is complete (may involve page flushing)</param>
+        internal void ShiftReadOnlyAddressWithWait(long newReadOnlyAddress, bool wait)
+        {
+            // If we don't have the epoch, acquire it only long enough to launch the shift.
+            if (epoch.ResumeIfNotProtected())
+            {
+                try
+                {
+                    _ = ShiftReadOnlyAddress(newReadOnlyAddress);
+                }
+                finally
+                {
+                    epoch.Suspend();
+                }
+
+                // Wait for flush to complete
+                while (wait && !disposed && FlushedUntilAddress < newReadOnlyAddress)
+                    _ = Thread.Yield();
+                return;
+            }
+
+            // Epoch already protected, so launch the shift and wait for flush to complete
+            _ = ShiftReadOnlyAddress(newReadOnlyAddress);
+            while (wait && !disposed && FlushedUntilAddress < newReadOnlyAddress)
+                epoch.ProtectAndDrain();
+        }
+
+        /// <summary>
+        /// Shift log readonly and head addresses, with an optional wait on the head address shift
+        /// </summary>
+        /// <param name="newReadOnlyAddress">New ReadOnlyAddress</param>
+        /// <param name="newHeadAddress">New HeadAddress</param>
+        /// <param name="waitForEviction">Wait for eviction to complete, i.e., until ClosedUntilAddress catches up (may involve page flushing, closing, and eviction callbacks)</param>
+        public void ShiftAddressesWithWait(long newReadOnlyAddress, long newHeadAddress, bool waitForEviction)
+        {
+            Debug.Assert(newHeadAddress <= newReadOnlyAddress, $"new HeadAddress {newHeadAddress} must not be ahead of newReadOnlyAddress {newReadOnlyAddress}");
+
+            // First shift read-only; force wait so that we do not close unflushed page
+            ShiftReadOnlyAddressWithWait(newReadOnlyAddress, wait: true);
+
+            // Then shift head address. If we don't have the epoch, acquire it only long enough to launch the shift.
+            if (epoch.ResumeIfNotProtected())
+            {
+                try
+                {
+                    // ShiftHeadAddress caps the shift at FlushedUntilAddress and returns where it actually shifted to.
+                    // ClosedUntilAddress can only reach that capped value, so the wait below must use it.
+                    newHeadAddress = ShiftHeadAddress(newHeadAddress);
+                }
+                finally
+                {
+                    epoch.Suspend();
+                }
+
+                while (waitForEviction && !disposed && ClosedUntilAddress < newHeadAddress)
+                    _ = Thread.Yield();
+                return;
+            }
+
+            // Epoch already protected, so launch the shift and wait for eviction to complete
+            newHeadAddress = ShiftHeadAddress(newHeadAddress);
+
+            // We wait for ClosedUntilAddress here to ensure eviction scan is complete
+            while (waitForEviction && !disposed && ClosedUntilAddress < newHeadAddress)
+                epoch.ProtectAndDrain();
+        }
+
+        /// <summary>
+        /// Whether we need to shift HeadAddress and ReadOnlyAddress to higher addresses when turning the page.
+        /// </summary>
+        /// <param name="pageIndex">The page we are turning to; it has just been allocated and TailAddress will be moving to this page</param>
+        /// <param name="localTailPageOffset">Local copy of PageOffset (includes the addition of numSlots)</param>
+        /// <param name="numSlots">Size of new allocation</param>
+        /// <returns></returns>
+        bool NeedToShiftAddress(long pageIndex, PageOffset localTailPageOffset, int numSlots)
+        {
+            var tailAddress = GetLogicalAddressOfStartOfPage(localTailPageOffset.Page) | ((long)(localTailPageOffset.Offset - numSlots));
+            var shiftAddress = GetLogicalAddressOfStartOfPage(pageIndex);
+
+            // First check whether we need to shift HeadAddress. If we have a logSizeTracker that's over budget then we have already issued
+            // a shift if needed (and allowed by allocated page count); otherwise make sure we stay in the MaxAllocatedPageCount (which may be less than BufferSize).
+            // When the background resizer is not running (before it is started, or after it has been stopped for shutdown) it will not issue that shift, and
+            // NeedToWaitForClose does not wait on it either, so we must request the MaxAllocatedPageCount-based shift here as we do when there is no logSizeTracker;
+            // otherwise the page count would grow past the cap unchecked.
+            var desiredHeadAddress = HeadAddress;
+            if (logSizeTracker is null || !logSizeTracker.IsRunning || !logSizeTracker.IsOverBudget)
+            {
+                var headPage = GetPage(desiredHeadAddress);
+                if (pageIndex - headPage >= MaxAllocatedPageCount)
+                {
+                    desiredHeadAddress = GetFirstValidLogicalAddressOnPage(headPage + 1);
+                    if (desiredHeadAddress > tailAddress)
+                        desiredHeadAddress = tailAddress;
+                    return desiredHeadAddress > HeadAddress;
+                }
+            }
+
+            // Check whether we need to shift ROA based on desiredHeadAddress.
+            var desiredReadOnlyAddress = CalculateReadOnlyAddress(shiftAddress, desiredHeadAddress);
+            if (desiredReadOnlyAddress > tailAddress)
+                desiredReadOnlyAddress = tailAddress;
+            return desiredReadOnlyAddress > ReadOnlyAddress;
+        }
+
+        /// <summary>
+        /// Shift log addresses when turning the page.
+        /// </summary>
+        /// <param name="pageIndex">The page we are turning to</param>
+        /// <param name="needSHA">If true, we have determined that we must call <see cref="ShiftHeadAddress(long)"/> to Close and evict a
+        ///     page before we can allocate a new one. This is done for checks that do not issue a signal to the size tracker, such as a
+        ///     Flush or Close via normal wrapping operations.</param>
+        void IssueShiftAddress(long pageIndex, bool needSHA)
+        {
+            // Issue the shift of address
+            var shiftAddress = GetLogicalAddressOfStartOfPage(pageIndex);
+            var tailAddress = GetTailAddress();
+
+            // First check whether we need to shift HeadAddress. If we are not forcing for flush and have a logSizeTracker that's over budget then we have already issued
+            // a shift if needed (and allowed by allocated page count); otherwise make sure we stay in the MaxAllocatedPageCount (which may be less than BufferSize).
+            // When the background resizer is not running (e.g. before it is started, or after it has been stopped for shutdown), we cannot defer eviction to it, so we
+            // evict synchronously here based on MaxAllocatedPageCount; otherwise the allocation retry loop would livelock waiting for a page close that never happens.
+            var desiredHeadAddress = HeadAddress;
+            if (needSHA || logSizeTracker is null || !logSizeTracker.IsRunning || !logSizeTracker.IsOverBudget)
+            {
+                var headPage = GetPage(desiredHeadAddress);
+                if (pageIndex - headPage >= MaxAllocatedPageCount)
+                {
+                    // Snapping to start of page rather than PageHeader.Size means that HA being middle-of-page implies a partial page.
+                    desiredHeadAddress = GetLogicalAddressOfStartOfPage(headPage + 1);
+                    if (desiredHeadAddress > tailAddress)
+                        desiredHeadAddress = tailAddress;
+                }
+            }
+
+            // Check whether we need to shift ROA based on desiredHeadAddress.
+            var desiredReadOnlyAddress = CalculateReadOnlyAddress(shiftAddress, desiredHeadAddress);
+            if (desiredReadOnlyAddress > tailAddress)
+                desiredReadOnlyAddress = tailAddress;
+            if (desiredReadOnlyAddress > ReadOnlyAddress)
+                _ = ShiftReadOnlyAddress(desiredReadOnlyAddress);
+
+            // Now shift HeadAddress if needed
+            if (desiredHeadAddress > HeadAddress)
+                _ = ShiftHeadAddress(desiredHeadAddress);
+        }
+
+        /// <summary>
+        /// If the page we are trying to allocate is past the last page with an unflushed address region, we have to wait for the flushEvent.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool NeedToWaitForFlush(int page)
+            => page >= BufferSize + GetPage(FlushedUntilAddress);   // wraps around the BufferSize
+
+        /// <summary>
+        /// If the page we are trying to allocate is past the last page with an unclosed address region, then we can retry immediately
+        /// because this is called after NeedToWait, so we know we've completed the wait on flushEvent for the necessary pages to be flushed,
+        /// and are waiting for OnPagesClosed to be completed. Similarly, if the log size tracker is over budget and its background resizer
+        /// is running, that resizer will issue the ShiftHeadAddress that closes pages, so we can retry immediately.
+        /// </summary>
+        /// <param name="page">The page we are about to move to</param>
+        /// <param name="needSHA">Returns whether we need to call <see cref="ShiftHeadAddress(long)"/> to advance HeadAddress so ClosedUntilAddress will advance</param>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool NeedToWaitForClose(int page, out bool needSHA)
+        {
+            if (page >= BufferSize + GetPage(ClosedUntilAddress))   // wraps around the BufferSize
+            {
+                needSHA = HeadAddress == ClosedUntilAddress;    // Need SHA to advance HeadAddress to advance ClosedUntilAddress
+                return true;
+            }
+
+            needSHA = false;
+
+            // If the resizer is not running (before it is started, or after it has been stopped for shutdown) nobody will act on the Signal() below,
+            // so waiting for it would livelock the allocation retry loop when we are over budget because of heap size rather than page count.
+            // NeedToShiftAddress and IssueShiftAddress still enforce MaxAllocatedPageCount synchronously in that case, as they do when there is no
+            // size tracker at all. Test IsRunning before IsBeyondSizeLimitAndCanEvict: that method reads HeadAddress and TailAddress, which Recovery
+            // has not set up yet, so the short-circuit keeps it off the recovery path.
+            if (logSizeTracker is null || !logSizeTracker.IsRunning || !logSizeTracker.IsBeyondSizeLimitAndCanEvict(addingPage: true))
+                return false;
+
+            logSizeTracker.Signal();
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        long HandlePageOverflow(ref PageOffset localTailPageOffset, int numSlots, int partialSlots)
+        {
+            var pageIndex = localTailPageOffset.Page + 1;
+
+            // See if this thread is trying to allocate at an offset past where one or more previous threads
+            // already overflowed; if so, exit and allow the first overflow thread to proceed. Do not try to
+            // remove the update to TailPageOffset that was done by this thread; that will be overwritten when
+            // the first overflow thread finally completes and updates TailPageOffset.
+            if (localTailPageOffset.Offset - numSlots > PageSize)
+            {
+                if (NeedToWaitForFlush(pageIndex))
+                    return 0; // RETRY_LATER
+                return -1; // RETRY_NOW
+            }
+
+            // We are the single thread that "owns" the page-increment. This is the thread for which:
+            // 1. Old image of offset (pre-Interlocked.Increment) is <= PageSize, and
+            // 2. New image of offset (post-Interlocked.Increment) is > PageSize.
+            // We have an implicit latch because other threads exited in TryAllocate, so we can safely proceed.
+
+            // First see if partialSlots is > 0. If so, and the amount remaining on the page would split numSlots
+            // into two parts each of which is >= partialSlots, then we can satisfy the allocation by allocating
+            // the first part on this page and returning to the caller the length of that allocation. The caller
+            // will then allocate the second part on the next page after populating the first part.
+            if (partialSlots > 0)
+            {
+                var remainingOnPage = PageSize - (localTailPageOffset.Offset - numSlots);
+                if (remainingOnPage >= partialSlots && numSlots - remainingOnPage >= partialSlots)
+                {
+                    // Get the logical address using the original offset.
+                    var logicalAddress = GetLogicalAddressOfStartOfPage(localTailPageOffset.Page) | ((long)(localTailPageOffset.Offset - numSlots));
+
+                    // Reset to end of page
+                    localTailPageOffset.Offset = PageSize;
+                    _ = Interlocked.Exchange(ref TailPageOffset.PageAndOffset, localTailPageOffset.PageAndOffset);
+
+                    // We have satisfied the allocation on this page so we do not need to do size tracking, and can simply return the address.
+                    return logicalAddress;
+                }
+            }
+
+            // If we need to wait for the flushEvent, we have to RETRY_LATER
+            if (NeedToWaitForFlush(pageIndex))
+            {
+                // Reset to previous tail so that next attempt can retry
+                localTailPageOffset.PageAndOffset -= numSlots;
+                _ = Interlocked.Exchange(ref TailPageOffset.PageAndOffset, localTailPageOffset.PageAndOffset);
+
+                // Shift only after TailPageOffset is reset to a valid state
+                IssueShiftAddress(pageIndex, needSHA: true);
+                return 0; // RETRY_LATER
+            }
+
+            // We next verify that:
+            // 1. The next page (pageIndex) is ready to use (i.e., closed)
+            // 2. We have issued any necessary address shifting at the page-turn boundary.
+            // If either cannot be verified, we can ask the caller to retry now (immediately), because it is
+            // an ephemeral state.
+            if (NeedToWaitForClose(pageIndex, out bool needSHA) || NeedToShiftAddress(pageIndex, localTailPageOffset, numSlots))
+            {
+                // Reset to previous tail so that next attempt can retry
+                localTailPageOffset.PageAndOffset -= numSlots;
+                _ = Interlocked.Exchange(ref TailPageOffset.PageAndOffset, localTailPageOffset.PageAndOffset);
+
+                // Shift only after TailPageOffset is reset to a valid state
+                IssueShiftAddress(pageIndex, needSHA);
+                return -1; // RETRY_NOW
+            }
+
+            // TODO: Here we can "allocate" the last chunk on the page as an invalid record, and enqueue it into the revivification freelist if enabled,
+            // before we proceed to the next page. This will speed up scan by letting it jump to the end of the page rather than relying on the end of
+            // the page to be zero-initialized and traversing it by 8-byte IsNull RecordInfo increments.
+            // NOTE: this filler must be written differently per allocator. The main store uses a RecordInfo/RecordDataHeader invalid record
+            // (KeyLength=0, ValueLength=tail, PreviousAddress=kTempInvalidAddress, Filler unset). TsavoriteLog does NOT use RecordInfo records —
+            // its scan (TsavoriteLogScanIterator.GetNextInternal) already skips a zero-length page tail by jumping to the next page — so for
+            // TsavoriteLog the filler must be an entry-length-prefixed record (or left as a zero tail), not a RecordInfo record. Deferred for now
+            // (only exercised once a partialSlots caller wastes a sub-partialSlots tail; the AOF chunk writer's zero tails are already handled).
+
+            // Allocate next page and set new tail
+            if (!IsAllocated(pageIndex % BufferSize) || !IsAllocated((pageIndex + 1) % BufferSize))
+                AllocatePagesWithException(pageIndex, localTailPageOffset, numSlots);
+
+            // Set up the TailPageOffset to account for the page header and then this allocation.
+            localTailPageOffset.Page++;
+            localTailPageOffset.Offset = numSlots + pageHeaderSize;
+            TailPageOffset = localTailPageOffset;
+
+            // If the logSizeTracker is active then we may have expanded the AllocatedPageCount, and thus may be able to increase ReadOnlyAddress
+            // and flush, which will allow the logSizeTracker to evict more records when needed, such as when we add the page's size to the tracker.
+            if (logSizeTracker is not null)
+            {
+                var newReadOnlyAddress = CalculateReadOnlyAddress(GetTailAddress(), HeadAddress);
+                if (newReadOnlyAddress > ReadOnlyAddress)
+                    _ = ShiftReadOnlyAddress(newReadOnlyAddress);
+            }
+
+            // At this point the slot is allocated and we are not allowed to refresh epochs any longer.
+            // Return the first logical address after the page header.
+            return GetLogicalAddressOfStartOfPage(localTailPageOffset.Page) + pageHeaderSize;   // Same as GetFirstValidLogicalAddressOnPage(localTailPageOffset.Page) but faster
+        }
+
+        /// <summary>Try allocate, no thread spinning allowed</summary>
+        /// <param name="numSlots">Number of slots to allocate</param>
+        /// <param name="partialSlots">If nonzero, the number of partial slots to allocate if we are at the end of a page and we would split <paramref name="numSlots"/>
+        ///     into two parts, on this page and on the following page, each of size at least <paramref name="partialSlots"/>. If this condition is met we satisfy the
+        ///     allocation and the caller will also receive the length of the allocation so it can allocate the second part after populating the first.</param>
+        /// <returns>The allocated logical address, or 0 in case of inability to allocate</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private long TryAllocate(int numSlots, int partialSlots)
+        {
+            if (numSlots > PageSize)
+                ThrowTsavoriteException("Entry does not fit on page");
+
+            PageOffset localTailPageOffset = default;
+            localTailPageOffset.PageAndOffset = TailPageOffset.PageAndOffset;
+            Debug.Assert(localTailPageOffset.Offset >= pageHeaderSize, $"TailPageOffset consistency error: Offset {localTailPageOffset.Offset} should equal be >= pageHeaderSize {pageHeaderSize}");
+
+            // If the TailAddress.Offset is already past PageSize, another thread has incremented it and is working in HandlePageOverflow.
+            // Necessary to check because threads keep retrying and we do not want to overflow the offset more than once per thread.
+            if (localTailPageOffset.Offset > PageSize)
+            {
+                if (NeedToWaitForFlush(localTailPageOffset.Page + 1))
+                    return 0; // RETRY_LATER
+                return -1; // RETRY_NOW
+            }
+
+            // Determine insertion index. Note that this forms a kind of "lock"; after the first thread does this, other threads that do
+            // it will see that another thread got there first because the subsequent "back up by numSlots" will still be past PageSize,
+            // so they will exit and RETRY in HandlePageOverflow; the first thread "owns" the overflow operation and must stabilize it.
+            localTailPageOffset.PageAndOffset = Interlocked.Add(ref TailPageOffset.PageAndOffset, numSlots);
+
+            // Slow path when we reach the end of a page.
+            if (localTailPageOffset.Offset > PageSize)
+            {
+                // Note that TailPageOffset is now unstable -- there may be a GetTailAddress call spinning for
+                // it to stabilize. Therefore, HandlePageOverflow needs to stabilize TailPageOffset immediately,
+                // before performing any epoch bumps or system calls.
+                return HandlePageOverflow(ref localTailPageOffset, numSlots, partialSlots);
+            }
+
+            return GetLogicalAddressOfStartOfPage(localTailPageOffset.Page) | ((long)(localTailPageOffset.Offset - numSlots));
+        }
+
+        /// <summary>Try allocate, spin for RETRY_NOW (logicalAddress is less than 0) case</summary>
+        /// <param name="numSlots">Number of slots to allocate</param>
+        /// <param name="logicalAddress">Returned address, or RETRY_LATER (if 0) indicator</param>
+        /// <returns>True if we were able to allocate, else false</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryAllocateRetryNow(int numSlots, out long logicalAddress)
+        {
+            var spins = 0;
+            var localFlushEvent = flushEvent;
+            while ((logicalAddress = TryAllocate(numSlots, partialSlots: 0)) < 0)
+            {
+                // -1: RETRY_NOW
+                WaitToRetryNow(ref spins, ref localFlushEvent);
+            }
+
+            // 0: RETRY_LATER
+            return logicalAddress != 0;
+        }
+
+        /// <summary>Try allocate, spin for RETRY_NOW (logicalAddress is less than 0) case</summary>
+        /// <param name="numSlots">Number of slots to allocate</param>
+        /// <param name="partialSlots">If nonzero, the number of partial slots to allocate if we are at the end of a page and we would split <paramref name="numSlots"/>
+        ///     into two parts, on this page and on the following page, each of size at least <paramref name="partialSlots"/>. If this condition is met we satisfy the
+        ///     allocation and the caller will also receive the length of the allocation so it can allocate the second part after populating the first.</param>
+        /// <param name="logicalAddress">Returned address, or RETRY_LATER (if 0) indicator</param>
+        /// <param name="length">Length of the allocation, if successful</param>
+        /// <returns>True if we were able to allocate, else false</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryAllocateRetryNow(int numSlots, int partialSlots, out long logicalAddress, out long length)
+        {
+            var spins = 0;
+            var localFlushEvent = flushEvent;
+            while ((logicalAddress = TryAllocate(numSlots, partialSlots)) < 0)
+            {
+                // -1: RETRY_NOW
+                WaitToRetryNow(ref spins, ref localFlushEvent);
+            }
+
+            if (logicalAddress != 0)
+            {
+                // If we are at the end of a page, we may have allocated only a partial amount of the requested numSlots.
+                var offsetOnPage = GetOffsetOnPage(logicalAddress);
+                length = (offsetOnPage + numSlots > PageSize) ? (PageSize - offsetOnPage) : numSlots;
+                return true;
+            }
+
+            // 0: RETRY_LATER
+            length = 0;
+            return logicalAddress != 0;
+        }
+
+        void WaitToRetryNow(ref int spins, ref CompletionEvent localFlushEvent)
+        {
+            // Bounded backoff: yield kFlushSpinCount times, then suspend the epoch and wait on flushEvent.
+            // This eliminates CPU burn from all 64 inserter threads spinning while a flush is in flight
+            // (typically ~900us for libaio). We use a short timeout to handle the case where flushEvent was
+            // already Set() and replaced (no further flush coming) but we still need to drain OnPagesClosed.
+            _ = TryComplete();
+            epoch.ProtectAndDrain();
+            if (++spins < Constants.kFlushSpinCount)
+            {
+                _ = Thread.Yield();
+                return;
+            }
+            try
+            {
+                epoch.Suspend();
+                _ = localFlushEvent.Wait(TimeSpan.FromMilliseconds(1));
+            }
+            finally
+            {
+                epoch.Resume();
+            }
+
+            // Disposal permanently signals flushEvent, so without this the wait above would stop blocking and
+            // this loop would spin on a flush and page close that will never come.
+            ThrowIfDisposed();
+
+            localFlushEvent = flushEvent;
+            spins = 0;
+        }
+
+        /// <summary>
+        /// Calculate the new ReadOnlyAddress from the inputs. This may be called when <see cref="AllocatedPageCount"/> has changed due to memory
+        /// size limits, so we cannot use a constant lag approach.
+        /// </summary>
+        /// <param name="tailAddress">Either the next TailAddress if doing an allocation, or the current TailAddress if trimming memory size.</param>
+        /// <param name="headAddress">Either the current HeadAddress if doing an allocation, or the calculated HeadAddress if trimming memory size.</param>
+        /// <returns></returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal long CalculateReadOnlyAddress(long tailAddress, long headAddress)
+        {
+            // Defensive clamp: during normal operation HeadAddress is strictly behind TailAddress. If a caller passes an
+            // out-of-range headAddress (e.g. the long.MaxValue "never evict" sentinel that fast-commit recovery leaves in
+            // place, or that a read-only-mode log carries), the page arithmetic below overflows to a negative address.
+            // Clamp so we never return an out-of-range ReadOnlyAddress that would corrupt the log's address invariants
+            // (or, in Debug, trip the asserts below).
+            if (headAddress >= tailAddress)
+                return tailAddress;
+
+            // Snap ReadOnlyAddress to the start of the page that this calculation on logMutableFraction ends up in. If this is below HeadAddress,
+            // then make it the end of the HeadAddress page. If tailAddress is still on the first page, return HeadAddress.
+            if (tailAddress <= PageSize + PageHeader.Size)
+                return headAddress;
+
+            // First we try to set ReadOnlyAddress to the lower page boundary, to maximize mutable space.
+            var readOnlyAddress = RoundDown(headAddress + (long)((1.0 - logMutableFraction) * (tailAddress - headAddress)), PageSize);
+
+            // If are at the beginning we will have only a small number of pages, so it's even more important to maximize mutable space.
+            // If the new readOnlyAddress is less than or equal to the current one, make sure we have handled the boundary case where
+            // we had to tweak it to handle this.
+            // TODO: Currently we keep ReadOnlyAddress at page boundaries unless we can't (HeadAddress has grown but TailAddress is still
+            // on the first page); consider changing to fine-grained ReadOnlyAddress.
+            if (readOnlyAddress <= headAddress)
+            {
+                var headPage = GetPage(headAddress);
+
+                // If HeadAddress hasn't moved, currentReadOnlyAddress is either HeadAddress or at a page boundary, unless we have the case where
+                // we've gone beyond size budget on a single page; in that case we must remain at headAddress.
+                if ((GetOffsetOnPage(headAddress) <= PageHeader.Size) || GetPage(tailAddress) == headPage)
+                    readOnlyAddress = headAddress;
+                else
+                {
+                    // HeadAddress has moved and tailAddress is on another page.
+                    readOnlyAddress = GetLogicalAddressOfStartOfPage(headPage + 1);
+                }
+            }
+
+            // The HeadAddress page is always calculated to be below the TailAddress page once we have more than a page of records.
+            Debug.Assert(readOnlyAddress <= tailAddress, $"ReadOnlyAddress {readOnlyAddress} must not exceed TailAddress {tailAddress}");
+            Debug.Assert(readOnlyAddress >= headAddress, $"ReadOnlyAddress {readOnlyAddress} must not be less than HeadAddress {headAddress}");
+
+            //Debug.WriteLine($"Calcalating ROA: tailAddress={tailAddress}, headAddress={headAddress}, readOnlyAddress={readOnlyAddress}");
+            return readOnlyAddress;
+        }
+
+        /// <summary>Used by applications to make the current state of the database immutable quickly</summary>
+        public bool ShiftReadOnlyToTail(out long tailAddress, out Task notifyDone)
+        {
+            notifyDone = null;
+            tailAddress = GetTailAddress();
+            var localTailAddress = tailAddress;
+            if (MonotonicUpdate(ref ReadOnlyAddress, tailAddress, out _))
+            {
+                notifyFlushedUntilAddressTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                notifyDone = notifyFlushedUntilAddressTcs.Task;
+                notifyFlushedUntilAddress = localTailAddress;
+                epoch.BumpCurrentEpoch(() => OnPagesMarkedReadOnly(localTailAddress));
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Used by applications to move read-only forward</summary>
+        public bool ShiftReadOnlyAddress(long newReadOnlyAddress, bool noFlush = false)
+        {
+            if (MonotonicUpdate(ref ReadOnlyAddress, newReadOnlyAddress, out _))
+            {
+                epoch.BumpCurrentEpoch(() => OnPagesMarkedReadOnly(newReadOnlyAddress, noFlush));
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Shift begin address</summary>
+        public void ShiftBeginAddress(long newBeginAddress, bool truncateLog, bool noFlush = false)
+        {
+            // Recorded with the request, so the truncation is skipped if a Reset rewinds the log before it runs
+            var requestResetCount = Volatile.Read(ref resetCount);
+
+            // First update the begin address
+            if (!MonotonicUpdate(ref BeginAddress, newBeginAddress, out _))
+            {
+                if (truncateLog)
+                    epoch.BumpCurrentEpoch(() => TruncateUntilAddress(newBeginAddress, requestResetCount));
+                return;
+            }
+
+            // Shift read-only address
+            var localFlushEvent = flushEvent;
+            _ = ShiftReadOnlyAddress(newBeginAddress, noFlush);
+
+            if (!noFlush)
+            {
+                // Wait for flush to complete
+                var spins = 0;
+                while (true)
+                {
+                    if (FlushedUntilAddress >= newBeginAddress)
+                        break;
+
+                    // Disposal permanently signals flushEvent, so the wait below would stop blocking and no
+                    // further flush can advance FlushedUntilAddress; stop waiting rather than spin.
+                    if (IsDisposed)
+                        break;
+
+                    if (++spins < Constants.kFlushSpinCount)
+                    {
+                        _ = Thread.Yield();
+                        continue;
+                    }
+                    try
+                    {
+                        epoch.Suspend();
+                        localFlushEvent.Wait();
+                    }
+                    finally
+                    {
+                        epoch.Resume();
+                    }
+                    localFlushEvent = flushEvent;
+                }
+            }
+
+            // Checked on every exit from the wait above, including the flush-completed break and the noFlush path,
+            // because the hazard is disposal rather than how we got here. The head shift below is uncapped (unlike
+            // ShiftHeadAddress, which clamps to FlushedUntilAddress), and its OnPagesClosed would free pages
+            // concurrently with the teardown Dispose is already performing. BeginAddress and ReadOnlyAddress are
+            // published by this point; the remaining head shift and truncate are teardown work Dispose does itself.
+            if (IsDisposed)
+                return;
+
+            // Then shift head address
+            var h = MonotonicUpdate(ref HeadAddress, newBeginAddress, out _);
+            if (h || truncateLog)
+            {
+                epoch.BumpCurrentEpoch(() =>
+                {
+                    if (h)
+                        OnPagesClosed(newBeginAddress);
+                    if (truncateLog)
+                        TruncateUntilAddress(newBeginAddress, requestResetCount);
+                });
+            }
+        }
+
+        /// <summary>Find the head address cutoff on a page for partial object loading. Only implemented by ObjectAllocator.</summary>
+        internal virtual long FindHeadAddressCutoffOnPage(long page, long untilAddress, long totalPageObjectSize, int numPagesBelowCurrentPage, long remainingBudget, out int numPagesBelowToEvict)
+        {
+            numPagesBelowToEvict = 0;
+            return GetFirstValidLogicalAddressOnPage(page);
+        }
+
+        /// <summary>Invokes eviction observer if set and then frees the page.</summary>
+        internal void EvictPageForRecovery(long page)
+        {
+            var start = GetLogicalAddressOfStartOfPage(page);
+            var end = GetLogicalAddressOfStartOfPage(page + 1);
+
+            var source = IsReadCache ? EvictionSource.ReadCache : EvictionSource.MainLog;
+
+            // Per-record eviction walk handles internal heap accounting (key + value via
+            // logSizeTracker) and optionally notifies the application via OnEvict. isRecovery: true so that pages whose
+            // object load was deferred (empty ObjectIdMap, un-deserialized object/overflow slots) are skipped.
+            if (logSizeTracker is not null || storeFunctions.CallOnEvict)
+            {
+                _wrapper.EvictRecordsInRange(start, end, source, isRecovery: true);
+            }
+            if (onEvictionObserver is not null)
+            {
+                MemoryPageScan(start, end, onEvictionObserver);
+            }
+
+            _wrapper.FreePage(page);
+        }
+
+        /// <summary>
+        /// Action to be performed when pages move into the immutable region.
+        /// Seal: make sure there are no longer any threads writing to the page
+        /// Flush: send page to secondary store
+        /// </summary>
+        internal virtual void OnPagesMarkedReadOnly(long newSafeReadOnlyAddress, bool noFlush = false)
+        {
+            if (MonotonicUpdate(ref SafeReadOnlyAddress, newSafeReadOnlyAddress, out var oldSafeReadOnlyAddress))
+            {
+                try
+                {
+                    // Debug.WriteLine("SafeReadOnly shifted from {0:X} to {1:X}", oldSafeReadOnlyAddress, newSafeReadOnlyAddress);
+                    if (onReadOnlyObserver != null)
+                    {
+                        // This scan does not need a store because it does not lock; it is epoch-protected so by the time it runs no current thread
+                        // will have seen a record below the new ReadOnlyAddress as "in mutable region".
+                        using var iter = Scan(store: null, oldSafeReadOnlyAddress, newSafeReadOnlyAddress, DiskScanBufferingMode.NoBuffering);
+                        onReadOnlyObserver?.OnNext(iter);
+                    }
+                    AsyncFlushPagesForReadOnly(oldSafeReadOnlyAddress, newSafeReadOnlyAddress, noFlush);
+                }
+                catch (Exception ex)
+                {
+                    // SafeReadOnlyAddress has passed a range that may not be flushed, and FlushedUntilAddress cannot pass an unflushed
+                    // range, so the log would stall silently. Crash instead: a dump is the only practical way to diagnose this.
+                    FailFastOnWorkerException($"OnPagesMarkedReadOnly failed; allocator state is unrecoverable. Range [{oldSafeReadOnlyAddress}, {newSafeReadOnlyAddress}) "
+                        + $"may not be flushed. FlushedUntilAddress={FlushedUntilAddress}", ex);
+                }
+            }
+        }
+
+        /// <summary>Action to be performed when all threads have agreed that a page range is closed.</summary>
+        private void OnPagesClosed(long newSafeHeadAddress)
+        {
+            Debug.Assert(newSafeHeadAddress > 0);
+            if (MonotonicUpdate(ref SafeHeadAddress, newSafeHeadAddress, out _ /*oldSafeHeadAddress*/))
+            {
+                // This thread is responsible for [oldSafeHeadAddress -> newSafeHeadAddress]
+                while (true)
+                {
+                    var _ongoingCloseUntilAddress = OngoingCloseUntilAddress;
+
+                    // If we are closing in the middle of an ongoing OPCWorker loop, exit.
+                    if (_ongoingCloseUntilAddress >= newSafeHeadAddress)
+                        break;
+
+                    // We'll continue the loop if we fail the CAS here; that means another thread extended the Ongoing range.
+                    if (Interlocked.CompareExchange(ref OngoingCloseUntilAddress, newSafeHeadAddress, _ongoingCloseUntilAddress) == _ongoingCloseUntilAddress)
+                    {
+                        // If _ongoingCloseUntilAddress != 0 then another thread is runnning the OPCWorker loop and will see the OngoingCloseUntilAddress increment to
+                        // include newSafeHeadAddress so we are done here. Otherwise, this thread is responsible for closing [ClosedUntilAddress -> newSafeHeadAddress]
+                        // and any other ranges that OngoingCloseUntilAddress is incremented to, and we are done here when that concludes.
+                        if (_ongoingCloseUntilAddress == 0)
+                            OnPagesClosedWorker();
+                        return;
+                    }
+                    _ = Thread.Yield();
+                }
+            }
+        }
+
+        private void OnPagesClosedWorker()
+        {
+            try
+            {
+                OnPagesClosedWorkerCore();
+            }
+            catch (Exception ex)
+            {
+                // Page closing cannot resume after a failure here, so the log would stall silently. Crash instead: a dump is the
+                // only practical way to diagnose this.
+                FailFastOnWorkerException(
+                    $"OnPagesClosedWorker failed; allocator state is unrecoverable. ClosedUntilAddress={ClosedUntilAddress}, OngoingCloseUntilAddress={OngoingCloseUntilAddress}", ex);
+            }
+        }
+
+        /// <summary>
+        /// Terminates the process for an exception that escapes a page flush or close. These run in epoch drains on whichever thread
+        /// drains them, and the log cannot advance past the range they failed on.
+        /// </summary>
+        /// <param name="state">The failed operation and the allocator state it leaves.</param>
+        /// <param name="ex">The exception.</param>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private protected static void FailFastOnWorkerException(string state, Exception ex)
+        {
+            // Exception.ToString() is virtual, so an application exception can throw while formatting itself. FailFast formats the
+            // exception it is given and throws instead of terminating if that throws, so such an exception is reported by type only.
+            var exceptionType = ex.GetType().FullName ?? ex.GetType().Name;
+            string exceptionDetails;
+            var reportedException = ex;
+            try
+            {
+                exceptionDetails = ex.ToString() ?? exceptionType;
+            }
+            catch (Exception formatException)
+            {
+                exceptionDetails = $"{exceptionType}; its ToString() threw {formatException.GetType().FullName}";
+                reportedException = null;
+            }
+
+            Environment.FailFast($"{state}{Environment.NewLine}Caught exception:{Environment.NewLine}{exceptionDetails}", reportedException);
+        }
+
+        private void OnPagesClosedWorkerCore()
+        {
+            while (true)
+            {
+                var closeStartAddress = ClosedUntilAddress;
+                var closeEndAddress = OngoingCloseUntilAddress;
+
+                if (EvictCallback is not null)
+                    EvictCallback(closeStartAddress, closeEndAddress);
+
+                // Process a page (possibly fragment) at a time.
+                for (var closePageAddress = GetAddressOfStartOfPageOfAddress(closeStartAddress); closePageAddress < closeEndAddress; closePageAddress += PageSize)
+                {
+                    // Get the range on this page: the start may be 0 or greater, and the end may be end-of-page or less.
+                    var start = closeStartAddress > closePageAddress ? closeStartAddress : closePageAddress;
+                    var end = closeEndAddress < closePageAddress + PageSize ? closeEndAddress : closePageAddress + PageSize;
+
+                    // Legacy observer path — skip if the observer IS the logSizeTracker, since
+                    // EvictRecordsInRange below already handles heap accounting via logSizeTracker.
+                    if (onEvictionObserver is not null)
+                        MemoryPageScan(start, end, onEvictionObserver);
+
+                    // Per-record eviction walk: handles internal heap-size accounting (key overflow
+                    // and value heap via logSizeTracker) and optionally notifies the application
+                    // via OnEvict for app-level cleanup.
+                    var evictSource = IsReadCache ? EvictionSource.ReadCache : EvictionSource.MainLog;
+                    if (logSizeTracker is not null || storeFunctions.CallOnEvict)
+                        _wrapper.EvictRecordsInRange(start, end, evictSource, isRecovery: false);
+
+                    // If we are using a null storage device, we must also shift BeginAddress (leave it in-memory)
+                    if (IsNullDevice)
+                        _ = MonotonicUpdate(ref BeginAddress, end, out _);
+
+                    // If the end of the closing range is at the end of the page, free the page
+                    if (end == closePageAddress + PageSize)
+                        _wrapper.FreePage((int)GetPage(closePageAddress));
+
+                    _ = MonotonicUpdate(ref ClosedUntilAddress, end, out _);
+                }
+
+                // End if we have exhausted co-operative work. This includes the case where OngoingCloseUntilAddress and closeEndAddress are already 0.
+                if (Interlocked.CompareExchange(ref OngoingCloseUntilAddress, 0, closeEndAddress) == closeEndAddress)
+                    break;
+                _ = Thread.Yield();
+            }
+        }
+
+        private void DebugPrintAddresses()
+        {
+            var _begin = BeginAddress;
+            var _closedUntil = ClosedUntilAddress;
+            var _safehead = SafeHeadAddress;
+            var _head = HeadAddress;
+            var _flush = FlushedUntilAddress;
+            var _safereadonly = SafeReadOnlyAddress;
+            var _readonly = ReadOnlyAddress;
+            var _tail = GetTailAddress();
+
+            Console.WriteLine("BeginAddress: {0}.{1}", GetPage(_begin), GetOffsetOnPage(_begin));
+            Console.WriteLine("ClosedUntilAddress: {0}.{1}", GetPage(_closedUntil), GetOffsetOnPage(_closedUntil));
+            Console.WriteLine("SafeHead: {0}.{1}", GetPage(_safehead), GetOffsetOnPage(_safehead));
+            Console.WriteLine("Head: {0}.{1}", GetPage(_head), GetOffsetOnPage(_head));
+            Console.WriteLine("FlushedUntil: {0}.{1}", GetPage(_flush), GetOffsetOnPage(_flush));
+            Console.WriteLine("SafeReadOnly: {0}.{1}", GetPage(_safereadonly), GetOffsetOnPage(_safereadonly));
+            Console.WriteLine("ReadOnly: {0}.{1}", GetPage(_readonly), GetOffsetOnPage(_readonly));
+            Console.WriteLine("Tail: {0}.{1}", GetPage(_tail), GetOffsetOnPage(_tail));
+        }
+
+        /// <summary>
+        /// Tries to shift head address to specified value
+        /// </summary>
+        /// <param name="desiredHeadAddress"></param>
+        public long ShiftHeadAddress(long desiredHeadAddress)
+        {
+            // Obtain local values of variables that can change
+            var currentFlushedUntilAddress = FlushedUntilAddress;
+
+            // Cap the new head address at the last flushed address.
+            var newHeadAddress = desiredHeadAddress;
+            if (newHeadAddress > currentFlushedUntilAddress)
+                newHeadAddress = currentFlushedUntilAddress;
+
+            // Note: Currently nothing needs to be done if HeadAddress advancement is at a finer grain than page-level.
+            if (MonotonicUpdate(ref HeadAddress, newHeadAddress, out _))
+            {
+                // Debug.WriteLine("Allocate: Moving head offset from {0:X} to {1:X}", oldHeadAddress, newHeadAddress);
+                epoch.BumpCurrentEpoch(() => OnPagesClosed(newHeadAddress));
+            }
+
+            return newHeadAddress;
+        }
+
+        /// <summary>
+        /// Every async flush callback tries to update the flushed until address to the latest value possible
+        /// TODO: Is there a better way to do this with enabling fine-grained addresses (not necessarily at page boundaries)?
+        /// </summary>
+        protected void ShiftFlushedUntilAddress()
+        {
+            var currentFlushedUntilAddress = FlushedUntilAddress;
+            var page = GetPage(currentFlushedUntilAddress);
+
+            var update = false;
+            var pageLastFlushedAddress = PageStatusIndicator[page % BufferSize].LastFlushedUntilAddress;
+            while (pageLastFlushedAddress >= currentFlushedUntilAddress && currentFlushedUntilAddress >= GetLogicalAddressOfStartOfPage(page))
+            {
+                currentFlushedUntilAddress = pageLastFlushedAddress;
+                update = true;
+                page++;
+                pageLastFlushedAddress = PageStatusIndicator[page % BufferSize].LastFlushedUntilAddress;
+            }
+
+            if (update)
+            {
+                // Anything here must be valid flushes because error flushes do not set LastFlushedUntilAddress, which
+                // prevents future ranges from being marked as flushed
+                if (MonotonicUpdate(ref FlushedUntilAddress, currentFlushedUntilAddress, out long oldFlushedUntilAddress))
+                {
+                    FlushCallback?.Invoke(
+                        new CommitInfo
+                        {
+                            FromAddress = oldFlushedUntilAddress,
+                            UntilAddress = currentFlushedUntilAddress,
+                            ErrorCode = 0
+                        });
+
+                    flushEvent.Set();
+
+                    if ((oldFlushedUntilAddress < notifyFlushedUntilAddress) && (currentFlushedUntilAddress >= notifyFlushedUntilAddress))
+                        _ = notifyFlushedUntilAddressTcs?.TrySetResult(true);
+                }
+            }
+
+            if (!errorList.Empty)
+            {
+                var info = errorList.GetEarliestError();
+                if (info.FromAddress == FlushedUntilAddress)
+                {
+                    // All requests before error range has finished successfully -- this is the earliest error and we can invoke callback on it.
+                    FlushCallback?.Invoke(info);
+                }
+                // Otherwise, do nothing and wait for the next invocation.
+            }
+        }
+
+        /// <summary>Address for notification of flushed-until</summary>
+        public long notifyFlushedUntilAddress;
+
+        /// <summary>TaskCompletionSource for notification of flushed-until</summary>
+        public TaskCompletionSource<bool> notifyFlushedUntilAddressTcs;
+
+        /// <summary>Reset for recovery</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        protected internal virtual void RecoveryReset(long tailAddress, long headAddress, long beginAddress, long readonlyAddress)
+        {
+            long tailPage = GetPage(tailAddress);
+            long offsetInPage = GetOffsetOnPage(tailAddress);
+            TailPageOffset.Page = (int)tailPage;
+            TailPageOffset.Offset = (int)offsetInPage;
+            // Sometimes the tailAddress calculation ends on a page boundary and this gets into the RecoveryInfo.
+            // Don't change GetTailAddress() as that may affect other calculations; instead, ensure it's set correctly here.
+            if (pageHeaderSize > 0 && TailPageOffset.Offset == 0)
+                TailPageOffset.Offset = pageHeaderSize;
+
+            // Allocate the current page and the next page (the allocate-ahead invariant) if necessary.
+            AllocateCurrentAndNextPage(TailPageOffset.Page);
+
+            BeginAddress = beginAddress;
+            HeadAddress = headAddress;
+            SafeHeadAddress = headAddress;
+            ClosedUntilAddress = headAddress;
+            FlushedUntilAddress = readonlyAddress;
+            ReadOnlyAddress = readonlyAddress;
+            SafeReadOnlyAddress = readonlyAddress;
+
+            // for the last page which contains tailoffset, it must be open
+            var pageIndex = GetPageIndexForAddress(tailAddress);
+
+            // clear the last page starting from tail address
+            ClearPage(pageIndex, (int)GetOffsetOnPage(tailAddress));
+
+            // Printing debug info
+            logger?.LogInformation("******* Recovered HybridLog Stats *******");
+            logger?.LogInformation("Head Address: {HeadAddress}", HeadAddress);
+            logger?.LogInformation("Safe Head Address: {SafeHeadAddress}", SafeHeadAddress);
+            logger?.LogInformation("ReadOnly Address: {ReadOnlyAddress}", ReadOnlyAddress);
+            logger?.LogInformation("Safe ReadOnly Address: {SafeReadOnlyAddress}", SafeReadOnlyAddress);
+            logger?.LogInformation("Tail Address: {tailAddress}", tailAddress);
+        }
+
+        /// <summary>Read a main log record to <see cref="SectorAlignedMemory"/> - used for RUMD operations.</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void AsyncReadRecordToMemory(long fromLogicalAddress, int numBytes, DeviceIOCompletionCallback callback, ref AsyncIOContext context)
+        {
+            context.record = GetAndPopulateReadBuffer(fromLogicalAddress, numBytes, out var alignedFileOffset, out var alignedReadLength);
+            // The AsyncIOContext is itself the object-context handed to the device; it is carried back to
+            // the completion callback and (for async ops) on to the run thread via readyResponses.
+            device.ReadAsync(alignedFileOffset, (IntPtr)context.record.aligned_pointer, alignedReadLength, callback, context);
+        }
+
+        /// <summary>Read inline blittable record to <see cref="SectorAlignedMemory"/> - simple read context version. Used by TsavoriteLog.</summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void AsyncReadBlittableRecordToMemory(long fromLogicalAddress, int numBytes, DeviceIOCompletionCallback callback, ref SimpleReadContext context)
+        {
+            context.record = GetAndPopulateReadBuffer(fromLogicalAddress, numBytes, out var alignedReadStart, out var alignedReadLength);
+            device.ReadAsync(alignedReadStart, (IntPtr)context.record.aligned_pointer, alignedReadLength, callback, context);
+        }
+
+        private SectorAlignedMemory GetAndPopulateReadBuffer(long fromLogicalAddress, int numBytes, out ulong alignedReadStart, out uint alignedReadLength)
+        {
+            var readStart = (ulong)(AlignedPageSizeBytes * GetPage(fromLogicalAddress) + GetOffsetOnPage(fromLogicalAddress));
+            alignedReadStart = (ulong)RoundDown((long)readStart, sectorSize);
+            var alignedReadEnd = (ulong)RoundUp((long)readStart + numBytes, sectorSize);
+            alignedReadLength = (uint)(alignedReadEnd - alignedReadStart);
+
+            // Records never span page boundaries (HandlePageOverflow guarantees this), but the
+            // sector-aligned read window above can over-extend past the page-end on records near
+            // the end of a page. When the device segment size is a multiple of the page size
+            // (e.g. 4MB pages, 1GB segments — the Garnet default), an over-extended read at the
+            // last page of a segment also crosses the device's segment boundary; native devices
+            // that implement segmented files (FileSystemSegmentedFile in NativeStorageDevice)
+            // reject such reads with IOError and the engine spins retrying the same address
+            // forever. Clamp the read length so it never crosses page-end. pageEnd is
+            // sector-aligned (PageSizeBits >= SectorSize), so the clamped length stays
+            // sector-aligned.
+            var pageEndInFile = (ulong)(AlignedPageSizeBytes * (GetPage(fromLogicalAddress) + 1));
+            if (alignedReadStart + alignedReadLength > pageEndInFile)
+                alignedReadLength = (uint)(pageEndInFile - alignedReadStart);
+
+            // Rent the read-destination buffer with clearOnReturn=false: the device read
+            // will fully overwrite [aligned_pointer .. aligned_pointer + alignedReadLength)
+            // and downstream consumers bound their access by valid_offset / available_bytes,
+            // so the historical Array.Clear on Return is pure waste here (~4-8 KB of memory
+            // bandwidth per pending read).
+            var record = bufferPool.Get((int)alignedReadLength, clearOnReturn: false);
+            record.valid_offset = (int)(readStart - alignedReadStart);
+            record.available_bytes = (int)(alignedReadLength - record.valid_offset);
+            record.required_bytes = numBytes;
+            return record;
+        }
+
+        /// <summary>Read pages from specified device(s) for recovery, with no output of the countdown event (but it is still created in the
+        ///     <see cref="PageAsyncReadResult{TContext}"/> and thus must be Dispose()d).</summary>
+        /// <typeparam name="TContext">The type of <paramref name="context"/></typeparam>
+        /// <param name="readPageStart">The first page to read</param>
+        /// <param name="numPages">The number of pages to read</param>
+        /// <param name="untilAddress">The end of the data to read; the page holding it is read only up to it, rounded up to a sector</param>
+        /// <param name="context">The context passed to the read completion callback</param>
+        /// <param name="devicePageOffset">For a snapshot <paramref name="logDevice"/>, the page at its offset 0</param>
+        /// <param name="logDevice">The snapshot device to read from; null for the main log device</param>
+        /// <param name="objectLogDevice">The object-log device a <see cref="RecoveryPhase.Pass2"/> read deserializes objects from; null for the main object log</param>
+        /// <param name="recoveryPhase">The recovery phase of the read; objects are deserialized as each page is read except in <see cref="RecoveryPhase.Pass1"/></param>
+        /// <param name="firstPageReadOffset">The sector-aligned offset on <paramref name="readPageStart"/> from which to read that page; the resident page's
+        ///     bytes below it are kept. Nonzero only for a <see cref="RecoveryPhase.Pass1"/> read, which deserializes no objects (that would start at the page start).</param>
+        internal void AsyncReadPagesForRecovery<TContext>(long readPageStart, int numPages, long untilAddress, TContext context,
+            long devicePageOffset = 0, IDevice logDevice = null, IDevice objectLogDevice = null, RecoveryPhase recoveryPhase = RecoveryPhase.Pass1, int firstPageReadOffset = 0)
+            => AsyncReadPagesForRecovery(readPageStart, numPages, untilAddress, context, out _, devicePageOffset, logDevice, objectLogDevice, recoveryPhase, firstPageReadOffset);
+
+        /// <summary>Read pages from specified device for recovery, returning the countdown event</summary>
+        /// <typeparam name="TContext">The type of <paramref name="context"/></typeparam>
+        /// <param name="readPageStart">The first page to read</param>
+        /// <param name="numPages">The number of pages to read</param>
+        /// <param name="untilAddress">The end of the data to read; the page holding it is read only up to it, rounded up to a sector</param>
+        /// <param name="context">The context passed to the read completion callback</param>
+        /// <param name="completed">Outputs the countdown event for the page reads; see <see cref="PageAsyncReadResult{TContext}.handle"/></param>
+        /// <param name="devicePageOffset">For a snapshot <paramref name="logDevice"/>, the page at its offset 0</param>
+        /// <param name="logDevice">The snapshot device to read from; null for the main log device</param>
+        /// <param name="objectLogDevice">The object-log device a <see cref="RecoveryPhase.Pass2"/> read deserializes objects from; null for the main object log</param>
+        /// <param name="recoveryPhase">The recovery phase of the read; objects are deserialized as each page is read except in <see cref="RecoveryPhase.Pass1"/></param>
+        /// <param name="firstPageReadOffset">The sector-aligned offset on <paramref name="readPageStart"/> from which to read that page; the resident page's
+        ///     bytes below it are kept. Nonzero only for a <see cref="RecoveryPhase.Pass1"/> read, which deserializes no objects (that would start at the page start).</param>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AsyncReadPagesForRecovery<TContext>(long readPageStart, int numPages, long untilAddress, TContext context,
+            out CountdownEvent completed, long devicePageOffset = 0, IDevice logDevice = null, IDevice objectLogDevice = null, RecoveryPhase recoveryPhase = RecoveryPhase.Pass1,
+            int firstPageReadOffset = 0)
+        {
+            Debug.Assert(firstPageReadOffset == 0 || (firstPageReadOffset % sectorSize == 0 && firstPageReadOffset < PageSize && recoveryPhase == RecoveryPhase.Pass1
+                && IsAllocated(GetPageIndexForPage(readPageStart))), $"Invalid firstPageReadOffset {firstPageReadOffset}");
+            var usedDevice = logDevice ?? this.device;
+
+            completed = new CountdownEvent(numPages);
+
+            // firstPageReadOffset applies only to the first page; the loop update clears pageReadOffset for the rest.
+            var pageReadOffset = firstPageReadOffset;
+            for (long readPage = readPageStart; readPage < (readPageStart + numPages); readPage++, pageReadOffset = 0)
+            {
+                var pageIndex = (int)(readPage % BufferSize);
+                if (!IsAllocated(pageIndex))
+                    _wrapper.AllocatePage(pageIndex);
+                else
+                    ClearPage(readPage, offset: pageReadOffset);
+
+                var asyncResult = new PageAsyncReadResult<TContext>()
+                {
+                    page = readPage,
+                    devicePageOffset = devicePageOffset,
+                    context = context,
+                    handle = completed,
+                    maxAddressOffsetOnPage = PageSize,
+                    recoveryPhase = recoveryPhase
+                };
+
+                var offsetInFile = (ulong)(AlignedPageSizeBytes * readPage);
+                var readLength = (uint)AlignedPageSizeBytes;
+                long adjustedUntilAddress = AlignedPageSizeBytes * GetPage(untilAddress) + GetOffsetOnPage(untilAddress);
+
+                if (adjustedUntilAddress > 0 && ((adjustedUntilAddress - (long)offsetInFile) < PageSize))
+                {
+                    readLength = (uint)(adjustedUntilAddress - (long)offsetInFile);
+                    asyncResult.maxAddressOffsetOnPage = readLength;
+                    readLength = (uint)((readLength + (sectorSize - 1)) & ~(sectorSize - 1));
+                }
+
+                // If device != null then it is the snapshot file device. In that case we may have an offset into it due to FlushedUntilAddress
+                // having advanced; see Recovery.cs:RecoverHybridLog.
+                if (logDevice != null)
+                    offsetInFile = (ulong)(AlignedPageSizeBytes * (readPage - devicePageOffset));
+
+                // Start the read at pageReadOffset, in both the file and the page; readLength was computed from the page start.
+                Debug.Assert(pageReadOffset == 0 || readLength > pageReadOffset, $"readLength {readLength} must exceed pageReadOffset {pageReadOffset}");
+                offsetInFile += (ulong)pageReadOffset;
+                readLength -= (uint)pageReadOffset;
+
+                if (recoveryPhase == RecoveryPhase.Pass2)
+                {
+                    // Create separate readBuffers for each main-log page, as each page launches its own async read and callbacks are on different threads.
+                    // Do *not* use "using" here as we need it to survive to the ReadAsync AsyncReadPagesForRecoveryCallback.
+                    asyncResult.readBuffers = CreateCircularReadBuffers(objectLogDevice, logger);
+                }
+
+                // Call the overridden ReadAsync for the derived allocator class
+                ReadAsync(offsetInFile, (IntPtr)(pagePointers[pageIndex] + pageReadOffset), readLength, AsyncReadPagesForRecoveryCallback, asyncResult, usedDevice);
+            }
+        }
+
+        /// <summary>
+        /// Flush page range to disk. Called when all threads have agreed that a page range is sealed.
+        /// </summary>
+        /// <remarks>
+        /// This is called synchronously from OnPagesMarkedReadOnly to kick off a flush sequence of (possibly multiple and/or partial) pages.
+        /// </remarks>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal virtual void AsyncFlushPagesForReadOnly(long fromAddress, long untilAddress, bool noFlush = false)
+        {
+            // This is the base implementation, used by TsavoriteLog and SpanByteAllocator; it is overridden by ObjectAllocatorImpl to handle object log flushes.
+            GetFlushPageRange(fromAddress, untilAddress, out var startPage, out var numPages);
+
+            // Write each page (or partial page) in the range.
+            for (var flushPage = startPage; flushPage < (startPage + numPages); flushPage++)
+            {
+                if (!PrepareFlushAsyncResult(fromAddress, untilAddress, noFlush, flushPage, out var asyncResult))
+                    continue;
+
+                // If there are partial pages, we need to wait until the ongoing prior adjacent flush is completed to ensure correctness; otherwise, given
+                // that we write in multiples of sector size, if the adjacent fragments do not end/start on sector alignment there may be a race where the
+                // final sector in the prior fragment (which is incomplete) overwrites the same sector (which was completed) in the next adjacent fragment.
+                // To accomplish this we use PendingFlush and AsyncFlushPageCallback chains to the next fragment in the sequence. TsavoriteLog in particular
+                // does fine-grained flushing and this is critical for its performance and correctness.
+                var index = GetPageIndexForAddress(asyncResult.fromAddress);
+                if (GetOffsetOnPage(asyncResult.fromAddress) > 0)
+                {
+                    // Try to merge request with existing adjacent (earlier) pending requests (these have not yet begun or they would not be in the queue).
+                    while (PendingFlush[index].RemovePreviousAdjacent(asyncResult.fromAddress, out var existingRequest))
+                        asyncResult.fromAddress = existingRequest.fromAddress;
+
+                    // Enqueue the (possibly merged) new work item into the queue.
+                    PendingFlush[index].Add(asyncResult);
+
+                    // Perform work from shared queue if possible: When a flush completes it updates FlushedUntilAddress. If there is an item in the shared
+                    // queue that starts at FlushedUntilAddress, it can now be flushed. Flush callbacks will RemoveNextAdjacent(FlushedUntilAddress, ...)
+                    // to continue the chain of flushes until the queue is empty. This will issue a write that completes in the background as we move to the
+                    // next adjacent chunk (or page if this is the last chunk on the current page).
+                    if (PendingFlush[index].RemoveNextAdjacent(FlushedUntilAddress, out PageAsyncFlushResult<Empty> request))
+                        WriteAsync(GetPage(request.fromAddress), AsyncFlushPageCallback, request);  // Call the overridden WriteAsync for the derived allocator class
+                    continue;
+                }
+
+                // This is the start of a possibly partial page range; if partial, there may be elements in the PendingFlush array for this index.
+                // The flush will issue a write that completes in the background as we move to the next range to flush; if this was a partial range
+                // then the PendingFlush list will be drained via chained WriteAsync in the callbacks.
+                WriteAsync(flushPage, AsyncFlushPageCallback, asyncResult);                     // Call the overridden WriteAsync for the derived allocator class
+            }
+        }
+
+        private protected void GetFlushPageRange(long fromAddress, long untilAddress, out long startPage, out long numPages)
+        {
+            startPage = GetPage(fromAddress);
+            var endPage = GetPage(untilAddress);
+            numPages = (int)(endPage - startPage);
+
+            // Extra (partial) page being flushed
+            if (GetOffsetOnPage(untilAddress) > 0)
+                numPages++;
+        }
+
+        private protected bool PrepareFlushAsyncResult(long fromAddress, long untilAddress, bool noFlush, long flushPage, out PageAsyncFlushResult<Empty> asyncResult)
+        {
+            // Default to writing the full page.
+            var pageStartAddress = GetLogicalAddressOfStartOfPage(flushPage);
+            var pageEndAddress = GetLogicalAddressOfStartOfPage(flushPage + 1);
+
+            asyncResult = new PageAsyncFlushResult<Empty>
+            {
+                page = flushPage,
+                count = 1,
+                partial = false,
+                fromAddress = pageStartAddress,
+                untilAddress = pageEndAddress
+            };
+
+            // If either fromAddress or untilAddress is in the middle of the page, this will be a partial page flush.
+            asyncResult.partial = ((fromAddress > pageStartAddress) && (fromAddress < pageEndAddress))
+                                || ((untilAddress > pageStartAddress) && (untilAddress < pageEndAddress));
+            if (asyncResult.partial)
+            {
+                if (untilAddress < pageEndAddress)
+                    asyncResult.untilAddress = untilAddress;
+                if (fromAddress > pageStartAddress)
+                    asyncResult.fromAddress = fromAddress;
+            }
+
+            // We skip if either of the following, and need to check both.
+            var skip = false;
+            if (asyncResult.untilAddress <= BeginAddress)
+            {
+                // Short circuit as no flush needed; just advance the flushed until address to BeginAddress.
+                _ = MonotonicUpdate(ref PageStatusIndicator[flushPage % BufferSize].LastFlushedUntilAddress, BeginAddress, out _);
+                ShiftFlushedUntilAddress();
+                skip = true;
+            }
+
+            if (IsNullDevice || noFlush)
+            {
+                // Short circuit as no flush needed; just advance the flushed until address to untilAddress.
+                _ = MonotonicUpdate(ref PageStatusIndicator[flushPage % BufferSize].LastFlushedUntilAddress, asyncResult.untilAddress, out _);
+                ShiftFlushedUntilAddress();
+                skip = true;
+            }
+
+            return !skip;
+        }
+
+        /// <summary>
+        /// Flush pages asynchronously for recovery (such as when we have invalidated v+1 records, or when replaying snapshot pages into the main log).
+        /// </summary>
+        /// <param name="scanFromAddress">The lowest address being flushed on <paramref name="flushPageStart"/></param>
+        /// <param name="flushPageStart">First page to flush</param>
+        /// <param name="numPages">Number of pages to flush</param>
+        /// <param name="callback">Flush completion callback</param>
+        /// <param name="context">Callback context</param>
+        /// <param name="snapshotObjectLogDevice">For the snapshot-replay flush, the snapshot object-log device whose object bytes (for records at/above
+        ///     <paramref name="formerFlushedUntilAddress"/>) are copied into the main object-log during the flush. Null for non-object or hybrid-log-only flushes.</param>
+        /// <param name="formerFlushedUntilAddress">The former FlushedUntilAddress (hybrid-log/snapshot boundary); records at/above it have their objects copied.</param>
+        public void AsyncFlushPagesForRecovery<TContext>(long scanFromAddress, long flushPageStart, int numPages, DeviceIOCompletionCallback callback, TContext context,
+            IDevice snapshotObjectLogDevice = null, long formerFlushedUntilAddress = long.MaxValue)
+        {
+            Debug.Assert(scanFromAddress < GetLogicalAddressOfStartOfPage(flushPageStart + 1), $"scanFromAddress ({scanFromAddress}) must be on flushPageStart ({flushPageStart})");
+
+            // When copying snapshot object bytes into the main object-log, we need write buffers on the main object-log device (as for a normal flush).
+            var copyObjects = snapshotObjectLogDevice is not null;
+            for (var flushPage = flushPageStart; flushPage < (flushPageStart + numPages); flushPage++)
+            {
+                var pageStartAddress = GetLogicalAddressOfStartOfPage(flushPage);
+                var flushFromAddress = Math.Max(scanFromAddress, pageStartAddress);
+
+                // When copying snapshot object bytes into the main object-log, rent this page's object-log write buffers; the hybrid-log region
+                // (which reuses the stored lengths/positions without writing object bytes) needs none.
+                var flushBuffers = copyObjects ? CreateCircularFlushBuffers(objectLogDevice: null, logger) : null;
+                var asyncResult = new PageAsyncFlushResult<TContext>()
+                {
+                    page = flushPage,
+                    context = context,
+                    count = 1,
+                    // A recovery flush starts at scanFromAddress, which may be mid-page. In that case it is a front-partial flush: the write length is derived
+                    // from untilAddress (the page end) rather than a full page. At the first record past the PageHeader the PageHeader is re-included when the
+                    // page is written; further in, only the records from there on need writing, as those below it are already on the main log. That happens
+                    // at a mid-page hybrid-log scan start and at the snapshot recovery boundary. The snapshot/hybrid-log boundary that selects which records
+                    // copy their objects is carried separately via formerFlushedUntilAddress.
+                    partial = flushFromAddress > pageStartAddress,
+                    fromAddress = flushFromAddress,
+                    untilAddress = GetLogicalAddressOfStartOfPage(flushPage + 1),
+                    flushRequestState = FlushRequestState.Recovery,
+                    recoverySnapshotObjectLogDevice = snapshotObjectLogDevice,
+                    recoveryFormerFlushedUntilAddress = formerFlushedUntilAddress,
+                    flushBuffers = flushBuffers
+                };
+
+                try
+                {
+                    // For the snapshot region (records at/above formerFlushedUntilAddress) we copy object bytes from the snapshot object-log to the main
+                    // object-log using flushBuffers; otherwise (hybrid-log region) we reuse the stored lengths/positions without writing object bytes.
+                    WriteAsync(flushPage, callback, asyncResult);
+                }
+                finally
+                {
+                    // WriteAsync issues all of this page's object-log and main-log device writes synchronously before returning, and the recovery completion
+                    // callback (AsyncFlushPageCallbackForRecovery) never reuses flushBuffers, so dispose it here, even if WriteAsync throws. Dispose defers the
+                    // actual return-to-pool (ClearBuffers) until any still-in-flight writes complete.
+                    flushBuffers?.Dispose();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Flush pages from startPage (inclusive) to endPage (exclusive) to specified log device and obj device for a snapshot checkpoint.
+        /// </summary>
+        /// <param name="flushBuffers"></param>
+        /// <param name="startPage"></param>
+        /// <param name="endPage"></param>
+        /// <param name="startLogicalAddress"></param>
+        /// <param name="endLogicalAddress"></param>
+        /// <param name="fuzzyStartLogicalAddress"></param>
+        /// <param name="logDevice"></param>
+        /// <param name="objectLogDevice"></param>
+        /// <param name="completedTask">Task that completes when all pages are flushed, or faults if an exception occurs</param>
+        /// <param name="throttleCheckpointFlushDelayMs"></param>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        public void AsyncFlushPagesForSnapshot(CircularDiskWriteBuffer flushBuffers, long startPage, long endPage, long startLogicalAddress, long endLogicalAddress,
+            long fuzzyStartLogicalAddress, IDevice logDevice, IDevice objectLogDevice, out Task completedTask, int throttleCheckpointFlushDelayMs)
+        {
+            logger?.LogTrace("Starting async full log flush with throttling {throttlingEnabled}", throttleCheckpointFlushDelayMs >= 0 ? $"enabled ({throttleCheckpointFlushDelayMs}ms)" : "disabled");
+
+            var completionTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            completedTask = completionTcs.Task;
+
+            // Park (do not munmap) any native page evicted while this snapshot's writes are in flight; free them only
+            // once EVERY issued write has called back (see DirectVmBlockOwner). Snapshot IO reads page
+            // pointers directly and is not gated by FlushedUntilAddress, so a page could otherwise be unmapped under
+            // an in-flight snapshot write. BeginNativeSnapshotFlush holds a producer sentinel for the issuance; the
+            // FlushRunner releases it when issuance ends, and each issued write's callback releases its own unit.
+            BeginNativeSnapshotFlush();
+
+            // If throttled, convert rest of the method into a truly async task run because issuing IO can take up synchronous time
+            if (throttleCheckpointFlushDelayMs >= 0)
+                _ = Task.Run(FlushRunner);
+            else
+                FlushRunner();
+
+            void FlushRunner()
+            {
+                var totalNumPages = (int)(endPage - startPage);
+
+                var flushCompletionTracker = new FlushCompletionTracker(completionTcs, enableThrottling: throttleCheckpointFlushDelayMs >= 0, totalNumPages);
+
+                try
+                {
+                    // Flush each page in sequence
+                    for (long flushPage = startPage; flushPage < endPage; flushPage++)
+                    {
+                        // For the first page, startLogicalAddress may be in the middle of the page; for the last page, endLogicalAddress may be in the middle of the page;
+                        // for middle pages, we flush the entire page.
+                        var flushStartAddress = GetLogicalAddressOfStartOfPage(flushPage);
+                        if (startLogicalAddress > flushStartAddress)
+                            flushStartAddress = startLogicalAddress;
+                        var flushEndAddress = GetLogicalAddressOfStartOfPage(flushPage + 1);
+                        if (endLogicalAddress < flushEndAddress)
+                            flushEndAddress = endLogicalAddress;
+                        var flushSize = flushEndAddress - flushStartAddress;
+                        if (flushSize <= 0)
+                        {
+                            // No data to flush for this page. Signal completion and drain the
+                            // throttle semaphore so the next real page's WaitOneFlush is not
+                            // satisfied by this page's release.
+                            flushCompletionTracker.CompleteFlush();
+                            flushCompletionTracker.WaitOneFlush();
+                            continue;
+                        }
+
+                        var asyncResult = new PageAsyncFlushResult<Empty>
+                        {
+                            flushCompletionTracker = flushCompletionTracker,
+                            page = flushPage,
+                            fromAddress = flushStartAddress,
+                            untilAddress = flushEndAddress,
+                            count = 1,
+                            flushRequestState = FlushRequestState.Snapshot,
+                            flushBuffers = flushBuffers
+                        };
+
+                        // Intended destination is flushPage
+                        // Count this native page write as outstanding snapshot IO BEFORE issuing, so an eviction that
+                        // races the issue parks the page instead of unmapping it. The unit is released exactly once:
+                        // by the write's completion callback iff the write was actually submitted
+                        // (snapshotDeviceWriteIssued), otherwise (WriteNotIssued, or the issue threw before the
+                        // submit) by the issuing thread here. The TryClaimSnapshotUnitRelease guards the exotic
+                        // overlap where a synchronously-invoked callback released and then threw back out of the submit.
+                        BeginNativeSnapshotFlush();
+                        try
+                        {
+                            WriteAsyncToDeviceForSnapshot(startPage, flushPage, (int)flushSize, AsyncFlushPageForSnapshotCallback, asyncResult, logDevice, objectLogDevice, fuzzyStartLogicalAddress);
+                        }
+                        catch (Exception writeEx)
+                        {
+                            // Fault the flush FIRST so a racing callback's Release()->CompleteFlush cannot report
+                            // success for this page before we mark it failed. If the main device write was submitted,
+                            // its callback owns releasing this page's IO unit and buffers — releasing here too would
+                            // underflow the nativeLog owner's outstanding-IO count and could unmap a page under an in-flight write.
+                            // If it was NOT submitted, no callback will fire, so release the unit (exactly once) and
+                            // the buffers here. Then rethrow into the outer catch for logging + SetException.
+                            flushCompletionTracker.SetException(writeEx);
+                            if (!asyncResult.snapshotDeviceWriteIssued)
+                            {
+                                if (asyncResult.TryClaimSnapshotUnitRelease())
+                                    EndNativeSnapshotFlush();
+                                _ = asyncResult.Release();
+                            }
+                            throw;
+                        }
+
+                        var writeIssued = asyncResult.snapshotDeviceWriteIssued;
+
+                        // If we did not issue a flush write (due to HeadAddress moving past flushPage), then WriteAsync set isForSnapshot false and we release the asyncResult here;
+                        // otherwise, we wait for the completion of the flush (and the callback will release the asyncResult).
+                        if (writeIssued)
+                        {
+                            if (throttleCheckpointFlushDelayMs >= 0)
+                            {
+                                flushCompletionTracker.WaitOneFlush();
+                                Thread.Sleep(throttleCheckpointFlushDelayMs);
+                            }
+                        }
+                        else
+                        {
+                            // WriteNotIssued: no callback will fire, so release this page's IO unit (exactly once)
+                            // and the asyncResult buffers here.
+                            if (asyncResult.TryClaimSnapshotUnitRelease())
+                                EndNativeSnapshotFlush();
+                            _ = asyncResult.Release();
+                            // Release() called CompleteFlush() which released the throttle semaphore.
+                            // Drain it so the next real page's WaitOneFlush is not satisfied by this no-op.
+                            flushCompletionTracker.WaitOneFlush();
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogError(ex, "{method} failed while flushing snapshot pages from {startPage} to {endPage}", nameof(AsyncFlushPagesForSnapshot), startPage, endPage);
+                    flushCompletionTracker.SetException(ex);
+                }
+                finally
+                {
+                    // Release the issuance producer sentinel taken by the outer BeginNativeSnapshotFlush. Any writes
+                    // still in flight keep the nativeLog owner's outstanding-IO count > 0 until their callbacks fire; the last one
+                    // drains the deferred frees — independent of completionTcs faulting early on the error path.
+                    EndNativeSnapshotFlush();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Get a single record from the disk.
+        /// </summary>
+        /// <param name="fromLogicalAddress">Start of the record</param>
+        /// <param name="numBytes">Number of bytes to be read (may be less than actual record size)</param>
+        /// <param name="context">The <see cref="AsyncIOContext"/> of the operation (a reference type). In the iterator/completion-event
+        ///     case it IS the completionEvent's request instance, and the completed record is read back through it.</param>
+        internal void AsyncGetFromDisk(long fromLogicalAddress, int numBytes, AsyncIOContext context)
+        {
+            // A protected thread waits until the device is not throttled, reaping its own completions; there is no
+            // completion signal to block on. The wait releases the epoch so it does not hold an epoch-table entry;
+            // no caller depends on epoch-protected state across this call.
+            if (epoch.ThisInstanceProtected() && device.Throttle())
+            {
+                epoch.Suspend();
+                try
+                {
+                    while (device.Throttle())
+                    {
+                        _ = device.TryCompleteMine();
+                        _ = Thread.Yield();
+                    }
+                }
+                finally
+                {
+                    epoch.Resume();
+                }
+            }
+
+            AsyncReadRecordToMemory(fromLogicalAddress, numBytes, asyncGetFromDiskCallbackDelegate, ref context);
+        }
+
+        /// <summary>
+        /// Prepare a frame's page-load completion event for a new read, reusing the frame's existing event rather than
+        /// allocating one per page.
+        /// </summary>
+        /// <remarks>
+        /// Reuse is safe because a frame is only re-read once its previous load has completed: the scanning thread
+        /// awaits the current frame in <c>WaitForFrameLoad</c> and any read-ahead frame in <c>WaitForPriorFrameLoad</c>
+        /// before re-claiming it, so no completion callback still references the event when it is reset. This keeps one
+        /// event, and so at most one lazily-created kernel wait handle, per frame for the iterator's lifetime; the scan
+        /// iterator's Dispose releases them.
+        /// </remarks>
+        private protected static void PrepareFrameLoadCompletionEvent(ref CountdownEvent completed)
+        {
+            if (completed is null)
+                completed = new CountdownEvent(1);
+            else
+                completed.Reset();
+        }
+
+        /// <summary>
+        /// Compute the device read length, and the extent of in-range data, for loading <paramref name="readPage"/> into a scan frame.
+        /// </summary>
+        /// <param name="readPage">The page to read</param>
+        /// <param name="untilAddress">The address the scan stops at; it may be mid-page and may fall inside a record</param>
+        /// <param name="maxAddressOffsetOnPage">Receives the offset on the page at which record parsing must stop: the offset of
+        ///     <paramref name="untilAddress"/> when it falls on this page, else <see cref="PageSize"/>.</param>
+        /// <returns>The sector-aligned number of bytes to read from the device</returns>
+        /// <remarks>
+        /// The parse extent and the transfer length are two different bounds.
+        /// <para>Parsing stops at <paramref name="untilAddress"/>: records starting at or above it are outside the scan's range, and the
+        /// sector-aligned read pulls some of them in only partially. For the object allocator those partial records are actively harmful --
+        /// the ObjectLogPosition word and the R11 value-length high bits sit near a record's tail, so a straddling record yields a bogus
+        /// position and length read from the un-transferred (only incidentally zeroed) buffer tail.</para>
+        /// <para>The transfer must go further, because the last record that starts below <paramref name="untilAddress"/> can end above it and
+        /// the scan returns that record whole. Reading only to <paramref name="untilAddress"/> leaves that record's tail in the cleared frame,
+        /// so it is handed out zero-filled -- the same Scan call then returns different bytes depending on whether the page is in memory.</para>
+        /// <para>The read therefore extends to the end of the page's valid data: the lesser of the page end and <see cref="FlushedUntilAddress"/>,
+        /// past which this page has nothing on the device. That always covers the straddling record, because records never span pages and
+        /// FlushedUntilAddress is a record boundary. It stops short of a blanket full-page read, which would run past what was written for a page
+        /// that is only partially flushed. And it never shortens a read below what <paramref name="untilAddress"/> alone would require.</para>
+        /// </remarks>
+        private protected uint GetFrameReadLength(long readPage, long untilAddress, out long maxAddressOffsetOnPage)
+        {
+            var offsetInFile = AlignedPageSizeBytes * readPage;
+            var adjustedUntilAddress = AlignedPageSizeBytes * GetPage(untilAddress) + GetOffsetOnPage(untilAddress);
+
+            maxAddressOffsetOnPage = PageSize;
+            if (adjustedUntilAddress <= 0 || adjustedUntilAddress - offsetInFile >= PageSize)
+                return (uint)AlignedPageSizeBytes;
+            maxAddressOffsetOnPage = adjustedUntilAddress - offsetInFile;
+
+            var pageEndAddress = GetLogicalAddressOfStartOfPage(readPage + 1);
+            var validUntilAddress = Math.Min(FlushedUntilAddress, pageEndAddress);
+            var adjustedValidUntilAddress = AlignedPageSizeBytes * GetPage(validUntilAddress) + GetOffsetOnPage(validUntilAddress);
+
+            var readLength = RoundUp(Math.Max(adjustedValidUntilAddress, adjustedUntilAddress) - offsetInFile, sectorSize);
+            return (uint)Math.Min(readLength, AlignedPageSizeBytes);
+        }
+
+        /// <summary>
+        /// Read pages from specified device
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        internal void AsyncReadPageFromDeviceToFrame<TContext>(CircularDiskReadBuffer readBuffers,
+                                        long readPage,
+                                        long untilAddress,
+                                        DeviceIOCompletionCallback callback,
+                                        TContext context,
+                                        BlittableFrame frame,
+                                        ref CountdownEvent completed,
+                                        long devicePageOffset = 0,
+                                        IDevice device = null, IDevice objectLogDevice = null, CancellationTokenSource cts = null,
+                                        ObjectScanFrame objectFrame = null)
+        {
+            var usedDevice = device ?? this.device;
+
+            PrepareFrameLoadCompletionEvent(ref completed);
+
+            int pageIndex = (int)(readPage % frame.frameSize);
+            if (!frame.IsAllocated(pageIndex))
+                frame.Allocate(pageIndex);
+            else
+                frame.Clear(pageIndex);
+
+            // The read length covers whole records; maxAddressOffsetOnPage bounds the object-record walk in
+            // ObjectAllocatorImpl.DeserializeObjectsOnPage to the data this scan actually requested.
+            var readLength = GetFrameReadLength(readPage, untilAddress, out var maxAddressOffsetOnPage);
+
+            var asyncResult = new PageAsyncReadResult<TContext>()
+            {
+                page = readPage,
+                context = context,
+                handle = completed,
+                cts = cts,
+                readBuffers = readBuffers,
+                objectFrame = objectFrame,
+                maxAddressOffsetOnPage = maxAddressOffsetOnPage
+            };
+
+            var offsetInFile = (ulong)(AlignedPageSizeBytes * (device != null ? readPage - devicePageOffset : readPage));
+
+            ReadAsync(offsetInFile, (IntPtr)frame.GetPhysicalAddress(pageIndex), readLength, callback, asyncResult, usedDevice);
+        }
+
+        /// <summary>
+        /// Checks to see if we have a full record, or at least enough to compare the key.
+        /// </summary>
+        /// <param name="ctx">The context from the IO operation</param>
+        /// <param name="prevAddressToRead">If we return false, the address to issue the next IO for</param>
+        /// <param name="prevLengthToRead">If we return false, the number of bytes to issue the next IO for</param>
+        /// <returns>True if we have the full record and the key was the requested key; if the record is fully inline, then the ctx.diskLogRecord is set and the ctx.record is transferred to it.
+        /// Otherwise it is false, and:
+        /// <list type="bullet">
+        ///     <item>If the key was present, it did not match ctx.requestKey; <paramref name="prevAddressToRead"/> is recordInfo.PreviousAddress, and <paramref name="prevLengthToRead"/>
+        ///         is the initial IO size.</item>
+        ///     <item>Otherwise, the data we have is not sufficient to determine record length, or we know the length and it is greater than the data we have now.
+        ///         <paramref name="prevAddressToRead"/> is the same address we just read, and <paramref name="prevLengthToRead"/>is one of:</item>
+        ///         <list type="bullet">
+        ///             <item>If we did not have enough data to determine required length, we use the initial IO size. This should seldom happen as we issue the initial
+        ///                 IO request with this size, but perhaps this is called with a partial buffer.</item>
+        ///             <item>Otherwise, we know the data length needed, and we set <paramref name="prevLengthToRead"/> to that.</item>
+        ///         </list>
+        /// </list>
+        /// </returns>
+        /// <remarks>If we have a complete record and the key passes the comparison and we have overflow or objects, then this will be overridden by a derived class (see 
+        ///     <see cref="ObjectAllocatorImpl{TStoreFunctions}"/>) which will issue additional reads to retrieve those objects.</remarks>
+        private protected virtual bool VerifyRecordFromDiskCallback(ref AsyncIOContext ctx, out long prevAddressToRead, out int prevLengthToRead)
+        {
+            // TODO: Optimize for non-ReadAtAddress tombstoned records to not have to retrieve the full record or, if we have it, not deserialize objects.
+
+            // Initialize to "key is not present (data too small) or does not match so get previous record" length to read
+            prevLengthToRead = IStreamBuffer.DefaultInitialIORecordSize;
+
+            // See if we have a complete record.
+            var currentLength = ctx.record.available_bytes;
+            if (currentLength >= Constants.FixedHeaderSize)
+            {
+                var ptr = ctx.record.GetValidPointer();
+                var recordInfo = *(RecordInfo*)ptr;
+                var dataHeader = *(RecordDataHeader*)(ptr + RecordInfo.Size);
+                var headerLength = RecordDataHeader.Size;
+
+                // GetRecordLength is always safe, because it is in the second sizeof(ulong) and we round up to 8-byte alignment.
+                var recordLength = dataHeader.GetRecordLength();
+                if (currentLength <= headerLength)
+                {
+                    prevLengthToRead = recordLength;
+                    goto RereadCurrent;
+                }
+
+                // Initialize to "invalid record or key does not match so get previous record" address to read
+                prevAddressToRead = recordInfo.PreviousAddress;
+
+                if (recordInfo.Invalid) // includes IsNull
+                    return false;
+
+                var offsetToKeyStart = dataHeader.GetOffsetToKeyStart();
+
+                // If the length is up to offsetToKeyStart, we can read the full lengths. If not, we'll fall through to reread the current record.
+                if (currentLength >= offsetToKeyStart)
+                {
+                    var keyLength = dataHeader.KeyLength;
+
+                    if ((offsetToKeyStart + keyLength) <= currentLength)
+                    {
+                        // We have the full key if it is inline, so check for a match if we had a requested key, and return if not.
+                        if (!ctx.requestKey.IsEmpty && dataHeader.KeyIsInline)
+                        {
+                            var diskLogRecord = new LogRecord((long)ptr);
+                            if (!storeFunctions.KeysEqual(ctx.requestKey, diskLogRecord))
+                                return false;
+                        }
+
+                        // Keys match. If we have the full record, return success; otherwise we'll drop through to read the full record with the length we now know.
+                        if (currentLength >= recordLength)
+                        {
+                            ctx.diskLogRecord = DiskLogRecord.TransferFrom(ref ctx.record, transientObjectIdMap);
+                            ctx.diskLogRecord.InfoRef.ClearBitsForDiskImages();
+                            if (storeFunctions.CallOnDiskRead)
+                                storeFunctions.OnDiskRead(ref ctx.diskLogRecord.logRecord);
+                            return true;
+                        }
+                    }
+
+                    // We didn't have the full key so drop through to read the full record with the length we now know.
+                    prevLengthToRead = recordLength;
+                }
+            }
+
+        RereadCurrent:
+            // Either we didn't have the full record size, or we didn't have enough bytes to even read the full record size. Either way, prevLengthToRead
+            // is set for a re-read of the same record.
+            prevAddressToRead = ctx.logicalAddress;
+            return false;
+        }
+
+        /// <summary>
+        /// Verify a pending read's record and, on an incomplete record or key mismatch, re-issue the next disk
+        /// read on the SAME op (walking the disk hash chain). Returns true if the op is resolved and ready for
+        /// completion (full record with a key match, or walked below the resolvable range); false if a new IO was
+        /// issued and the op is therefore still pending. Shared by the synchronous iterator/scan path (called on
+        /// the device completion thread) and the asynchronous run-thread drain (<see cref="TsavoriteKV{TStoreFunctions,TAllocator}.InternalCompletePendingRequest{TInput,TOutput,TContext,TSessionFunctionsWrapper}"/>).
+        /// </summary>
+        internal bool TryVerifyOrReissuePendingRead(ref AsyncIOContext ctx)
+        {
+            if (!VerifyRecordFromDiskCallback(ref ctx, out var prevAddressToRead, out var prevLengthToRead))
+            {
+                // Either we had an incomplete record (re-read the current record) or the key didn't match (read the
+                // previous record in the chain). If that address is in range, issue the read; else fall through to
+                // "IO complete" and let ContinuePending* detect the below-range case.
+                ctx.logicalAddress = prevAddressToRead;
+                if (ctx.logicalAddress >= BeginAddress && ctx.logicalAddress >= ctx.minAddress)
+                {
+                    _wrapper.OnDisposeDiskRecord(ref ctx.diskLogRecord, DisposeReason.DeserializedFromDisk);
+                    ctx.DisposeRecord();
+                    // Re-issue this same op (a reference), repopulating its read buffer; all fields propagate.
+                    AsyncGetFromDisk(ctx.logicalAddress, prevLengthToRead, ctx);
+                    return false;
+                }
+                else
+                {
+                    // We're at the end of the chain; dispose the diskLogRecord so it is not taken as the result.
+                    _wrapper.OnDisposeDiskRecord(ref ctx.diskLogRecord, DisposeReason.DeserializedFromDisk);
+                    ctx.diskLogRecord.Dispose();
+                }
+            }
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void AsyncGetFromDiskCallback(uint errorCode, uint numBytes, object context, Exception ioException)
+        {
+            if (errorCode != 0)
+            {
+                if (ioException is null)
+                    logger?.LogError("AsyncGetFromDiskCallback error: {errorCode}", errorCode);
+                else
+                    logger?.LogError("AsyncGetFromDiskCallback error: {exception}", Utility.GetCallbackExceptionDetail(ioException));
+            }
+
+            // The AsyncIOContext is the object-context handed to the device; it comes back here directly.
+            var ctx = (AsyncIOContext)context;
+
+            // available_bytes is the count of valid bytes starting at GetValidPointer() (= aligned_pointer + valid_offset),
+            // so subtract valid_offset from the device's reported transfer count (total bytes written from aligned_pointer).
+            Debug.Assert(numBytes <= (uint)(ctx.record.available_bytes + ctx.record.valid_offset),
+                $"Expected numBytes ({numBytes}) <= (available_bytes ({ctx.record.available_bytes}) + valid_offset ({ctx.record.valid_offset})), per {nameof(GetAndPopulateReadBuffer)}()");
+            Debug.Assert(numBytes >= (uint)ctx.record.valid_offset,
+                $"Short read: {numBytes} bytes were read, which is below the valid_offset ({ctx.record.valid_offset}); the record start was not delivered by the device");
+            ctx.record.available_bytes = (int)numBytes - ctx.record.valid_offset;
+
+            if (ctx.record.available_bytes >= RecordInfo.Size)
+            {
+                var recordInfo = *(RecordInfo*)ctx.record.GetValidPointer();
+                Debug.Assert(!recordInfo.Invalid,
+                    $"Invalid records should not be in the hash chain for pending IO; address {ctx.logicalAddress}, recordInfo {recordInfo}");
+            }
+
+            if (ctx.completionEvent is null)
+            {
+                // Asynchronous path: keep the completion thread minimal — record the device result and hand the op
+                // to the run thread via the per-session ready queue. The run-thread drain verifies the record,
+                // walks the disk chain, and runs ContinuePending*; it returns the op to the per-session pool.
+                ctx.callbackQueue.Enqueue(ctx);
+                return;
+            }
+
+            // Synchronous iterator/scan path: verify and walk the disk chain here, then signal the waiter, which
+            // reads ctx.diskLogRecord directly after Wait().
+            try
+            {
+                if (!TryVerifyOrReissuePendingRead(ref ctx))
+                    return;   // re-issued; the next completion will signal the waiter
+                ctx.completionEvent.Set(ctx);
+            }
+            catch (Exception e)
+            {
+                logger?.LogError(e, "AsyncGetFromDiskCallback error");
+                _wrapper.OnDisposeDiskRecord(ref ctx.diskLogRecord, DisposeReason.DeserializedFromDisk);
+                ctx.DisposeRecord();
+                ctx.completionEvent.SetException(e);
+            }
+        }
+
+        /// <summary>
+        /// IOCompletion callback for page flush
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="numBytes"></param>
+        /// <param name="context"></param>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private protected void AsyncFlushPageCallback(uint errorCode, uint numBytes, object context, Exception ioException)
+        {
+            try
+            {
+                if (errorCode != 0)
+                {
+                    if (ioException is null)
+                        logger?.LogError("AsyncFlushPageCallback error: {errorCode}", errorCode);
+                    else
+                        logger?.LogError("AsyncFlushPageCallback error: {exception}", Utility.GetCallbackExceptionDetail(ioException));
+                }
+
+                // Set the page status to flushed
+                var result = (PageAsyncFlushResult<Empty>)context;
+
+                if (result.Release() == 0)
+                {
+                    if (errorCode != 0)
+                    {
+                        // Note down error details and trigger handling only when we are certain this is the earliest error among currently issued flushes.
+                        // Surface the device's underlying exception (plumbed through the completion callback) so an opaque numeric code carries the real fault for diagnosis.
+                        errorList.Add(new CommitInfo { FromAddress = result.fromAddress, UntilAddress = result.untilAddress, ErrorCode = errorCode, Exception = ioException });
+                    }
+                    else
+                    {
+                        // There is no failure so update the page's last flushed until address.
+                        _ = MonotonicUpdate(ref PageStatusIndicator[result.page % BufferSize].LastFlushedUntilAddress, result.untilAddress, out _);
+                    }
+
+                    ShiftFlushedUntilAddress();
+                }
+
+                // Continue the chained flushes, popping the next request from the queue if it is adjacent.
+                var _flush = FlushedUntilAddress;
+                if (GetOffsetOnPage(_flush) > 0 && PendingFlush[GetPage(_flush) % BufferSize].RemoveNextAdjacent(_flush, out PageAsyncFlushResult<Empty> request))
+                {
+                    request.flushBuffers = result.flushBuffers;  // Reuse the flush buffers from the completed flush to continue the flush chain
+                    WriteAsync(GetPage(request.fromAddress), AsyncFlushPageCallback, request);  // Call the overridden WriteAsync for the derived allocator class
+                }
+            }
+            catch when (disposed) { }
+        }
+
+        internal void UnsafeSkipError(CommitInfo info)
+        {
+            try
+            {
+                errorList.TruncateUntil(info.UntilAddress);
+                var page = GetPage(info.FromAddress);
+                _ = MonotonicUpdate(ref PageStatusIndicator[page % BufferSize].LastFlushedUntilAddress, info.UntilAddress, out _);
+                ShiftFlushedUntilAddress();
+                var _flush = FlushedUntilAddress;
+                if (GetOffsetOnPage(_flush) > 0 && PendingFlush[GetPage(_flush) % BufferSize].RemoveNextAdjacent(_flush, out PageAsyncFlushResult<Empty> request))
+                {
+                    // Reuse the flush buffers from the completed flush to continue the flush chain
+                    WriteAsync(GetPage(request.fromAddress), AsyncFlushPageCallback, request);  // Call the overridden WriteAsync for the derived allocator class
+                }
+            }
+            catch when (disposed) { }
+        }
+
+        /// <summary>
+        /// IOCompletion callback for page flush for snapshot checkpoint
+        /// </summary>
+        /// <param name="errorCode"></param>
+        /// <param name="numBytes"></param>
+        /// <param name="context"></param>
+        protected void AsyncFlushPageForSnapshotCallback(uint errorCode, uint numBytes, object context, Exception ioException)
+        {
+            var result = (PageAsyncFlushResult<Empty>)context;
+            try
+            {
+                try
+                {
+                    if (errorCode != 0)
+                    {
+                        if (ioException is null)
+                            logger?.LogError("AsyncFlushPageToDeviceCallback error: {errorCode}", errorCode);
+                        else
+                            logger?.LogError("AsyncFlushPageToDeviceCallback error: {exception}", Utility.GetCallbackExceptionDetail(ioException));
+
+                        // Fault the snapshot's flush-completion so the checkpoint fails rather than committing a snapshot with
+                        // an unwritten page; the Release() below still frees buffers and its CompleteFlush becomes a no-op.
+                        result.flushCompletionTracker?.SetException(
+                            new TsavoriteException($"Snapshot page flush failed with error code {errorCode}"));
+                    }
+
+                    var epochTaken = epoch.ResumeIfNotProtected();
+
+                    try
+                    {
+                        var startAddress = GetLogicalAddressOfStartOfPage(result.page);
+                        var endAddress = startAddress + PageSize;
+
+                        // First make sure we're not trying to process a logical address that's in a page header.
+                        startAddress += PageHeader.Size;
+
+                        if (result.fromAddress > startAddress)
+                            startAddress = result.fromAddress;
+                        if (result.untilAddress < endAddress)
+                            endAddress = result.untilAddress;
+
+                        var _readOnlyAddress = SafeReadOnlyAddress;
+                        if (_readOnlyAddress > startAddress)
+                            startAddress = _readOnlyAddress;
+                        if (_readOnlyAddress > endAddress)
+                            endAddress = _readOnlyAddress;
+
+                        var flushWidth = (int)(endAddress - startAddress);
+
+                        if (flushWidth > 0)
+                        {
+                            var physicalAddress = GetPhysicalAddress(startAddress);
+                            var endPhysicalAddress = physicalAddress + flushWidth;
+
+                            while (physicalAddress < endPhysicalAddress)
+                            {
+                                var logRecord = _wrapper.CreateLogRecord(startAddress);
+                                var alignedRecordSize = logRecord.AllocatedSize;
+                                physicalAddress += alignedRecordSize;
+                                startAddress += alignedRecordSize;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (epochTaken)
+                            epoch.Suspend();
+                        _ = result.Release();
+                    }
+                }
+                catch when (disposed) { }
+            }
+            finally
+            {
+                // Release this issued page write's unit of outstanding snapshot IO. In an OUTERMOST finally so it
+                // runs on every path (success, error, disposed, or a cleanup exception in the inner finally), since
+                // this callback fires exactly once per issued write. The TryClaim guards the exotic overlap where
+                // this callback ran synchronously during the submit, then threw back out so the issuing thread also
+                // attempts the release. When the last unit is released, pages parked while snapshot writes were in
+                // flight are freed.
+                if (result.TryClaimSnapshotUnitRelease())
+                    EndNativeSnapshotFlush();
+            }
+        }
+
+        internal string PrettyPrintLogicalAddress(long logicalAddress) => $"{logicalAddress}:{GetPage(logicalAddress)}.{GetOffsetOnPage(logicalAddress)}";
+    }
+}

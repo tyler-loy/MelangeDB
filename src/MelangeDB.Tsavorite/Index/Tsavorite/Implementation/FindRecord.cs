@@ -1,0 +1,248 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+
+namespace Tsavorite.core
+{
+    using static LogAddress;
+
+    public unsafe partial class TsavoriteKV<TStoreFunctions, TAllocator> : TsavoriteBase
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryFindRecordInMemory<TKey, TInput, TOutput, TContext>(TKey key, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx,
+                                                                   ref OperationState<TInput, TOutput, TContext> operationState)
+            where TKey : IKey, allows ref struct
+        {
+            // Add 1 to the operationState minAddresses because we don't want an inclusive search; we're looking to see if it was added *after*.
+            // Gate on hei.IsReadCache (not UseReadCache): it implies UseReadCache and is false when the tag chain has no readcache
+            // prefix, so we skip the (NoInlining) FindInReadCache call entirely in that common case.
+            if (stackCtx.hei.IsReadCache)
+            {
+                var minRC = IsReadCache(operationState.initialEntryAddress) ? operationState.initialEntryAddress + 1 : kInvalidAddress;
+                if (FindInReadCache(key, ref stackCtx, minAddress: minRC))
+                    return true;
+            }
+            var minLog = operationState.initialLatestLogicalAddress < hlogBase.HeadAddress ? hlogBase.HeadAddress : operationState.initialLatestLogicalAddress + 1;
+            return TraceBackForKeyMatch(key, ref stackCtx.recSrc, minAddress: minLog);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        // Return true if the record is found in the log, else false and an indication of whether we need to do IO to continue the search
+        internal bool TryFindRecordInMainLogForConditionalOperation<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TSessionFunctionsWrapper sessionFunctions,
+                TKey key, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, long currentAddress, long minAddress, long maxAddress, out OperationStatus internalStatus, out bool needIO)
+            where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            if (!FindTag(ref stackCtx.hei))
+            {
+                internalStatus = OperationStatus.NOTFOUND;
+                return needIO = false;
+            }
+
+            internalStatus = OperationStatus.SUCCESS;
+            if (!stackCtx.hei.IsReadCache)
+            {
+                // If the address in the HashBucketEntry is the current address, there'll be no record above it, so return false (not found).
+                // If there are no valid records in the HashBucketEntry (minAddress is inclusive), return false (not found).
+                if (stackCtx.hei.Address == currentAddress || stackCtx.hei.Address < minAddress || stackCtx.hei.Address < hlogBase.BeginAddress)
+                {
+                    stackCtx.SetRecordSourceToHashEntry(hlogBase);
+                    return needIO = false;
+                }
+                if (stackCtx.hei.Address < hlogBase.HeadAddress)
+                {
+                    stackCtx.SetRecordSourceToHashEntry(hlogBase);
+                    needIO = true;
+                    return false;
+                }
+            }
+
+            if (RevivificationManager.UseFreeRecordPool)
+            {
+                // The EphemeralSLock here is necessary only for the tag chain to avoid record elision/revivification during traceback.
+                if (!TryEphemeralSLock<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, out internalStatus))
+                    return needIO = false;
+            }
+            else
+                stackCtx.SetRecordSourceToHashEntry(hlogBase);
+
+            try
+            {
+                // Gate on hei.IsReadCache (same cost as the UseReadCache field read): skips the call when this chain has no
+                // RC prefix, and — since hei.IsReadCache implies UseReadCache — lets SkipReadCache's UseReadCache assert
+                // flag an RC-record-while-!UseReadCache anomaly instead of silently skipping it.
+                if (stackCtx.hei.IsReadCache)
+                    SkipReadCache(ref stackCtx, out _); // Where this is called, we have no dependency on source addresses so we don't care if it Refreshed
+
+                // We don't have an operationState here, so pass the minAddress directly.
+                needIO = false;
+                if (TryFindRecordInMainLogForPendingOperation(key, ref stackCtx, minAddress < hlogBase.HeadAddress ? hlogBase.HeadAddress : minAddress, maxAddress, out internalStatus))
+                    return true;
+
+                needIO = stackCtx.recSrc.LogicalAddress >= minAddress && stackCtx.recSrc.LogicalAddress < hlogBase.HeadAddress && stackCtx.recSrc.LogicalAddress >= hlogBase.BeginAddress;
+                return false;
+            }
+            finally
+            {
+                EphemeralSUnlock<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx);
+            }
+        }
+
+        // We want to return non-Invalid records or Invalid records that are Sealed, because Sealed is part of our "need RETRY" handling.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsValidTracebackRecord(RecordInfo recordInfo) => !recordInfo.Invalid || recordInfo.IsSealed;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TraceBackForKeyMatch<TKey>(TKey key, ref RecordSource<TStoreFunctions, TAllocator> recSrc, long minAddress)
+            where TKey : IKey, allows ref struct
+        {
+            Debug.Assert(!recSrc.HasInMemorySrc, "Should not have found record before this call");
+            if (recSrc.LogicalAddress >= minAddress)
+            {
+                _ = recSrc.SetPhysicalAddress();
+                var logRecord = recSrc.CreateLogRecord();
+                if (IsValidTracebackRecord(logRecord.Info) && storeFunctions.KeysEqual(key, logRecord))
+                {
+                    recSrc.SetHasMainLogSrc();
+                    return true;
+                }
+
+                if (TraceBackForKeyMatch(key, logRecord.Info.PreviousAddress, minAddress, out recSrc.LogicalAddress, out recSrc.PhysicalAddress))
+                {
+                    recSrc.SetHasMainLogSrc();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Overload with maxAddress to avoid the extra if condition - TODO: check that this duplication saves on IL/perf
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TraceBackForKeyMatch<TKey>(TKey key, ref RecordSource<TStoreFunctions, TAllocator> recSrc, long minAddress, long maxAddress)
+            where TKey : IKey, allows ref struct
+        {
+            Debug.Assert(!recSrc.HasInMemorySrc, "Should not have found record before this call");
+            if (recSrc.LogicalAddress >= minAddress)
+            {
+                _ = recSrc.SetPhysicalAddress();
+                var logRecord = recSrc.CreateLogRecord();
+                if (IsValidTracebackRecord(logRecord.Info) && recSrc.LogicalAddress < maxAddress && storeFunctions.KeysEqual(key, logRecord))
+                {
+                    recSrc.SetHasMainLogSrc();
+                    return true;
+                }
+
+                if (TraceBackForKeyMatch(key, logRecord.Info.PreviousAddress, minAddress, maxAddress, out recSrc.LogicalAddress, out recSrc.PhysicalAddress))
+                {
+                    recSrc.SetHasMainLogSrc();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TraceBackForKeyMatch<TKey>(TKey key, long fromLogicalAddress, long minAddress, out long foundLogicalAddress, out long foundPhysicalAddress)
+            where TKey : IKey, allows ref struct
+        {
+            // This overload is called when the record at the "current" logical address does not match 'key'; fromLogicalAddress is its .PreviousAddress.
+            foundLogicalAddress = fromLogicalAddress;
+            while (foundLogicalAddress >= minAddress)
+            {
+                var logRecord = hlog.CreateLogRecord(foundLogicalAddress);
+                foundPhysicalAddress = logRecord.physicalAddress;
+
+                if (IsValidTracebackRecord(logRecord.Info) && storeFunctions.KeysEqual(key, logRecord))
+                    return true;
+
+                foundLogicalAddress = logRecord.Info.PreviousAddress;
+            }
+            foundPhysicalAddress = kInvalidAddress;
+            return false;
+        }
+
+        // Overload with maxAddress to avoid the extra if condition - TODO: check that this duplication saves on IL/perf
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TraceBackForKeyMatch<TKey>(TKey key, long fromLogicalAddress, long minAddress, long maxAddress, out long foundLogicalAddress, out long foundPhysicalAddress)
+            where TKey : IKey, allows ref struct
+        {
+            // This overload is called when the record at the "current" logical address does not match 'key'; fromLogicalAddress is its .PreviousAddress.
+            foundLogicalAddress = fromLogicalAddress;
+            while (foundLogicalAddress >= minAddress)
+            {
+                var logRecord = hlog.CreateLogRecord(foundLogicalAddress);
+                foundPhysicalAddress = logRecord.physicalAddress;
+
+                if (IsValidTracebackRecord(logRecord.Info) && foundLogicalAddress < maxAddress && storeFunctions.KeysEqual(key, logRecord))
+                    return true;
+
+                foundLogicalAddress = logRecord.Info.PreviousAddress;
+            }
+            foundPhysicalAddress = kInvalidAddress;
+            return false;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryFindRecordForUpdate<TKey>(TKey key, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, long minAddress, out OperationStatus internalStatus)
+            where TKey : IKey, allows ref struct
+        {
+            // This routine returns true if we should proceed with the InternalXxx operation (whether the record was found or not),
+            // else false (including false if we need a RETRY). If it returns true with recSrc.HasInMemorySrc, caller must set srcRecordInfo.
+
+            // We are not here from Read() so have not processed readcache; search that as well as the in-memory log.
+            // minAddress is either HeadAddress or ReadOnlyAddress for the main log.
+            // Gate the readcache search on hei.IsReadCache (implies UseReadCache; false when there is no readcache prefix) to
+            // skip the NoInlining FindInReadCache call when the tag chain has none.
+            if ((stackCtx.hei.IsReadCache && FindInReadCache(key, ref stackCtx, minAddress: kInvalidAddress))
+                || TraceBackForKeyMatch(key, ref stackCtx.recSrc, minAddress: minAddress))
+            {
+                if (stackCtx.recSrc.GetInfo().IsClosed)
+                {
+                    internalStatus = OperationStatus.RETRY_LATER;
+                    return false;
+                }
+            }
+            internalStatus = OperationStatus.SUCCESS;
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryFindRecordForPendingOperation<TKey, TInput, TOutput, TContext>(TKey key, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, out OperationStatus internalStatus,
+                                                      ref OperationState<TInput, TOutput, TContext> operationState)
+            where TKey : IKey, allows ref struct
+        {
+            // This routine returns true if we find the key, else false.
+            internalStatus = OperationStatus.SUCCESS;
+
+            if (!TryFindRecordInMemory(key, ref stackCtx, ref operationState))
+                return false;
+            if (stackCtx.recSrc.GetInfo().IsClosed)
+                internalStatus = OperationStatus.RETRY_LATER;
+
+            // We do not lock here; this is just to see if the key is found
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool TryFindRecordInMainLogForPendingOperation<TKey>(TKey key, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, long minAddress, long maxAddress, out OperationStatus internalStatus)
+            where TKey : IKey, allows ref struct
+        {
+            // This overload is called when we do not have a OperationState to get minAddress from, and we've skipped the readcache if present.
+
+            // This routine returns true if we find the key, else false.
+            internalStatus = OperationStatus.SUCCESS;
+
+            if (!TraceBackForKeyMatch(key, ref stackCtx.recSrc, minAddress, maxAddress))
+                return false;
+            if (stackCtx.recSrc.GetInfo().IsClosed)
+                internalStatus = OperationStatus.RETRY_LATER;
+
+            // We do not lock here; this is just to see if the key is found
+            return true;
+        }
+    }
+}

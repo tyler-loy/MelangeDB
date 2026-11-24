@@ -1,0 +1,123 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// Non-generic interface for hybrid log memory allocator struct wrapper for inlining. This contains the performance-critical methods that must be inlined;
+    /// abstract/virtual methods may be called via <see cref="AllocatorBase{TStoreFunctions, TAllocator}"/>.
+    /// </summary>
+    public interface IAllocator
+    {
+        /// <summary>Get record size required to allocate a new record. Includes allocator-specific information such as key and value overflow.</summary>
+        /// <remarks>Requires <see cref="RecordSizeInfo.FieldInfo"/> to be populated already.</remarks>
+        void PopulateRecordSizeInfo(ref RecordSizeInfo sizeInfo);
+
+        /// <summary>Allocate the page in the circular buffer slot at <paramref name="pageIndex"/></summary>
+        void AllocatePage(int pageIndex);
+
+        /// <summary>Free the page at <paramref name="pageIndex"/></summary>
+        void FreePage(long pageIndex);
+
+        /// <summary>Number of extra overflow pages allocated</summary>
+        int OverflowPageCount { get; }
+
+        /// <summary>Get the page number of a logical address, using the allocator-specific address interpretation.
+        /// Main-store allocators mask off the read-cache bit (via <see cref="LogAddress"/>); TsavoriteLog has no read
+        /// cache and uses the full address range.</summary>
+        long GetPageOfAddress(long logicalAddress, int logPageSizeBits);
+    }
+
+    /// <summary>
+    /// Generic interface for hybrid log memory allocator struct wrapper for inlining. This contains the performance-critical methods that must be inlined;
+    /// abstract/virtual methods may be called via <see cref="AllocatorBase{TStoreFunctions, TAllocator}"/>.
+    /// </summary>
+    public interface IAllocator<TStoreFunctions> : IAllocator
+        where TStoreFunctions : IStoreFunctions
+    {
+        /// <summary>The base class instance of the allocator implementation</summary>
+        AllocatorBase<TStoreFunctions, TAllocator> GetBase<TAllocator>()
+            where TAllocator : IAllocator<TStoreFunctions>;
+
+        /// <summary>Whether this allocator uses a separate object log</summary>
+        bool HasObjectLog { get; }
+
+        /// <summary>Initialize the RecordDataHeader lengths to key length and a value that spans the address range, and the serialize the key into the record.</summary>
+        /// <param name="key">The key to be copied into the record</param>
+        /// <param name="logicalAddress">The logical address of the new record</param>
+        /// <param name="sizeInfo">The record size info, which tells us the value size and whether that is overflow.</param>
+        /// <param name="logRecord">The new log record being initialized</param>
+        void InitializeRecord<TKey>(TKey key, long logicalAddress, in RecordSizeInfo sizeInfo, ref LogRecord logRecord)
+            where TKey : IKey, allows ref struct
+            ;
+
+        /// <summary>Get copy destination size for RMW, taking Input into account</summary>
+        RecordSizeInfo GetRMWCopyRecordSize<TSourceLogRecord, TInput, TVariableLengthInput>(in TSourceLogRecord srcLogRecord, ref TInput input, TVariableLengthInput varlenInput)
+            where TSourceLogRecord : ISourceLogRecord
+            where TVariableLengthInput : IVariableLengthInput<TInput>;
+
+        /// <summary>Get initial record size for RMW, given the <paramref name="key"/> and <paramref name="input"/></summary>
+        RecordSizeInfo GetRMWInitialRecordSize<TKey, TInput, TVariableLengthInput>(TKey key, ref TInput input, TVariableLengthInput varlenInput)
+            where TKey : IKey, allows ref struct
+            where TVariableLengthInput : IVariableLengthInput<TInput>;
+
+        /// <summary>Get record size required for the given <paramref name="key"/>, <paramref name="value"/>, and <paramref name="input"/></summary>
+        RecordSizeInfo GetUpsertRecordSize<TKey, TInput, TVariableLengthInput>(TKey key, ReadOnlySpan<byte> value, ref TInput input, TVariableLengthInput varlenInput)
+            where TKey : IKey, allows ref struct
+            where TVariableLengthInput : IVariableLengthInput<TInput>;
+
+        /// <summary>Get record size required for the given <paramref name="key"/>, <paramref name="value"/>, and <paramref name="input"/></summary>
+        RecordSizeInfo GetUpsertRecordSize<TKey, TInput, TVariableLengthInput>(TKey key, IHeapObject value, ref TInput input, TVariableLengthInput varlenInput)
+            where TKey : IKey, allows ref struct
+            where TVariableLengthInput : IVariableLengthInput<TInput>;
+
+        /// <summary>Get record size required for the given <paramref name="key"/>, <paramref name="inputLogRecord"/>, and <paramref name="input"/></summary>
+        RecordSizeInfo GetUpsertRecordSize<TKey, TSourceLogRecord, TInput, TVariableLengthInput>(TKey key, in TSourceLogRecord inputLogRecord, ref TInput input, TVariableLengthInput varlenInput)
+            where TKey : IKey, allows ref struct
+            where TSourceLogRecord : ISourceLogRecord
+            where TVariableLengthInput : IVariableLengthInput<TInput>;
+
+        /// <summary>Get record size required for a new tombstone record</summary>
+        RecordSizeInfo GetDeleteRecordSize<TKey>(TKey key)
+            where TKey : IKey, allows ref struct
+            ;
+
+        /// <summary>Return the <see cref="LogRecord"/> for the allocator page at <paramref name="logicalAddress"/></summary>
+        LogRecord CreateLogRecord(long logicalAddress);
+
+        /// <summary>Return the <see cref="LogRecord"/> for the allocator page at <paramref name="physicalAddress"/></summary>
+        LogRecord CreateLogRecord(long logicalAddress, long physicalAddress);
+
+        /// <summary>Return the <see cref="LogRecord"/> for a transient (e.g. iterator or pending IO) page at <paramref name="physicalAddress"/></summary>
+        LogRecord CreateRemappedLogRecordOverPinnedTransientMemory(long logicalAddress, long physicalAddress);
+
+        /// <summary>Return the <see cref="ObjectIdMap"/> for transient log records (e.g. iterator)</summary>
+        ObjectIdMap TransientObjectIdMap { get; }
+
+        /// <summary>Return the <see cref="ObjectIdMap"/> for a specific page number (not index)</summary>
+        ObjectIdMap GetPageObjectIdMap(long pageNumber);
+
+        /// <summary>Dispose an in-memory log record</summary>
+        void OnDispose(ref LogRecord logRecord, DisposeReason disposeReason);
+
+        /// <summary>Dispose an on-disk / transient log record. Invokes the store's
+        /// <see cref="IStoreFunctions.OnDisposeDiskRecord"/> trigger; the caller should then call
+        /// <see cref="DiskLogRecord.Dispose"/> to release the record buffer.</summary>
+        void OnDisposeDiskRecord(ref DiskLogRecord logRecord, DisposeReason disposeReason);
+
+        /// <summary>
+        /// Iterate records in the given logical address range and invoke the application-level
+        /// <see cref="IRecordTriggers.OnEvict"/> hook for each valid, non-tombstoned record.
+        /// Used during page eviction to allow cleanup of external resources.
+        /// </summary>
+        /// <param name="startAddress">Start logical address of the range.</param>
+        /// <param name="endAddress">End logical address of the range (exclusive).</param>
+        /// <param name="source">Identifies whether this eviction is from the main log or the read cache.</param>
+        /// <param name="isRecovery">True when called during recovery, where a page's object load may have been deferred — such a page has an empty
+        /// ObjectIdMap and per-record object/overflow slots that still hold raw on-disk values (not valid ObjectIdMap ids) and is skipped. False for
+        /// normal eviction, where an empty map simply means an object-free page whose inline records must still be visited.</param>
+        void EvictRecordsInRange(long startAddress, long endAddress, EvictionSource source, bool isRecovery);
+    }
+}

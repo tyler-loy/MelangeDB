@@ -1,0 +1,322 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Runtime.CompilerServices;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// Wrapper to process log-related commands
+    /// </summary>
+    public sealed class LogAccessor<TStoreFunctions, TAllocator> : IObservable<ITsavoriteScanIterator>
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        private readonly TsavoriteKV<TStoreFunctions, TAllocator> store;
+        private readonly TAllocator allocator;
+        internal readonly AllocatorBase<TStoreFunctions, TAllocator> allocatorBase;
+
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        /// <param name="store"></param>
+        /// <param name="allocator"></param>
+        internal LogAccessor(TsavoriteKV<TStoreFunctions, TAllocator> store, TAllocator allocator)
+        {
+            this.store = store;
+            this.allocator = allocator;
+            allocatorBase = allocator.GetBase<TAllocator>();
+        }
+
+        /// <summary>
+        /// Tail address of log
+        /// </summary>
+        public long TailAddress => allocatorBase.GetTailAddress();
+
+        /// <summary>
+        /// Read-only address of log, i.e. boundary between read-only region and mutable region
+        /// </summary>
+        public long ReadOnlyAddress => allocatorBase.ReadOnlyAddress;
+
+        /// <summary>
+        /// Safe read-only address of log, i.e. boundary between read-only region and mutable region
+        /// </summary>
+        public long SafeReadOnlyAddress => allocatorBase.SafeReadOnlyAddress;
+
+        /// <summary>
+        /// Flushed-until address of log, i.e. all records below this address have been written to disk
+        /// </summary>
+        public long FlushedUntilAddress => allocatorBase.FlushedUntilAddress;
+
+        /// <summary>
+        /// Head address of log, i.e. beginning of in-memory regions
+        /// </summary>
+        public long HeadAddress => allocatorBase.HeadAddress;
+
+        /// <summary>
+        /// Beginning address of log
+        /// </summary>
+        public long BeginAddress => allocatorBase.BeginAddress;
+
+        /// <summary>
+        /// <see cref="ObjectIdMap"/> for serializing/deserializing <see cref="DiskLogRecord"/>.
+        /// </summary>
+        public ObjectIdMap TransientObjectIdMap => allocatorBase.transientObjectIdMap;
+
+        /// <summary>
+        /// Total in-memory circular buffer capacity (in number of pages)
+        /// </summary>
+        public int BufferSize => allocatorBase.BufferSize;
+
+        /// <summary>
+        /// Maximum number of pages that can be allocated in the log (the cap on AllocatedPageCount)
+        /// </summary>
+        public int MaxAllocatedPageCount => allocatorBase.MaxAllocatedPageCount;
+
+        /// <summary>
+        /// Size of a single log page, in bytes
+        /// </summary>
+        public long PageSizeBytes => 1L << allocatorBase.LogPageSizeBits;
+
+        /// <summary>
+        /// The log size tracker (currently used only by test)
+        /// </summary>
+        public LogSizeTracker<TStoreFunctions, TAllocator> LogSizeTracker => allocatorBase.logSizeTracker;
+
+        /// <summary>
+        /// Actual memory used by log (not including heap objects)
+        /// </summary>
+        // (long) cast required: AllocatedPageCount and LogPageSizeBits are both int, so the shift
+        // would otherwise be evaluated in 32-bit and overflow once allocated memory exceeds 2 GiB.
+        public long MemorySizeBytes => (long)allocatorBase.AllocatedPageCount << allocatorBase.LogPageSizeBits;
+
+        /// <summary>
+        /// Actual memory used by log (not including heap objects), including overflow pages
+        /// </summary>
+        public long MemorySizeBytesIncludingOverflowPages => (long)(allocatorBase.AllocatedPageCount + allocator.OverflowPageCount) << allocatorBase.LogPageSizeBits;
+
+        /// <summary>
+        /// Heap memory used
+        /// </summary>
+        public long HeapSizeBytes => allocatorBase.logSizeTracker is null ? 0 : allocatorBase.logSizeTracker.LogHeapSizeBytes;
+
+        /// <summary>
+        /// Maximum memory size in bytes
+        /// </summary>
+        public long MaxMemorySizeBytes => allocatorBase.MaxMemorySizeBytes;
+
+        /// <summary>
+        /// Number of pages allocated
+        /// </summary>
+        public int AllocatedPageCount => allocatorBase.AllocatedPageCount;
+
+        /// <summary>Get record size required to allocate a new record. Includes allocator-specific information such as key and value overflow.</summary>
+        /// <remarks>Requires <see cref="RecordSizeInfo.FieldInfo"/> to be populated already.</remarks>
+        public void PopulateRecordSizeInfo(ref RecordSizeInfo sizeInfo) => allocator.PopulateRecordSizeInfo(ref sizeInfo);
+
+        /// <summary>
+        /// Shift begin address to the provided untilAddress. Make sure address corresponds to record boundary if snapToPageStart is set to 
+        /// false. Destructive operation if truncateLog is set to true.
+        /// </summary>
+        /// <param name="untilAddress">Address to shift begin address until</param>
+        /// <param name="snapToPageStart">Whether given address should be snapped to nearest earlier page start address</param>
+        /// <param name="truncateLog">If true, we will also truncate the log on disk until the given BeginAddress. Truncate is a destructive operation 
+        /// that can result in data loss. If false, log will be truncated after the next checkpoint.</param>
+        public void ShiftBeginAddress(long untilAddress, bool snapToPageStart = false, bool truncateLog = false)
+        {
+            if (snapToPageStart)
+                untilAddress = allocatorBase.GetAddressOfStartOfPageOfAddress(untilAddress);
+
+            var epochAcquired = store.epoch.ResumeIfNotProtected();
+            try
+            {
+                allocatorBase.ShiftBeginAddress(untilAddress, truncateLog);
+            }
+            finally
+            {
+                if (epochAcquired)
+                    store.epoch.Suspend();
+            }
+        }
+
+        /// <summary>
+        /// Truncate physical log on disk until the current BeginAddress. Use ShiftBeginAddress to shift the begin address.
+        /// Truncate is a destructive operation that can result in data loss. For data safety, take a checkpoint instead of 
+        /// using this call, as a checkpoint truncates the log to the BeginAddress after persisting the data and metadata.
+        /// </summary>
+        public void Truncate() => ShiftBeginAddress(BeginAddress, truncateLog: true);
+
+        /// <summary>
+        /// Shift log head address to prune memory footprint of hybrid log
+        /// </summary>
+        /// <param name="newHeadAddress">Address to shift head until</param>
+        /// <param name="wait">Wait for operation to complete (may involve page flushing and closing)</param>
+        public void ShiftHeadAddress(long newHeadAddress, bool wait) => ShiftAddresses(newHeadAddress, newHeadAddress, wait);
+
+        /// <summary>
+        /// Shift log read-only address, with an optional wait
+        /// </summary>
+        /// <param name="newReadOnlyAddress">Address to shift read-only until</param>
+        /// <param name="wait">Wait to ensure shift is complete (may involve page flushing)</param>
+        public void ShiftReadOnlyAddress(long newReadOnlyAddress, bool wait) => allocatorBase.ShiftReadOnlyAddressWithWait(newReadOnlyAddress, wait);
+
+        /// <summary>
+        /// Shift log readonly and head addresses, with an optional wait on the head address shift
+        /// </summary>
+        /// <param name="newReadOnlyAddress">New ReadOnlyAddress</param>
+        /// <param name="newHeadAddress">New HeadAddress</param>
+        /// <param name="waitForEviction">Wait for operation to complete (may involve page flushing and closing)</param>
+        public void ShiftAddresses(long newReadOnlyAddress, long newHeadAddress, bool waitForEviction)
+            => allocatorBase.ShiftAddressesWithWait(newReadOnlyAddress, newHeadAddress, waitForEviction);
+
+        /// <summary>
+        /// Subscribe to records (in batches) as they become read-only in the log
+        /// Currently, we support only one subscriber to the log (easy to extend)
+        /// Subscriber only receives new log updates from the time of subscription onwards
+        /// To scan the historical part of the log, use the Scan(...) method
+        /// </summary>
+        /// <param name="readOnlyObserver">Observer to which scan iterator is pushed</param>
+        public IDisposable Subscribe(IObserver<ITsavoriteScanIterator> readOnlyObserver)
+        {
+            allocatorBase.onReadOnlyObserver = readOnlyObserver;
+            return new LogSubscribeDisposable(allocatorBase, isReadOnly: true);
+        }
+
+        /// <summary>
+        /// Subscribe to records (in batches) as they get evicted from main memory.
+        /// Currently, we support only one subscriber to the log (easy to extend)
+        /// Subscriber only receives eviction updates from the time of subscription onwards
+        /// To scan the historical part of the log, use the Scan(...) method
+        /// </summary>
+        /// <param name="evictionObserver">Observer to which scan iterator is pushed</param>
+        public IDisposable SubscribeEvictions(IObserver<ITsavoriteScanIterator> evictionObserver)
+        {
+            allocatorBase.onEvictionObserver = evictionObserver;
+            return new LogSubscribeDisposable(allocatorBase, isReadOnly: false);
+        }
+
+        /// <summary>
+        /// Set the Log Size Tracker to track log size for operations that do not surface to the caller's level
+        /// (e.g. <see cref="ISessionFunctions{TInput, TOutput, TContext}"/> implementations). This includes
+        /// internal copies to log or readcache tail, memory trimming calculations, recovery eviction, etc.
+        /// </summary>
+        /// <param name="logSizeTracker">The tracker to record operations</param>
+        public void SetLogSizeTracker(LogSizeTracker<TStoreFunctions, TAllocator> logSizeTracker)
+            => allocatorBase.logSizeTracker = logSizeTracker;
+
+        /// <summary>
+        /// Wrapper to help dispose the subscription
+        /// </summary>
+        class LogSubscribeDisposable(AllocatorBase<TStoreFunctions, TAllocator> allocator, bool isReadOnly) : IDisposable
+        {
+            private readonly AllocatorBase<TStoreFunctions, TAllocator> allocator = allocator;
+            private readonly bool readOnly = isReadOnly;
+
+            public void Dispose()
+            {
+                if (readOnly)
+                    allocator.onReadOnlyObserver = null;
+                else
+                    allocator.onEvictionObserver = null;
+            }
+        }
+
+        /// <summary>
+        /// Pull-scan the log given address range; returns all records with address less than endAddress
+        /// </summary>
+        /// <remarks>
+        /// <para><paramref name="endAddress"/> need not be a record boundary. A record that starts below it is returned whole even if it
+        /// ends above it, so the iterator's <see cref="ITsavoriteScanIterator.NextAddress"/> can exceed <paramref name="endAddress"/>.</para>
+        /// <para>This is a physical walk of the log, so it returns every version of a key that the range contains, not just the live one:
+        /// an updated key appears once per surviving version, and so does a key whose record was copied to the tail by a compaction that
+        /// did not go on to shift BeginAddress past the original. Callers that need one record per key must uniquify, as the store's own
+        /// consumers do, giving precedence to the later record for a key: <c>ClientSession.Iterate</c> and <see cref="CompactionType.Scan"/>
+        /// buffer the earlier versions in a temporary store, while <see cref="CompactionType.Lookup"/> consults the hash index for a newer
+        /// version of the key.</para>
+        /// </remarks>
+        /// <returns>Scan iterator instance</returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public ITsavoriteScanIterator Scan(long beginAddress, long endAddress, DiskScanBufferingMode scanBufferingMode = DiskScanBufferingMode.DoublePageBuffering, bool includeClosedRecords = false)
+            => allocatorBase.Scan(store: null, beginAddress, endAddress, scanBufferingMode, includeClosedRecords);
+
+        /// <summary>
+        /// Clear checkpoint serialization cached by heap objects in the specified in-memory range.
+        /// </summary>
+        /// <param name="beginAddress">Inclusive beginning address.</param>
+        /// <param name="endAddress">Exclusive ending address.</param>
+        public void ClearSerializedObjectData(long beginAddress, long endAddress)
+            => allocatorBase.ClearSerializedObjectData(beginAddress, endAddress);
+
+        /// <summary>
+        /// Push-scan the log given address range; returns all records with address less than endAddress
+        /// </summary>
+        /// <remarks>
+        /// <para><paramref name="endAddress"/> need not be a record boundary; a record that starts below it is returned whole even if it ends above it.</para>
+        /// <para>This is a physical walk of the log, so it pushes every version of a key that the range contains, not just the live one.
+        /// Callers that need one record per key must uniquify, giving precedence to the later record for a key, as <c>ClientSession.Iterate</c>
+        /// and compaction do.</para>
+        /// </remarks>
+        /// <returns>True if Scan completed; false if Scan ended early due to one of the TScanIterator reader functions returning false</returns>
+        public bool Scan<TScanFunctions>(ref TScanFunctions scanFunctions, long beginAddress, long endAddress, DiskScanBufferingMode scanBufferingMode = DiskScanBufferingMode.DoublePageBuffering)
+            where TScanFunctions : IScanIteratorFunctions
+            => allocatorBase.Scan(store, beginAddress, endAddress, ref scanFunctions, scanBufferingMode);
+
+        /// <summary>
+        /// Iterate versions of the specified key, starting with most recent
+        /// </summary>
+        /// <returns>True if Scan completed; false if Scan ended early due to one of the TScanIterator reader functions returning false</returns>
+        public bool IterateKeyVersions<TKey, TScanFunctions>(ref TScanFunctions scanFunctions, TKey key)
+            where TKey : IKey, allows ref struct
+            where TScanFunctions : IScanIteratorFunctions
+            => allocatorBase.IterateKeyVersions(store, key, ref scanFunctions);
+
+        /// <summary>
+        /// Flush log until current tail (records are still retained in memory)
+        /// </summary>
+        /// <param name="wait">Synchronous wait for operation to complete</param>
+        public void Flush(bool wait) => ShiftReadOnlyAddress(allocatorBase.GetTailAddress(), wait);
+
+        /// <summary>
+        /// Flush log and evict all records from memory
+        /// </summary>
+        /// <param name="wait">Wait for operation to complete</param>
+        public void FlushAndEvict(bool wait) => ShiftHeadAddress(allocatorBase.GetTailAddress(), wait);
+
+        /// <summary>
+        /// Compact the log until specified address, moving active records to the tail of the log. BeginAddress is shifted, but the physical log
+        /// is not deleted from disk. Caller is responsible for truncating the physical log on disk by taking a checkpoint or calling Log.Truncate
+        /// </summary>
+        /// <remarks>
+        /// <paramref name="untilAddress"/> need not be a record boundary; compaction snaps it to the end of the last record that starts below it,
+        /// which is the returned address.
+        /// <para>On failure this throws without shifting BeginAddress, so no source record is dropped. Records already copied to the tail
+        /// are left as the live versions; re-running Compact is the repair, as it skips those (a newer version now exists for the key) and
+        /// reclaims the originals once it completes.</para>
+        /// </remarks>
+        /// <param name="untilAddress">Compact log until this address</param>
+        /// <param name="compactionType">Compaction type (whether we lookup records or scan log for liveness checking)</param>
+        /// <returns>Address until which compaction was done</returns>
+        public long Compact<TInput, TOutput, TContext>(long untilAddress, CompactionType compactionType)
+            => Compact<TInput, TOutput, TContext, DefaultCompactionFunctions>(default, untilAddress, compactionType);
+
+        /// <summary>
+        /// Compact the log until specified address, moving active records to the tail of the log. BeginAddress is shifted, but the physical log
+        /// is not deleted from disk. Caller is responsible for truncating the physical log on disk by taking a checkpoint or calling Log.Truncate
+        /// </summary>
+        /// <remarks>
+        /// <paramref name="untilAddress"/> need not be a record boundary; compaction snaps it to the end of the last record that starts below it,
+        /// which is the returned address.
+        /// <para>On failure this throws without shifting BeginAddress, so no source record is dropped. Records already copied to the tail
+        /// are left as the live versions; re-running Compact is the repair, as it skips those (a newer version now exists for the key) and
+        /// reclaims the originals once it completes.</para>
+        /// </remarks>
+        /// <param name="cf">User provided compaction functions (see <see cref="ICompactionFunctions"/>)</param>
+        /// <param name="untilAddress">Compact log until this address</param>
+        /// <param name="compactionType">Compaction type (whether we lookup records or scan log for liveness checking)</param>
+        /// <returns>Address until which compaction was done</returns>
+        public long Compact<TInput, TOutput, TContext, TCompactionFunctions>(TCompactionFunctions cf, long untilAddress, CompactionType compactionType)
+            where TCompactionFunctions : ICompactionFunctions
+            => store.Compact<TInput, TOutput, TContext, TCompactionFunctions>(cf, untilAddress, compactionType);
+    }
+}

@@ -25,7 +25,7 @@ public sealed class FasterHotStoreProvider : IHotStoreProvider
     public IHotStore Create(HotStoreContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-        return new FasterHotStore(context, _engine ?? PagedEngines.For(context.Options.HotStore.PagedEngine));
+        return new FasterHotStore(context, _engine ?? PagedEngines.For(context.Options.HotStore.PagedEngine, context.LoggerFactory));
     }
 }
 
