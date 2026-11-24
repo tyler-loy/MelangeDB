@@ -84,7 +84,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
             $"Serve: hub + {_options.Nodes} shard node(s), world {_options.World} " +
             $"({_options.WorldChunksX}x{_options.WorldChunksY} chunks), band {_options.BandChunks}, " +
             $"fsync {_options.Fsync}{(_options.Fsync == "interval" ? $" ({_options.FsyncIntervalMs} ms)" : string.Empty)}, " +
-            $"hot store {_options.HotStore}, heartbeat {HeartbeatMs} ms, failure timeout {FailureTimeoutMs} ms.");
+            $"hot store {_options.HotStore}{(_options.HotStore == "faster" ? $" ({_options.PagedEngine})" : "")}, heartbeat {HeartbeatMs} ms, failure timeout {FailureTimeoutMs} ms.");
 
         // FreePort is allocate-close-rebind, so another process can win a port in the gap and the
         // real bind then fails — one stolen port out of the dozens churning on a busy CI machine
@@ -179,6 +179,36 @@ internal sealed class LoadTestServer : IAsyncDisposable
             throw new InvalidOperationException($"Node {name} is already running.");
         var app = await WithFreshPortsRetryAsync(() => StartAppAsync(name, ClusterRole.Shard, FreePort())).ConfigureAwait(false);
         _nodeApps[index] = (name, app);
+    }
+
+    /// <summary>
+    /// The paged logs of every live primary shard engine, summed: log, live and reclaimed bytes,
+    /// segment files and compaction steps. An engine that does not report a figure (-1) adds nothing.
+    /// </summary>
+    public (long LogBytes, long LiveBytes, long ReclaimedBytes, long SegmentFiles, long CompactionSteps) HotStoreTotals()
+    {
+        long log = 0, live = 0, reclaimed = 0, segments = 0, steps = 0;
+        foreach (var (_, app) in _nodeApps)
+        {
+            if (app is null)
+                continue;
+            var node = app.Services.GetRequiredService<ShardNodeRuntime>();
+            foreach (var shard in node.OwnedShards)
+            {
+                if (node.TryGetShard(shard) is not { } runtime)
+                    continue;
+                foreach (var space in runtime.Engine.HotStore.Statistics().Logs)
+                {
+                    log += Math.Max(0, space.LogBytes);
+                    live += Math.Max(0, space.LiveBytes);
+                    reclaimed += Math.Max(0, space.ReclaimedBytes);
+                    segments += Math.Max(0, space.SegmentFiles);
+                    steps += Math.Max(0, space.CompactionSteps);
+                }
+            }
+        }
+
+        return (log, live, reclaimed, segments, steps);
     }
 
     /// <summary>The same counters the stats endpoint serves, for the serve console's periodic line.</summary>
@@ -331,6 +361,8 @@ internal sealed class LoadTestServer : IAsyncDisposable
             ["MelangeDb:Cluster:HeartbeatIntervalMs"] = HeartbeatMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:FailureTimeoutMs"] = FailureTimeoutMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:HotStore:Engine"] = _options.HotStore == "faster" ? "Faster" : "InMemory",
+            ["MelangeDb:HotStore:PagedEngine"] = PagedEngineName(_options.PagedEngine),
+            ["MelangeDb:HotStore:MemoryBudgetBytes"] = ((_options.BudgetMb ?? 128) * (1L << 20)).ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:BorderBandChunks"] = _options.BandChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMarginChunks"] = _options.MarginChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMinIntervalMs"] = _options.HandoffMinIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
@@ -589,4 +621,12 @@ internal sealed class LoadTestServer : IAsyncDisposable
             await app.DisposeAsync().ConfigureAwait(false);
         }
     }
+
+    /// <summary>The <c>HotStore:PagedEngine</c> value for a <c>--paged-engine</c> flag.</summary>
+    internal static string PagedEngineName(string flag) => flag switch
+    {
+        "melangelog" => "MelangeLog",
+        "tsavorite" => "Tsavorite",
+        _ => "Faster",
+    };
 }

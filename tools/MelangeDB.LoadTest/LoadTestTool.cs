@@ -56,6 +56,9 @@ public static class LoadTestTool
     private static async Task<int> ServeAsync(LoadTestOptions options, TextWriter output, CancellationToken ct)
     {
         await using var server = await LoadTestServer.StartAsync(options, output, ct).ConfigureAwait(false);
+        await using var ballast = options.BallastRows > 0
+            ? await BallastSoak.StartAsync(server, options, output, ct).ConfigureAwait(false)
+            : null;
         var clock = Stopwatch.StartNew();
         try
         {
@@ -70,6 +73,11 @@ public static class LoadTestTool
                     $"{stats.HandoffsAborted} aborted {stats.HandoffsInFlight} in flight; working set " +
                     $"{stats.WorkingSetBytes / (1024 * 1024)} MiB, GC heap {stats.GcHeapBytes / (1024 * 1024)} MiB, " +
                     $"gen2 {stats.Gen2Collections}");
+                var hot = server.HotStoreTotals();
+                output.WriteLine(
+                    $"[serve {clock.Elapsed.TotalSeconds,5:F0}s] hot store log {hot.LogBytes >> 20} MiB live {hot.LiveBytes >> 20} MiB " +
+                    $"reclaimed {hot.ReclaimedBytes >> 20} MiB segments {hot.SegmentFiles} compaction steps {hot.CompactionSteps}" +
+                    (ballast is null ? "" : $"; ballast rewritten {ballast.Rewritten} failed {ballast.Failed}{(ballast.LastError is { } e ? $" (last: {e})" : "")}"));
             }
         }
         catch (OperationCanceledException)
@@ -156,6 +164,14 @@ public static class LoadTestTool
         "--port", options.Port.ToString(CultureInfo.InvariantCulture),
         "--listen", options.Listen,
         "--hot-store", options.HotStore,
+        "--paged-engine", options.PagedEngine,
+        .. (options.BudgetMb is { } budget ? ["--budget-mb", budget.ToString(CultureInfo.InvariantCulture)] : Array.Empty<string>()),
+        .. (options.DataPath is { } data ? ["--data", data] : Array.Empty<string>()),
+        .. (options.BallastRows > 0
+            ? ["--ballast-rows", options.BallastRows.ToString(CultureInfo.InvariantCulture),
+               "--ballast-churn", options.BallastChurnPerSecond.ToString(CultureInfo.InvariantCulture),
+               "--row-bytes", options.RowBytes.ToString(CultureInfo.InvariantCulture)]
+            : Array.Empty<string>()),
         .. (options.LockSplit ? ["--lock-split"] : Array.Empty<string>()),
         .. (options.HeartbeatMs is { } heartbeat ? ["--heartbeat-ms", heartbeat.ToString(CultureInfo.InvariantCulture)] : Array.Empty<string>()),
         .. (options.FailureTimeoutMs is { } timeout ? ["--failure-timeout-ms", timeout.ToString(CultureInfo.InvariantCulture)] : Array.Empty<string>()),

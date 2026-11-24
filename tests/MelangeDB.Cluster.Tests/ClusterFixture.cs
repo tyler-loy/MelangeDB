@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using MelangeDB.Client;
 using MelangeDB.Core;
 using MelangeDB.Server;
+using MelangeDB.Storage.Faster;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
@@ -283,6 +284,17 @@ internal sealed class ClusterFixture : IAsyncDisposable
             // what lets a reassigned shard's new owner open the shard's log and recover it.
             ["MelangeDb:Cluster:ShardDataPath"] = Path.Combine(_root, "shards"),
         };
+        // MELANGE_TEST_PAGED_ENGINE (faster, melangelog, tsavorite) runs every node's stores on the
+        // paged store over that engine, as it does the store suite; unset, they stay in memory.
+        var pagedEngine = Environment.GetEnvironmentVariable("MELANGE_TEST_PAGED_ENGINE") is { Length: > 0 } engineName
+            ? Enum.Parse<PagedEngine>(engineName, ignoreCase: true)
+            : (PagedEngine?)null;
+        if (pagedEngine is { } paged)
+        {
+            settings["MelangeDb:HotStore:Engine"] = nameof(HotStoreEngine.Faster);
+            settings["MelangeDb:HotStore:PagedEngine"] = paged.ToString();
+        }
+
         foreach (var (key, value) in _extraSettings ?? new Dictionary<string, string?>())
             settings[key] = value;
         if (role == ClusterRole.Shard)
@@ -323,12 +335,17 @@ internal sealed class ClusterFixture : IAsyncDisposable
             };
         });
         builder.Services.AddSingleton<EventReceipts>();
-        builder.Services.AddMelangeDb(melange => melange
-            .AddTablesFrom(typeof(Mob).Assembly)
-            .AddReducersFrom(typeof(ClusterReducers).Assembly)
-            .AddProducersFrom(typeof(ClusterProducers).Assembly)
-            .AddEventHandler<MobDiedHandler>()
-            .AddEventHandler<GiftSagaHandler>());
+        builder.Services.AddMelangeDb(melange =>
+        {
+            melange
+                .AddTablesFrom(typeof(Mob).Assembly)
+                .AddReducersFrom(typeof(ClusterReducers).Assembly)
+                .AddProducersFrom(typeof(ClusterProducers).Assembly)
+                .AddEventHandler<MobDiedHandler>()
+                .AddEventHandler<GiftSagaHandler>();
+            if (pagedEngine is not null)
+                melange.UseFasterHotStore();
+        });
         if (_spatial)
         {
             builder.Services.AddSingleton<IShardStrategy>(static provider => new SpatialShardStrategy(

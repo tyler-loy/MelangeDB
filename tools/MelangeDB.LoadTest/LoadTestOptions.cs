@@ -88,6 +88,12 @@ public sealed class LoadTestOptions
     /// <summary>HotStore:Engine for every node: "inmemory" or "faster".</summary>
     public string HotStore { get; set; } = "inmemory";
 
+    /// <summary>HotStore:PagedEngine for every node, when <see cref="HotStore"/> is "faster": "faster", "melangelog" or "tsavorite".</summary>
+    public string PagedEngine { get; set; } = "faster";
+
+    /// <summary>HotStore:MemoryBudgetBytes for every node, in MiB; null keeps the library's 128 MiB.</summary>
+    public int? BudgetMb { get; set; }
+
     // ---- failover: the reassignment-window measurement ----
 
     /// <summary>Ballast rows on the measured shard, one run per entry — the shard-heat sweep.</summary>
@@ -95,6 +101,14 @@ public sealed class LoadTestOptions
 
     /// <summary>Payload bytes per ballast row.</summary>
     public int RowBytes { get; set; } = 256;
+
+    // ---- serve/all: a paged working set larger than the memory budget, rewritten throughout ----
+
+    /// <summary><c>--ballast-rows</c>: ballast rows seeded across every block at serve start; 0 seeds none.</summary>
+    public int BallastRows { get; set; }
+
+    /// <summary><c>--ballast-churn</c>: ballast rows rewritten per second while serving, so a paged log accrues garbage to compact.</summary>
+    public int BallastChurnPerSecond { get; set; }
 
     /// <summary>
     /// <c>--replicas 0|1</c>: <c>Cluster:ShardReplicas</c> for the failover measurement. With 1 (the
@@ -287,11 +301,23 @@ public sealed class LoadTestOptions
 
                         options.HotStore = value;
                         break;
+                    case "--paged-engine":
+                        if (value is not ("faster" or "melangelog" or "tsavorite"))
+                        {
+                            error.WriteLine($"--paged-engine takes 'faster', 'melangelog' or 'tsavorite', not '{value}'.");
+                            return null;
+                        }
+
+                        options.PagedEngine = value;
+                        break;
+                    case "--budget-mb": options.BudgetMb = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--rows":
                         options.FailoverRows = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                             .Select(static v => int.Parse(v, CultureInfo.InvariantCulture)).ToArray();
                         break;
                     case "--row-bytes": options.RowBytes = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--ballast-rows": options.BallastRows = int.Parse(value, CultureInfo.InvariantCulture); break;
+                    case "--ballast-churn": options.BallastChurnPerSecond = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--tail": options.TailRecords = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--replicas": options.Replicas = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--repeat": options.Repeat = int.Parse(value, CultureInfo.InvariantCulture); break;
