@@ -165,6 +165,9 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     internal const int PadKeyLength = -1;
 
     private const long FirstAddress = 64;
+
+    /// <summary>The longest a compaction step holds the store lock: half a millisecond.</summary>
+    private static readonly long MaxStepTicks = System.Diagnostics.Stopwatch.Frequency / 2000;
     private const int MaxKeyLength = 1024;
 
     // A slot packs the record's address and size, both in 8-byte units (records are 8-byte aligned):
@@ -554,9 +557,17 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
                 _victimCursor = victimInfo.FirstRecord;
             }
 
+            // A step ends at its byte budget, copied or merely scanned (most of a victim is dead
+            // records, each a hash and a probe), or at half a millisecond, whichever comes first:
+            // writers and readers wait behind it. Its pages were faulted in off the lock beforehand.
             var segmentEnd = (victim + 1) << _segmentBits;
-            while (_victimCursor < segmentEnd && relocated < byteBudget && scanned < byteBudget * 4)
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
+            var records = 0;
+            while (_victimCursor < segmentEnd && relocated < byteBudget && scanned < byteBudget)
             {
+                if ((++records & 31) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - started > MaxStepTicks)
+                    break;
+
                 var address = _victimCursor;
                 var inPage = _pageSize - (address & _pageOffsetMask);
                 if (inPage < HeaderSize)
