@@ -16,7 +16,8 @@ namespace MelangeDB.LoadTest;
 /// The shapes are the cluster's own: a border batch of 500 rows of 1 KiB (what a bulk write at a
 /// block edge mirrors), one of 50 small rows (a walker band), and a heartbeat. Each runs
 /// sequentially (latency) and from 32 concurrent senders (throughput, and what per-thread pooling
-/// retains when many pool threads touch the link).
+/// retains when many pool threads touch the link), in both frame formats: JSON, which a link
+/// keeps when one end predates binary frames, and binary.
 /// </para>
 /// </summary>
 internal static class LinkBench
@@ -35,17 +36,20 @@ internal static class LinkBench
         output.WriteLine($"link-bench: node link over loopback, {options.Repeat} round(s) per shape; process GC: {(System.Runtime.GCSettings.IsServerGC ? "server" : "workstation")}, {Environment.ProcessorCount} cores.");
         for (var round = 1; round <= options.Repeat; round++)
         {
-            foreach (var shape in shapes)
+            foreach (var binary in new[] { false, true })
             {
-                await MeasureAsync(shape, concurrency: 1, shape.Sequential, round, output, ct).ConfigureAwait(false);
-                await MeasureAsync(shape, concurrency: 32, shape.Concurrent, round, output, ct).ConfigureAwait(false);
+                foreach (var shape in shapes)
+                {
+                    await MeasureAsync(shape, binary, concurrency: 1, shape.Sequential, round, output, ct).ConfigureAwait(false);
+                    await MeasureAsync(shape, binary, concurrency: 32, shape.Concurrent, round, output, ct).ConfigureAwait(false);
+                }
             }
         }
 
         return 0;
     }
 
-    private static async Task MeasureAsync(Shape shape, int concurrency, int messages, int round, TextWriter output, CancellationToken ct)
+    private static async Task MeasureAsync(Shape shape, bool binary, int concurrency, int messages, int round, TextWriter output, CancellationToken ct)
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
@@ -63,6 +67,8 @@ internal static class LinkBench
             Interlocked.Add(ref decodedOps, Decode(type, body));
             return Task.FromResult<object?>(null);
         };
+        sender.SendsBinary = binary;
+        receiver.SendsBinary = binary;
         sender.Start();
         receiver.Start();
 
@@ -75,6 +81,7 @@ internal static class LinkBench
         var sentBefore = senderMetrics.SentBytesByType.GetValueOrDefault(shape.Type);
         var countBefore = senderMetrics.SentByType.GetValueOrDefault(shape.Type);
         var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
+        var gen0Before = GC.CollectionCount(0);
         var clock = Stopwatch.StartNew();
         var next = -1;
         var workers = Enumerable.Range(0, concurrency).Select(_ => Task.Run(async () =>
@@ -86,22 +93,23 @@ internal static class LinkBench
         await Task.WhenAll(workers).ConfigureAwait(false);
         clock.Stop();
         var allocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
+        var gen0 = GC.CollectionCount(0) - gen0Before;
         var wire = senderMetrics.SentBytesByType.GetValueOrDefault(shape.Type) - sentBefore;
         var sent = senderMetrics.SentByType.GetValueOrDefault(shape.Type) - countBefore;
         var retained = Retained() - retainedBefore;
 
         output.WriteLine(string.Create(CultureInfo.InvariantCulture,
-            $"LINKBENCH round={round} shape={shape.Name} senders={concurrency} msgs={sent} " +
+            $"LINKBENCH round={round} format={(binary ? "binary" : "json")} shape={shape.Name} senders={concurrency} msgs={sent} " +
             $"us_per_msg={clock.Elapsed.TotalMicroseconds / messages:F1} msgs_per_s={messages / clock.Elapsed.TotalSeconds:F0} " +
             $"mib_per_s={wire / clock.Elapsed.TotalSeconds / (1 << 20):F1} wire_bytes_per_msg={wire / Math.Max(1, sent)} " +
-            $"alloc_bytes_per_msg={allocated / messages} retained_mib={retained / (double)(1 << 20):F1} decoded_ops={Interlocked.Read(ref decodedOps)}"));
+            $"alloc_bytes_per_msg={allocated / messages} gen0={gen0} retained_mib={retained / (double)(1 << 20):F1} decoded_ops={Interlocked.Read(ref decodedOps)}"));
     }
 
     /// <summary>What a real handler does with the body: decode it into its message type.</summary>
-    private static int Decode(string type, System.Text.Json.JsonElement? body) => type switch
+    private static int Decode(string type, LinkBody? body) => type switch
     {
-        "border-apply" => System.Text.Json.JsonSerializer.Deserialize<BorderBatch>(body!.Value)!.Ops.Length,
-        "heartbeat" => System.Text.Json.JsonSerializer.Deserialize<HeartbeatRequest>(body!.Value)!.Loads.Length,
+        "border-apply" => body!.Value.Read<BorderBatch>()!.Ops.Length,
+        "heartbeat" => body!.Value.Read<HeartbeatRequest>()!.Loads.Length,
         _ => 0,
     };
 

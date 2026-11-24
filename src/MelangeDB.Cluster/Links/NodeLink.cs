@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net.Sockets;
@@ -372,8 +373,9 @@ public sealed class LivenessGaps
 }
 
 /// <summary>
-/// One authenticated TCP connection between a shard node and the hub: length-prefixed JSON
-/// frames, duplex request/response with correlation ids, and notifications. The link is
+/// One authenticated TCP connection between a shard node and the hub: length-prefixed frames,
+/// JSON or JSON with a binary attachment for row data (<see cref="LinkCodec"/>), duplex
+/// request/response with correlation ids, and notifications. The link is
 /// transport only — message semantics (auth, heartbeats, replication, events, handoff) live in
 /// the hub and shard runtimes, which install a handler. Every frame is counted in
 /// <see cref="ClusterMetrics"/>; serialization is real, which is the point of running multi-node
@@ -388,13 +390,35 @@ public sealed class LivenessGaps
 /// </summary>
 internal sealed class NodeLink : IDisposable
 {
+    /// <summary>A received frame's envelope. <see cref="Body"/> is the raw JSON; the frame's attachment rides beside it.</summary>
     private sealed record WireFrame(long Id, long Re, string Type, JsonElement? Body);
+
+    /// <summary>
+    /// Encoded frames are built in buffers from this pool rather than the shared one. Its arrays top
+    /// out at 1 MiB, four to a size, so whatever it holds between sends is bounded (about 8 MiB for
+    /// the whole process); a bigger frame allocates and is collected. The shared pool caches an
+    /// array per size per thread, and node-link sends happen on any pool thread: with frames of
+    /// hundreds of KiB it held over 300 MiB nothing accounted for.
+    /// </summary>
+    private static readonly ArrayPool<byte> FrameBuffers = ArrayPool<byte>.Create(1024 * 1024, 4);
+
+    /// <summary>A JSON buffer this thread keeps between frames only while it stays this small.</summary>
+    private const int KeptJsonBufferBytes = 64 * 1024;
+
+    // The envelope's JSON is written into a per-thread buffer and writer, as JsonSerializer's own
+    // SerializeToUtf8Bytes does, so a heartbeat allocates neither. A frame whose JSON outgrows
+    // KeptJsonBufferBytes (a JSON link carrying rows) drops the buffer rather than pin it.
+    [ThreadStatic]
+    private static ArrayBufferWriter<byte>? t_jsonBuffer;
+
+    [ThreadStatic]
+    private static Utf8JsonWriter? t_jsonWriter;
 
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private readonly ClusterMetrics _metrics;
     private readonly Lock _sendLock = new();
-    private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement?>> _pending = new();
+    private readonly ConcurrentDictionary<long, TaskCompletionSource<LinkBody?>> _pending = new();
     private readonly CancellationTokenSource _closed = new();
     private long _nextId;
 
@@ -412,7 +436,20 @@ internal sealed class NodeLink : IDisposable
     }
 
     /// <summary>Set by the owner before <see cref="Start"/>: answers inbound requests and notifications.</summary>
-    public Func<NodeLink, string, JsonElement?, Task<object?>>? Handler { get; set; }
+    public Func<NodeLink, string, LinkBody?, Task<object?>>? Handler { get; set; }
+
+    /// <summary>
+    /// Whether this end sends binary frames. Off until the peer has said, at authentication, that it
+    /// reads them (<see cref="LinkCodec.BinaryFormat"/>); a reader accepts both kinds regardless, so
+    /// either end may switch at any point after that.
+    /// </summary>
+    public bool SendsBinary
+    {
+        get => Volatile.Read(ref _sendsBinary);
+        set => Volatile.Write(ref _sendsBinary, value);
+    }
+
+    private bool _sendsBinary;
 
     /// <summary>
     /// The one request type answered on the reader thread itself by <see cref="InlineHandler"/>,
@@ -424,7 +461,7 @@ internal sealed class NodeLink : IDisposable
     public string? InlineType { get; set; }
 
     /// <summary>Answers <see cref="InlineType"/> requests on the reader thread; throwing sends an error reply.</summary>
-    public Func<NodeLink, JsonElement?, object?>? InlineHandler { get; set; }
+    public Func<NodeLink, LinkBody?, object?>? InlineHandler { get; set; }
 
     /// <summary>Cancelled when the link dies.</summary>
     public CancellationToken ClosedToken => _closed.Token;
@@ -446,14 +483,14 @@ internal sealed class NodeLink : IDisposable
     /// so nothing on this path waits for a pool thread.
     /// </summary>
     /// <exception cref="NodeLinkException">An error reply, a timeout, or the link closing.</exception>
-    public JsonElement? Request(string type, object? body, int timeoutMs)
+    public LinkBody? Request(string type, object? body, int timeoutMs)
     {
         var id = Interlocked.Increment(ref _nextId);
-        var tcs = new TaskCompletionSource<JsonElement?>();
+        var tcs = new TaskCompletionSource<LinkBody?>();
         _pending[id] = tcs;
         try
         {
-            Send(new WireFrame(id, 0, type, ToElement(body)));
+            Send(id, 0, type, body);
             try
             {
                 if (!tcs.Task.Wait(timeoutMs, _closed.Token))
@@ -477,14 +514,14 @@ internal sealed class NodeLink : IDisposable
     }
 
     /// <summary>Sends a request and awaits the peer's response body; throws <see cref="NodeLinkException"/> on an error reply.</summary>
-    public async Task<JsonElement?> RequestAsync(string type, object? body, CancellationToken ct = default, int timeoutMs = 15_000)
+    public async Task<LinkBody?> RequestAsync(string type, object? body, CancellationToken ct = default, int timeoutMs = 15_000)
     {
         var id = Interlocked.Increment(ref _nextId);
-        var tcs = new TaskCompletionSource<JsonElement?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tcs = new TaskCompletionSource<LinkBody?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[id] = tcs;
         try
         {
-            await SendAsync(new WireFrame(id, 0, type, ToElement(body)), ct).ConfigureAwait(false);
+            await SendAsync(id, 0, type, body, ct).ConfigureAwait(false);
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct, _closed.Token);
             timeout.CancelAfter(timeoutMs);
             await using var _ = timeout.Token.Register(() => tcs.TrySetException(
@@ -499,10 +536,7 @@ internal sealed class NodeLink : IDisposable
 
     /// <summary>Sends a one-way notification.</summary>
     public Task NotifyAsync(string type, object? body, CancellationToken ct = default) =>
-        SendAsync(new WireFrame(0, 0, type, ToElement(body)), ct);
-
-    private static JsonElement? ToElement(object? body) =>
-        body is null ? null : JsonSerializer.SerializeToElement(body, body.GetType());
+        SendAsync(0, 0, type, body, ct);
 
     /// <summary>
     /// The largest frame payload a link accepts. A reader that receives a larger one cannot trust
@@ -512,19 +546,85 @@ internal sealed class NodeLink : IDisposable
     /// </summary>
     internal const int MaxFramePayloadBytes = 64 * 1024 * 1024;
 
-    private static (byte[] Buffer, int PayloadLength) Encode(WireFrame frame)
+    /// <summary>
+    /// Encodes a frame in one pass: the envelope and body written straight into a JSON writer (with
+    /// row bytes routed to an attachment on a binary link), then the length prefix, JSON and
+    /// attachment copied once into a pooled buffer. The caller returns the buffer to
+    /// <see cref="FrameBuffers"/> once it is written.
+    /// </summary>
+    private (byte[] Buffer, int FrameLength, int PayloadLength) Encode(long id, long re, string type, object? body)
     {
-        var payload = JsonSerializer.SerializeToUtf8Bytes(frame);
-        if (payload.Length > MaxFramePayloadBytes)
+        var attachment = SendsBinary ? new AttachmentWriter() : null;
+        var json = t_jsonBuffer ??= new ArrayBufferWriter<byte>(1024);
+        json.ResetWrittenCount();
+        var writer = t_jsonWriter ??= new Utf8JsonWriter(json);
+        writer.Reset(json);
+        try
         {
-            throw new NodeLinkException(
-                $"A '{frame.Type}' frame of {payload.Length} bytes exceeds the node link's {MaxFramePayloadBytes}-byte limit; it was not sent.");
+            writer.WriteStartObject();
+            writer.WriteNumber("Id", id);
+            writer.WriteNumber("Re", re);
+            writer.WriteString("Type", type);
+            writer.WritePropertyName("Body");
+            switch (body)
+            {
+                case null:
+                    writer.WriteNullValue();
+                    break;
+                case JsonElement element:
+                    element.WriteTo(writer);
+                    break;
+                case LinkBody { HasAttachment: false } received:
+                    received.Json.WriteTo(writer);
+                    break;
+                case LinkBody:
+                    throw new NodeLinkException($"A '{type}' body read from a binary frame cannot be forwarded as is; decode it into its message first.");
+                default:
+                    LinkCodec.Write(writer, body, attachment);
+                    break;
+            }
+
+            writer.WriteEndObject();
+            writer.Flush();
+        }
+        catch
+        {
+            t_jsonBuffer = null;
+            t_jsonWriter = null;
+            throw;
         }
 
-        var buffer = new byte[4 + payload.Length];
-        BinaryPrimitives.WriteInt32LittleEndian(buffer, payload.Length);
-        payload.CopyTo(buffer, 4);
-        return (buffer, payload.Length);
+        // The locals keep this frame's buffer; the thread keeps it for the next only if it is small.
+        if (json.Capacity > KeptJsonBufferBytes)
+        {
+            t_jsonBuffer = null;
+            t_jsonWriter = null;
+        }
+
+        var payloadLength = attachment is null
+            ? json.WrittenCount
+            : LinkCodec.BinaryHeaderBytes + json.WrittenCount + attachment.Length;
+        if (payloadLength > MaxFramePayloadBytes)
+        {
+            throw new NodeLinkException(
+                $"A '{type}' frame of {payloadLength} bytes exceeds the node link's {MaxFramePayloadBytes}-byte limit; it was not sent.");
+        }
+
+        var frameLength = 4 + payloadLength;
+        var buffer = FrameBuffers.Rent(frameLength);
+        var span = buffer.AsSpan(0, frameLength);
+        BinaryPrimitives.WriteInt32LittleEndian(span, payloadLength);
+        span = span[4..];
+        if (attachment is not null)
+        {
+            span[0] = LinkCodec.BinaryMarker;
+            BinaryPrimitives.WriteInt32LittleEndian(span[1..], json.WrittenCount);
+            span = span[LinkCodec.BinaryHeaderBytes..];
+        }
+
+        json.WrittenSpan.CopyTo(span);
+        attachment?.CopyTo(span[json.WrittenCount..]);
+        return (buffer, frameLength, payloadLength);
     }
 
     /// <summary>
@@ -534,32 +634,39 @@ internal sealed class NodeLink : IDisposable
     /// load a liveness ping sat behind that queue for up to 1.5 s while no write held the lock for
     /// more than 23 ms (phase 30's soak). Waiters on a plain lock are threads already running.
     /// </summary>
-    private void Send(WireFrame frame)
+    private void Send(long id, long re, string type, object? body)
     {
-        var (buffer, length) = Encode(frame);
-        _closed.Token.ThrowIfCancellationRequested();
-        lock (_sendLock)
+        var (buffer, frameLength, payloadLength) = Encode(id, re, type, body);
+        try
         {
-            try
+            _closed.Token.ThrowIfCancellationRequested();
+            lock (_sendLock)
             {
-                _stream.Write(buffer);
-            }
-            catch (IOException)
-            {
-                Dispose();
-                throw;
+                try
+                {
+                    _stream.Write(buffer, 0, frameLength);
+                }
+                catch (IOException)
+                {
+                    Dispose();
+                    throw;
+                }
             }
         }
+        finally
+        {
+            FrameBuffers.Return(buffer);
+        }
 
-        _metrics.RecordSent(frame.Type, length);
+        _metrics.RecordSent(type, payloadLength);
     }
 
-    private Task SendAsync(WireFrame frame, CancellationToken ct)
+    private Task SendAsync(long id, long re, string type, object? body, CancellationToken ct)
     {
         try
         {
             ct.ThrowIfCancellationRequested();
-            Send(frame);
+            Send(id, re, type, body);
             return Task.CompletedTask;
         }
         catch (Exception exception)
@@ -582,8 +689,7 @@ internal sealed class NodeLink : IDisposable
                     throw new InvalidDataException($"Node-link frame length {length} is out of range.");
                 var payload = new byte[length];
                 _stream.ReadExactly(payload);
-                var frame = JsonSerializer.Deserialize<WireFrame>(payload)
-                    ?? throw new InvalidDataException("Node-link frame deserialized to null.");
+                var (frame, body) = Decode(payload);
                 _metrics.RecordReceived(frame.Type, payload.Length);
                 if (frame.Re != 0)
                 {
@@ -594,13 +700,13 @@ internal sealed class NodeLink : IDisposable
                             tcs.TrySetException(new NodeLinkException(
                                 frame.Body?.GetProperty("Message").GetString() ?? "error",
                                 isPeerError: true,
-                                frame.Body is { } body && body.TryGetProperty("Code", out var code) && code.ValueKind == JsonValueKind.String
+                                frame.Body is { } error && error.TryGetProperty("Code", out var code) && code.ValueKind == JsonValueKind.String
                                     ? code.GetString()
                                     : null));
                         }
                         else
                         {
-                            tcs.TrySetResult(frame.Body);
+                            tcs.TrySetResult(body);
                         }
                     }
 
@@ -609,13 +715,13 @@ internal sealed class NodeLink : IDisposable
 
                 if (frame.Id != 0 && frame.Type == InlineType && InlineHandler is { } inline)
                 {
-                    AnswerInline(frame, inline);
+                    AnswerInline(frame, body, inline);
                     continue;
                 }
 
                 // Handled off the read loop so a slow handler cannot stall unrelated traffic;
                 // responses re-serialize through SendAsync like everything else.
-                _ = Task.Run(() => DispatchAsync(frame), CancellationToken.None);
+                _ = Task.Run(() => DispatchAsync(frame, body), CancellationToken.None);
             }
         }
         catch (Exception)
@@ -632,22 +738,53 @@ internal sealed class NodeLink : IDisposable
         }
     }
 
-    private void AnswerInline(WireFrame frame, Func<NodeLink, JsonElement?, object?> handler)
+    /// <summary>
+    /// Splits a received payload into its envelope and body. A JSON frame is the envelope itself; a
+    /// binary one is the marker, the JSON's length, the envelope, and the attachment its body's row
+    /// bytes point into. The body keeps the payload array alive until the handler has decoded it.
+    /// </summary>
+    private static (WireFrame Frame, LinkBody? Body) Decode(byte[] payload)
     {
-        WireFrame reply;
+        WireFrame? frame;
+        LinkBody? body;
+        if (payload[0] == LinkCodec.BinaryMarker)
+        {
+            if (payload.Length < LinkCodec.BinaryHeaderBytes)
+                throw new InvalidDataException("Node-link binary frame is shorter than its header.");
+            var jsonLength = BinaryPrimitives.ReadInt32LittleEndian(payload.AsSpan(1));
+            if (jsonLength <= 0 || jsonLength > payload.Length - LinkCodec.BinaryHeaderBytes)
+                throw new InvalidDataException($"Node-link binary frame JSON length {jsonLength} is out of range.");
+            frame = JsonSerializer.Deserialize<WireFrame>(payload.AsSpan(LinkCodec.BinaryHeaderBytes, jsonLength));
+            body = frame?.Body is { } json ? new LinkBody(json, payload, LinkCodec.BinaryHeaderBytes + jsonLength) : null;
+        }
+        else
+        {
+            frame = JsonSerializer.Deserialize<WireFrame>(payload);
+            body = frame?.Body is { } json ? new LinkBody(json) : null;
+        }
+
+        return (frame ?? throw new InvalidDataException("Node-link frame deserialized to null."), body);
+    }
+
+    private void AnswerInline(WireFrame frame, LinkBody? body, Func<NodeLink, LinkBody?, object?> handler)
+    {
+        object? reply;
+        string type;
         try
         {
-            reply = new WireFrame(0, frame.Id, frame.Type + "-ok", ToElement(handler(this, frame.Body)));
+            reply = handler(this, body);
+            type = frame.Type + "-ok";
         }
         catch (Exception exception)
         {
-            reply = new WireFrame(0, frame.Id, "error", ToElement(new { Message = exception.Message, Code = ReducerCallErrors.CodeOf(exception) }));
+            reply = new { Message = exception.Message, Code = ReducerCallErrors.CodeOf(exception) };
+            type = "error";
         }
 
-        Send(reply);
+        Send(0, frame.Id, type, reply);
     }
 
-    private async Task DispatchAsync(WireFrame frame)
+    private async Task DispatchAsync(WireFrame frame, LinkBody? body)
     {
         object? result = null;
         string? error = null;
@@ -655,7 +792,7 @@ internal sealed class NodeLink : IDisposable
         try
         {
             if (Handler is { } handler)
-                result = await handler(this, frame.Type, frame.Body).ConfigureAwait(false);
+                result = await handler(this, frame.Type, body).ConfigureAwait(false);
             else
                 error = "No handler installed.";
         }
@@ -669,11 +806,9 @@ internal sealed class NodeLink : IDisposable
             return;
         try
         {
-            await SendAsync(
-                error is null
-                    ? new WireFrame(0, frame.Id, frame.Type + "-ok", ToElement(result))
-                    : new WireFrame(0, frame.Id, "error", ToElement(new { Message = error, Code = code })),
-                _closed.Token).ConfigureAwait(false);
+            await (error is null
+                ? SendAsync(0, frame.Id, frame.Type + "-ok", result, _closed.Token)
+                : SendAsync(0, frame.Id, "error", new { Message = error, Code = code }, _closed.Token)).ConfigureAwait(false);
         }
         catch (Exception)
         {

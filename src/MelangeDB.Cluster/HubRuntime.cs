@@ -421,7 +421,7 @@ internal sealed partial class HubRuntime : IDisposable
                     new HandoffFreeze(handoffId, from.Value, to.Value, origin.FencingToken, player.ToString()),
                     ct).ConfigureAwait(false);
                 Metrics.HandoffFreeze.Record(Stopwatch.GetElapsedTime(freezeStarted));
-                rows = frozen!.Value.Deserialize<HandoffFrozenRows>()!.Rows;
+                rows = frozen!.Value.Read<HandoffFrozenRows>()!.Rows;
             }
 
             var (destination, _) = ResolveShard(to);
@@ -652,7 +652,7 @@ internal sealed partial class HubRuntime : IDisposable
                 source.CallerIsGuest,
                 claims.Count == 0 ? null : [.. claims.AsPairs()]),
             ct).ConfigureAwait(false);
-        return reply!.Value.Deserialize<ShardExecuteReply>()!.Lsn;
+        return reply!.Value.Read<ShardExecuteReply>()!.Lsn;
     }
 
     /// <summary>
@@ -698,7 +698,7 @@ internal sealed partial class HubRuntime : IDisposable
             "shard-bulk",
             new ShardBulk(shard.Value, assignment.FencingToken, caller.ToString(), rows),
             ct).ConfigureAwait(false);
-        return reply!.Value.Deserialize<ShardBulkReply>()!;
+        return reply!.Value.Read<ShardBulkReply>()!;
     }
 
     private readonly ConcurrentDictionary<ShardKey, byte> _drainsInFlight = new();
@@ -771,7 +771,7 @@ internal sealed partial class HubRuntime : IDisposable
             var stepTimeoutMs = Math.Max(30_000, Cluster.DrainQueueTimeoutMs);
             var response = await link.RequestAsync(
                 "shard-reap", new ShardReap(shard.Value, assignment.FencingToken), ct, stepTimeoutMs).ConfigureAwait(false);
-            var reply = response?.Deserialize<ShardReapReply>()
+            var reply = response?.Read<ShardReapReply>()
                 ?? throw new InvalidOperationException($"'{owner}' returned no answer for the reap of {shard}.");
             if (!reply.Reaped)
             {
@@ -795,7 +795,7 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 var deleted = await link.RequestAsync(
                     "shard-reap-delete", new ShardReapDelete(shard.Value), ct, stepTimeoutMs).ConfigureAwait(false);
-                if (deleted?.Deserialize<ShardReapReply>() is { Reaped: false } refusal)
+                if (deleted?.Read<ShardReapReply>() is { Reaped: false } refusal)
                     LogShardReapDeleteFailed(_logger, shard.Value, owner, refusal.Refusal ?? "no reason given");
             }
             catch (Exception exception)
@@ -1550,10 +1550,10 @@ internal sealed partial class HubRuntime : IDisposable
         }
     }
 
-    private async Task<object?> HandleAsync(NodeLink link, NodeSession session, string type, JsonElement? body)
+    private async Task<object?> HandleAsync(NodeLink link, NodeSession session, string type, LinkBody? body)
     {
         if (type == "auth")
-            return HandleAuth(link, session, body!.Value.Deserialize<AuthRequest>()!);
+            return HandleAuth(link, session, body!.Value.Read<AuthRequest>()!);
 
         if (session.NodeName is null)
             throw new InvalidOperationException("The link is not authenticated.");
@@ -1563,7 +1563,7 @@ internal sealed partial class HubRuntime : IDisposable
             case "heartbeat":
                 RecordHeartbeat(session.NodeName);
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
-                if (body?.Deserialize<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
+                if (body?.Read<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
                 {
                     Load.Record(session.NodeName, heartbeat.Loads, _time.GetUtcNow());
                     foreach (var load in heartbeat.Loads)
@@ -1578,13 +1578,13 @@ internal sealed partial class HubRuntime : IDisposable
                 _membership.AssignUnowned(_time.GetUtcNow());
                 return new HeartbeatReply(AssignmentsDto(session.NodeName), ReplicasDto(session.NodeName));
             case "replica-subscribe":
-                var subscribe = body!.Value.Deserialize<ReplicaSubscribe>()!;
+                var subscribe = body!.Value.Read<ReplicaSubscribe>()!;
                 StartReplicaPump(link, session, subscribe.FromLsn);
                 return null;
             case "replica-read":
-                return ReadReplicaForOpen(body!.Value.Deserialize<ReplicaRead>()!.FromLsn);
+                return ReadReplicaForOpen(body!.Value.Read<ReplicaRead>()!.FromLsn);
             case "events-forward":
-                var forward = body!.Value.Deserialize<EventsForward>()!;
+                var forward = body!.Value.Read<EventsForward>()!;
                 RequireOwnedBy(session, forward.ShardValue, type);
                 await _foreignEvents.DispatchAsync(session.NodeName, forward.ShardValue, forward, _stopped.Token).ConfigureAwait(false);
                 return null;
@@ -1592,7 +1592,7 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 // Routed, not answered: the hub knows who owns the owner shard; the stream itself
                 // is owner node -> hub -> observer node, so the star topology carries it.
-                var borderSubscribe = body!.Value.Deserialize<BorderSubscribe>()!;
+                var borderSubscribe = body!.Value.Read<BorderSubscribe>()!;
                 var owner = _membership.GetAssignment(new ShardKey(borderSubscribe.OwnerShard));
                 if (owner?.NodeName is not { } ownerNode || LinkOf(ownerNode) is not { } ownerLink)
                     return new BorderSubscribeReply(false); // Empty world region, or its owner is down: benign, retry later.
@@ -1602,7 +1602,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             case "border-batch":
             {
-                var batch = body!.Value.Deserialize<BorderBatch>()!;
+                var batch = body!.Value.Read<BorderBatch>()!;
                 RequireOwnedBy(session, batch.OwnerShard, type);
                 var observer = _membership.GetAssignment(new ShardKey(batch.ObserverShard));
                 if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
@@ -1613,7 +1613,7 @@ internal sealed partial class HubRuntime : IDisposable
 
             case "border-reset":
             {
-                var reset = body!.Value.Deserialize<BorderReset>()!;
+                var reset = body!.Value.Read<BorderReset>()!;
                 RequireOwnedBy(session, reset.OwnerShard, type);
                 var observer = _membership.GetAssignment(new ShardKey(reset.ObserverShard));
                 if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
@@ -1626,7 +1626,7 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 // Relayed part by part, unchanged: the hub holds no staging, and a part that
                 // cannot be delivered fails back to the owner, which starts the reset over.
-                var part = body!.Value.Deserialize<BorderResetPart>()!;
+                var part = body!.Value.Read<BorderResetPart>()!;
                 RequireOwnedBy(session, part.Reset.OwnerShard, type);
                 var observer = _membership.GetAssignment(new ShardKey(part.Reset.ObserverShard));
                 if (observer?.NodeName is not { } observerNode || LinkOf(observerNode) is not { } observerLink)
@@ -1636,11 +1636,11 @@ internal sealed partial class HubRuntime : IDisposable
             }
 
             case "handoff-request":
-                HandleHandoffRequest(session, body!.Value.Deserialize<HandoffRequest>()!);
+                HandleHandoffRequest(session, body!.Value.Read<HandoffRequest>()!);
                 return null;
             case "handoff-approach":
             {
-                var approach = body!.Value.Deserialize<HandoffApproach>()!;
+                var approach = body!.Value.Read<HandoffApproach>()!;
                 var player = new Identity(Convert.FromHexString(approach.PlayerHex));
                 foreach (var target in approach.ToShards)
                 {
@@ -1663,12 +1663,12 @@ internal sealed partial class HubRuntime : IDisposable
             }
 
             case "handoff-resolved":
-                HandleHandoffResolved(body!.Value.Deserialize<HandoffResolved>()!);
+                HandleHandoffResolved(body!.Value.Read<HandoffResolved>()!);
                 return null;
             case "handoff-query":
-                return await HandleHandoffQueryAsync(body!.Value.Deserialize<HandoffQuery>()!).ConfigureAwait(false);
+                return await HandleHandoffQueryAsync(body!.Value.Read<HandoffQuery>()!).ConfigureAwait(false);
             case "handoff-freeze-query":
-                return await HandleFreezeQueryAsync(body!.Value.Deserialize<HandoffFreezeQuery>()!).ConfigureAwait(false);
+                return await HandleFreezeQueryAsync(body!.Value.Read<HandoffFreezeQuery>()!).ConfigureAwait(false);
             default:
                 throw new InvalidOperationException($"Unknown node-link message '{type}'.");
         }
@@ -1691,10 +1691,16 @@ internal sealed partial class HubRuntime : IDisposable
         _membership.AssignUnowned(_time.GetUtcNow());
         LogNodeRegistered(_logger, request.NodeName, request.PublicAddress);
         OnNodeRegistered(request.NodeName);
+
+        // Binary frames only to a node that said it reads them, and only once it has proved itself;
+        // an older node never says so and keeps getting JSON.
+        var binary = request.LinkFormat >= LinkCodec.BinaryFormat;
+        link.SendsBinary = binary;
         return new AuthReply(
             LinkProof.Compute(cluster.Secret, request.NodeNonce, "hub"),
             AssignmentsDto(request.NodeName),
-            cluster.FailureTimeoutMs);
+            cluster.FailureTimeoutMs,
+            binary ? LinkCodec.BinaryFormat : 0);
     }
 
     private async Task<HandoffQueryReply> HandleHandoffQueryAsync(HandoffQuery query)
@@ -1710,7 +1716,7 @@ internal sealed partial class HubRuntime : IDisposable
         if (destination?.NodeName is not { } owner || LinkOf(owner) is not { } link)
             throw new InvalidOperationException($"The destination shard's owner is unreachable; retry.");
         var reply = await link.RequestAsync("handoff-query-owner", query, _stopped.Token).ConfigureAwait(false);
-        return reply!.Value.Deserialize<HandoffQueryReply>()!;
+        return reply!.Value.Read<HandoffQueryReply>()!;
     }
 
     /// <summary>
@@ -1727,7 +1733,7 @@ internal sealed partial class HubRuntime : IDisposable
         if (origin?.NodeName is not { } owner || LinkOf(owner) is not { } link)
             throw new InvalidOperationException("The origin shard's owner is unreachable; retry.");
         var reply = await link.RequestAsync("handoff-freeze-query-owner", query, _stopped.Token).ConfigureAwait(false);
-        return reply!.Value.Deserialize<HandoffFreezeQueryReply>()!;
+        return reply!.Value.Read<HandoffFreezeQueryReply>()!;
     }
 
     private ShardAssignmentDto[] AssignmentsDto(string nodeName) =>

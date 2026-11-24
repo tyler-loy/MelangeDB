@@ -292,6 +292,13 @@ public class ClusterAcceptanceTests
         Assert.Contains("assertion", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>A hub and nodes of this build agree, at authentication, to send row data as binary attachments.</summary>
+    [Fact]
+    public void Nodes_and_hub_of_this_build_negotiate_binary_frames()
+    {
+        Assert.All(_cluster.Nodes, static node => Assert.True(node.Runtime.HubLinkSendsBinary, $"{node.Name} still sends JSON"));
+    }
+
     [Fact]
     public async Task A_node_link_with_the_wrong_secret_is_refused()
     {
@@ -302,7 +309,7 @@ public class ClusterAcceptanceTests
         link.Handler = (_, type, body) =>
         {
             if (type == "challenge")
-                challenge.TrySetResult(body!.Value.GetProperty("ServerNonce").GetString()!);
+                challenge.TrySetResult(body!.Value.Json.GetProperty("ServerNonce").GetString()!);
             return Task.FromResult<object?>(null);
         };
         link.Start();

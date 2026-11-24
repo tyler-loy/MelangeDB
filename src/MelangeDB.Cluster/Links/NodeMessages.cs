@@ -31,9 +31,14 @@ internal sealed record ShardAssignmentDto(ulong Shard, string? NodeName, long Fe
     public ShardAssignment ToAssignment() => new(new ShardKey(Shard), NodeName, FencingToken, Originator);
 }
 
-internal sealed record AuthRequest(string NodeName, string PublicAddress, string NodeNonce, string Proof);
+/// <summary>
+/// A node's authentication. <see cref="LinkFormat"/> is the highest node-link frame format it reads
+/// (<see cref="LinkCodec.BinaryFormat"/>); a node from before binary frames sends none, which reads as 0.
+/// </summary>
+internal sealed record AuthRequest(string NodeName, string PublicAddress, string NodeNonce, string Proof, int LinkFormat = 0);
 
-internal sealed record AuthReply(string Proof, ShardAssignmentDto[] Assignments, int FailureTimeoutMs);
+/// <summary>The hub's answer. <see cref="LinkFormat"/> is the frame format the hub will send and accepts back (0: JSON only).</summary>
+internal sealed record AuthReply(string Proof, ShardAssignmentDto[] Assignments, int FailureTimeoutMs, int LinkFormat = 0);
 
 /// <summary>
 /// A shard this node keeps a warm replica of (phase 30): the originator its sequences continue
