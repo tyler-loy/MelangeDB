@@ -238,8 +238,8 @@ and the link owns a bounded pool of its own.
 the managed heap at the end was about 10% lower. The bigger effect shows under a heap limit: with a
 2 GiB GC heap limit, the JSON link ran out of memory while seeding the 400,000 rows and served no
 calls. The binary link seeded them and served 218,000 calls before the key directory, still managed
-in that run, ran out. The native directory is the fix for that second limit. A run with both under
-the same cap is pending ([End-to-end check on 0.5.0](#end-to-end-check-on-050)). Older nodes in a
+in that run, ran out. The native directory is the fix for that second limit. With both, the same run
+completes under the cap, at the edge of it ([End-to-end check on 0.5.0](#end-to-end-check-on-050)). Older nodes in a
 mixed-version cluster keep exchanging JSON; see [Upgrading](#upgrading-to-050).
 
 ### Border-band mirroring multiplies live bytes
@@ -281,8 +281,11 @@ a process restart costs more than read speed. Each segment is mapped whole, so a
 that many bytes have been appended since the last one, even short of `Snapshots:IntervalTransactions`.
 Nodes that commit rarely but in bulk now truncate their commit logs: out-of-world shards taking only
 border mirrors, and blob-heavy tables. The paging soak saw the commit log grow about 5.7 GiB/h on
-both engines before this change. Whether the byte trigger accounts for all of that has not yet been
-re-measured.
+both engines before this change: the shards just outside the world, which take only border mirrors,
+never reached the transaction count, so never snapshotted and never truncated. In the
+[end-to-end check](#end-to-end-check-on-050) every snapshot truncated and the commit logs moved
+within a 2.7–4.1 GiB band over 20 minutes, which is about what a dozen logs each refilling to
+256 MiB between snapshots would hold. A longer run would confirm the plateau.
 
 **Native memory is outside the GC.** `GCHeapHardLimit` and `DOTNET_GCHeapHardLimit` no longer cover
 the paged store's directory. A container's memory limit still does.
@@ -360,4 +363,55 @@ It measures round trip, allocation and wire bytes per message shape, over loopba
 
 ## End-to-end check on 0.5.0
 
-<!-- CLUSTER-CHECK-RESULTS -->
+The [paging soak](#disk-over-time) workload again, on `main` with 0.5.0's store and link changes:
+MelangeLog, the native directory, binary node links, the session-expiry fix and the snapshot byte
+trigger. Four nodes in one process with their replicas, 100 walkers, 400,000 paged rows of 1 KiB
+under an 8 MiB budget, 1,000 rewritten a second. Two runs: 20 minutes uncapped, then 6 minutes
+with the GC heap capped at 2 GiB (`DOTNET_GCHeapHardLimit`). One run each, on the same 32-core
+machine as the earlier soaks.
+
+### Uncapped, 20 minutes
+
+| | 0.5.0 check (20 min) | MelangeLog overnight, before (2.7 h) |
+| --- | --- | --- |
+| Calls acked | 1.82M, 1,515/s | — |
+| Rejected calls | 251 (12.6 a minute) | 4,244 (26 a minute) |
+| Call → delta p50 / p99 / max | 3.2 / 182 / 2,328 ms | 2.9 / 211 / 2,352 ms |
+| Handoffs completed / aborted | 8,297 / 0 | — |
+| Disconnects / resyncs / inconsistencies | 0 / 0 / 0 | 0 / 100 `token_expired` + 100 resyncs / 0 |
+| Replica staleness, max | 0.92 s | 1.1 s |
+| Primaries' paged log against live | 2.54 GiB / 1.30 GiB | ~2.55 GiB / 1.30 GiB |
+| Hot-store disk, primaries and replicas | flat at ~5.4 GiB from minute 10 | 5.4 → 5.5 GiB |
+| Commit logs | 2.7–4.1 GiB band, every snapshot truncated | grew ~5.7 GiB/h |
+| GC heap at end / GC pause share | 2.8 GiB / 20% (Server GC, 32 cores) | 4–5 GiB / — |
+
+The durations differ, so read rates rather than totals. The `token_expired` drops and the
+commit-log growth were the two faults the overnight run found; both are gone. The hot store's
+numbers match the overnight run's, which is what the engine was already doing; the directory and
+the link changes show up in memory, below.
+
+### GC heap capped at 2 GiB, 6 minutes
+
+| Build | Seeding 400,000 rows | Serving |
+| --- | --- | --- |
+| JSON link, managed directory | out of memory | 0 calls |
+| Binary link, managed directory | completes | 218,000 calls, then out of memory in the key directory |
+| **0.5.0** (binary link, native directory) | completes | **all 6 minutes: 503,000 calls acked** |
+
+0.5.0 completes the run, at the edge of the cap: the GC heap sat at 1.5–1.8 GiB with the GC paused
+37% of the time, and 7.8% of calls were rejected as transient (42,784 of 545,800). Four allocations
+failed with `OutOfMemoryException` during the run, and each was contained the way it is designed to
+be:
+- one hot-store apply: the shard closed itself to writes (EventId 1517) and the node reopened it from
+  its log on the next heartbeat (EventId 1765); one call came back `outcome_unknown`;
+- one replica poll, retried on the next;
+- one reducer call, rejected;
+- one automatic snapshot, retried at the next interval.
+
+56 handoffs aborted and 24 clients resynced; none disconnected and none saw an inconsistency.
+
+**What to take from it:** the cap covers four nodes, their replicas and the hub, about
+2.4 million stored rows once border mirrors and replicas are counted, in one 2 GiB heap. That is
+far tighter than a deployment would run, and 0.5.0 is the first build that gets through it. Do not
+size a deployment from it: give each node GC heap headroom well above its steady state, and count
+the native directory and the mapped segments in the container limit rather than the GC heap.
