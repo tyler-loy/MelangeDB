@@ -13,7 +13,8 @@ All packages ship together at one version; there is no per-package versioning. S
 ### Added
 
 - **`HotStore:NativeDirectory` keeps the paged store's key directory and secondary indexes off
-  the managed heap**, in native copy-on-write B+trees (1 KiB pages). Off by default for now.
+  the managed heap**, in native copy-on-write B+trees (1 KiB pages). On by default; `false` keeps
+  the managed trees.
   - **Why:** a paged row kept about 300 bytes and five GC objects resident in persistent managed
     trees, so memory and full-collection marking grew with row count whatever the budget.
   - **Measured** (bake-off, 1M rows + 200k blobs, 1 GiB cap):

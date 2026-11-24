@@ -95,8 +95,8 @@ jobs:
           for engine in melangelog tsavorite; do
             MELANGE_TEST_PAGED_ENGINE=$engine dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-release-engines.log || failed=1
           done
-          # The key directory and indexes in native trees (HotStore:NativeDirectory), on MelangeLog.
-          MELANGE_TEST_NATIVE_DIRECTORY=1 MELANGE_TEST_PAGED_ENGINE=melangelog dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-release-engines.log || failed=1
+          # The managed key directory and indexes (HotStore:NativeDirectory=false), on MelangeLog.
+          MELANGE_TEST_NATIVE_DIRECTORY=0 MELANGE_TEST_PAGED_ENGINE=melangelog dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-release-engines.log || failed=1
           if grep -E 'Skipped:\s*[1-9]' test-release-engines.log; then
             echo '::error::Skipped tests detected in the per-engine run; CI requires zero skips.'
             exit 1
@@ -157,8 +157,8 @@ jobs:
           for engine in faster melangelog tsavorite; do
             MELANGE_TEST_PAGED_ENGINE=$engine dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-engines.log || failed=1
           done
-          # The key directory and indexes in native trees (HotStore:NativeDirectory), on MelangeLog.
-          MELANGE_TEST_NATIVE_DIRECTORY=1 MELANGE_TEST_PAGED_ENGINE=melangelog dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-engines.log || failed=1
+          # The managed key directory and indexes (HotStore:NativeDirectory=false), on MelangeLog.
+          MELANGE_TEST_NATIVE_DIRECTORY=0 MELANGE_TEST_PAGED_ENGINE=melangelog dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-engines.log || failed=1
           if grep -E 'Skipped:\s*[1-9]' test-engines.log; then
             echo '::error::Skipped tests detected in the per-engine run; CI requires zero skips.'
             exit 1
@@ -187,8 +187,8 @@ jobs:
           for engine in faster melangelog tsavorite; do
             MELANGE_TEST_PAGED_ENGINE=$engine dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-engines.log || failed=1
           done
-          # The key directory and indexes in native trees (HotStore:NativeDirectory), on MelangeLog.
-          MELANGE_TEST_NATIVE_DIRECTORY=1 MELANGE_TEST_PAGED_ENGINE=melangelog dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-engines.log || failed=1
+          # The managed key directory and indexes (HotStore:NativeDirectory=false), on MelangeLog.
+          MELANGE_TEST_NATIVE_DIRECTORY=0 MELANGE_TEST_PAGED_ENGINE=melangelog dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-engines.log || failed=1
           if grep -E 'Skipped:\s*[1-9]' test-engines.log; then
             echo '::error::Skipped tests detected in the per-engine run; CI requires zero skips.'
             exit 1

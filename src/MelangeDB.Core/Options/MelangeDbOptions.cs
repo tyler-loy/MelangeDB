@@ -780,9 +780,9 @@ public sealed class HotStoreOptions
     /// instead of persistent trees on the managed heap: some tens of bytes of native memory per row
     /// and index entry rather than about 300 bytes and five GC objects per paged row. Read once,
     /// when the store is created; the store is rebuilt from the log on every start, so switching
-    /// needs only a restart.
+    /// needs only a restart. On by default; false keeps the managed trees.
     /// </summary>
-    public bool NativeDirectory { get; set; }
+    public bool NativeDirectory { get; set; } = true;
 
     /// <summary>
     /// Cap on the paging buffer pool in bytes. <b>Excludes</b> resident tables, which are

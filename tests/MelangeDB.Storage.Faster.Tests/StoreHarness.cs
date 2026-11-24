@@ -35,7 +35,8 @@ internal sealed class StoreHarness : IDisposable
         Action<MelangeDbOptions>? configure = null,
         Type[]? tables = null,
         TimeProvider? timeProvider = null,
-        IHotStoreProvider? provider = null)
+        IHotStoreProvider? provider = null,
+        bool directoryOverride = true)
     {
         Kind = kind;
         _tables = tables ?? DefaultTables;
@@ -54,10 +55,11 @@ internal sealed class StoreHarness : IDisposable
         };
         configure?.Invoke(Options);
 
-        // MELANGE_TEST_NATIVE_DIRECTORY=1 runs every harness test with the directory and indexes
-        // in native trees, the way MELANGE_TEST_PAGED_ENGINE picks the paged engine.
-        if (Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") == "1")
-            Options.HotStore.NativeDirectory = true;
+        // MELANGE_TEST_NATIVE_DIRECTORY=0 (or 1) runs every harness test with the managed (or native)
+        // directory and indexes, the way MELANGE_TEST_PAGED_ENGINE picks the paged engine. A test
+        // that sets both kinds itself opts out.
+        if (directoryOverride && Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") is "0" or "1")
+            Options.HotStore.NativeDirectory = Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") == "1";
         Engine = CreateEngine();
     }
 

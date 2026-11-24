@@ -39,7 +39,7 @@ internal static class Runner
             Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"),
             Compaction: flags.GetValueOrDefault("compaction") != "off",
             IndexGrowth: flags.GetValueOrDefault("index-growth") == "on",
-            NativeDirectory: flags.GetValueOrDefault("native-directory") == "on");
+            NativeDirectory: flags.GetValueOrDefault("native-directory") != "off");
 
         if (flags.TryGetValue("engine", out var single))
         {

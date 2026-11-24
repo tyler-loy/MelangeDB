@@ -8,7 +8,7 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// copy-on-write trees. Whatever the representation, the store must answer every lookup, key walk
 /// and index scan the same; a read view must keep reading its version through any number of later
 /// commits and collections; and the bookkeeping must survive tier migrations and a restart. CI also
-/// runs the whole suite with MELANGE_TEST_NATIVE_DIRECTORY=1.
+/// runs the whole suite a second time with MELANGE_TEST_NATIVE_DIRECTORY=0, the managed trees.
 /// </summary>
 public sealed class NativeDirectoryTests
 {
@@ -61,8 +61,7 @@ public sealed class NativeDirectoryTests
         }
 
         Assert.True(native.Engine.HotStore.Statistics().NativeDirectoryBytes > 0);
-        if (Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") != "1")
-            Assert.Equal(0, managed.Engine.HotStore.Statistics().NativeDirectoryBytes); // Unless the run forces every store native.
+        Assert.Equal(0, managed.Engine.HotStore.Statistics().NativeDirectoryBytes);
 
         native.Restart();
         AssertSame(native, managed);
@@ -261,5 +260,6 @@ public sealed class NativeDirectoryTests
                 options.Residency.Default = Residency.Paged;
                 options.HotStore.NativeDirectory = native;
             },
-            tables: [table ?? typeof(Creature)]);
+            tables: [table ?? typeof(Creature)],
+            directoryOverride: false);
 }
