@@ -66,6 +66,9 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private readonly Dictionary<(ulong Observer, ulong Owner), (int Band, long LastSentTicks)> _borderSubscriptions = [];
     private readonly CancellationTokenSource _stopped = new();
     private volatile NodeLink? _link;
+
+    /// <summary>Test hook: whether this node's link to the hub sends binary frames (negotiated at authentication).</summary>
+    internal bool HubLinkSendsBinary => _link?.SendsBinary ?? false;
     private IShardStrategy? _strategy;
     /// <summary>
     /// When the lease ends, as a <see cref="TimeProvider.GetTimestamp"/> value: monotonic, so a
@@ -474,10 +477,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 cluster.NodeName,
                 cluster.PublicAddress,
                 nodeNonce,
-                LinkProof.Compute(cluster.Secret, hubNonce, cluster.NodeName)), ct).ConfigureAwait(false);
-            var auth = reply!.Value.Deserialize<AuthReply>()!;
+                LinkProof.Compute(cluster.Secret, hubNonce, cluster.NodeName),
+                LinkCodec.BinaryFormat), ct).ConfigureAwait(false);
+            var auth = reply!.Value.Read<AuthReply>()!;
             if (!LinkProof.Verify(cluster.Secret, nodeNonce, "hub", auth.Proof))
                 throw new InvalidOperationException("The hub failed to prove possession of the cluster secret.");
+
+            // Binary frames only to a hub that said it reads them; an older hub never says so.
+            link.SendsBinary = auth.LinkFormat >= LinkCodec.BinaryFormat;
 
             _link = link;
             AdoptHubTimeout(auth.FailureTimeoutMs);
@@ -498,7 +505,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 var sent = _time.GetTimestamp();
                 var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(loads), ct).ConfigureAwait(false);
                 RenewLease(sent);
-                var beatReply = beat!.Value.Deserialize<HeartbeatReply>()!;
+                var beatReply = beat!.Value.Read<HeartbeatReply>()!;
                 ApplyAssignments(beatReply.Assignments);
                 ApplyReplicas(beatReply.Replicas ?? []);
                 await SubscribeReplicationAsync(link, ct).ConfigureAwait(false);
@@ -915,7 +922,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             try
             {
                 reply = link.Request("replica-read", new ReplicaRead(cursor), ReplicaReadTimeoutMs)!.Value
-                    .Deserialize<ReplicaReadReply>()!;
+                    .Read<ReplicaReadReply>()!;
             }
             catch (NodeLinkException failure)
                 when (failure.IsPeerError && failure.Message.StartsWith("Unknown node-link message", StringComparison.Ordinal))
@@ -1368,22 +1375,22 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     private static void WriteReplicaCursor(string shardDirectory, ulong lsn) =>
         File.WriteAllText(Path.Combine(shardDirectory, "replica.cursor"), lsn.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
-    private Task<object?> HandleAsync(NodeLink link, string type, JsonElement? body, TaskCompletionSource<string> challenge)
+    private Task<object?> HandleAsync(NodeLink link, string type, LinkBody? body, TaskCompletionSource<string> challenge)
     {
         switch (type)
         {
             case "challenge":
-                challenge.TrySetResult(body!.Value.GetProperty("ServerNonce").GetString()!);
+                challenge.TrySetResult(body!.Value.Json.GetProperty("ServerNonce").GetString()!);
                 return Task.FromResult<object?>(null);
             case "replica-batch":
-                ApplyReplicaBatch(body!.Value.Deserialize<ReplicaBatch>()!);
+                ApplyReplicaBatch(body!.Value.Read<ReplicaBatch>()!);
                 return Task.FromResult<object?>(null);
             case "replica-reset":
-                ApplyReplicaReset(body!.Value.Deserialize<ReplicaReset>()!);
+                ApplyReplicaReset(body!.Value.Read<ReplicaReset>()!);
                 return Task.FromResult<object?>(null);
             case "handoff-freeze":
             {
-                var freeze = body!.Value.Deserialize<HandoffFreeze>()!;
+                var freeze = body!.Value.Read<HandoffFreeze>()!;
                 var runtime = RequireShard(new ShardKey(freeze.FromShard), freeze.FencingToken);
                 var rows = runtime.FreezeAndCollect(
                     freeze.HandoffId, new Identity(Convert.FromHexString(freeze.PlayerHex)), new ShardKey(freeze.ToShard));
@@ -1392,7 +1399,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "handoff-import":
             {
-                var import = body!.Value.Deserialize<HandoffImport>()!;
+                var import = body!.Value.Read<HandoffImport>()!;
                 var runtime = RequireShard(new ShardKey(import.ToShard), import.FencingToken);
                 runtime.Import(import.HandoffId, import.PlayerHex, import.FromShard, import.Rows);
                 return Task.FromResult<object?>(null);
@@ -1400,21 +1407,21 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "handoff-release":
             {
-                var release = body!.Value.Deserialize<HandoffRelease>()!;
+                var release = body!.Value.Read<HandoffRelease>()!;
                 RequireShard(new ShardKey(release.FromShard), release.FencingToken).Release(release.HandoffId);
                 return Task.FromResult<object?>(null);
             }
 
             case "handoff-abort":
             {
-                var abort = body!.Value.Deserialize<HandoffRelease>()!;
+                var abort = body!.Value.Read<HandoffRelease>()!;
                 RequireShard(new ShardKey(abort.FromShard), abort.FencingToken).Abort(abort.HandoffId);
                 return Task.FromResult<object?>(null);
             }
 
             case "border-subscribe-owner":
             {
-                var subscribe = body!.Value.Deserialize<BorderSubscribe>()!;
+                var subscribe = body!.Value.Read<BorderSubscribe>()!;
                 BorderPublisher? publisher;
                 lock (_shardsLock)
                 {
@@ -1429,7 +1436,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "border-apply":
             {
-                var batch = body!.Value.Deserialize<BorderBatch>()!;
+                var batch = body!.Value.Read<BorderBatch>()!;
                 var observer = TryGetShard(new ShardKey(batch.ObserverShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {batch.ObserverShard}.");
                 observer.ApplyBorder(batch);
@@ -1438,7 +1445,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "border-reset-apply":
             {
-                var reset = body!.Value.Deserialize<BorderReset>()!;
+                var reset = body!.Value.Read<BorderReset>()!;
                 var observer = TryGetShard(new ShardKey(reset.ObserverShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {reset.ObserverShard}.");
                 observer.ApplyBorderReset(reset);
@@ -1447,7 +1454,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "border-reset-part-apply":
             {
-                var part = body!.Value.Deserialize<BorderResetPart>()!;
+                var part = body!.Value.Read<BorderResetPart>()!;
                 var observer = TryGetShard(new ShardKey(part.Reset.ObserverShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {part.Reset.ObserverShard}.");
                 observer.ApplyBorderResetPart(part);
@@ -1455,14 +1462,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             }
 
             case "shard-drain":
-                return Task.FromResult<object?>(QuiesceShard(body!.Value.Deserialize<ShardDrain>()!));
+                return Task.FromResult<object?>(QuiesceShard(body!.Value.Read<ShardDrain>()!));
             case "shard-reap":
-                return Task.FromResult<object?>(ReapShard(body!.Value.Deserialize<ShardReap>()!));
+                return Task.FromResult<object?>(ReapShard(body!.Value.Read<ShardReap>()!));
             case "shard-reap-delete":
-                return Task.FromResult<object?>(DeleteReapedShard(body!.Value.Deserialize<ShardReapDelete>()!));
+                return Task.FromResult<object?>(DeleteReapedShard(body!.Value.Read<ShardReapDelete>()!));
             case "shard-drain-abort":
             {
-                var abort = body!.Value.Deserialize<ShardDrainAbort>()!;
+                var abort = body!.Value.Read<ShardDrainAbort>()!;
                 lock (_shardsLock)
                 {
                     _draining.Remove(new ShardKey(abort.Shard));
@@ -1479,10 +1486,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 // push started — on this request's own task, which the link dispatches apart from
                 // its read loop, so heartbeat replies keep flowing while it waits. The hub bounds
                 // the wait with its step timeout and falls back to the heartbeat clock past it.
-                return ApplyAndAwaitOpensAsync(body!.Value.Deserialize<AssignmentsApply>()!.Assignments);
+                return ApplyAndAwaitOpensAsync(body!.Value.Read<AssignmentsApply>()!.Assignments);
             case "shard-execute":
             {
-                var execute = body!.Value.Deserialize<ShardExecute>()!;
+                var execute = body!.Value.Read<ShardExecute>()!;
                 ShardRuntime runtime;
                 try
                 {
@@ -1508,7 +1515,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "shard-bulk":
             {
-                var bulk = body!.Value.Deserialize<ShardBulk>()!;
+                var bulk = body!.Value.Read<ShardBulk>()!;
                 var runtime = RequireShard(new ShardKey(bulk.Shard), bulk.FencingToken);
                 return Task.FromResult<object?>(ApplyBulkGroup(
                     runtime,
@@ -1519,7 +1526,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "handoff-query-owner":
             {
-                var query = body!.Value.Deserialize<HandoffQuery>()!;
+                var query = body!.Value.Read<HandoffQuery>()!;
                 var runtime = TryGetShard(new ShardKey(query.ToShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {query.ToShard}.");
                 return Task.FromResult<object?>(new HandoffQueryReply(runtime.WasImported(query.HandoffId)));
@@ -1527,7 +1534,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
             case "handoff-freeze-query-owner":
             {
-                var query = body!.Value.Deserialize<HandoffFreezeQuery>()!;
+                var query = body!.Value.Read<HandoffFreezeQuery>()!;
                 var runtime = TryGetShard(new ShardKey(query.FromShard))
                     ?? throw new InvalidOperationException($"This node does not own shard {query.FromShard}.");
                 return Task.FromResult<object?>(new HandoffFreezeQueryReply(runtime.IsFreezePending(query.HandoffId)));
@@ -1762,7 +1769,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     {
                         var reply = await link.RequestAsync(
                             "handoff-query", new HandoffQuery(pending.HandoffId, pending.ToShard), ct).ConfigureAwait(false);
-                        var imported = reply!.Value.Deserialize<HandoffQueryReply>()!.Imported;
+                        var imported = reply!.Value.Read<HandoffQueryReply>()!.Imported;
                         if (imported)
                             runtime.Release(pending.HandoffId);
                         else
@@ -1795,7 +1802,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
                         var reply = await link.RequestAsync(
                             "handoff-freeze-query", new HandoffFreezeQuery(import.HandoffId, import.FromShard), ct).ConfigureAwait(false);
-                        if (!reply!.Value.Deserialize<HandoffFreezeQueryReply>()!.Pending)
+                        if (!reply!.Value.Read<HandoffFreezeQueryReply>()!.Pending)
                             runtime.Settle(import.HandoffId);
                     }
                     catch (Exception) when (!ct.IsCancellationRequested)
@@ -1865,7 +1872,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                             "border-subscribe",
                             new BorderSubscribe(owner.Value, shard.Value, epoch, lsn, band, ForceReset: storedBand != band),
                             ct).ConfigureAwait(false);
-                        if (reply!.Value.Deserialize<BorderSubscribeReply>()!.Exists)
+                        if (reply!.Value.Read<BorderSubscribeReply>()!.Exists)
                         {
                             lock (_shardsLock)
                             {
