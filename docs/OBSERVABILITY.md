@@ -288,6 +288,7 @@ Meter name: `MelangeDB`.
 | `melange.store.live_bytes` | gauge | `By` | `space` | 0.4.2 |
 | `melange.store.compaction.reclaimed_bytes` | counter | `By` | `space` | 0.4.2 |
 | `melange.store.compaction.relocated_bytes` | counter | `By` | `space` | 0.4.2 |
+| `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.4.2 |
 | `melange.subscriptions.active` | gauge | `{sub}` | `table` | 03 |
 | `melange.subscription.delta_rows` | counter | `{row}` | `table` | 03 |
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |

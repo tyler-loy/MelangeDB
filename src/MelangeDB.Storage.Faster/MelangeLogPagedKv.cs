@@ -104,9 +104,18 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
 /// <b>Writes.</b> An upsert whose record is still in the ring and has the capacity rewrites it in
 /// place, setting the new length (the #137 contract: a shorter value reads back at exactly its
 /// length). Anything else is a blind append at the tail: a record that has left memory is never read
-/// to be replaced, and a delete reads nothing at all. When the tail needs a page and the ring is full,
-/// the oldest page is written to its segment with <c>RandomAccess.Write</c> on the calling thread,
-/// and evicted.
+/// to be replaced, and a delete reads nothing at all.
+/// </para>
+/// <para>
+/// <b>Flushing.</b> The ring has three boundaries, <c>head ≤ readOnly ≤ tail</c>. Pages from the
+/// read-only boundary up are mutable, and only a record there is rewritten in place. Pages below it are
+/// immutable, and a flusher thread (one per space, started on first need) writes them to their segments
+/// with <c>RandomAccess.Write</c>, a run of pages a call, creating segment files as it reaches them.
+/// The read-only boundary trails the tail by the ring less an eighth of it, so the flusher works that
+/// far ahead of eviction. A writer that needs a page evicts the head only once it is flushed, and waits
+/// for the flusher only when it has fallen that far behind: disk slower than writes. That wait is
+/// counted (<see cref="PagedKvUsage.FlushStalls"/>). A flush that fails is rethrown to every writer
+/// that needs a page from then on.
 /// </para>
 /// <para>
 /// <b>Reads.</b> A record in the ring is read straight from it. One below the ring is read through a
@@ -178,7 +187,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     private readonly int _readGuess;
     private readonly long _hashSeed;
     private readonly ulong _hashMask;
-    private readonly List<Segment?> _segments = [];
+    private readonly long _readOnlyLag;
+    private readonly long _flushBatchPages;
+    private readonly Lock _segmentTableLock = new();
+    private readonly ManualResetEventSlim _flushWork = new(false);
+    private readonly ManualResetEventSlim _flushDone = new(false);
     private readonly List<SegmentInfo> _segmentInfo = [];
     private readonly byte[] _scratch;
     private readonly bool _batchPread;
@@ -190,6 +203,20 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     private long _headAddress;
     private long _tailPage;
     private long _liveBytes;
+
+    // Segments by number, published copy-on-write: the flusher creates them, compaction deletes them
+    // (both under _segmentTableLock), and readers index the published array with no lock.
+    private Segment?[] _segmentTable = new Segment?[16];
+
+    // Flushing: pages below _readOnlyPage are immutable (writer-owned, published to the flusher);
+    // pages below _flushedPage are on disk (flusher-owned, published to the writer).
+    private long _readOnlyPage;
+    private long _readOnlyAddress;
+    private long _flushedPage;
+    private long _flushStalls;
+    private Thread? _flusher;
+    private volatile bool _stopping;
+    private volatile Exception? _flushFault;
     private long _reclaimedBytes;
     private long _relocatedBytes;
 
@@ -229,6 +256,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         _pageOffsetMask = _pageSize - 1;
         _ringPages = 1L << ringPageBits;
         _ringMask = _ringPages - 1;
+
+        // The read-only region: an eighth of the ring, at least two pages where the ring allows, and
+        // never the tail page, which always stays mutable.
+        _readOnlyLag = _ringPages - Math.Clamp(_ringPages / 8, Math.Min(2, _ringPages - 1), _ringPages - 1);
+        _flushBatchPages = Math.Max(1, (_ringPages - _readOnlyLag) / 4);
         _segmentBits = segmentBits;
         _segmentSize = 1L << segmentBits;
         _segmentOffsetMask = _segmentSize - 1;
@@ -253,7 +285,8 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         Volatile.Read(ref _tail) - FirstAddress - Volatile.Read(ref _reclaimedBytes),
         Volatile.Read(ref _liveBytes),
         Volatile.Read(ref _reclaimedBytes),
-        Volatile.Read(ref _relocatedBytes));
+        Volatile.Read(ref _relocatedBytes),
+        Volatile.Read(ref _flushStalls));
 
     /// <summary>Diagnostics: the log tail, the lowest in-memory address, and the live index entries.</summary>
     internal (long Tail, long Head, long IndexEntries) Addresses => (_tail, _headAddress, _indexCount);
@@ -338,7 +371,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         {
             var packed = _index[slot].Packed;
             var current = AddressOf(packed);
-            if (current >= _headAddress)
+            if (current >= _readOnlyAddress)
             {
                 var record = RingPointer(current);
                 ref var header = ref Unsafe.AsRef<RecordHeader>(record);
@@ -348,9 +381,9 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
                 if (header.Capacity >= value.Length)
                 {
-                    // In place: the record is in the ring, so it has not been flushed yet and nothing
-                    // on disk goes stale. Setting the length is what makes a shrink read back exact.
-                    // Its size, and so the accounting, is unchanged.
+                    // In place: the record is in the ring's mutable region, so the flusher has not
+                    // taken it and nothing on disk goes stale. Setting the length is what makes a
+                    // shrink read back exact. Its size, and so the accounting, is unchanged.
                     header.ValueLength = value.Length;
                     header.Checksum = Checksum(hash, value.Length, header.Capacity, value);
                     WriteInPlace(current + HeaderSize + key.Length, value);
@@ -398,14 +431,21 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
             return;
         _disposed = true;
 
+        // The flusher reads the ring and writes the segments: stop it before either goes.
+        _stopping = true;
+        _flushWork.Set();
+        _flusher?.Join();
+
         NativeMemory.AlignedFree(_ring);
         _ring = null;
         NativeMemory.Free(_index);
         _index = null;
-        foreach (var segment in _segments)
+        foreach (var segment in _segmentTable)
             segment?.Dispose();
-        _segments.Clear();
+        _segmentTable = [];
         _victimSegment = null;
+        _flushWork.Dispose();
+        _flushDone.Dispose();
     }
 
     // ---- Compaction ---------------------------------------------------------------------------
@@ -549,7 +589,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
         var start = Math.Max((long)best << _segmentBits, FirstAddress);
         _victim = best;
-        _victimSegment = _segments[best];
+        _victimSegment = SegmentEntry(best);
         _victimCursor = start;
         _victimSpanPending = _segmentInfo[best].FirstRecord > start;
         if (!_victimSpanPending)
@@ -604,10 +644,16 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     {
         var info = _segmentInfo[(int)number];
         info.Dropped = true;
-        var segment = number < _segments.Count ? _segments[(int)number] : null;
+        Segment? segment;
+        lock (_segmentTableLock)
+        {
+            segment = SegmentEntry(number);
+            if (segment is not null)
+                _segmentTable[number] = null;
+        }
+
         if (segment is not null)
         {
-            _segments[(int)number] = null;
             if (ReferenceEquals(_victimSegment, segment))
                 _victimSegment = null;
             segment.Dispose();
@@ -689,7 +735,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     /// <summary>A read within one page (so within one segment) through the file, for pread mode.</summary>
     private void ReadFromFile(long address, Span<byte> buffer)
     {
-        var segment = _segments[(int)(address >> _segmentBits)] ?? throw DroppedSegment(address);
+        var segment = SegmentEntry(address >> _segmentBits) ?? throw DroppedSegment(address);
         var offset = address & _segmentOffsetMask;
         while (!buffer.IsEmpty)
         {
@@ -845,12 +891,29 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         }
     }
 
-    /// <summary>Makes <paramref name="page"/> the tail page, flushing and evicting the oldest pages to make room.</summary>
+    /// <summary>
+    /// Makes <paramref name="page"/> the tail page: evicts the oldest page once the ring is full, and
+    /// moves the read-only boundary up behind the tail, handing the pages it passes to the flusher.
+    /// </summary>
     private void EnsurePage(long page)
     {
         while (_tailPage < page)
         {
             var next = _tailPage + 1;
+
+            // The boundary first: it is what puts the head page in the flusher's hands, so evicting
+            // before moving it could wait on a page the flusher was never given (a two-page ring).
+            // The flusher is woken once a quarter of the read-only region is waiting for it, not per
+            // page: waking a parked thread is a system call on the writer's path.
+            var readOnly = next - _readOnlyLag;
+            if (readOnly > _readOnlyPage)
+            {
+                _readOnlyAddress = readOnly << _pageBits;
+                Volatile.Write(ref _readOnlyPage, readOnly);
+                if (readOnly - Volatile.Read(ref _flushedPage) >= _flushBatchPages)
+                    SignalFlusher();
+            }
+
             if (next - _headPage >= _ringPages)
                 EvictHead();
             _tailPage = next;
@@ -858,30 +921,121 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     }
 
     /// <summary>
-    /// Writes the oldest ring page to its segment and drops it from the ring: synchronous, on the
-    /// writer's thread. Only ever a full page (the tail page is never the head while another is allocated).
+    /// Drops the oldest page from the ring once the flusher has written it, waiting for that only if
+    /// it has not: the stall that means the disk is behind the writes.
     /// </summary>
     private void EvictHead()
     {
-        var pageAddress = _headPage << _pageBits;
-        var segment = SegmentAt(pageAddress >> _segmentBits);
-        RandomAccess.Write(segment.Handle, new ReadOnlySpan<byte>(RingSlot(_headPage), _pageSize), pageAddress & _segmentOffsetMask);
+        if (Volatile.Read(ref _flushedPage) <= _headPage)
+            WaitForFlush(_headPage + 1);
         _headPage++;
         _headAddress = _headPage << _pageBits;
     }
 
-    private Segment SegmentAt(long number)
+    private void WaitForFlush(long page)
     {
-        while (_segments.Count <= number)
+        Volatile.Write(ref _flushStalls, _flushStalls + 1);
+        while (true)
         {
-            _segments.Add(new Segment(
-                $"{_basePath}.{_segments.Count}",
-                _segmentSize,
-                map: _tuning.ReadMode == MelangeLogReadMode.Mmap,
-                randomAdvice: _tuning.RandomAdvice));
+            if (_flushFault is { } fault)
+                throw new IOException($"melangelog: writing the log to disk failed ({_basePath}): {fault.Message}", fault);
+            _flushDone.Reset();
+            if (Volatile.Read(ref _flushedPage) >= page)
+                return;
+            SignalFlusher();
+            _flushDone.Wait();
+        }
+    }
+
+    private void SignalFlusher()
+    {
+        if (_flusher is null)
+        {
+            _flusher = new Thread(FlushLoop) { IsBackground = true, Name = "melange-mlog-flush" };
+            _flusher.Start();
         }
 
-        return _segments[(int)number] ?? throw DroppedSegment(number << _segmentBits);
+        _flushWork.Set();
+    }
+
+    /// <summary>
+    /// The flusher: writes every page below the read-only boundary that is not on disk yet, a run of
+    /// pages contiguous in both the ring and one segment at a time, publishing its progress after each
+    /// run. Reads only immutable pages, so it needs no lock with the writer.
+    /// </summary>
+    private void FlushLoop()
+    {
+        try
+        {
+            while (!_stopping)
+            {
+                _flushWork.Reset();
+                var target = Volatile.Read(ref _readOnlyPage);
+                var flushed = _flushedPage;
+                if (flushed >= target)
+                {
+                    _flushWork.Wait();
+                    continue;
+                }
+
+                while (flushed < target && !_stopping)
+                {
+                    // A run ends at the ring's wrap or the segment's end, whichever is first.
+                    var ringRun = _ringPages - (flushed & _ringMask);
+                    var segmentRun = ((((flushed << _pageBits) | _segmentOffsetMask) + 1) >> _pageBits) - flushed;
+                    var pages = Math.Min(target - flushed, Math.Min(ringRun, segmentRun));
+                    var address = flushed << _pageBits;
+                    var segment = SegmentForFlush(address >> _segmentBits);
+                    RandomAccess.Write(
+                        segment.Handle,
+                        new ReadOnlySpan<byte>(RingSlot(flushed), checked((int)(pages << _pageBits))),
+                        address & _segmentOffsetMask);
+                    flushed += pages;
+                    Volatile.Write(ref _flushedPage, flushed);
+                    _flushDone.Set();
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            _flushFault = exception;
+            _flushDone.Set();
+        }
+    }
+
+    /// <summary>The segment the flusher writes to, created (and published) on first reach.</summary>
+    private Segment SegmentForFlush(long number)
+    {
+        if (SegmentEntry(number) is { } existing)
+            return existing;
+
+        var segment = new Segment(
+            $"{_basePath}.{number}",
+            _segmentSize,
+            map: _tuning.ReadMode == MelangeLogReadMode.Mmap,
+            randomAdvice: _tuning.RandomAdvice);
+        lock (_segmentTableLock)
+        {
+            var table = _segmentTable;
+            if (number >= table.Length)
+            {
+                var grown = new Segment?[Math.Max(table.Length * 2, number + 1)];
+                table.CopyTo(grown, 0);
+                table = grown;
+            }
+
+            table[number] = segment;
+            Volatile.Write(ref _segmentTable, table);
+        }
+
+        return segment;
+    }
+
+    /// <summary>The segment with this number, or null if it was never created or compaction deleted it.</summary>
+    private Segment? SegmentEntry(long number)
+    {
+        var table = Volatile.Read(ref _segmentTable);
+        return number < table.Length ? table[number] : null;
     }
 
     // ---- Index ------------------------------------------------------------------------------
@@ -1022,7 +1176,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte* MappedPointer(long address) =>
-        (_segments[(int)(address >> _segmentBits)] ?? throw DroppedSegment(address)).Base + (address & _segmentOffsetMask);
+        (SegmentEntry(address >> _segmentBits) ?? throw DroppedSegment(address)).Base + (address & _segmentOffsetMask);
 
     /// <summary>
     /// A record's fixed header. <see cref="Capacity"/> is the value room the record was laid out with

@@ -41,7 +41,10 @@ All packages ship together at one version; there is no per-package versioning. S
     rewriting its 1M-row table three times over ends with its log at about twice its live data.
     EventIds 1514–1516 log it; `melange.store.compaction.reclaimed_bytes` and `relocated_bytes`
     count it. FASTER and Tsavorite still do not reclaim.
-  - **Likely the future default,** once it flushes in the background.
+  - **Flushes in the background:** a flusher thread per log space writes pages to disk as they
+    leave the writable part of memory, so a write never waits on disk unless the disk has fallen a
+    sixteenth of the memory budget behind. `melange.store.flush.stalls` counts those waits.
+  - **Likely the future default.**
   - **Exact without reads:** its index keys each record by a 128-bit hash and records its size, so a
     delete reads nothing, and the log knows which bytes are live without reading them back.
 

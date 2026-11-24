@@ -59,9 +59,11 @@ internal interface IPagedKv : IDisposable
 /// <see cref="LiveBytes"/> is the part of it that current records occupy, or -1 when the engine
 /// cannot tell. The gap between them is superseded and deleted records waiting to be reclaimed.
 /// <see cref="ReclaimedBytes"/> and <see cref="RelocatedBytes"/> are compaction's running totals:
-/// log space given back, and live records copied forward to do it.
+/// log space given back, and live records copied forward to do it. <see cref="FlushStalls"/> counts
+/// the writes that waited for a background flush to catch up: disk slower than writes.
 /// </summary>
-internal readonly record struct PagedKvUsage(long LogBytes, long LiveBytes, long ReclaimedBytes = 0, long RelocatedBytes = 0);
+internal readonly record struct PagedKvUsage(
+    long LogBytes, long LiveBytes, long ReclaimedBytes = 0, long RelocatedBytes = 0, long FlushStalls = 0);
 
 /// <summary>
 /// A space that reclaims its own log while the store runs (#287): superseded and deleted records are

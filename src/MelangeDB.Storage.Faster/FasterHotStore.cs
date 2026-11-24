@@ -353,7 +353,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     }
 
     private static HotStoreLogStatistics LogStatistics(string space, PagedKvUsage usage) =>
-        new(space, usage.LogBytes, usage.LiveBytes, usage.ReclaimedBytes, usage.RelocatedBytes);
+        new(space, usage.LogBytes, usage.LiveBytes, usage.ReclaimedBytes, usage.RelocatedBytes, usage.FlushStalls);
 
     public void ApplyResidency(string tableName, Residency residency)
     {

@@ -12,18 +12,21 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// </summary>
 public sealed class MelangeLogModelTests
 {
-    public static TheoryData<string, bool, bool> Modes => new()
+    public static TheoryData<string, bool, bool, int> Modes => new()
     {
-        { "Mmap", false, false },
-        { "Mmap", false, true },
-        { "Mmap", true, true },
-        { "Pread", false, false },
-        { "Pread", false, true },
+        { "Mmap", false, false, 3 },
+        { "Mmap", false, true, 3 },
+        { "Mmap", true, true, 3 },
+        { "Pread", false, false, 3 },
+        { "Pread", false, true, 3 },
+
+        // A two-page ring: the tail page is the only mutable one, and every new page waits on the flusher.
+        { "Mmap", false, true, 1 },
     };
 
     [Theory]
     [MemberData(nameof(Modes))]
-    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread, bool compact)
+    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread, bool compact, int ringPageBits)
     {
         var mode = Enum.Parse<MelangeLogReadMode>(readMode);
         const int keySpace = 600;
@@ -32,9 +35,9 @@ public sealed class MelangeLogModelTests
         var random = new Random(7);
         var model = new Dictionary<int, byte[]>();
 
-        // 4 KiB pages, an 8-page ring, 16 KiB segments: a 20 KiB value spans pages and segments.
+        // 4 KiB pages, an 8-page ring (or 2), 16 KiB segments: a 20 KiB value spans pages and segments.
         using (var kv = new MelangeLogPagedKv(
-                   Path.Combine(directory, "check.mlog"), 12, 3, 14, 16, MelangeLogTuning.Default with { ReadMode = mode }, 512, pointPread))
+                   Path.Combine(directory, "check.mlog"), 12, ringPageBits, 14, 16, MelangeLogTuning.Default with { ReadMode = mode }, 512, pointPread))
         {
             for (var n = 0; n < ops; n++)
             {

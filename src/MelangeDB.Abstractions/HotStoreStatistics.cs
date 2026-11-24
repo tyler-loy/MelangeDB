@@ -33,7 +33,12 @@ public sealed class HotStoreStatistics
 /// <param name="LiveBytes">The bytes of that log current records occupy, or -1 when the engine cannot tell.</param>
 /// <param name="ReclaimedBytes">Cumulative log bytes compaction has given back.</param>
 /// <param name="RelocatedBytes">Cumulative live bytes compaction copied forward to do it.</param>
-public readonly record struct HotStoreLogStatistics(string Space, long LogBytes, long LiveBytes, long ReclaimedBytes = 0, long RelocatedBytes = 0);
+/// <param name="FlushStalls">
+/// Cumulative writes that waited for the log's background flush to catch up: the disk falling behind
+/// the write rate. Zero for an engine that flushes on the writing thread.
+/// </param>
+public readonly record struct HotStoreLogStatistics(
+    string Space, long LogBytes, long LiveBytes, long ReclaimedBytes = 0, long RelocatedBytes = 0, long FlushStalls = 0);
 
 /// <summary>One table's store-side statistics.</summary>
 /// <param name="Table">The table's id.</param>
