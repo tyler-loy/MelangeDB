@@ -4,8 +4,9 @@ namespace MelangeDB.Core;
 
 /// <summary>
 /// The <c>melange-log</c> health check: unhealthy when the commit log cannot accept appends —
-/// before startup completes, or after an append failure (disk full being the realistic case)
-/// poisoned the log. A poisoned log rejects every append until restart, so surfacing it through
+/// before startup completes, after an append failure (disk full being the realistic case)
+/// poisoned the log, or after the hot store failed to apply a committed record, which closes the
+/// engine to writes the same way. A poisoned log rejects every append until restart, so surfacing it through
 /// the host's health endpoint is what turns a silent write outage into a rotated pod.
 /// </summary>
 internal sealed class MelangeLogHealthCheck : IHealthCheck
@@ -30,6 +31,14 @@ internal sealed class MelangeLogHealthCheck : IHealthCheck
             return Task.FromResult(HealthCheckResult.Unhealthy(
                 "The commit log is poisoned and rejects appends until restart (unwritable or out of disk).",
                 failure));
+        }
+
+        if (engine.ProjectionFailure is { } projection)
+        {
+            return Task.FromResult(HealthCheckResult.Unhealthy(
+                "Applying a committed record to the hot store failed, so this database refuses writes until restart " +
+                "(EventId 1517; a restart rebuilds the store from the commit log).",
+                projection));
         }
 
         return Task.FromResult(HealthCheckResult.Healthy($"Commit log writable at LSN {engine.Log.HeadLsn}."));

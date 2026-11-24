@@ -57,6 +57,9 @@ internal sealed class FasterPagedKv : IPagedKv
 
     public long CapacityBytes { get; }
 
+    /// <summary>The hybrid log's extent. FASTER cannot say how much of it is live.</summary>
+    public HotStoreLogStatistics Statistics => new() { LogBytes = _store.Log.TailAddress - _store.Log.BeginAddress };
+
     public byte[]? Read(ReadOnlySpan<byte> key, out bool faulted)
     {
         faulted = false;

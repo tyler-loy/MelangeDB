@@ -49,6 +49,24 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private readonly IPagedKv? _blob;
     private readonly long _bufferPoolCapacityBytes;
 
+    /// <summary>Bytes a compaction step may copy before it gives the store lock back.</summary>
+    private const long CompactionStepBytes = 1 << 20;
+
+    /// <summary>How long the compaction thread sleeps when no space has anything to reclaim.</summary>
+    private static readonly TimeSpan CompactionIdle = TimeSpan.FromMilliseconds(100);
+
+    private readonly HotStoreCompactionOptions _compaction;
+    private readonly string _hotStorePath;
+
+    /// <summary>The lowest compaction trigger ratio: the setting's floor, and what pressure compacts at.</summary>
+    private const double MinTriggerRatio = 1.1;
+    private readonly CancellationTokenSource _compactionStop = new();
+    private readonly Thread? _compactor;
+
+    // Per space (0 main, 1 blob): compaction steps taken, and the time they held the store lock.
+    private readonly long[] _compactionSteps = new long[2];
+    private readonly long[] _compactionLockTicks = new long[2];
+
     /// <summary>Reused buffer for composed store and blob keys; see <see cref="StoreKey"/>.</summary>
     private byte[] _keyScratch = new byte[64];
     private bool _disposed;
@@ -88,14 +106,61 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _blob = engine.Open(path, PagedKvSpace.Blob, 1L << blobMemoryBits, hashBuckets);
         _bufferPoolCapacityBytes = _main.CapacityBytes + (_blob?.CapacityBytes ?? 0);
 
+        if (context.Options.HotStore.NativeDirectory)
+        {
+            _directoryPool = new NativePagePool(NativeDirectoryPageBytes);
+            _emptyTrees = NativeTableTrees.Create(_directoryPool, 0);
+        }
+        else
+        {
+            _emptyTrees = ManagedTableTrees.Create(0);
+        }
+
         foreach (var table in context.Schema.Tables)
         {
             var declared = context.Residency.GetValueOrDefault(table.Id, table.Residency);
-            _tables.Add(table.Id, new TableState(table, declared));
+            _tables.Add(table.Id, new TableState(table, declared, _emptyTrees));
+        }
+
+        _compaction = context.Options.HotStore.Compaction;
+        if (!(_compaction.TriggerRatio >= MinTriggerRatio))
+            throw new ArgumentOutOfRangeException(nameof(context), _compaction.TriggerRatio, "HotStore:Compaction:TriggerRatio must be at least 1.1.");
+        if (_compaction.MaxLogBytes < 0 || _compaction.MinFreeDiskBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(context), "HotStore:Compaction:MaxLogBytes and MinFreeDiskBytes must not be negative.");
+        _hotStorePath = Path.GetFullPath(path);
+        if (_compaction.MaxBytesPerSecond < 0)
+            throw new ArgumentOutOfRangeException(nameof(context), _compaction.MaxBytesPerSecond, "HotStore:Compaction:MaxBytesPerSecond must not be negative.");
+        if (_compaction.Enabled && (_main is ICompactingPagedKv || _blob is ICompactingPagedKv))
+        {
+            _compactor = new Thread(CompactionLoop) { IsBackground = true, Name = "melange-hotstore-compaction" };
+            _compactor.Start();
         }
     }
 
     public ulong AppliedLsn { get; private set; }
+
+    /// <summary>The kind of ordered bookkeeping tables start with (see <see cref="TableTrees"/>).</summary>
+    private readonly TableTrees _emptyTrees;
+
+    /// <summary>
+    /// The native directory's page size. Copy-on-write copies a page per tree level on each commit
+    /// and re-references every child of each internal page it copies, so a write's cost grows with
+    /// the page. The bake-off (1M rows, 1 GiB cap) measured hot single-row updates at 95k/s with
+    /// 8 KiB pages, 146k with 4 KiB, 161k with 2 KiB and 234–242k with 1 KiB, against 239k for the
+    /// managed trees; 512 B gained 8% more for 9% more memory and half the inline entry size.
+    /// At 1 KiB entries up to about 240 bytes stay inline; longer ones move out of line.
+    /// </summary>
+    private const int NativeDirectoryPageBytes = 1024;
+
+    /// <summary>The native pages of every table's directory and indexes, under <c>HotStore:NativeDirectory</c>.</summary>
+    private readonly NativePagePool? _directoryPool;
+
+    /// <summary>Publishes every table's open write (a no-op for tables the write did not touch, and during recovery).</summary>
+    private void PublishWrites()
+    {
+        foreach (var table in _tables.Values)
+            table.Publish();
+    }
 
     /// <summary>The engine under the paged tables (EventId 1512 logs it at construction).</summary>
     internal string EngineName { get; }
@@ -107,10 +172,17 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (AppliedLsn != 0)
                 throw new InvalidOperationException("A snapshot loads only into an empty store, before any record applies.");
-            foreach (var row in rows)
+            try
             {
-                if (_tables.TryGetValue(row.Table, out var table))
-                    PutRow(table, row.Key, row.Row);
+                foreach (var row in rows)
+                {
+                    if (_tables.TryGetValue(row.Table, out var table))
+                        PutRow(table, row.Key, row.Row);
+                }
+            }
+            finally
+            {
+                PublishWrites();
             }
 
             AppliedLsn = lsn;
@@ -151,14 +223,24 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (record.Lsn <= AppliedLsn)
                 return;
-            foreach (var op in record.WriteSet)
+            try
             {
-                if (!_tables.TryGetValue(op.Table, out var table))
-                    continue; // A table this projection doesn't know; nothing to project.
-                if (op.Kind == RowOpKind.Delete)
-                    DeleteRow(table, op.Key);
-                else
-                    PutRow(table, op.Key, op.Row);
+                foreach (var op in record.WriteSet)
+                {
+                    if (!_tables.TryGetValue(op.Table, out var table))
+                        continue; // A table this projection doesn't know; nothing to project.
+                    if (op.Kind == RowOpKind.Delete)
+                        DeleteRow(table, op.Key);
+                    else
+                        PutRow(table, op.Key, op.Row);
+                }
+            }
+            finally
+            {
+                // One version per record, so a reader never sees half of one. Published even when
+                // an op threw: the ops before it reached the paged engine, and the engine closes to
+                // writes on an apply failure rather than build on a partial record.
+                PublishWrites();
             }
 
             AppliedLsn = record.Lsn;
@@ -173,8 +255,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         // The key directory (paged) or the resident row map answers this — no FASTER read, no
         // out-of-line payload. The version is immutable, so no lock is needed, exactly as the
         // resident TryGetRow fast path reasons.
-        var version = state.Current;
-        return version.IsResident ? version.ResidentRows.ContainsKey(key) : version.Directory.ContainsKey(key);
+        var version = state.Acquire();
+        try
+        {
+            return version.Contains(key);
+        }
+        finally
+        {
+            version.Release();
+        }
     }
 
     public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
@@ -255,16 +344,30 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         if (!_tables.TryGetValue(table, out var state))
             return [];
-        var version = state.Current;
-        return MaterializeRows(state, version, [.. version.Indexes[state.IndexPosition(column)].Equal(value)]);
+        var version = state.Acquire();
+        try
+        {
+            return MaterializeRows(state, version, [.. version.Trees.IndexEqual(state.IndexPosition(column), value)]);
+        }
+        finally
+        {
+            version.Release();
+        }
     }
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
     {
         if (!_tables.TryGetValue(table, out var state))
             return [];
-        var version = state.Current;
-        return MaterializeRows(state, version, [.. version.Indexes[state.IndexPosition(column)].Range(low, high)]);
+        var version = state.Acquire();
+        try
+        {
+            return MaterializeRows(state, version, [.. version.Trees.IndexRange(state.IndexPosition(column), low, high)]);
+        }
+        finally
+        {
+            version.Release();
+        }
     }
 
     public long Count(TableId table) =>
@@ -286,7 +389,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         lock (_lock)
         {
-            return _tables.TryGetValue(table, out var state) ? state.Current.Keys : [];
+            return _tables.TryGetValue(table, out var state) ? LeaseCurrent(state, static version => version.Keys) : [];
         }
     }
 
@@ -294,7 +397,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         lock (_lock)
         {
-            return _tables.TryGetValue(table, out var state) ? state.Current.KeyRange(low, high) : [];
+            return _tables.TryGetValue(table, out var state) ? LeaseCurrent(state, version => version.KeyRange(low, high)) : [];
         }
     }
 
@@ -325,7 +428,124 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 state.RowsScanned));
         }
 
-        return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes };
+        HotStoreLogStatistics[] logs = _blob is null
+            ? [LogStatistics(0, "main", _main)]
+            : [LogStatistics(0, "main", _main), LogStatistics(1, "blob", _blob)];
+        return new HotStoreStatistics
+        {
+            Tables = tables,
+            BufferPoolCapacityBytes = _bufferPoolCapacityBytes,
+            Logs = logs,
+            NativeDirectoryBytes = _directoryPool?.AllocatedBytes ?? 0,
+        };
+    }
+
+    /// <summary>
+    /// Whether compaction must run flat out: the logs over <c>HotStore:Compaction:MaxLogBytes</c>, or the
+    /// hot store's disk under <c>MinFreeDiskBytes</c>. Checked at most once a second, on the compaction
+    /// thread. Each condition warns when it starts (EventIds 1519, 1518), every five minutes while it
+    /// lasts, and logs once when it clears.
+    /// </summary>
+    private sealed class CompactionPressure(FasterHotStore store, IPagedKv[] spaces)
+    {
+        private static readonly TimeSpan CheckEvery = TimeSpan.FromSeconds(1);
+        private static readonly TimeSpan RepeatEvery = TimeSpan.FromMinutes(5);
+
+        private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+        private TimeSpan _lastCheck = -CheckEvery;
+        private TimeSpan? _overSince;
+        private TimeSpan? _lowSince;
+        private TimeSpan _overWarned;
+        private TimeSpan _lowWarned;
+        private bool _urgent;
+
+        public bool Check()
+        {
+            var now = _clock.Elapsed;
+            if (now - _lastCheck < CheckEvery)
+                return _urgent;
+            _lastCheck = now;
+
+            var options = store._compaction;
+            var over = false;
+            if (options.MaxLogBytes > 0)
+            {
+                long log = 0, live = 0;
+                foreach (var space in spaces)
+                {
+                    var statistics = space.Statistics;
+                    log += Math.Max(0, statistics.LogBytes);
+                    live += Math.Max(0, statistics.LiveBytes);
+                }
+
+                over = log > options.MaxLogBytes;
+                if (Track(over, ref _overSince, ref _overWarned, now))
+                    LogMessages.LogOverCap(store._logger, log, options.MaxLogBytes, live);
+                else if (!over && _overSince is null && _overWarned != TimeSpan.Zero)
+                {
+                    _overWarned = TimeSpan.Zero;
+                    LogMessages.LogUnderCap(store._logger, log, options.MaxLogBytes);
+                }
+            }
+
+            var low = false;
+            if (options.MinFreeDiskBytes > 0 && FreeBytes(store._hotStorePath) is { } free)
+            {
+                low = free < options.MinFreeDiskBytes;
+                if (Track(low, ref _lowSince, ref _lowWarned, now))
+                    LogMessages.DiskSpaceLow(store._logger, store._hotStorePath, free, options.MinFreeDiskBytes);
+                else if (!low && _lowSince is null && _lowWarned != TimeSpan.Zero)
+                {
+                    _lowWarned = TimeSpan.Zero;
+                    LogMessages.DiskSpaceRecovered(store._logger, store._hotStorePath, free, options.MinFreeDiskBytes);
+                }
+            }
+
+            _urgent = over || low;
+            return _urgent;
+        }
+
+        /// <summary>Tracks one condition; true when it should warn now (it began, or five minutes passed).</summary>
+        private static bool Track(bool active, ref TimeSpan? since, ref TimeSpan warned, TimeSpan now)
+        {
+            if (!active)
+            {
+                since = null;
+                return false;
+            }
+
+            since ??= now;
+            if (warned != TimeSpan.Zero && now - warned < RepeatEvery)
+                return false;
+            warned = now == TimeSpan.Zero ? TimeSpan.FromTicks(1) : now;
+            return true;
+        }
+
+        /// <summary>Free bytes on the file system holding <paramref name="path"/>, or null if it cannot be read.</summary>
+        private static long? FreeBytes(string path)
+        {
+            try
+            {
+                return new DriveInfo(OperatingSystem.IsWindows() ? Path.GetPathRoot(path)! : path).AvailableFreeSpace;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                return null;
+            }
+        }
+    }
+
+    /// <summary>A space's engine statistics, named, with the compaction thread's own counters when it compacts.</summary>
+    private HotStoreLogStatistics LogStatistics(int index, string space, IPagedKv kv)
+    {
+        var statistics = kv.Statistics with { Space = space };
+        return kv is ICompactingPagedKv
+            ? statistics with
+            {
+                CompactionSteps = Volatile.Read(ref _compactionSteps[index]),
+                CompactionLockTime = TimeSpan.FromTicks(Volatile.Read(ref _compactionLockTicks[index])),
+            }
+            : statistics;
     }
 
     public void ApplyResidency(string tableName, Residency residency)
@@ -341,16 +561,31 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 || (residency == Residency.Auto && state.ResidentDataBytes <= _autoThresholdBytes);
             if (wantResident == state.IsResident)
                 return;
-            if (wantResident)
-                Promote(state);
-            else
-                Demote(state);
+            try
+            {
+                if (wantResident)
+                    Promote(state);
+                else
+                    Demote(state);
+            }
+            finally
+            {
+                PublishWrites();
+            }
+
             LogMessages.ResidencyChanged(_logger, tableName, residency, state.IsResident ? "resident" : "paged");
         }
     }
 
     public void Dispose()
     {
+        // The compaction thread reads a segment's mapped pages off the lock, so it must be gone
+        // before the spaces unmap them. It takes the lock itself, so it is joined outside it. The
+        // token source is never disposed: it has no timer, and a second Dispose cancels it again.
+        _compactionStop.Cancel();
+        if (_compactor is not null && Thread.CurrentThread != _compactor)
+            _compactor.Join();
+
         lock (_lock)
         {
             if (_disposed)
@@ -358,6 +593,93 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _disposed = true;
             _main.Dispose();
             _blob?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The compaction thread (#287): for each space that compacts, warm the next step's pages off the
+    /// lock, then run one bounded step under it, so writers and readers wait at most one step. Sleeps
+    /// while nothing is due. A segment it cannot read is logged and left; anything else stops
+    /// compaction (logged) rather than the process, and the store carries on without it.
+    /// </summary>
+    private void CompactionLoop()
+    {
+        var spaces = new List<(int Index, string Name, ICompactingPagedKv Space)>(2);
+        if (_main is ICompactingPagedKv main)
+            spaces.Add((0, "main", main));
+        if (_blob is ICompactingPagedKv blob)
+            spaces.Add((1, "blob", blob));
+
+        var token = _compactionStop.Token;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var copied = 0L;
+        var pressure = new CompactionPressure(this, spaces.Select(static s => (IPagedKv)s.Space).ToArray());
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                // Over the log cap or short of disk, compact as hard as possible: the lowest ratio, no rate cap.
+                var urgent = pressure.Check();
+                var ratio = urgent ? MinTriggerRatio : _compaction.TriggerRatio;
+                var busy = false;
+                foreach (var (index, name, space) in spaces)
+                {
+                    space.PrepareCompactionStep();
+                    CompactionStep step;
+                    lock (_lock)
+                    {
+                        if (_disposed)
+                            return;
+                        var held = System.Diagnostics.Stopwatch.GetTimestamp();
+                        try
+                        {
+                            step = space.Compact(ratio, CompactionStepBytes);
+                        }
+                        catch (InvalidDataException fault)
+                        {
+                            LogMessages.CompactionSkippedSegment(_logger, name, fault.Message);
+                            busy = true;
+                            continue;
+                        }
+                        finally
+                        {
+                            var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(held).Ticks;
+                            Volatile.Write(ref _compactionLockTicks[index], _compactionLockTicks[index] + elapsed);
+                        }
+                    }
+
+                    // A step that found nothing due is a probe, not compaction: only work is counted.
+                    if (step.MoreWork || step.SegmentsDropped > 0)
+                        Volatile.Write(ref _compactionSteps[index], _compactionSteps[index] + 1);
+
+                    if (step.SegmentsDropped > 0)
+                        LogMessages.LogSpaceReclaimed(_logger, name, step.ReclaimedBytes, step.SegmentsDropped);
+                    busy |= step.MoreWork;
+                    copied += step.RelocatedBytes;
+                }
+
+                if (!busy)
+                {
+                    token.WaitHandle.WaitOne(CompactionIdle);
+                    continue;
+                }
+
+                // Under a cap, run no faster than it allows; uncapped, still let a waiting writer in.
+                if (_compaction.MaxBytesPerSecond > 0 && !urgent)
+                {
+                    var ahead = TimeSpan.FromSeconds((double)copied / _compaction.MaxBytesPerSecond) - clock.Elapsed;
+                    if (ahead > TimeSpan.Zero && token.WaitHandle.WaitOne(ahead))
+                        return;
+                }
+                else
+                {
+                    Thread.Yield();
+                }
+            }
+        }
+        catch (Exception exception) when (!token.IsCancellationRequested)
+        {
+            LogMessages.CompactionStopped(_logger, exception);
         }
     }
 
@@ -373,7 +695,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             ObjectDisposedException.ThrowIf(_disposed, this);
             var captured = new Dictionary<TableId, PinnedTable>(_tables.Count);
             foreach (var (id, state) in _tables)
-                captured.Add(id, new PinnedTable(state, state.Current, state.ResidencyEpoch));
+                captured.Add(id, new PinnedTable(state, state.Acquire(), state.ResidencyEpoch));
             var view = new ReadView(this, AppliedLsn, captured);
             _openViews.Add(view);
             return view;
@@ -465,14 +787,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public bool ContainsKey(TableId table, in RowKey key) =>
             Pin(table) is { } pinned
-            && (pinned.Version.IsResident ? pinned.Version.ResidentRows.ContainsKey(key) : pinned.Version.Directory.ContainsKey(key));
+            && pinned.Version.Contains(key);
 
         public long Count(TableId table) => Pin(table) is { } pinned ? pinned.Version.RowCount : 0;
 
-        public IEnumerable<RowKey> ScanKeys(TableId table) => Pin(table) is { } pinned ? pinned.Version.Keys : [];
+        public IEnumerable<RowKey> ScanKeys(TableId table) =>
+            Pin(table) is { } pinned ? LeasePinned(pinned.Version, static version => version.Keys) : [];
 
         public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high) =>
-            Pin(table) is { } pinned ? pinned.Version.KeyRange(low, high) : [];
+            Pin(table) is { } pinned ? LeasePinned(pinned.Version, version => version.KeyRange(low, high)) : [];
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table)
         {
@@ -480,23 +803,23 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 return [];
             return pinned.Version.IsResident
                 ? Resident(pinned)
-                : Materialize(pinned, pinned.Version.Directory.Keys);
+                : Materialize(pinned, LeasePinned(pinned.Version, static version => version.Trees.Keys));
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
         {
             if (Pin(table) is not { } pinned)
                 return [];
-            var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
-            return Materialize(pinned, index.Equal(value));
+            var position = pinned.Owner.IndexPosition(column);
+            return Materialize(pinned, LeasePinned(pinned.Version, version => version.Trees.IndexEqual(position, value)));
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
         {
             if (Pin(table) is not { } pinned)
                 return [];
-            var index = pinned.Version.Indexes[pinned.Owner.IndexPosition(column)];
-            return Materialize(pinned, index.Range(low, high));
+            var position = pinned.Owner.IndexPosition(column);
+            return Materialize(pinned, LeasePinned(pinned.Version, version => version.Trees.IndexRange(position, low, high)));
         }
 
         public void Dispose()
@@ -506,6 +829,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _disposed = true;
             store.CloseReadView(this);
             _undo.Clear();
+            foreach (var pinned in tables.Values)
+                pinned.Version.Release();
             tables.Clear();
         }
 
@@ -640,6 +965,44 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     /// lock; a paged one takes the store lock per row, because the hybrid log overwrites in place
     /// and the directory probe and record read have to be atomic against a concurrent write.
     /// </summary>
+    /// <summary>
+    /// A lazy walk over the table's current version as of the first step, holding a lease on it
+    /// until the walk ends, so its pages stay put however long the caller takes between steps.
+    /// </summary>
+    private static IEnumerable<T> LeaseCurrent<T>(TableState state, Func<TableVersion, IEnumerable<T>> walk)
+    {
+        var version = state.Acquire();
+        try
+        {
+            foreach (var item in walk(version))
+                yield return item;
+        }
+        finally
+        {
+            version.Release();
+        }
+    }
+
+    /// <summary>
+    /// A lazy walk over one captured version, holding a lease for the walk. A version already
+    /// released (its read view closed and every newer version published) refuses rather than read
+    /// freed bookkeeping.
+    /// </summary>
+    private static IEnumerable<T> LeasePinned<T>(TableVersion version, Func<TableVersion, IEnumerable<T>> walk)
+    {
+        if (!version.TryAcquire())
+            throw new ObjectDisposedException(nameof(IHotStoreReadView), "The read view this enumeration came from has been closed.");
+        try
+        {
+            foreach (var item in walk(version))
+                yield return item;
+        }
+        finally
+        {
+            version.Release();
+        }
+    }
+
     private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(
         TableState state, TableVersion version, RowKey[] keys)
     {
@@ -661,7 +1024,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                  {
                      lock (_lock)
                      {
-                         state.AddRowsScanned(ReadRowsBatched(state, version, batch, rows, skipUnreadable: true));
+                         // The current directory, under the lock: the records read here are the current
+                         // ones, and the version the keys came from may since have been released.
+                         state.AddRowsScanned(ReadRowsBatched(state, state.Current, batch, rows, skipUnreadable: true));
                          return true;
                      }
                  }))
@@ -686,6 +1051,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
+    /// <summary>Test-only: corrupts one paged row's main record in a MelangeLog space, where it lives now.</summary>
+    internal void CorruptPagedRowForTest(TableId table, in RowKey key)
+    {
+        lock (_lock)
+        {
+            ((MelangeLogPagedKv)_main).CorruptForTest(StoreKey(table, key));
+        }
+    }
+
     private byte[]? ReadRow(TableState table, in RowKey key) => ReadRow(table, table.Current, key);
 
     private byte[]? ReadRow(TableState table, TableVersion version, in RowKey key)
@@ -699,7 +1073,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (version.IsResident)
             return version.ResidentRows.TryGetValue(key, out var resident) ? resident : null;
-        if (!version.Directory.TryGetValue(key, out var entry))
+        if (!version.Trees.TryGetEntry(key, out var entry))
             return null;
 
         var rowKey = key;
@@ -801,70 +1175,97 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             return found;
         }
 
-        var entries = new DirectoryEntry?[count];
-        var mains = new byte[]?[count];
-        var mainKeys = new byte[count][];
-        var mainSlots = new int[count];
-        var mainReads = 0;
-        for (var i = 0; i < count; i++)
+        try
         {
-            rows[i] = null;
-            if (!version.Directory.TryGetValue(keys[i], out var entry))
-                continue;
-            entries[i] = entry;
-            mainKeys[mainReads] = StoreKey(table.Schema.Id, keys[i]).ToArray();
-            mainSlots[mainReads++] = i;
-        }
-
-        var mainValues = new byte[]?[mainReads];
-        table.PageFaults += _main.ReadMany(mainKeys.AsSpan(0, mainReads), mainValues);
-        for (var j = 0; j < mainReads; j++)
-            mains[mainSlots[j]] = mainValues[j];
-
-        var blobs = new Dictionary<(int Row, int Ordinal), byte[]>();
-        var blobKeys = new List<byte[]>();
-        var blobSlots = new List<(int Row, int Ordinal)>();
-        for (var i = 0; i < count; i++)
-        {
-            if (entries[i] is not { } entry || entry.BlobMask == 0 || mains[i] is null)
-                continue;
-            var mask = entry.BlobMask;
-            for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+            var entries = new DirectoryEntry?[count];
+            var mains = new byte[]?[count];
+            var mainKeys = new byte[count][];
+            var mainSlots = new int[count];
+            var mainReads = 0;
+            for (var i = 0; i < count; i++)
             {
-                if ((mask & 1) == 0)
+                rows[i] = null;
+                if (!version.Trees.TryGetEntry(keys[i], out var entry))
                     continue;
-                blobKeys.Add(BlobKey(table.Schema.Id, keys[i], ordinal).ToArray());
-                blobSlots.Add((i, ordinal));
+                entries[i] = entry;
+                mainKeys[mainReads] = StoreKey(table.Schema.Id, keys[i]).ToArray();
+                mainSlots[mainReads++] = i;
             }
-        }
 
-        if (blobKeys.Count > 0)
+            var mainValues = new byte[]?[mainReads];
+            table.PageFaults += _main.ReadMany(mainKeys.AsSpan(0, mainReads), mainValues);
+            for (var j = 0; j < mainReads; j++)
+                mains[mainSlots[j]] = mainValues[j];
+
+            var blobs = new Dictionary<(int Row, int Ordinal), byte[]>();
+            var blobKeys = new List<byte[]>();
+            var blobSlots = new List<(int Row, int Ordinal)>();
+            for (var i = 0; i < count; i++)
+            {
+                if (entries[i] is not { } entry || entry.BlobMask == 0 || mains[i] is null)
+                    continue;
+                var mask = entry.BlobMask;
+                for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+                {
+                    if ((mask & 1) == 0)
+                        continue;
+                    blobKeys.Add(BlobKey(table.Schema.Id, keys[i], ordinal).ToArray());
+                    blobSlots.Add((i, ordinal));
+                }
+            }
+
+            if (blobKeys.Count > 0)
+            {
+                var blobValues = new byte[]?[blobKeys.Count];
+                table.PageFaults += _blob!.ReadMany(blobKeys.ToArray(), blobValues);
+                for (var j = 0; j < blobValues.Length; j++)
+                {
+                    if (blobValues[j] is { } payload)
+                        blobs[blobSlots[j]] = payload;
+                }
+            }
+
+            for (var i = 0; i < count; i++)
+            {
+                if (entries[i] is not { } entry)
+                    continue;
+                try
+                {
+                    rows[i] = JoinRow(table, keys[i], entry, mains[i], i, blobs);
+                    found++;
+                }
+                catch (InvalidDataException fault) when (skipUnreadable)
+                {
+                    LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
+                }
+            }
+
+            return found;
+        }
+        catch (InvalidDataException) when (skipUnreadable)
         {
-            var blobValues = new byte[]?[blobKeys.Count];
-            table.PageFaults += _blob!.ReadMany(blobKeys.ToArray(), blobValues);
-            for (var j = 0; j < blobValues.Length; j++)
+            // An engine that verifies records as it reads them (MelangeLog's checksums) fails a
+            // batched read whole when one record is bad. A scan skips unreadable rows, not batches:
+            // read this batch again a row at a time, so only the bad one is logged and left out.
+            found = 0;
+            for (var i = 0; i < count; i++)
             {
-                if (blobValues[j] is { } payload)
-                    blobs[blobSlots[j]] = payload;
-            }
-        }
+                rows[i] = null;
+                try
+                {
+                    rows[i] = ReadRow(table, version, keys[i]);
+                }
+                catch (InvalidDataException fault)
+                {
+                    LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
+                }
 
-        for (var i = 0; i < count; i++)
-        {
-            if (entries[i] is not { } entry)
-                continue;
-            try
-            {
-                rows[i] = JoinRow(table, keys[i], entry, mains[i], i, blobs);
-                found++;
+                if (rows[i] is not null)
+                    found++;
             }
-            catch (InvalidDataException fault) when (skipUnreadable)
-            {
-                LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
-            }
-        }
 
-        return found;
+            return found;
+        }
     }
 
     private static byte[] JoinRow(
@@ -998,9 +1399,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     }
 
     /// <summary>
-    /// Pins a paged table wholly into managed memory — one deliberate faulting pass over its rows.
-    /// The hybrid-log records it leaves behind are unreachable (the directory is the authority)
-    /// and vanish at the next start's rebuild, so they are not tombstoned here.
+    /// Pins a paged table wholly into managed memory — one deliberate faulting pass over its rows —
+    /// then deletes the paged records it read. Nothing could read them again (the directory is the
+    /// authority, and a read view pinned on the paged tier refuses reads once the tier changes), but
+    /// left in place they would count as live in the engine's log forever, and the log space they
+    /// hold could never be reclaimed.
     /// </summary>
     private void Promote(TableState table)
     {
@@ -1010,6 +1413,19 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (ReadRow(table, key) is { } bytes)
                 rows.Add((key, bytes));
+        }
+
+        foreach (var key in keys)
+        {
+            if (!table.TryGetDirectory(key, out var entry))
+                continue;
+            _main.Delete(StoreKey(table.Schema.Id, key));
+            var mask = entry.BlobMask;
+            for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+            {
+                if ((mask & 1) != 0)
+                    _blob!.Delete(BlobKey(table.Schema.Id, key, ordinal));
+            }
         }
 
         table.BeginResident();
@@ -1077,38 +1493,58 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         return BitOperations.IsPow2(clamped) ? clamped : 1L << (64 - BitOperations.LeadingZeroCount((ulong)clamped));
     }
 
-    private sealed record DirectoryEntry(uint BlobMask, RowKey[]? IndexValues);
-
     /// <summary>
     /// One immutable version of a table's managed-memory state: which tier it is in, a resident
-    /// table's rows, a paged table's key directory, and the secondary indexes positionally aligned
-    /// with the schema's index list. A write publishes a new version; a read view holds an older one.
-    /// Row payloads and index-value arrays are shared across versions — they are replaced, never
-    /// mutated — so an extra version costs container nodes, not a copy of the data.
+    /// table's rows, and the table's ordered bookkeeping (a paged table's key directory and every
+    /// table's secondary indexes, <see cref="TableTrees"/>). A commit record publishes one new
+    /// version; a read view holds an older one. Row payloads and index-value arrays are shared
+    /// across versions — they are replaced, never mutated.
     /// </summary>
-    private sealed class TableVersion(
-        bool isResident,
-        RowDirectory<byte[]> residentRows,
-        RowDirectory<DirectoryEntry> directory,
-        ImmutableArray<SecondaryIndex> indexes)
+    private sealed class TableVersion(bool isResident, RowDirectory<byte[]> residentRows, TableTrees trees)
     {
+        /// <summary>
+        /// Holders of this version: one while it is the table's current version, plus one per lease
+        /// (a lock-free read in progress, a lazy key walk, an open read view). When the count reaches
+        /// zero nothing can read the version again, and its trees are released at once: native
+        /// pages go back as soon as the last reader is done rather than whenever a collection runs.
+        /// </summary>
+        private int _holders = 1;
+
         public bool IsResident { get; } = isResident;
+
+        /// <summary>Takes a lease, unless the version has already been released.</summary>
+        public bool TryAcquire()
+        {
+            while (true)
+            {
+                var holders = Volatile.Read(ref _holders);
+                if (holders == 0)
+                    return false;
+                if (Interlocked.CompareExchange(ref _holders, holders + 1, holders) == holders)
+                    return true;
+            }
+        }
+
+        /// <summary>Gives back a lease (or, from the publisher, the current-version hold).</summary>
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _holders) == 0)
+                Trees.Release();
+        }
 
         public RowDirectory<byte[]> ResidentRows { get; } = residentRows;
 
-        public RowDirectory<DirectoryEntry> Directory { get; } = directory;
+        public TableTrees Trees { get; } = trees;
 
-        public ImmutableArray<SecondaryIndex> Indexes { get; } = indexes;
+        public long RowCount => IsResident ? ResidentRows.Count : Trees.Count;
 
-        public long RowCount => IsResident ? ResidentRows.Count : Directory.Count;
-
-        public IEnumerable<RowKey> Keys => IsResident ? ResidentRows.Keys : Directory.Keys;
+        public IEnumerable<RowKey> Keys => IsResident ? ResidentRows.Keys : Trees.Keys;
 
         /// <summary>The keys in [low, high], sought rather than scanned to; see IHotStoreReader.ScanKeyRange.</summary>
         public IEnumerable<RowKey> KeyRange(RowKey low, RowKey high) =>
-            IsResident ? ResidentRows.KeyRange(low, high) : Directory.KeyRange(low, high);
+            IsResident ? ResidentRows.KeyRange(low, high) : Trees.KeyRange(low, high);
 
-        public bool Contains(in RowKey key) => IsResident ? ResidentRows.ContainsKey(key) : Directory.ContainsKey(key);
+        public bool Contains(in RowKey key) => IsResident ? ResidentRows.ContainsKey(key) : Trees.Contains(key);
     }
 
     private sealed class TableState
@@ -1120,15 +1556,14 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         private TableVersion _current;
 
         /// <summary>
-        /// Recovery's builder state, non-null while the store is in bulk mode. Every mutator and
-        /// every write-path read routes here when set, so replay mutates owned builder nodes in
-        /// place instead of publishing a structurally shared version per row — versions built for
-        /// a reader that cannot exist yet. <see cref="Current"/> is stale until
-        /// <see cref="CompleteBulk"/> publishes.
+        /// The next version while a write is open: everything a commit record (or a migration, a
+        /// snapshot load, or recovery's whole replay) changes, published once by <see cref="Publish"/>
+        /// or <see cref="CompleteBulk"/>. The write path reads through it, so a record's later ops
+        /// see its earlier ones; readers see <see cref="Current"/> and so never a half-applied record.
         /// </summary>
-        private BulkState? _bulk;
+        private Pending? _pending;
 
-        public TableState(TableSchema schema, Residency declared)
+        public TableState(TableSchema schema, Residency declared, TableTrees emptyTrees)
         {
             var bytesColumns = schema.Columns.Count(c => c.Kind == ColumnKind.Bytes);
             if (bytesColumns > 32)
@@ -1140,19 +1575,16 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             Schema = schema;
             Declared = declared;
             _indexColumns = new string[schema.Indexes.Count];
-            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(schema.Indexes.Count);
             for (var i = 0; i < schema.Indexes.Count; i++)
             {
                 _indexPositions[schema.Indexes[i].Column] = i;
                 _indexColumns[i] = schema.Indexes[i].Column;
-                indexes.Add(SecondaryIndex.Empty);
             }
 
             _current = new TableVersion(
                 declared is Residency.Resident or Residency.Auto,
                 RowDirectory<byte[]>.Empty,
-                RowDirectory<DirectoryEntry>.Empty,
-                indexes.MoveToImmutable());
+                emptyTrees.Empty(schema.Indexes.Count));
         }
 
         public TableSchema Schema { get; }
@@ -1178,11 +1610,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         public int ResidencyEpoch { get; private set; }
 
         /// <summary>Whether the table's rows are currently pinned in managed memory.</summary>
-        public bool IsResident => _bulk?.IsResident ?? Current.IsResident;
+        public bool IsResident => _pending?.IsResident ?? Current.IsResident;
 
         public RowDirectory<byte[]> ResidentRows => Current.ResidentRows;
-
-        public RowDirectory<DirectoryEntry> Directory => Current.Directory;
 
         public long PageFaults { get; set; }
 
@@ -1220,53 +1650,41 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 ? position
                 : throw new ArgumentException($"Table {Schema.Id} has no index on column '{column}'.", nameof(column));
 
-        public SecondaryIndex Index(string column) =>
-            Current.Indexes[IndexPosition(column)];
-
         public RowKey[] SnapshotKeys() => [.. Current.Keys];
 
-        /// <summary>A row's bytes if resident — the write path's read, so it consults the builders in bulk mode.</summary>
-        public bool TryGetResident(in RowKey key, out byte[] bytes) =>
-            _bulk is { } bulk
-                ? bulk.Rows.TryGetValue(key, out bytes!)
-                : Current.ResidentRows.TryGetValue(key, out bytes!);
+        /// <summary>A row's bytes if resident — the write path's read, so it sees the open write.</summary>
+        public bool TryGetResident(in RowKey key, out byte[] bytes)
+        {
+            if (_pending is { } pending)
+            {
+                return pending.BulkRows is { } bulkRows
+                    ? bulkRows.TryGetValue(key, out bytes!)
+                    : pending.Rows.TryGetValue(key, out bytes!);
+            }
 
-        /// <summary>A paged row's directory entry — the write path's read, so it consults the builders in bulk mode.</summary>
+            return Current.ResidentRows.TryGetValue(key, out bytes!);
+        }
+
+        /// <summary>A paged row's directory entry — the write path's read, so it sees the open write.</summary>
         public bool TryGetDirectory(in RowKey key, [NotNullWhen(true)] out DirectoryEntry? entry) =>
-            _bulk is { } bulk
-                ? bulk.Directory.TryGetValue(key, out entry)
-                : Current.Directory.TryGetValue(key, out entry);
+            _pending is { } pending
+                ? pending.Trees.TryGetEntry(key, out entry)
+                : Current.Trees.TryGetEntry(key, out entry);
 
         /// <summary>The resident rows materialized for a tier migration, which is about to reset them.</summary>
-        public KeyValuePair<RowKey, byte[]>[] SnapshotResidentRows() =>
-            _bulk is { } bulk ? [.. bulk.Rows] : [.. Current.ResidentRows];
+        public KeyValuePair<RowKey, byte[]>[] SnapshotResidentRows()
+        {
+            if (_pending is { } pending)
+                return pending.BulkRows is { } bulkRows ? [.. bulkRows] : [.. pending.Rows];
+            return [.. Current.ResidentRows];
+        }
 
         public void PutResident(RowKey key, byte[] bytes)
         {
-            if (_bulk is { } bulk)
+            var pending = Write();
+            if (TryGetResident(key, out var previous))
             {
-                if (bulk.Rows.TryGetValue(key, out var previousRow))
-                {
-                    Unindex(bulk.Indexes, key, EncodeIndexValues(previousRow));
-                    ResidentDataBytes -= previousRow.Length;
-                }
-                else
-                {
-                    OverheadBytes += key.Length + 32;
-                }
-
-                ResidentDataBytes += bytes.Length;
-                bulk.Rows[key] = bytes;
-                Index(bulk.Indexes, key, EncodeIndexValues(bytes));
-                return;
-            }
-
-            var current = Current;
-            var rows = current.ResidentRows;
-            var indexes = current.Indexes;
-            if (rows.TryGetValue(key, out var previous))
-            {
-                indexes = Unindex(indexes, key, EncodeIndexValues(previous));
+                Unindex(key, EncodeIndexValues(previous));
                 ResidentDataBytes -= previous.Length;
             }
             else
@@ -1275,36 +1693,25 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             }
 
             ResidentDataBytes += bytes.Length;
-            Current = new TableVersion(
-                current.IsResident,
-                rows.SetItem(key, bytes),
-                current.Directory,
-                Index(indexes, key, EncodeIndexValues(bytes)));
+            if (pending.BulkRows is { } bulkRows)
+                bulkRows[key] = bytes;
+            else
+                pending.Rows = pending.Rows.SetItem(key, bytes);
+            Index(key, EncodeIndexValues(bytes));
         }
 
         public void RemoveResident(RowKey key)
         {
-            if (_bulk is { } bulk)
-            {
-                if (!bulk.Rows.TryGetValue(key, out var previousRow))
-                    return;
-                ResidentDataBytes -= previousRow.Length;
-                OverheadBytes -= key.Length + 32;
-                bulk.Rows.Remove(key);
-                Unindex(bulk.Indexes, key, EncodeIndexValues(previousRow));
+            if (!TryGetResident(key, out var previous))
                 return;
-            }
-
-            var current = Current;
-            if (!current.ResidentRows.TryGetValue(key, out var previous))
-                return;
+            var pending = Write();
             ResidentDataBytes -= previous.Length;
             OverheadBytes -= key.Length + 32;
-            Current = new TableVersion(
-                current.IsResident,
-                current.ResidentRows.Remove(key),
-                current.Directory,
-                Unindex(current.Indexes, key, EncodeIndexValues(previous)));
+            if (pending.BulkRows is { } bulkRows)
+                bulkRows.Remove(key);
+            else
+                pending.Rows = pending.Rows.Remove(key);
+            Unindex(key, EncodeIndexValues(previous));
         }
 
         public void PutDirectory(RowKey key, DirectoryEntry entry, DirectoryEntry? previous)
@@ -1314,35 +1721,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             else
                 OverheadBytes += key.Length + 32;
             OverheadBytes += EntryOverhead(entry);
-            if (_bulk is { } bulk)
-            {
-                bulk.Directory[key] = entry;
-                return;
-            }
-
-            var current = Current;
-            Current = new TableVersion(
-                current.IsResident,
-                current.ResidentRows,
-                current.Directory.SetItem(key, entry),
-                current.Indexes);
+            Write().Trees.SetEntry(key, entry);
         }
 
         public void RemoveDirectory(RowKey key, DirectoryEntry entry)
         {
             OverheadBytes -= EntryOverhead(entry) + key.Length + 32;
-            if (_bulk is { } bulk)
-            {
-                bulk.Directory.Remove(key);
-                return;
-            }
-
-            var current = Current;
-            Current = new TableVersion(
-                current.IsResident,
-                current.ResidentRows,
-                current.Directory.Remove(key),
-                current.Indexes);
+            Write().Trees.RemoveEntry(key);
         }
 
         /// <summary>Drops the resident rows and switches to paged bookkeeping; the caller re-puts the rows.</summary>
@@ -1356,69 +1741,106 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             ResidentDataBytes = 0;
             OverheadBytes = 0;
             ResidencyEpoch++;
-            if (_bulk is { } bulk)
-            {
-                // An Auto demotion mid-replay: the migration restarts inside the builders, and
-                // nothing publishes until recovery completes.
-                bulk.IsResident = isResident;
-                bulk.Rows.Clear();
-                bulk.Directory.Clear();
-                for (var i = 0; i < bulk.Indexes.Length; i++)
-                    bulk.Indexes[i] = SecondaryIndex.Empty.ToBuilder();
-                return;
-            }
 
-            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(_indexPositions.Count);
-            for (var i = 0; i < _indexPositions.Count; i++)
-                indexes.Add(SecondaryIndex.Empty);
-            Current = new TableVersion(
-                isResident,
-                RowDirectory<byte[]>.Empty,
-                RowDirectory<DirectoryEntry>.Empty,
-                indexes.MoveToImmutable());
-        }
-
-        /// <summary>Enters bulk mode: mutators write builders seeded from the current version.</summary>
-        public void BeginBulk()
-        {
-            var current = Current;
-            var indexes = new SecondaryIndex.Builder[current.Indexes.Length];
-            for (var i = 0; i < indexes.Length; i++)
-                indexes[i] = current.Indexes[i].ToBuilder();
-            _bulk = new BulkState
+            // The migration restarts from empty inside the open write (recovery's included), and
+            // nothing publishes until that write does.
+            var bulk = _pending?.BulkRows is not null;
+            _pending?.Trees.Dispose();
+            var empty = Current.Trees.Empty(_indexColumns.Length);
+            _pending = new Pending
             {
-                IsResident = current.IsResident,
-                Rows = current.ResidentRows.ToBuilder(),
-                Directory = current.Directory.ToBuilder(),
-                Indexes = indexes,
+                IsResident = isResident,
+                Rows = RowDirectory<byte[]>.Empty,
+                BulkRows = bulk ? RowDirectory<byte[]>.Empty.ToBuilder() : null,
+                Trees = empty.BeginEdit(bulk),
             };
         }
 
-        /// <summary>Publishes one version from the builders and leaves bulk mode.</summary>
-        public void CompleteBulk()
+        /// <summary>
+        /// Enters bulk mode: one write held open for recovery's whole replay, seeded from the
+        /// current version, published by <see cref="CompleteBulk"/>.
+        /// </summary>
+        public void BeginBulk()
         {
-            if (_bulk is not { } bulk)
-                return;
-            var indexes = ImmutableArray.CreateBuilder<SecondaryIndex>(bulk.Indexes.Length);
-            foreach (var builder in bulk.Indexes)
-                indexes.Add(builder.ToImmutable());
-            _bulk = null;
-            Current = new TableVersion(
-                bulk.IsResident,
-                bulk.Rows.ToImmutable(),
-                bulk.Directory.ToImmutable(),
-                indexes.MoveToImmutable());
+            Publish();
+            var current = Current;
+            _pending = new Pending
+            {
+                IsResident = current.IsResident,
+                Rows = current.ResidentRows,
+                BulkRows = current.ResidentRows.ToBuilder(),
+                Trees = current.Trees.BeginEdit(bulk: true),
+            };
         }
 
-        private sealed class BulkState
+        /// <summary>Publishes recovery's write and leaves bulk mode.</summary>
+        public void CompleteBulk()
         {
-            public required bool IsResident { get; set; }
+            if (_pending is not { BulkRows: { } bulkRows } pending)
+                return;
+            _pending = null;
+            Supersede(new TableVersion(pending.IsResident, bulkRows.ToImmutable(), pending.Trees.Commit()));
+        }
 
-            public required RowDirectory<byte[]>.Builder Rows { get; init; }
+        /// <summary>
+        /// A lease on the current version, for a read that runs without the store lock. Retries if
+        /// the version it read was superseded and released in between; the caller releases it.
+        /// </summary>
+        public TableVersion Acquire()
+        {
+            while (true)
+            {
+                var version = Current;
+                if (version.TryAcquire())
+                    return version;
+            }
+        }
 
-            public required RowDirectory<DirectoryEntry>.Builder Directory { get; init; }
+        /// <summary>Publishes <paramref name="next"/> and drops the current-version hold on the one it replaces.</summary>
+        private void Supersede(TableVersion next)
+        {
+            var previous = Current;
+            Current = next;
+            previous.Release();
+        }
 
-            public required SecondaryIndex.Builder[] Indexes { get; init; }
+        /// <summary>
+        /// Publishes the open write, if any, as the table's next version. Recovery's bulk write is
+        /// left open: it publishes once, at <see cref="CompleteBulk"/>.
+        /// </summary>
+        public void Publish()
+        {
+            if (_pending is not { BulkRows: null } pending)
+                return;
+            _pending = null;
+            Supersede(new TableVersion(pending.IsResident, pending.Rows, pending.Trees.Commit()));
+        }
+
+        /// <summary>The open write, opened on first use from the current version.</summary>
+        private Pending Write()
+        {
+            if (_pending is { } pending)
+                return pending;
+            var current = Current;
+            return _pending = new Pending
+            {
+                IsResident = current.IsResident,
+                Rows = current.ResidentRows,
+                Trees = current.Trees.BeginEdit(bulk: false),
+            };
+        }
+
+        private sealed class Pending
+        {
+            public required bool IsResident { get; init; }
+
+            /// <summary>The resident rows as of this write, path-copied per op (an ordinary write).</summary>
+            public required RowDirectory<byte[]> Rows { get; set; }
+
+            /// <summary>Recovery's mutable resident rows, assembled once at <see cref="CompleteBulk"/>; null outside bulk mode.</summary>
+            public RowDirectory<byte[]>.Builder? BulkRows { get; init; }
+
+            public required TableTreesEdit Trees { get; init; }
         }
 
         /// <summary>
@@ -1453,92 +1875,28 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (values is null)
                 return;
-            if (_bulk is { } bulk)
+            var trees = Write().Trees;
+            for (var i = 0; i < Schema.Indexes.Count; i++)
             {
-                Index(bulk.Indexes, key, values);
-                return;
+                var value = values[i];
+                if (value.Length == 0)
+                    continue; // A null column value is unindexed, matching the in-memory store.
+                trees.IndexAdd(i, value, key);
             }
-
-            var current = Current;
-            Current = new TableVersion(
-                current.IsResident, current.ResidentRows, current.Directory, Index(current.Indexes, key, values));
         }
 
         public void Unindex(RowKey key, RowKey[]? values)
         {
             if (values is null)
                 return;
-            if (_bulk is { } bulk)
-            {
-                Unindex(bulk.Indexes, key, values);
-                return;
-            }
-
-            var current = Current;
-            Current = new TableVersion(
-                current.IsResident, current.ResidentRows, current.Directory, Unindex(current.Indexes, key, values));
-        }
-
-        private void Index(SecondaryIndex.Builder[] indexes, RowKey key, RowKey[]? values)
-        {
-            if (values is null)
-                return;
-            for (var i = 0; i < Schema.Indexes.Count; i++)
-            {
-                var value = values[i];
-                if (value.Length == 0)
-                    continue; // A null column value is unindexed, matching the in-memory store.
-                indexes[i].Add(value, key);
-            }
-        }
-
-        private void Unindex(SecondaryIndex.Builder[] indexes, RowKey key, RowKey[]? values)
-        {
-            if (values is null)
-                return;
+            var trees = Write().Trees;
             for (var i = 0; i < Schema.Indexes.Count; i++)
             {
                 var value = values[i];
                 if (value.Length == 0)
                     continue;
-                indexes[i].Remove(value, key);
+                trees.IndexRemove(i, value, key);
             }
-        }
-
-        private ImmutableArray<SecondaryIndex> Index(
-            ImmutableArray<SecondaryIndex> indexes,
-            RowKey key,
-            RowKey[]? values)
-        {
-            if (values is null)
-                return indexes;
-            for (var i = 0; i < Schema.Indexes.Count; i++)
-            {
-                var value = values[i];
-                if (value.Length == 0)
-                    continue; // A null column value is unindexed, matching the in-memory store.
-                indexes = indexes.SetItem(i, indexes[i].Add(value, key));
-            }
-
-            return indexes;
-        }
-
-        private ImmutableArray<SecondaryIndex> Unindex(
-            ImmutableArray<SecondaryIndex> indexes,
-            RowKey key,
-            RowKey[]? values)
-        {
-            if (values is null)
-                return indexes;
-            for (var i = 0; i < Schema.Indexes.Count; i++)
-            {
-                var value = values[i];
-                if (value.Length == 0)
-                    continue;
-                indexes = indexes.SetItem(i, indexes[i].Remove(value, key));
-            }
-
-            return indexes;
         }
 
         private static long EntryOverhead(DirectoryEntry entry)
@@ -1594,5 +1952,73 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public static void UnreadableRowSkipped(ILogger logger, string table, string key, string reason) =>
             UnreadableRowSkippedMessage(logger, table, key, reason, null);
+
+        private static readonly Action<ILogger, long, string, int, Exception?> LogSpaceReclaimedMessage =
+            LoggerMessage.Define<long, string, int>(
+                LogLevel.Debug,
+                new EventId(1514, "PagedLogSpaceReclaimed"),
+                "Compaction gave back {Bytes} bytes of the paged {Space} log ({Segments} segment(s) deleted).");
+
+        public static void LogSpaceReclaimed(ILogger logger, string space, long bytes, int segments) =>
+            LogSpaceReclaimedMessage(logger, bytes, space, segments, null);
+
+        private static readonly Action<ILogger, string, string, Exception?> CompactionSkippedSegmentMessage =
+            LoggerMessage.Define<string, string>(
+                LogLevel.Warning,
+                new EventId(1515, "PagedCompactionSkippedSegment"),
+                "Compaction could not read a segment of the paged {Space} log and will leave it in place ({Reason}). "
+                + "Its disk space is not reclaimed until a restart, which rebuilds the store from the commit log.");
+
+        public static void CompactionSkippedSegment(ILogger logger, string space, string reason) =>
+            CompactionSkippedSegmentMessage(logger, space, reason, null);
+
+        private static readonly Action<ILogger, Exception?> CompactionStoppedMessage =
+            LoggerMessage.Define(
+                LogLevel.Error,
+                new EventId(1516, "PagedCompactionStopped"),
+                "Paged log compaction failed and has stopped for this store; its disk use now grows with write volume "
+                + "until a restart. The store itself carries on.");
+
+        public static void CompactionStopped(ILogger logger, Exception exception) =>
+            CompactionStoppedMessage(logger, exception);
+
+        private static readonly Action<ILogger, string, long, long, Exception?> DiskSpaceLowMessage =
+            LoggerMessage.Define<string, long, long>(
+                LogLevel.Warning,
+                new EventId(1518, "PagedDiskSpaceLow"),
+                "The hot store's disk ({Path}) has {Free} bytes free, under HotStore:Compaction:MinFreeDiskBytes ({Threshold}). "
+                + "Compaction now runs as hard as it can. If the disk fills, a write to the paged store fails and the database "
+                + "closes to writes (EventId 1517).");
+
+        public static void DiskSpaceLow(ILogger logger, string path, long free, long threshold) =>
+            DiskSpaceLowMessage(logger, path, free, threshold, null);
+
+        private static readonly Action<ILogger, string, long, long, Exception?> DiskSpaceRecoveredMessage =
+            LoggerMessage.Define<string, long, long>(
+                LogLevel.Information,
+                new EventId(1518, "PagedDiskSpaceLow"),
+                "The hot store's disk ({Path}) has {Free} bytes free again, over HotStore:Compaction:MinFreeDiskBytes ({Threshold}).");
+
+        public static void DiskSpaceRecovered(ILogger logger, string path, long free, long threshold) =>
+            DiskSpaceRecoveredMessage(logger, path, free, threshold, null);
+
+        private static readonly Action<ILogger, long, long, long, Exception?> LogOverCapMessage =
+            LoggerMessage.Define<long, long, long>(
+                LogLevel.Warning,
+                new EventId(1519, "PagedLogOverCap"),
+                "The paged logs hold {LogBytes} bytes, over HotStore:Compaction:MaxLogBytes ({Cap}), with {LiveBytes} bytes live. "
+                + "Compaction now runs as hard as it can. If live bytes alone exceed the cap, it cannot get under it: raise the cap.");
+
+        public static void LogOverCap(ILogger logger, long logBytes, long cap, long liveBytes) =>
+            LogOverCapMessage(logger, logBytes, cap, liveBytes, null);
+
+        private static readonly Action<ILogger, long, long, Exception?> LogUnderCapMessage =
+            LoggerMessage.Define<long, long>(
+                LogLevel.Information,
+                new EventId(1519, "PagedLogOverCap"),
+                "The paged logs are back under HotStore:Compaction:MaxLogBytes: {LogBytes} of {Cap} bytes.");
+
+        public static void LogUnderCap(ILogger logger, long logBytes, long cap) =>
+            LogUnderCapMessage(logger, logBytes, cap, null);
     }
 }

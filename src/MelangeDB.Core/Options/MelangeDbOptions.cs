@@ -783,6 +783,15 @@ public sealed class HotStoreOptions
     public PagedEngine PagedEngine { get; set; } = PagedEngine.Faster;
 
     /// <summary>
+    /// Keeps the paged store's key directory and secondary indexes in native copy-on-write B+trees
+    /// instead of persistent trees on the managed heap: some tens of bytes of native memory per row
+    /// and index entry rather than about 300 bytes and five GC objects per paged row. Read once,
+    /// when the store is created; the store is rebuilt from the log on every start, so switching
+    /// needs only a restart. On by default; false keeps the managed trees.
+    /// </summary>
+    public bool NativeDirectory { get; set; } = true;
+
+    /// <summary>
     /// Cap on the paging buffer pool in bytes. <b>Excludes</b> resident tables, which are
     /// accounted separately — the total declared footprint is this plus the residency report.
     /// Ignored by the in-memory engine, which does not page.
@@ -800,6 +809,75 @@ public sealed class HotStoreOptions
     /// </para>
     /// </summary>
     public long HashBuckets { get; set; }
+
+    /// <summary>Reclaiming the paged tier's log space while the store runs (<c>HotStore:Compaction:*</c>).</summary>
+    public HotStoreCompactionOptions Compaction { get; set; } = new();
+
+    /// <summary>Settings for the <see cref="PagedEngine.MelangeLog"/> engine (<c>HotStore:MelangeLog:*</c>).</summary>
+    public MelangeLogOptions MelangeLog { get; set; } = new();
+}
+
+/// <summary>How the MelangeLog engine reads a record that has left memory.</summary>
+public enum MelangeLogReadMode
+{
+    /// <summary>
+    /// Through a read-only memory map of the record's segment: a page fault rather than a system call
+    /// and a copy, and the faster path. A disk error on a mapped page is a signal (SIGBUS on Linux)
+    /// that ends the process, which then restarts and rebuilds.
+    /// </summary>
+    Mmap,
+
+    /// <summary>
+    /// <c>RandomAccess.Read</c> through the OS page cache: a system call and a copy per read, slower,
+    /// and a disk error is an exception the store reports (EventId 1511 for a scan) instead.
+    /// </summary>
+    Pread,
+}
+
+/// <summary>Options for the MelangeLog paged engine (<c>MelangeDb:HotStore:MelangeLog:*</c>).</summary>
+public sealed class MelangeLogOptions
+{
+    /// <summary>How records that have left memory are read; see <see cref="MelangeLogReadMode"/>.</summary>
+    public MelangeLogReadMode ReadMode { get; set; } = MelangeLogReadMode.Mmap;
+}
+
+/// <summary>
+/// Options for reclaiming paged log space (<c>MelangeDb:HotStore:Compaction:*</c>). An engine that
+/// appends a record per update keeps the superseded ones until they are reclaimed; compaction copies
+/// a segment's live records forward and deletes the segment, in short steps on a background thread
+/// that interleave with writes. Only the <see cref="PagedEngine.MelangeLog"/> engine compacts today.
+/// </summary>
+public sealed class HotStoreCompactionOptions
+{
+    /// <summary>Whether to compact at all. Off, the log grows with write volume until a restart.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Compact while a space's log is more than this many times its live bytes. Lower keeps disk
+    /// closer to the data's size and copies more to do it: at 2, a record is copied about once for
+    /// each segment of garbage reclaimed. At least 1.1.
+    /// </summary>
+    public double TriggerRatio { get; set; } = 2.0;
+
+    /// <summary>
+    /// Cap on bytes compaction copies per second, across spaces; zero is uncapped, which still
+    /// yields the store lock between steps of about a megabyte.
+    /// </summary>
+    public long MaxBytesPerSecond { get; set; }
+
+    /// <summary>
+    /// A soft cap on the paged logs' combined size; zero is none. Above it, compaction runs as hard as
+    /// it can (a ratio of 1.1, ignoring <see cref="MaxBytesPerSecond"/>) and EventId 1519 warns while
+    /// the logs stay over. It does not refuse writes: live data larger than the cap is a sizing error,
+    /// and failing the store over it would only rebuild into the same state.
+    /// </summary>
+    public long MaxLogBytes { get; set; }
+
+    /// <summary>
+    /// Free space on the hot store's disk below which compaction runs as hard as it can and EventId
+    /// 1518 warns; zero turns the check off. Checked once a second.
+    /// </summary>
+    public long MinFreeDiskBytes { get; set; } = 1L << 30;
 }
 
 /// <summary>When the commit log forces appended records to stable storage.</summary>

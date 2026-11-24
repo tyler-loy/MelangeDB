@@ -708,11 +708,35 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     {
         var assigned = assignments.Select(static a => a.ToAssignment()).ToDictionary(static a => a.Shard);
         List<ShardRuntime> closed = [];
+        HashSet<ShardKey> reopenNextBeat = [];
         var shardSetChanged = false;
         lock (_shardsLock)
         {
             foreach (var (shard, runtime) in _shards.ToList())
             {
+                // A shard whose engine has closed itself to writes (its commit log poisoned, or its
+                // hot store failed to apply a committed record) refuses every write, and the hub,
+                // which still sees a live lease, keeps routing to it. Close it here and reopen it on
+                // the next heartbeat: recovery rebuilds the hot store from the shard's log, which is
+                // what a process restart would do, scoped to the one shard. The next beat, not this
+                // one, so the old engine has let go of the log before the new one opens it.
+                var failure = runtime.Engine.ProjectionFailure ?? runtime.Engine.LogFailure;
+                if (failure is not null && assigned.ContainsKey(shard))
+                {
+                    _shards.Remove(shard);
+                    if (_forwarders.Remove(shard, out var failedForwarder))
+                        failedForwarder.Dispose();
+                    if (_borderPublishers.Remove(shard, out var failedPublisher))
+                        failedPublisher.Dispose();
+                    if (_boundaryMonitors.Remove(shard, out var failedMonitor))
+                        failedMonitor.Dispose();
+                    closed.Add(runtime);
+                    reopenNextBeat.Add(shard);
+                    shardSetChanged = true;
+                    LogShardEngineFailed(_logger, shard.Value, NodeName, failure.Message);
+                    continue;
+                }
+
                 if (assigned.TryGetValue(shard, out var assignment))
                 {
                     runtime.FencingToken = assignment.FencingToken;
@@ -754,7 +778,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             _assigned = leaseValid ? assigned : [];
             foreach (var assignment in leaseValid ? assigned.Values : Enumerable.Empty<ShardAssignment>())
             {
-                if (_shards.ContainsKey(assignment.Shard) || _opening.ContainsKey(assignment.Shard))
+                if (_shards.ContainsKey(assignment.Shard) || _opening.ContainsKey(assignment.Shard) || reopenNextBeat.Contains(assignment.Shard))
                     continue;
                 if (IsDrainingLocked(assignment.Shard))
                     continue;
@@ -1935,6 +1959,11 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     [LoggerMessage(EventId = 1708, EventName = "ShardReleased", Level = LogLevel.Information,
         Message = "Shard {Shard} released by node '{NodeName}': the hub reassigned it.")]
     private static partial void LogShardReleased(ILogger logger, ulong shard, string nodeName);
+
+    [LoggerMessage(EventId = 1765, EventName = "ShardEngineFailed", Level = LogLevel.Error,
+        Message = "Shard {Shard} on node {NodeName} closed itself to writes ({Reason}); closing it, and reopening it on the next " +
+            "heartbeat, which rebuilds its hot store from its log. If it fails again, the cause (a full or failing disk) is still there.")]
+    private static partial void LogShardEngineFailed(ILogger logger, ulong shard, string nodeName, string reason);
 
     [LoggerMessage(EventId = 1709, EventName = "HubLinkLost", Level = LogLevel.Warning,
         Message = "The hub link failed ({Reason}); reconnecting. If Cluster:FailureTimeoutMs passes first, this node self-fences its shards.")]

@@ -21,6 +21,26 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Added
 
+- **`HotStore:NativeDirectory` keeps the paged store's key directory and secondary indexes off
+  the managed heap**, in native copy-on-write B+trees (1 KiB pages). On by default; `false` keeps
+  the managed trees.
+  - **Why:** a paged row kept about 300 bytes and five GC objects resident in persistent managed
+    trees, so memory and full-collection marking grew with row count whatever the budget.
+  - **Measured** (bake-off, 1M rows + 200k blobs, 1 GiB cap):
+    - bookkeeping memory falls from 279 MiB managed to 50 MiB managed plus 39.5 MiB native;
+    - rebuild is 40% faster;
+    - point reads are 40–70% faster and index window scans 44% faster;
+    - updates, deletes and churn are at or above the managed trees (hot updates 234–242k/s
+      against 239k/s).
+  - **Reclamation:** a superseded version's pages go back as soon as its last reader is done; read
+    views and lazy key walks hold their version until they finish.
+  - **Reporting:** `HotStoreStatistics.NativeDirectoryBytes` and the
+    `melange.store.directory.native_bytes` gauge.
+- **The load tool can soak a paged store that really pages.** `--ballast-rows` seeds paged rows
+  larger than the memory budget and `--ballast-churn` keeps rewriting them, so a soak exercises
+  appends, flushing and compaction; the serve console reports the hot store's log, live and
+  reclaimed bytes. `all` now passes `--data` to its serve process. Results:
+  [docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#paging-soak--melangelog-against-faster-under-constant-rewrites-2026-11-24).
 - **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default,
   and two preview engines join it.
   - **Why:** FASTER has been unmaintained upstream since August 2026.
@@ -43,7 +63,53 @@ All packages ship together at one version; there is no per-package versioning. S
     record carries a checksum.
   - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on
     writes.
-  - **Likely the future default,** once it can reclaim log space (#287) and flush in the background.
+  - **Reclaims log space as it runs** (#287): `HotStore:Compaction:Enabled` (default on),
+    `TriggerRatio` (default 2: compact while the log is over twice its live bytes) and
+    `MaxBytesPerSecond`. A background thread copies the live records out of the segment with the
+    least live data, in steps of about 1 MiB under the store lock, and deletes the segment. A store
+    rewriting its 1M-row table three times over ends with its log at about twice its live data.
+    EventIds 1514–1516 log it; `melange.store.compaction.reclaimed_bytes` and `relocated_bytes`
+    count it. FASTER and Tsavorite still do not reclaim.
+  - **Flushes in the background:** a flusher thread per log space writes pages to disk as they
+    leave the writable part of memory, so a write never waits on disk unless the disk has fallen a
+    sixteenth of the memory budget behind. `melange.store.flush.stalls` counts those waits.
+  - **Disk limits:** `HotStore:Compaction:MaxLogBytes` (a soft cap on the logs) and
+    `MinFreeDiskBytes` (default 1 GiB) make compaction run flat out when crossed, with EventIds 1519
+    and 1518. `HotStore:MelangeLog:ReadMode` chooses `Mmap` (default) or `Pread`, under which a disk
+    read error is an exception rather than a signal that ends the process.
+  - **The index grows incrementally:** a full index no longer rehashes inside one write.
+  - **Likely the future default.**
+  - **Exact without reads:** its index keys each record by a 128-bit hash and records its size, so a
+    delete reads nothing, and the log knows which bytes are live without reading them back.
+
+- **Paged log statistics and instruments.** `HotStoreStatistics.Logs` reports each paged space
+  (`main`, `blob`): log against live bytes, in-place against appended writes, memory held, flush
+  lag and stalls, segment files, index size and resizes, integrity failures, and compaction's
+  steps, lock time and bytes moved. Each is a `melange.store.*` instrument with a `space`
+  dimension ([docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)). The gap between `log_bytes` and
+  `live_bytes` is the backlog of #287. FASTER and Tsavorite report the log's extent only;
+  MelangeLog reports them all.
+
+### Fixed
+
+- **Promoting a paged table to resident left its paged records in the log** until the next restart.
+  They are now deleted as the table moves.
+- **A shard node now reopens a shard whose engine closed itself to writes** (its hot store failed to
+  apply a record, or its commit log was poisoned). The node kept the lease and the hub kept routing
+  to a shard that refused every write; now the node closes it and reopens it on the next heartbeat,
+  rebuilding it from its log, as a restart would, for that shard alone (EventId 1765).
+- **A scan failed whole on one unreadable paged row under MelangeLog.** Its batched read throws on
+  a record that fails its checksum; the store now reads that batch again a row at a time and skips
+  only the bad row (EventId 1511), as it does for FASTER.
+- **A hot store that failed to apply a committed record left the database taking writes.** The
+  record was already in the commit log, the caller got a generic error, and the next commit
+  replayed into the part-applied store. Now the database closes to writes, as it does when the log
+  is poisoned. The caller gets `CommitOutcomeUnknownException` (the write may or may not be
+  durable), later writes get `TransientRejectionException`, EventId 1517 logs it at Critical, and
+  the `melange-log` health check reports unhealthy so the host is rotated. A restart rebuilds the
+  store from the log. This applies to every hot-store engine; MelangeLog reaches it when a disk
+  write fails, and it now preallocates segment files so a full disk fails there rather than
+  partway through a write.
 
 ## [0.4.1] — 2026-11-23
 

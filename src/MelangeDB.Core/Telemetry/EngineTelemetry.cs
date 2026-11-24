@@ -99,6 +99,124 @@ internal sealed class EngineTelemetry : IDisposable
             () => StoreMeasurements(static t => t.RowsScanned),
             "{row}",
             "Rows returned by full table scans.");
+        _meter.CreateObservableGauge(
+            "melange.store.log_bytes",
+            () => LogMeasurements(static l => l.LogBytes),
+            "By",
+            "Extent of each paged log space (main, blob): live records plus superseded ones not yet reclaimed.");
+        _meter.CreateObservableGauge(
+            "melange.store.live_bytes",
+            () => LogMeasurements(static l => l.LiveBytes),
+            "By",
+            "Bytes of each paged log space that current records occupy; absent for an engine that cannot tell.");
+        _meter.CreateObservableCounter(
+            "melange.store.compaction.reclaimed_bytes",
+            () => LogMeasurements(static l => l.ReclaimedBytes),
+            "By",
+            "Log bytes compaction has given back, per paged log space.");
+        _meter.CreateObservableCounter(
+            "melange.store.compaction.relocated_bytes",
+            () => LogMeasurements(static l => l.RelocatedBytes),
+            "By",
+            "Live bytes compaction copied forward to reclaim space, per paged log space: its write cost.");
+        _meter.CreateObservableCounter(
+            "melange.store.flush.stalls",
+            () => LogMeasurements(static l => l.FlushStalls),
+            "{stall}",
+            "Writes to a paged log space that waited for its background flush: the disk falling behind the write rate.");
+        _meter.CreateObservableCounter(
+            "melange.store.writes",
+            () => WriteMeasurements(),
+            "{write}",
+            "Writes to each paged log space by mode: in_place rewrote a record in memory, append wrote a new one and left garbage for compaction.");
+        _meter.CreateObservableGauge(
+            "melange.store.directory.native_bytes",
+            () => _storeStatistics?.Invoke().NativeDirectoryBytes ?? 0L,
+            "By",
+            "Native memory held by the paged store's key directory and secondary indexes under HotStore:NativeDirectory, including versions not yet collected.");
+        _meter.CreateObservableGauge(
+            "melange.store.memory_bytes",
+            () => LogMeasurements(static l => l.MemoryBytes),
+            "By",
+            "Bytes of each paged log space held in memory now: its newest records, up to the space's budget.");
+        _meter.CreateObservableGauge(
+            "melange.store.flush.lag_bytes",
+            () => LogMeasurements(static l => l.FlushLagBytes),
+            "By",
+            "Bytes of each paged log space waiting for the background flush.");
+        _meter.CreateObservableGauge(
+            "melange.store.segments",
+            () => LogMeasurements(static l => l.SegmentFiles),
+            "{segment}",
+            "Segment files on disk for each paged log space; each is preallocated and memory-mapped.");
+        _meter.CreateObservableGauge(
+            "melange.store.index.entries",
+            () => LogMeasurements(static l => l.IndexEntries),
+            "{entry}",
+            "Keys in each paged log space's hash index.");
+        _meter.CreateObservableGauge(
+            "melange.store.index.capacity",
+            () => LogMeasurements(static l => l.IndexCapacity),
+            "{slot}",
+            "Slots in each paged log space's hash index; it doubles past 75% load.");
+        _meter.CreateObservableCounter(
+            "melange.store.index.resizes",
+            () => LogMeasurements(static l => l.IndexResizes),
+            "{resize}",
+            "Doublings of each paged log space's hash index.");
+        _meter.CreateObservableCounter(
+            "melange.store.integrity_failures",
+            () => LogMeasurements(static l => l.IntegrityFailures),
+            "{record}",
+            "Records in each paged log space that failed their checksum or header check when read, refused rather than returned.");
+        _meter.CreateObservableCounter(
+            "melange.store.compaction.steps",
+            () => LogMeasurements(static l => l.CompactionSteps),
+            "{step}",
+            "Compaction steps on each paged log space, each one hold of the store lock.");
+        _meter.CreateObservableCounter(
+            "melange.store.compaction.lock_time",
+            () => LockTimeMeasurements(),
+            "s",
+            "Time compaction held the store lock, per paged log space: what writers and readers waited behind.");
+    }
+
+    private IEnumerable<Measurement<long>> WriteMeasurements()
+    {
+        if (_storeStatistics is null)
+            yield break;
+        foreach (var log in _storeStatistics().Logs)
+        {
+            var space = new KeyValuePair<string, object?>("space", log.Space);
+            if (log.InPlaceWrites >= 0)
+                yield return new Measurement<long>(log.InPlaceWrites, space, new KeyValuePair<string, object?>("mode", "in_place"));
+            if (log.AppendedWrites >= 0)
+                yield return new Measurement<long>(log.AppendedWrites, space, new KeyValuePair<string, object?>("mode", "append"));
+        }
+    }
+
+    private IEnumerable<Measurement<double>> LockTimeMeasurements()
+    {
+        if (_storeStatistics is null)
+            yield break;
+        foreach (var log in _storeStatistics().Logs)
+        {
+            if (log.CompactionSteps >= 0)
+                yield return new Measurement<double>(log.CompactionLockTime.TotalSeconds, new KeyValuePair<string, object?>("space", log.Space));
+        }
+    }
+
+    /// <summary>One measurement per paged log space, skipping values the engine reports as unknown (-1).</summary>
+    private IEnumerable<Measurement<long>> LogMeasurements(Func<HotStoreLogStatistics, long> select)
+    {
+        if (_storeStatistics is null)
+            yield break;
+        foreach (var log in _storeStatistics().Logs)
+        {
+            var value = select(log);
+            if (value >= 0)
+                yield return new Measurement<long>(value, new KeyValuePair<string, object?>("space", log.Space));
+        }
     }
 
     /// <summary>

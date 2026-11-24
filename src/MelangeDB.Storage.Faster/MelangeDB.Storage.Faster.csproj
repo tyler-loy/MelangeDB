@@ -21,6 +21,8 @@
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Storage.Faster.Tests" />
     <InternalsVisibleTo Include="MelangeDB.HotStoreBakeoff" />
+    <!-- The native tree's suite measures internal types against Core's internal containers. -->
+    <InternalsVisibleTo Include="MelangeDB.Benchmarks" />
   </ItemGroup>
 
   <ItemGroup>
