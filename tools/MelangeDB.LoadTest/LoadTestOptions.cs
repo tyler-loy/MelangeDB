@@ -89,7 +89,7 @@ public sealed class LoadTestOptions
     public string HotStore { get; set; } = "inmemory";
 
     /// <summary>HotStore:PagedEngine for every node, when <see cref="HotStore"/> is "faster": "faster", "melangelog" or "tsavorite".</summary>
-    public string PagedEngine { get; set; } = "faster";
+    public string PagedEngine { get; set; } = "melangelog";
 
     /// <summary>HotStore:MemoryBudgetBytes for every node, in MiB; null keeps the library's 128 MiB.</summary>
     public int? BudgetMb { get; set; }
