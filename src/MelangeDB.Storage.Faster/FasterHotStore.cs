@@ -106,6 +106,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _blob = engine.Open(path, PagedKvSpace.Blob, 1L << blobMemoryBits, hashBuckets);
         _bufferPoolCapacityBytes = _main.CapacityBytes + (_blob?.CapacityBytes ?? 0);
 
+        // A row key travels inside the engine's keys: StoreKey adds the 4-byte table id, BlobKey
+        // that and a column ordinal byte.
+        MaxKeyBytes = Math.Min(
+            _main.MaxKeyBytes == int.MaxValue ? int.MaxValue : _main.MaxKeyBytes - 4,
+            _blob is null || _blob.MaxKeyBytes == int.MaxValue ? int.MaxValue : _blob.MaxKeyBytes - 5);
+
         if (context.Options.HotStore.NativeDirectory)
         {
             _directoryPool = new NativePagePool(NativeDirectoryPageBytes);
@@ -138,6 +144,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     }
 
     public ulong AppliedLsn { get; private set; }
+
+    /// <summary>The longest row key the paged engine's keys leave room for (MelangeLog: 1 KiB less the store's prefix).</summary>
+    public int MaxKeyBytes { get; }
 
     /// <summary>The kind of ordered bookkeeping tables start with (see <see cref="TableTrees"/>).</summary>
     private readonly TableTrees _emptyTrees;

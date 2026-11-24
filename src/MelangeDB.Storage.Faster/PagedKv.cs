@@ -26,6 +26,9 @@ internal enum PagedKvSpace
 /// </summary>
 internal interface IPagedKv : IDisposable
 {
+    /// <summary>The longest key the engine accepts; unlimited unless the engine says otherwise.</summary>
+    int MaxKeyBytes => int.MaxValue;
+
     /// <summary>
     /// Reads a value, or null when absent. <paramref name="faulted"/> says the read waited on
     /// storage rather than being served from memory, as best the engine can tell.

@@ -1012,8 +1012,30 @@ public sealed partial class MelangeEngine : IDisposable
 
     private void RunCommitGuards(string reducerName, IReadOnlyList<RowOp> ops, CommitOrigin origin)
     {
+        CheckKeyLengths(ops);
         foreach (var guard in _commitGuards)
             guard.Validate(reducerName, ops, origin);
+    }
+
+    /// <summary>
+    /// Refuses a write whose primary key is longer than the hot store can hold, before anything is
+    /// appended. Applied, such a record failed in the store after it was durable, closing the
+    /// database to writes, and failed again on every replay, so the database could not start (#307).
+    /// </summary>
+    private void CheckKeyLengths(IReadOnlyList<RowOp> ops)
+    {
+        var limit = HotStore.MaxKeyBytes;
+        if (limit == int.MaxValue)
+            return;
+        foreach (var op in ops)
+        {
+            if (op.Key.Length > limit)
+            {
+                throw new ArgumentException(
+                    $"Table '{Schema.Get(op.Table).Name}': a primary key of {op.Key.Length} bytes is longer than the hot store holds ({limit} bytes; " +
+                    "HotStore:PagedEngine MelangeLog limits keys to about 1 KiB). Nothing was written.");
+            }
+        }
     }
 
     /// <summary>
