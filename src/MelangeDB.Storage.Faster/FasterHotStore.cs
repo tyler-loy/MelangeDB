@@ -2,7 +2,6 @@ using System.Buffers.Binary;
 using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Numerics;
-using FASTER.core;
 using MelangeDB.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -45,12 +44,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private readonly Dictionary<TableId, TableState> _tables = [];
     private readonly List<ReadView> _openViews = [];
 
-    private readonly IDevice _mainDevice;
-    private readonly FasterKV<SpanByte, SpanByte> _main;
-    private readonly ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> _mainSession;
-    private readonly IDevice? _blobDevice;
-    private readonly FasterKV<SpanByte, SpanByte>? _blob;
-    private readonly ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions>? _blobSession;
+    private readonly IPagedKv _main;
+    private readonly IPagedKv? _blob;
     private readonly long _bufferPoolCapacityBytes;
 
     /// <summary>Reused buffer for composed store and blob keys; see <see cref="StoreKey"/>.</summary>
@@ -58,8 +53,18 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private bool _disposed;
 
     public FasterHotStore(HotStoreContext context)
+        : this(context, FasterPagedKvFactory.Instance)
+    {
+    }
+
+    /// <summary>
+    /// The store over another engine's key-value spaces: everything but where the paged bytes live
+    /// is this class's own. FASTER is the shipped engine; the constructor is how a bake-off swaps it.
+    /// </summary>
+    internal FasterHotStore(HotStoreContext context, IPagedKvFactory engine)
     {
         ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(engine);
         _registry = context.Schema;
         _logger = context.LoggerFactory.CreateLogger<FasterHotStore>();
         _autoThresholdBytes = context.Options.Residency.AutoThresholdBytes;
@@ -69,41 +74,16 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         var totalBits = Math.Clamp(63 - BitOperations.LeadingZeroCount((ulong)budget), 21, 34);
         var mainMemoryBits = anyBlobColumns ? totalBits - 1 : totalBits;
         var blobMemoryBits = totalBits - 1;
-        _bufferPoolCapacityBytes = (1L << mainMemoryBits) + (anyBlobColumns ? 1L << blobMemoryBits : 0);
         var hashBuckets = HashBuckets(context.Options.HotStore);
 
         // The store is rebuilt from snapshot + log replay on every start, so files left by a
-        // previous run (clean or crashed) are stale projections; start from nothing.
+        // previous run (clean or crashed) are stale projections; each space opens empty.
         var path = context.Options.HotStore.Path;
         Directory.CreateDirectory(path);
-        CleanStoreFiles(path);
-
-        _mainDevice = Devices.CreateLogDevice(Path.Combine(path, "main.hlog"), deleteOnClose: true);
-        _main = new FasterKV<SpanByte, SpanByte>(
-            hashBuckets,
-            new LogSettings
-            {
-                LogDevice = _mainDevice,
-                MemorySizeBits = mainMemoryBits,
-                PageSizeBits = Math.Min(mainMemoryBits - 1, 19),
-                SegmentSizeBits = 26,
-            });
-        _mainSession = _main.For(new StoreFunctions()).NewSession<StoreFunctions>();
-
+        _main = engine.Open(path, PagedKvSpace.Main, 1L << mainMemoryBits, hashBuckets);
         if (anyBlobColumns)
-        {
-            _blobDevice = Devices.CreateLogDevice(Path.Combine(path, "blob.hlog"), deleteOnClose: true);
-            _blob = new FasterKV<SpanByte, SpanByte>(
-                hashBuckets,
-                new LogSettings
-                {
-                    LogDevice = _blobDevice,
-                    MemorySizeBits = blobMemoryBits,
-                    PageSizeBits = Math.Min(blobMemoryBits - 1, 22),
-                    SegmentSizeBits = 26,
-                });
-            _blobSession = _blob.For(new StoreFunctions()).NewSession<StoreFunctions>();
-        }
+            _blob = engine.Open(path, PagedKvSpace.Blob, 1L << blobMemoryBits, hashBuckets);
+        _bufferPoolCapacityBytes = _main.CapacityBytes + (_blob?.CapacityBytes ?? 0);
 
         foreach (var table in context.Schema.Tables)
         {
@@ -370,12 +350,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (_disposed)
                 return;
             _disposed = true;
-            _mainSession.Dispose();
-            _blobSession?.Dispose();
             _main.Dispose();
             _blob?.Dispose();
-            _mainDevice.Dispose();
-            _blobDevice?.Dispose();
         }
     }
 
@@ -700,7 +676,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         lock (_lock)
         {
-            UpsertValue(_blobSession!, BlobKey(table, key, ordinal), payload);
+            _blob!.Upsert(BlobKey(table, key, ordinal), payload);
         }
     }
 
@@ -721,7 +697,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             return null;
 
         var rowKey = key;
-        var main = ReadValue(_mainSession, StoreKey(table.Schema.Id, rowKey), table)
+        var main = ReadValue(_main, StoreKey(table.Schema.Id, rowKey), table)
             ?? throw new InvalidDataException(
                 $"Table '{table.Schema.Name}': key {rowKey} is in the directory but its main record is missing.");
         if (entry.BlobMask == 0)
@@ -735,7 +711,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         try
         {
             return RowBlobSplitter.Join(table.Schema, main, entry.BlobMask, ordinal =>
-                ReadValue(_blobSession!, BlobKey(table.Schema.Id, rowKey, ordinal), table)
+                ReadValue(_blob!, BlobKey(table.Schema.Id, rowKey, ordinal), table)
                 ?? throw new InvalidDataException(
                     $"out-of-line payload for bytes-column ordinal {ordinal} is missing."));
         }
@@ -821,29 +797,27 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         var entries = new DirectoryEntry?[count];
         var mains = new byte[]?[count];
-        var pendingMains = new Dictionary<byte[], List<int>>(ByteArrayComparer.Instance);
+        var mainKeys = new byte[count][];
+        var mainSlots = new int[count];
+        var mainReads = 0;
         for (var i = 0; i < count; i++)
         {
             rows[i] = null;
             if (!version.Directory.TryGetValue(keys[i], out var entry))
                 continue;
             entries[i] = entry;
-            var storeKey = StoreKey(table.Schema.Id, keys[i]);
-            switch (IssueRead(_mainSession, storeKey, out var value))
-            {
-                case IssuedRead.Found:
-                    mains[i] = value;
-                    break;
-                case IssuedRead.Pending:
-                    AddPending(pendingMains, storeKey, i);
-                    break;
-            }
+            mainKeys[mainReads] = StoreKey(table.Schema.Id, keys[i]).ToArray();
+            mainSlots[mainReads++] = i;
         }
 
-        CompleteReads(_mainSession, pendingMains, table, (slot, value) => mains[slot] = value);
+        var mainValues = new byte[]?[mainReads];
+        table.PageFaults += _main.ReadMany(mainKeys.AsSpan(0, mainReads), mainValues);
+        for (var j = 0; j < mainReads; j++)
+            mains[mainSlots[j]] = mainValues[j];
 
         var blobs = new Dictionary<(int Row, int Ordinal), byte[]>();
-        var pendingBlobs = new Dictionary<byte[], List<(int Row, int Ordinal)>>(ByteArrayComparer.Instance);
+        var blobKeys = new List<byte[]>();
+        var blobSlots = new List<(int Row, int Ordinal)>();
         for (var i = 0; i < count; i++)
         {
             if (entries[i] is not { } entry || entry.BlobMask == 0 || mains[i] is null)
@@ -853,21 +827,21 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             {
                 if ((mask & 1) == 0)
                     continue;
-                var blobKey = BlobKey(table.Schema.Id, keys[i], ordinal);
-                switch (IssueRead(_blobSession!, blobKey, out var value))
-                {
-                    case IssuedRead.Found:
-                        blobs[(i, ordinal)] = value!;
-                        break;
-                    case IssuedRead.Pending:
-                        AddPending(pendingBlobs, blobKey, (i, ordinal));
-                        break;
-                }
+                blobKeys.Add(BlobKey(table.Schema.Id, keys[i], ordinal).ToArray());
+                blobSlots.Add((i, ordinal));
             }
         }
 
-        if (pendingBlobs.Count > 0)
-            CompleteReads(_blobSession!, pendingBlobs, table, (slot, value) => blobs[slot] = value);
+        if (blobKeys.Count > 0)
+        {
+            var blobValues = new byte[]?[blobKeys.Count];
+            table.PageFaults += _blob!.ReadMany(blobKeys.ToArray(), blobValues);
+            for (var j = 0; j < blobValues.Length; j++)
+            {
+                if (blobValues[j] is { } payload)
+                    blobs[blobSlots[j]] = payload;
+            }
+        }
 
         for (var i = 0; i < count; i++)
         {
@@ -908,100 +882,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         catch (InvalidDataException fault)
         {
             throw new InvalidDataException($"Table '{table.Schema.Name}': key {key}: {fault.Message}", fault);
-        }
-    }
-
-    private enum IssuedRead
-    {
-        NotFound,
-        Found,
-        Pending,
-    }
-
-    /// <summary>Issues one read without waiting for it: a pending read completes in <see cref="CompleteReads{TSlot}"/>.</summary>
-    private static IssuedRead IssueRead(
-        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        ReadOnlySpan<byte> keyBytes,
-        out byte[]? value)
-    {
-        Status status;
-        unsafe
-        {
-            fixed (byte* keyPointer = keyBytes)
-            {
-                var key = SpanByte.FromPointer(keyPointer, keyBytes.Length);
-                byte[] result = [];
-                status = session.Read(ref key, ref result);
-                value = result;
-            }
-        }
-
-        if (status.IsPending)
-        {
-            value = null;
-            return IssuedRead.Pending;
-        }
-
-        if (status.Found)
-            return IssuedRead.Found;
-        value = null;
-        return IssuedRead.NotFound;
-    }
-
-    /// <summary>
-    /// Waits once for every read <see cref="IssueRead"/> left pending on <paramref name="session"/>
-    /// and hands each found value to its slot. FASTER copies a pending read's key, so the scratch
-    /// buffer the key was built in is free to be reused while the reads are in flight.
-    /// </summary>
-    private static void CompleteReads<TSlot>(
-        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        Dictionary<byte[], List<TSlot>> pending,
-        TableState faultAccounting,
-        Action<TSlot, byte[]> deliver)
-    {
-        if (pending.Count == 0)
-            return;
-        faultAccounting.PageFaults += pending.Count;
-        session.CompletePendingWithOutputs(out var outputs, wait: true);
-        using (outputs)
-        {
-            while (outputs.Next())
-            {
-                if (!outputs.Current.Status.Found || !pending.TryGetValue(outputs.Current.Key.ToByteArray(), out var slots))
-                    continue;
-                foreach (var slot in slots)
-                    deliver(slot, outputs.Current.Output);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Records a pending read's slot. A key read twice in one block (never expected from a
-    /// directory or an index, but cheap to tolerate) delivers to both slots rather than leaving
-    /// one looking like a missing record.
-    /// </summary>
-    private static void AddPending<TSlot>(Dictionary<byte[], List<TSlot>> pending, ReadOnlySpan<byte> key, TSlot slot)
-    {
-        var copy = key.ToArray();
-        if (pending.TryGetValue(copy, out var slots))
-            slots.Add(slot);
-        else
-            pending[copy] = [slot];
-    }
-
-    /// <summary>Content equality for FASTER key bytes, to match completed reads back to their rows.</summary>
-    private sealed class ByteArrayComparer : IEqualityComparer<byte[]>
-    {
-        public static readonly ByteArrayComparer Instance = new();
-
-        public bool Equals(byte[]? x, byte[]? y) =>
-            ReferenceEquals(x, y) || (x is not null && y is not null && x.AsSpan().SequenceEqual(y));
-
-        public int GetHashCode(byte[] obj)
-        {
-            var hash = default(HashCode);
-            hash.AddBytes(obj);
-            return hash.ToHashCode();
         }
     }
 
@@ -1061,15 +941,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             for (var ordinal = 0; stale != 0; ordinal++, stale >>= 1)
             {
                 if ((stale & 1) != 0)
-                    DeleteValue(_blobSession!, BlobKey(table.Schema.Id, key, ordinal));
+                    _blob!.Delete(BlobKey(table.Schema.Id, key, ordinal));
             }
         }
 
-        UpsertValue(_mainSession, StoreKey(table.Schema.Id, key), main.Span);
+        _main.Upsert(StoreKey(table.Schema.Id, key), main.Span);
         if (blobs is not null)
         {
             foreach (var (ordinal, payload) in blobs)
-                UpsertValue(_blobSession!, BlobKey(table.Schema.Id, key, ordinal), payload.Span);
+                _blob!.Upsert(BlobKey(table.Schema.Id, key, ordinal), payload.Span);
         }
 
         table.PutDirectory(key, new DirectoryEntry(mask, indexValues), previous);
@@ -1088,12 +968,12 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             return;
         CapturePreImage(table, key);
         table.Unindex(key, entry.IndexValues);
-        DeleteValue(_mainSession, StoreKey(table.Schema.Id, key));
+        _main.Delete(StoreKey(table.Schema.Id, key));
         var mask = entry.BlobMask;
         for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
         {
             if ((mask & 1) != 0)
-                DeleteValue(_blobSession!, BlobKey(table.Schema.Id, key, ordinal));
+                _blob!.Delete(BlobKey(table.Schema.Id, key, ordinal));
         }
 
         table.RemoveDirectory(key, entry);
@@ -1131,77 +1011,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             table.PutResident(key, bytes);
     }
 
-    private byte[]? ReadValue(
-        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        ReadOnlySpan<byte> keyBytes,
-        TableState faultAccounting)
+    /// <summary>Reads one value from a space, counting a read that waited on storage against the table.</summary>
+    private static byte[]? ReadValue(IPagedKv space, ReadOnlySpan<byte> key, TableState faultAccounting)
     {
-        byte[]? output = null;
-        Status status;
-        unsafe
-        {
-            fixed (byte* keyPointer = keyBytes)
-            {
-                var key = SpanByte.FromPointer(keyPointer, keyBytes.Length);
-                byte[] result = [];
-                status = session.Read(ref key, ref result);
-                output = result;
-            }
-        }
-
-        if (status.IsPending)
-        {
+        var value = space.Read(key, out var faulted);
+        if (faulted)
             faultAccounting.PageFaults++;
-            output = null;
-            session.CompletePendingWithOutputs(out var outputs, wait: true);
-            using (outputs)
-            {
-                while (outputs.Next())
-                {
-                    if (outputs.Current.Status.Found)
-                        output = outputs.Current.Output;
-                }
-            }
-
-            return output;
-        }
-
-        return status.Found ? output : null;
-    }
-
-    private static void UpsertValue(
-        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        ReadOnlySpan<byte> keyBytes,
-        ReadOnlySpan<byte> value)
-    {
-        unsafe
-        {
-            fixed (byte* keyPointer = keyBytes)
-            fixed (byte* valuePointer = value)
-            {
-                var key = SpanByte.FromPointer(keyPointer, keyBytes.Length);
-                var val = SpanByte.FromPointer(valuePointer, value.Length);
-                var status = session.Upsert(ref key, ref val);
-                if (status.IsPending)
-                    session.CompletePending(wait: true);
-            }
-        }
-    }
-
-    private static void DeleteValue(
-        ClientSession<SpanByte, SpanByte, SpanByte, byte[], Empty, StoreFunctions> session,
-        ReadOnlySpan<byte> keyBytes)
-    {
-        unsafe
-        {
-            fixed (byte* keyPointer = keyBytes)
-            {
-                var key = SpanByte.FromPointer(keyPointer, keyBytes.Length);
-                var status = session.Delete(ref key);
-                if (status.IsPending)
-                    session.CompletePending(wait: true);
-            }
-        }
+        return value;
     }
 
     /// <summary>
@@ -1255,17 +1071,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         return BitOperations.IsPow2(clamped) ? clamped : 1L << (64 - BitOperations.LeadingZeroCount((ulong)clamped));
     }
 
-    private static void CleanStoreFiles(string path)
-    {
-        foreach (var file in Directory.EnumerateFiles(path))
-        {
-            var name = Path.GetFileName(file);
-            if (name.StartsWith("main.hlog", StringComparison.Ordinal) || name.StartsWith("blob.hlog", StringComparison.Ordinal))
-                File.Delete(file);
-        }
-    }
-
-    /// <summary>One row's pinned bookkeeping in a paged table: which bytes-columns are out of line, and the row's indexed values.</summary>
     private sealed record DirectoryEntry(uint BlobMask, RowKey[]? IndexValues);
 
     /// <summary>
@@ -1740,43 +1545,6 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             }
 
             return overhead;
-        }
-    }
-
-    /// <summary>FASTER callbacks: reads copy the stored span out as a fresh array; writes copy the span in.</summary>
-    private sealed class StoreFunctions : FunctionsBase<SpanByte, SpanByte, SpanByte, byte[], Empty>
-    {
-        public override bool SingleReader(ref SpanByte key, ref SpanByte input, ref SpanByte value, ref byte[] dst, ref ReadInfo readInfo)
-        {
-            dst = value.ToByteArray();
-            return true;
-        }
-
-        public override bool ConcurrentReader(ref SpanByte key, ref SpanByte input, ref SpanByte value, ref byte[] dst, ref ReadInfo readInfo)
-        {
-            dst = value.ToByteArray();
-            return true;
-        }
-
-        public override bool SingleWriter(ref SpanByte key, ref SpanByte input, ref SpanByte src, ref SpanByte dst, ref byte[] output, ref UpsertInfo upsertInfo, WriteReason reason)
-            => src.TryCopyTo(ref dst);
-
-        // The in-place overwrite. dst is the existing record's value slot, sized for whatever was
-        // written before; src is the new value. TryCopyTo alone copies src's bytes but leaves the
-        // slot's serialized length unchanged, so a *shorter* new value reads back at the OLD length
-        // with a stale tail — the row grew large once and shrank, and the read returns the larger,
-        // now-wrong bytes. (That is issue #137: a blob written at 339 then rewritten at 315 read
-        // back as 339, which no longer matched the main record's declared 315, and threw out of
-        // every scan.) So a value too large for the slot goes to a fresh record (return false → the
-        // store copy-updates), and one that fits shrinks the slot's length to match before copying,
-        // so the record reads back at exactly the new length.
-        public override bool ConcurrentWriter(ref SpanByte key, ref SpanByte input, ref SpanByte src, ref SpanByte dst, ref byte[] output, ref UpsertInfo upsertInfo)
-        {
-            if (dst.Length < src.Length)
-                return false;
-            dst.ShrinkSerializedLength(src.Length);
-            src.CopyTo(ref dst);
-            return true;
         }
     }
 

@@ -7,9 +7,19 @@ namespace MelangeDB.Storage.Faster;
 /// <summary>The provider <c>UseFasterHotStore()</c> registers; <c>HotStore:Engine</c> Auto selects it by its presence.</summary>
 public sealed class FasterHotStoreProvider : IHotStoreProvider
 {
+    private readonly IPagedKvFactory _engine;
+
+    public FasterHotStoreProvider()
+        : this(FasterPagedKvFactory.Instance)
+    {
+    }
+
+    /// <summary>The paged store over another engine's key-value spaces; how a bake-off swaps FASTER out.</summary>
+    internal FasterHotStoreProvider(IPagedKvFactory engine) => _engine = engine;
+
     public HotStoreEngine Engine => HotStoreEngine.Faster;
 
-    public IHotStore Create(HotStoreContext context) => new FasterHotStore(context);
+    public IHotStore Create(HotStoreContext context) => new FasterHotStore(context, _engine);
 }
 
 /// <summary>Registers the FASTER storage engine on the MelangeDB builder.</summary>
