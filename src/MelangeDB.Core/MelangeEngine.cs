@@ -557,6 +557,13 @@ public sealed partial class MelangeEngine : IDisposable
     /// </summary>
     internal Exception? ProjectionFailure => Volatile.Read(ref _projectionFailure);
 
+    /// <summary>Test-only: puts the engine in the state a failed hot-store apply leaves it in.</summary>
+    internal void FailProjectionForTest(Exception failure)
+    {
+        Interlocked.CompareExchange(ref _projectionFailure, failure, null);
+        Volatile.Write(ref _closed, true);
+    }
+
     /// <summary>
     /// Applies a live change to the durability keys. Not a plain options copy: a policy change is
     /// a durability boundary, and the log makes everything appended under the outgoing policy

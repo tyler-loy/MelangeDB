@@ -923,6 +923,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
     }
 
+    /// <summary>Test-only: corrupts one paged row's main record in a MelangeLog space, where it lives now.</summary>
+    internal void CorruptPagedRowForTest(TableId table, in RowKey key)
+    {
+        lock (_lock)
+        {
+            ((MelangeLogPagedKv)_main).CorruptForTest(StoreKey(table, key));
+        }
+    }
+
     private byte[]? ReadRow(TableState table, in RowKey key) => ReadRow(table, table.Current, key);
 
     private byte[]? ReadRow(TableState table, TableVersion version, in RowKey key)
@@ -1038,70 +1047,97 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             return found;
         }
 
-        var entries = new DirectoryEntry?[count];
-        var mains = new byte[]?[count];
-        var mainKeys = new byte[count][];
-        var mainSlots = new int[count];
-        var mainReads = 0;
-        for (var i = 0; i < count; i++)
+        try
         {
-            rows[i] = null;
-            if (!version.Directory.TryGetValue(keys[i], out var entry))
-                continue;
-            entries[i] = entry;
-            mainKeys[mainReads] = StoreKey(table.Schema.Id, keys[i]).ToArray();
-            mainSlots[mainReads++] = i;
-        }
-
-        var mainValues = new byte[]?[mainReads];
-        table.PageFaults += _main.ReadMany(mainKeys.AsSpan(0, mainReads), mainValues);
-        for (var j = 0; j < mainReads; j++)
-            mains[mainSlots[j]] = mainValues[j];
-
-        var blobs = new Dictionary<(int Row, int Ordinal), byte[]>();
-        var blobKeys = new List<byte[]>();
-        var blobSlots = new List<(int Row, int Ordinal)>();
-        for (var i = 0; i < count; i++)
-        {
-            if (entries[i] is not { } entry || entry.BlobMask == 0 || mains[i] is null)
-                continue;
-            var mask = entry.BlobMask;
-            for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+            var entries = new DirectoryEntry?[count];
+            var mains = new byte[]?[count];
+            var mainKeys = new byte[count][];
+            var mainSlots = new int[count];
+            var mainReads = 0;
+            for (var i = 0; i < count; i++)
             {
-                if ((mask & 1) == 0)
+                rows[i] = null;
+                if (!version.Directory.TryGetValue(keys[i], out var entry))
                     continue;
-                blobKeys.Add(BlobKey(table.Schema.Id, keys[i], ordinal).ToArray());
-                blobSlots.Add((i, ordinal));
+                entries[i] = entry;
+                mainKeys[mainReads] = StoreKey(table.Schema.Id, keys[i]).ToArray();
+                mainSlots[mainReads++] = i;
             }
-        }
 
-        if (blobKeys.Count > 0)
+            var mainValues = new byte[]?[mainReads];
+            table.PageFaults += _main.ReadMany(mainKeys.AsSpan(0, mainReads), mainValues);
+            for (var j = 0; j < mainReads; j++)
+                mains[mainSlots[j]] = mainValues[j];
+
+            var blobs = new Dictionary<(int Row, int Ordinal), byte[]>();
+            var blobKeys = new List<byte[]>();
+            var blobSlots = new List<(int Row, int Ordinal)>();
+            for (var i = 0; i < count; i++)
+            {
+                if (entries[i] is not { } entry || entry.BlobMask == 0 || mains[i] is null)
+                    continue;
+                var mask = entry.BlobMask;
+                for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+                {
+                    if ((mask & 1) == 0)
+                        continue;
+                    blobKeys.Add(BlobKey(table.Schema.Id, keys[i], ordinal).ToArray());
+                    blobSlots.Add((i, ordinal));
+                }
+            }
+
+            if (blobKeys.Count > 0)
+            {
+                var blobValues = new byte[]?[blobKeys.Count];
+                table.PageFaults += _blob!.ReadMany(blobKeys.ToArray(), blobValues);
+                for (var j = 0; j < blobValues.Length; j++)
+                {
+                    if (blobValues[j] is { } payload)
+                        blobs[blobSlots[j]] = payload;
+                }
+            }
+
+            for (var i = 0; i < count; i++)
+            {
+                if (entries[i] is not { } entry)
+                    continue;
+                try
+                {
+                    rows[i] = JoinRow(table, keys[i], entry, mains[i], i, blobs);
+                    found++;
+                }
+                catch (InvalidDataException fault) when (skipUnreadable)
+                {
+                    LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
+                }
+            }
+
+            return found;
+        }
+        catch (InvalidDataException) when (skipUnreadable)
         {
-            var blobValues = new byte[]?[blobKeys.Count];
-            table.PageFaults += _blob!.ReadMany(blobKeys.ToArray(), blobValues);
-            for (var j = 0; j < blobValues.Length; j++)
+            // An engine that verifies records as it reads them (MelangeLog's checksums) fails a
+            // batched read whole when one record is bad. A scan skips unreadable rows, not batches:
+            // read this batch again a row at a time, so only the bad one is logged and left out.
+            found = 0;
+            for (var i = 0; i < count; i++)
             {
-                if (blobValues[j] is { } payload)
-                    blobs[blobSlots[j]] = payload;
-            }
-        }
+                rows[i] = null;
+                try
+                {
+                    rows[i] = ReadRow(table, version, keys[i]);
+                }
+                catch (InvalidDataException fault)
+                {
+                    LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
+                }
 
-        for (var i = 0; i < count; i++)
-        {
-            if (entries[i] is not { } entry)
-                continue;
-            try
-            {
-                rows[i] = JoinRow(table, keys[i], entry, mains[i], i, blobs);
-                found++;
+                if (rows[i] is not null)
+                    found++;
             }
-            catch (InvalidDataException fault) when (skipUnreadable)
-            {
-                LogMessages.UnreadableRowSkipped(_logger, table.Schema.Name, keys[i].ToString(), fault.Message);
-            }
-        }
 
-        return found;
+            return found;
+        }
     }
 
     private static byte[] JoinRow(

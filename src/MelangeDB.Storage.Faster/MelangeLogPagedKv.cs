@@ -501,6 +501,30 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         _flushDone.Dispose();
     }
 
+    /// <summary>
+    /// Fault injection: flips a byte of the key's record checksum where the record lives now, in the
+    /// ring or in its segment file (which the map sees). Returns whether the record had left memory.
+    /// </summary>
+    internal bool CorruptForTest(ReadOnlySpan<byte> key)
+    {
+        var entry = Find(Hash(key));
+        if (entry == null)
+            throw new KeyNotFoundException();
+        var at = AddressOf(entry->Packed) + 12;
+        if (at >= _headAddress)
+        {
+            RingPointer(at)[0] ^= 0xFF;
+            return false;
+        }
+
+        var segment = SegmentEntry(at >> _segmentBits)!;
+        Span<byte> one = stackalloc byte[1];
+        RandomAccess.Read(segment.Handle, one, at & _segmentOffsetMask);
+        one[0] ^= 0xFF;
+        RandomAccess.Write(segment.Handle, one, at & _segmentOffsetMask);
+        return true;
+    }
+
     // ---- Compaction ---------------------------------------------------------------------------
 
     public void PrepareCompactionStep()

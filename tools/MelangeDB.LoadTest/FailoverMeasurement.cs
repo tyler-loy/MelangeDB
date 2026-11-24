@@ -58,7 +58,7 @@ internal static class FailoverMeasurement
         var failureTimeout = options.FailureTimeoutMs ?? tuning.FailureTimeoutMs;
         output.WriteLine(
             $"Failover: rows [{string.Join(", ", options.FailoverRows)}] x {options.RowBytes} B, tail {options.TailRecords} records, " +
-            $"{options.Repeat} kill(s) each, {options.Clients} client(s) at {options.TickHz} Hz, hot store {options.HotStore}, " +
+            $"{options.Repeat} kill(s) each, {options.Clients} client(s) at {options.TickHz} Hz, hot store {options.HotStore} ({options.PagedEngine}), " +
             $"heartbeat {heartbeat} ms, failure timeout {failureTimeout} ms (deadline check every {Math.Clamp(failureTimeout / 20, 25, 250)} ms), " +
             $"fast failover {(options.FastFailover ? "on" : "off")}, replicas {options.Replicas}.");
         output.WriteLine(
@@ -137,7 +137,7 @@ internal static class FailoverMeasurement
             var falseDeaths = liveness.NodesDeclaredDead - runs.Count;
             var windows = runs.Select(static r => r.ServerWindowMs).ToList();
             var line =
-                FormattableString.Invariant($"FAILOVER rows={rows} row_bytes={options.RowBytes} tail={options.TailRecords} hot_store={options.HotStore} replicas={options.Replicas} ") +
+                FormattableString.Invariant($"FAILOVER rows={rows} row_bytes={options.RowBytes} tail={options.TailRecords} hot_store={options.HotStore} paged_engine={options.PagedEngine} replicas={options.Replicas} ") +
                 FormattableString.Invariant($"promoted={runs.Count(static r => r.Promoted)}/{runs.Count} replica_behind_records={Range(runs.Select(static r => (double)r.ReplicaBehind))} ") +
                 FormattableString.Invariant($"kills={runs.Count} shard_dir_mib={footprint / (1024.0 * 1024):F1} ") +
                 FormattableString.Invariant($"detect_ms={Range(runs.Select(static r => r.DetectMs))} ") +
@@ -324,6 +324,7 @@ internal static class FailoverMeasurement
         engineOptions.CommitLog.Path = Path.Combine(shardDirectory, "log");
         engineOptions.HotStore.Path = Path.Combine(shardDirectory, "hot");
         engineOptions.HotStore.Engine = options.HotStore == "faster" ? HotStoreEngine.Faster : HotStoreEngine.InMemory;
+        engineOptions.HotStore.PagedEngine = Enum.Parse<PagedEngine>(LoadTestServer.PagedEngineName(options.PagedEngine));
         engineOptions.Events.DeadLetterPath = Path.Combine(shardDirectory, "deadletter");
         engineOptions.Snapshots.IntervalTransactions = 1_000_000_000_000;
         engineOptions.Residency.ReportOnStartup = false;

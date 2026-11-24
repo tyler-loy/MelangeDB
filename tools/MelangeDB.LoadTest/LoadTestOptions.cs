@@ -88,6 +88,9 @@ public sealed class LoadTestOptions
     /// <summary>HotStore:Engine for every node: "inmemory" or "faster".</summary>
     public string HotStore { get; set; } = "inmemory";
 
+    /// <summary>HotStore:PagedEngine for every node, when <see cref="HotStore"/> is "faster": "faster", "melangelog" or "tsavorite".</summary>
+    public string PagedEngine { get; set; } = "faster";
+
     // ---- failover: the reassignment-window measurement ----
 
     /// <summary>Ballast rows on the measured shard, one run per entry — the shard-heat sweep.</summary>
@@ -286,6 +289,15 @@ public sealed class LoadTestOptions
                         }
 
                         options.HotStore = value;
+                        break;
+                    case "--paged-engine":
+                        if (value is not ("faster" or "melangelog" or "tsavorite"))
+                        {
+                            error.WriteLine($"--paged-engine takes 'faster', 'melangelog' or 'tsavorite', not '{value}'.");
+                            return null;
+                        }
+
+                        options.PagedEngine = value;
                         break;
                     case "--rows":
                         options.FailoverRows = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)

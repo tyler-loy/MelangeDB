@@ -65,6 +65,13 @@ All packages ship together at one version; there is no per-package versioning. S
 
 - **Promoting a paged table to resident left its paged records in the log** until the next restart.
   They are now deleted as the table moves.
+- **A shard node now reopens a shard whose engine closed itself to writes** (its hot store failed to
+  apply a record, or its commit log was poisoned). The node kept the lease and the hub kept routing
+  to a shard that refused every write; now the node closes it and reopens it on the next heartbeat,
+  rebuilding it from its log, as a restart would, for that shard alone (EventId 1765).
+- **A scan failed whole on one unreadable paged row under MelangeLog.** Its batched read throws on
+  a record that fails its checksum; the store now reads that batch again a row at a time and skips
+  only the bad row (EventId 1511), as it does for FASTER.
 - **A hot store that failed to apply a committed record left the database taking writes.** The
   record was already in the commit log, the caller got a generic error, and the next commit
   replayed into the part-applied store. Now the database closes to writes, as it does when the log

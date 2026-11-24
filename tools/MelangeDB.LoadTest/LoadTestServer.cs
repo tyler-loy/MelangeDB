@@ -84,7 +84,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
             $"Serve: hub + {_options.Nodes} shard node(s), world {_options.World} " +
             $"({_options.WorldChunksX}x{_options.WorldChunksY} chunks), band {_options.BandChunks}, " +
             $"fsync {_options.Fsync}{(_options.Fsync == "interval" ? $" ({_options.FsyncIntervalMs} ms)" : string.Empty)}, " +
-            $"hot store {_options.HotStore}, heartbeat {HeartbeatMs} ms, failure timeout {FailureTimeoutMs} ms.");
+            $"hot store {_options.HotStore}{(_options.HotStore == "faster" ? $" ({_options.PagedEngine})" : "")}, heartbeat {HeartbeatMs} ms, failure timeout {FailureTimeoutMs} ms.");
 
         // FreePort is allocate-close-rebind, so another process can win a port in the gap and the
         // real bind then fails — one stolen port out of the dozens churning on a busy CI machine
@@ -331,6 +331,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
             ["MelangeDb:Cluster:HeartbeatIntervalMs"] = HeartbeatMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:FailureTimeoutMs"] = FailureTimeoutMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:HotStore:Engine"] = _options.HotStore == "faster" ? "Faster" : "InMemory",
+            ["MelangeDb:HotStore:PagedEngine"] = PagedEngineName(_options.PagedEngine),
             ["MelangeDb:Cluster:BorderBandChunks"] = _options.BandChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMarginChunks"] = _options.MarginChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMinIntervalMs"] = _options.HandoffMinIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
@@ -589,4 +590,12 @@ internal sealed class LoadTestServer : IAsyncDisposable
             await app.DisposeAsync().ConfigureAwait(false);
         }
     }
+
+    /// <summary>The <c>HotStore:PagedEngine</c> value for a <c>--paged-engine</c> flag.</summary>
+    internal static string PagedEngineName(string flag) => flag switch
+    {
+        "melangelog" => "MelangeLog",
+        "tsavorite" => "Tsavorite",
+        _ => "Faster",
+    };
 }
