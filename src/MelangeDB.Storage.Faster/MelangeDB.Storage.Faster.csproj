@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Description>IHotStore backed by Microsoft.FASTER.Core, providing a hybrid log with spill-to-disk. See DESIGN.md section 7 for why this is FASTER rather than Tsavorite.</Description>
+    <Description>The paged IHotStore: a hybrid log with spill-to-disk, on Microsoft.FASTER.Core by default or MelangeDB's own log engine (HotStore:PagedEngine). See docs/design/hot-store-bakeoff.md.</Description>
   </PropertyGroup>
 
   <ItemGroup>
@@ -12,10 +12,13 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="MelangeDB.Storage.Faster.Tests" />
+    <InternalsVisibleTo Include="MelangeDB.HotStoreBakeoff" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.FASTER.Core" Version="2.6.5" />
+    <!-- XxHash3, for melangelog's index and record checksums. -->
+    <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
   </ItemGroup>
 
 </Project>

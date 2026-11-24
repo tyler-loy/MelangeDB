@@ -229,6 +229,24 @@ public enum HotStoreEngine
     Faster,
 }
 
+/// <summary>
+/// The storage engine under the paged store (<c>HotStore:PagedEngine</c>), when <c>HotStore:Engine</c>
+/// selects it. The key directory, indexes, residency and read views are the same for each; only where
+/// a paged row's bytes live changes. The store is rebuilt from the commit log on every start, so
+/// switching engines is a restart, with nothing to migrate.
+/// </summary>
+public enum PagedEngine
+{
+    /// <summary>Microsoft.FASTER.Core, the default. Unmaintained upstream since August 2026.</summary>
+    Faster,
+
+    /// <summary>
+    /// MelangeDB's own append-only log: in-place updates in memory, blind appends otherwise, and reads
+    /// of flushed records through memory-mapped segments. Preview; the likely successor to FASTER.
+    /// </summary>
+    MelangeLog,
+}
+
 /// <summary>Options for the event bus (<c>MelangeDb:Events:*</c>).</summary>
 public sealed class EventsOptions
 {
@@ -743,6 +761,12 @@ public sealed class HotStoreOptions
 
     /// <summary>Which storage engine backs the hot tier; see <see cref="HotStoreEngine"/>.</summary>
     public HotStoreEngine Engine { get; set; } = HotStoreEngine.Auto;
+
+    /// <summary>
+    /// The engine under the paged store, when <see cref="Engine"/> selects it; see
+    /// <see cref="Core.PagedEngine"/>. Read once, when the store is created.
+    /// </summary>
+    public PagedEngine PagedEngine { get; set; } = PagedEngine.Faster;
 
     /// <summary>
     /// Cap on the paging buffer pool in bytes. <b>Excludes</b> resident tables, which are

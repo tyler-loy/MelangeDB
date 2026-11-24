@@ -108,5 +108,5 @@ internal sealed class StoreHarness : IDisposable
             new SchemaRegistry(new MelangeDB.Generated.MelangeModel().Tables().Where(t => _tables.Contains(t.RowType))),
             loggerFactory: null,
             _timeProvider,
-            Kind == StoreKind.Faster ? new FasterHotStoreProvider() : null);
+            Kind == StoreKind.Faster ? TestEngine.Provider() : null);
 }

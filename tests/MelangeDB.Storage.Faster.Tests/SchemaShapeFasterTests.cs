@@ -52,7 +52,7 @@ public class SchemaShapeFasterTests : IDisposable
     };
 
     private static MelangeEngine Boot(MelangeDbOptions options, TableSchema table) =>
-        new(options, new SchemaRegistry([table]), null, null, new FasterHotStoreProvider());
+        new(options, new SchemaRegistry([table]), null, null, TestEngine.Provider());
 
     private static TableSchema Declare<TRow>() where TRow : struct
     {

@@ -83,6 +83,19 @@ jobs:
             exit 1
           fi
 
+      # The store suite once more per selectable paged engine (HotStore:PagedEngine). The Release
+      # run above covers FASTER, the default.
+      - name: Test (Release, paged store on each engine)
+        shell: bash
+        run: |
+          for engine in melangelog; do
+            MELANGE_TEST_PAGED_ENGINE=$engine dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-release-engines.log
+          done
+          if grep -E 'Skipped:\s*[1-9]' test-release-engines.log; then
+            echo '::error::Skipped tests detected in the per-engine run; CI requires zero skips.'
+            exit 1
+          fi
+
       - name: Build (Debug, warnings as errors)
         run: dotnet build MelangeDB.slnx -c Debug --no-restore
 

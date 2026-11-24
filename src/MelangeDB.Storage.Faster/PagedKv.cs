@@ -1,3 +1,5 @@
+using MelangeDB.Core;
+
 namespace MelangeDB.Storage.Faster;
 
 /// <summary>
@@ -62,4 +64,15 @@ internal interface IPagedKvFactory
     /// size a hash index up front.
     /// </summary>
     IPagedKv Open(string directory, PagedKvSpace space, long memoryBudgetBytes, long hashBucketsHint);
+}
+
+/// <summary>The engine behind each <see cref="PagedEngine"/> value.</summary>
+internal static class PagedEngines
+{
+    public static IPagedKvFactory For(PagedEngine engine) => engine switch
+    {
+        PagedEngine.Faster => FasterPagedKvFactory.Instance,
+        PagedEngine.MelangeLog => new MelangeLogPagedKvFactory(),
+        _ => throw new ArgumentOutOfRangeException(nameof(engine), engine, "Not a paged engine this build knows."),
+    };
 }

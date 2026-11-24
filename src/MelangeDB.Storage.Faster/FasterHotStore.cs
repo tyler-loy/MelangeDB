@@ -9,8 +9,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace MelangeDB.Storage.Faster;
 
 /// <summary>
-/// The FASTER-backed hot store: paged tables live in FASTER hybrid logs whose in-memory portion is
-/// capped by <c>HotStore:MemoryBudgetBytes</c>, so the working set bounds memory instead of the
+/// The paged hot store: paged tables live in a storage engine's key-value spaces (FASTER hybrid logs
+/// by default; <c>HotStore:PagedEngine</c> selects another, see <see cref="IPagedKv"/>) whose
+/// in-memory portion is capped by <c>HotStore:MemoryBudgetBytes</c>, so the working set bounds memory instead of the
 /// dataset; resident tables are pinned wholly in managed memory outside that budget. Large
 /// <c>byte[]</c> payloads are stored out of line in a second hybrid log, so a blob table's main
 /// records stay small and scanning by key faults no blobs. Store-owned indexes: the key directory
@@ -67,6 +68,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         ArgumentNullException.ThrowIfNull(engine);
         _registry = context.Schema;
         _logger = context.LoggerFactory.CreateLogger<FasterHotStore>();
+        EngineName = engine.EngineName;
+        LogMessages.PagedEngine(_logger, engine.EngineName);
         _autoThresholdBytes = context.Options.Residency.AutoThresholdBytes;
 
         var anyBlobColumns = context.Schema.Tables.Any(RowBlobSplitter.HasBytesColumns);
@@ -93,6 +96,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     }
 
     public ulong AppliedLsn { get; private set; }
+
+    /// <summary>The engine under the paged tables (EventId 1512 logs it at construction).</summary>
+    internal string EngineName { get; }
 
     public void LoadSnapshot(ulong lsn, IEnumerable<SnapshotRow> rows)
     {
@@ -1550,6 +1556,14 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     private static class LogMessages
     {
+        private static readonly Action<ILogger, string, Exception?> PagedEngineMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Information,
+                new EventId(1512, "PagedEngine"),
+                "The paged hot store keeps paged rows in the {Engine} engine (HotStore:PagedEngine).");
+
+        public static void PagedEngine(ILogger logger, string engine) => PagedEngineMessage(logger, engine, null);
+
         private static readonly Action<ILogger, string, long, long, Exception?> AutoResidencyDemotedMessage =
             LoggerMessage.Define<string, long, long>(
                 LogLevel.Warning,

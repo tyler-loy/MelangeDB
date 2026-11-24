@@ -10,7 +10,22 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default.
+  `MelangeLog`, a new preview engine, is MelangeDB's own append-only log. A record still in memory
+  is updated in place; otherwise the new version is appended without reading the old one. Records
+  that have left memory are read through memory-mapped segment files, and each record carries a
+  checksum.
+  - **Why:** FASTER has been unmaintained upstream since August 2026.
+  - **The bake-off:** FASTER, Tsavorite, LMDB, RocksDB, ZoneTree and MelangeLog were compared under a
+    1 GiB memory cap ([docs/design/hot-store-bakeoff.md](docs/design/hot-store-bakeoff.md)).
+    MelangeLog matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on writes.
+  - **Likely future default.** MelangeLog is expected to become the default once it can reclaim log
+    space (#287) and flush in the background.
+  - **Switching is a restart.** The store is rebuilt from the commit log on every start, so there is
+    nothing to migrate in either direction.
+  - **Logging:** EventId 1512 names the engine in use.
 
 ## [0.4.1] — 2026-11-23
 
