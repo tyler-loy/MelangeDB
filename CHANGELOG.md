@@ -27,6 +27,17 @@ All packages ship together at one version; there is no per-package versioning. S
   soak, the shards just outside the world, which take only border-band mirrors, grew their logs by
   several GiB an hour while the busy shards held flat. The new **`Snapshots:IntervalBytes`** (default
   256 MiB, `0` off) also snapshots once that much log has been appended since the last snapshot.
+### Changed
+
+- **Node links carry row data as binary, not base64 JSON.** Border batches, replica batches, handoff
+  rows, event payloads and bulk rows now travel after a frame's JSON in a binary attachment, encoded
+  in one pass into a bounded buffer pool.
+  - **Why:** each row went over as base64, serialized twice and staged in the shared `ArrayPool`, whose
+    per-thread caches held over 300 MiB under a paging soak, outside every memory budget.
+  - **Measured** (`link-bench`, a 500-row batch of 1 KiB rows): 4.5 ms to 0.49 ms a round trip, 4.5 MB
+    to 1.1 MB allocated, 763 KB to 520 KB on the wire, and nothing held after a full collection.
+  - **Mixed versions:** a node advertises binary frames at authentication and each end switches only
+    once the other has said it reads them, so an older hub or node keeps exchanging JSON.
 - **A primary key too long for MelangeLog no longer makes the database unstartable (#307).**
   - **What happened:** MelangeLog holds keys of at most 1 KiB. A longer one reached the commit log,
     failed when the store applied it (closing the database to writes), and failed again on every
@@ -59,6 +70,8 @@ All packages ship together at one version; there is no per-package versioning. S
   appends, flushing and compaction; the serve console reports the hot store's log, live and
   reclaimed bytes. `all` now passes `--data` to its serve process. Results:
   [docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#paging-soak--melangelog-against-faster-under-constant-rewrites-2026-11-24).
+- **`MelangeDB.LoadTest link-bench`** measures the node link alone: round trip, allocation, wire bytes
+  and retained heap per message shape, in both frame formats.
 - **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default,
   and two preview engines join it.
   - **Why:** FASTER has been unmaintained upstream since August 2026.
