@@ -1,0 +1,304 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+
+namespace Tsavorite.core
+{
+    public unsafe partial class TsavoriteKV<TStoreFunctions, TAllocator> : TsavoriteBase
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        /// <summary>
+        /// Delete operation. Replaces the value corresponding to 'key' with tombstone.
+        /// If at head, tries to remove item from hash chain
+        /// </summary>
+        /// <param name="key">Key of the record to be deleted.</param>
+        /// <param name="keyHash"></param>
+        /// <param name="userContext">User context for the operation, in case it goes pending.</param>
+        /// <param name="operationState">Pending context used internally to store the context of the operation.</param>
+        /// <param name="sessionFunctions">Callback functions.</param>
+        /// <returns>
+        /// <list type="table">
+        ///     <listheader>
+        ///     <term>Value</term>
+        ///     <term>Description</term>
+        ///     </listheader>
+        ///     <item>
+        ///     <term>SUCCESS</term>
+        ///     <term>The value has been successfully deleted</term>
+        ///     </item>
+        ///     <item>
+        ///     <term>RETRY_LATER</term>
+        ///     <term>Cannot  be processed immediately due to system state. Add to pending list and retry later</term>
+        ///     </item>
+        ///     <item>
+        ///     <term>CPR_SHIFT_DETECTED</term>
+        ///     <term>A shift in version has been detected. Synchronize immediately to avoid violating CPR consistency.</term>
+        ///     </item>
+        /// </list>
+        /// </returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal OperationStatus InternalDelete<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, long keyHash, ref TContext userContext,
+                            ref OperationState<TInput, TOutput, TContext> operationState, TSessionFunctionsWrapper sessionFunctions)
+            where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            OperationStackContext<TStoreFunctions, TAllocator> stackCtx = new(keyHash);
+
+            // operationState.keyHash is NOT written here: Delete never goes pending, so keyHash (a pending-only field) is dead.
+            // operationState.logicalAddress is NOT written here: it defaults to 0 (== kInvalidAddress) for a fresh operationState;
+            //   the in-memory IPDelete and CreateNewRecordDelete paths overwrite it on success, and HandleRetryStatus resets it on retry.
+
+            if (sessionFunctions.Ctx.phase == Phase.IN_PROGRESS_GROW)
+                SplitBuckets(stackCtx.hei.hash);
+
+            if (!FindTagAndTryEphemeralXLock<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, out OperationStatus status))
+                return status;
+
+            LogRecord srcLogRecord = default;
+
+            DeleteInfo deleteInfo = new()
+            {
+                Version = sessionFunctions.Ctx.version,
+                SessionID = sessionFunctions.Ctx.sessionID
+            };
+
+            // We must use try/finally to ensure unlocking even in the presence of exceptions. The inner try/finally ensures
+            // the ephemeral X-lock on the hash bucket is released even if a Post*Operation callback (e.g. AOF append) throws.
+            try
+            {
+                // Search the entire in-memory region; this lets us find a tombstoned record in the immutable region, avoiding unnecessarily adding one.
+                if (!TryFindRecordForUpdate(key, ref stackCtx, hlogBase.HeadAddress, out status))
+                    return status;
+
+                // Note: Delete does not track operationState.InitialAddress because we don't have an InternalContinuePendingDelete
+
+                deleteInfo.Address = stackCtx.recSrc.LogicalAddress;
+                deleteInfo.KeyHash = stackCtx.hei.hash;
+
+                if (stackCtx.recSrc.HasReadCacheSrc)
+                {
+                    // Use the readcache record as the CopyUpdater source.
+                    srcLogRecord = stackCtx.recSrc.CreateLogRecord();
+                    goto CreateNewRecord;
+                }
+
+                // Check for CPR consistency after checking if source is readcache.
+                if (sessionFunctions.Ctx.phase != Phase.REST)
+                {
+                    var latchDestination = CheckCPRConsistencyDelete(sessionFunctions.Ctx.phase, ref stackCtx, ref status);
+                    switch (latchDestination)
+                    {
+                        case LatchDestination.Retry:
+                            goto Done;
+                        case LatchDestination.CreateNewRecord:
+                            if (stackCtx.recSrc.HasMainLogSrc)
+                                srcLogRecord = stackCtx.recSrc.CreateLogRecord();
+                            goto CreateNewRecord;
+                        default:
+                            Debug.Assert(latchDestination == LatchDestination.NormalProcessing, "Unknown latchDestination value; expected NormalProcessing");
+                            break;
+                    }
+                }
+
+                if (stackCtx.recSrc.LogicalAddress >= hlogBase.ReadOnlyAddress)
+                {
+                    srcLogRecord = stackCtx.recSrc.CreateLogRecord();
+
+                    operationState.logicalAddress = stackCtx.recSrc.LogicalAddress;
+
+                    // If we already have a deleted record, there's nothing to do.
+                    if (srcLogRecord.Info.Tombstone)
+                        return OperationStatus.NOTFOUND;
+
+                    // Mutable Region: Update the record in-place
+
+                    // Evaluate expiration before InPlaceDeleter, which may clear the optionals. An expired record is still deleted
+                    // (to reclaim it) but is reported as Expired so the caller does not count it as an existing key.
+                    var expired = IsExpiredRecord(ref srcLogRecord);
+
+                    // DeleteInfo's lengths are filled in and GetRecordLengths and SetDeletedValueLength are called inside InPlaceDeleter.
+                    if (sessionFunctions.InPlaceDeleter(ref srcLogRecord, ref deleteInfo))
+                    {
+                        // Dispose resources and decrement value heap BEFORE setting Tombstone,
+                        // so that GetValueHeapMemorySize returns the correct pre-tombstone value.
+                        OnDispose(ref srcLogRecord, DisposeReason.Deleted);
+
+                        srcLogRecord.InfoRef.SetTombstone();
+                        srcLogRecord.InfoRef.SetModified();
+
+                        // Try to transfer the record from the tag chain to the free record pool iff previous address points to invalid address.
+                        // Otherwise an earlier record for this key could be reachable again.
+                        if (CanElide<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, srcLogRecord.Info))
+                            HandleRecordElision<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, ref srcLogRecord);
+
+                        status = OperationStatusUtils.AdvancedOpCode(OperationStatus.SUCCESS, expired ? StatusCode.InPlaceUpdatedRecord | StatusCode.Expired : StatusCode.InPlaceUpdatedRecord);
+                        goto Done;
+                    }
+
+                    if (deleteInfo.Action == DeleteAction.CancelOperation)
+                    {
+                        status = OperationStatus.CANCELED;
+                        goto Done;
+                    }
+
+                    // Could not delete in place for some reason - create new record.
+                    goto CreateNewRecord;
+                }
+                else if (stackCtx.recSrc.HasMainLogSrc)
+                {
+                    // If we already have a deleted record, there's nothing to do.
+                    srcLogRecord = stackCtx.recSrc.CreateLogRecord();
+                    if (srcLogRecord.Info.Tombstone)
+                        return OperationStatus.NOTFOUND;
+                    goto CreateNewRecord;
+                }
+
+                // Either on-disk or no record exists - drop through to create new record.
+                Debug.Assert(!sessionFunctions.IsTransactionalLocking || LockTable.IsLockedExclusive(ref stackCtx.hei), "A Transactional-session Delete() of an on-disk or non-existent key requires a LockTable lock");
+
+            CreateNewRecord:
+                // Immutable region or new record
+                status = CreateNewRecordDelete(key, ref srcLogRecord, ref operationState, sessionFunctions, ref stackCtx, ref deleteInfo);
+
+                // We should never return "SUCCESS" for a new record operation: it returns NOTFOUND on success.
+                Debug.Assert(OperationStatusUtils.IsAppend(status) || OperationStatusUtils.BasicOpCode(status) != OperationStatus.SUCCESS);
+                goto Done;
+            }
+            finally
+            {
+                stackCtx.HandleNewRecordOnException(this);
+                try
+                {
+                    sessionFunctions.PostDeleteOperation(key, ref deleteInfo, epoch);
+                }
+                finally
+                {
+                    EphemeralXUnlock<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx);
+                }
+            }
+
+        Done:
+            return status;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool IsExpiredRecord(ref LogRecord logRecord)
+            => logRecord.DataHeader.HasExpiration && logRecord.Expiration < System.DateTimeOffset.UtcNow.Ticks;
+
+        private LatchDestination CheckCPRConsistencyDelete(Phase phase, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, ref OperationStatus status)
+        {
+            // This is the same logic as Upsert; neither goes pending.
+            return CheckCPRConsistencyUpsert(phase, ref stackCtx, ref status);
+        }
+
+        /// <summary>
+        /// Create a new tombstoned record for Delete
+        /// </summary>
+        /// <param name="key">The record Key</param>
+        /// <param name="srcLogRecord">The source record, if <paramref name="stackCtx"/>.<see cref="RecordSource{TStoreFunctions, TAllocator}.HasInMemorySrc"/> and
+        /// it is either too small or is in readonly region, or is in raadcache</param>
+        /// <param name="operationState">Information about the operation context</param>
+        /// <param name="sessionFunctions">The current session</param>
+        /// <param name="stackCtx">Contains the <see cref="HashEntryInfo"/> and <see cref="RecordSource{TStoreFunctions, TAllocator}"/> structures for this operation,
+        ///     and allows passing back the newLogicalAddress for invalidation in the case of exceptions.</param>
+        /// <param name="deleteInfo">DeleteInfo</param>
+        private OperationStatus CreateNewRecordDelete<TKey, TInput, TOutput, TContext, TSessionFunctionsWrapper>(TKey key, ref LogRecord srcLogRecord, ref OperationState<TInput, TOutput, TContext> operationState,
+                TSessionFunctionsWrapper sessionFunctions, ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, ref DeleteInfo deleteInfo)
+            where TKey : IKey, allows ref struct
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+        {
+            // Capture expiration of the in-memory source (mutable-region, readonly-region or readcache) before it is disposed
+            var srcExpired = stackCtx.recSrc.HasInMemorySrc && IsExpiredRecord(ref srcLogRecord);
+
+            var sizeInfo = hlog.GetDeleteRecordSize(key);
+            Debug.Assert(!sizeInfo.FieldInfo.HasETag && !sizeInfo.FieldInfo.HasExpiration, $"Delete new-record sizeInfo should not have HasETag {sizeInfo.FieldInfo.HasETag} or HasExpiration {sizeInfo.FieldInfo.HasExpiration}");
+
+            AllocateOptions allocOptions = new()
+            {
+                recycle = true,
+                elideSourceRecord = stackCtx.recSrc.HasMainLogSrc && CanElide<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, srcLogRecord.Info)
+            };
+
+            // If the source record is elidable we will detach it from the tag chain below, after the CAS, by carrying its
+            // PreviousAddress on the new tombstone. CanElide() excludes checkpoint-frozen records.
+            if (!TryAllocateRecord(sessionFunctions, ref operationState, ref stackCtx, ref sizeInfo, allocOptions, out var newLogicalAddress, out var newPhysicalAddress, out var status))
+                return status;
+
+            var newLogRecord = WriteNewRecordInfo(key, hlogBase, newLogicalAddress, newPhysicalAddress, in sizeInfo, sessionFunctions.Ctx.InNewVersion, previousAddress: stackCtx.recSrc.LatestLogicalAddress);
+            if (allocOptions.elideSourceRecord)
+                newLogRecord.InfoRef.PreviousAddress = srcLogRecord.Info.PreviousAddress;
+            newLogRecord.InfoRef.SetTombstone();
+            stackCtx.SetNewRecord(newLogicalAddress);
+
+            deleteInfo.Address = newLogicalAddress;
+            deleteInfo.KeyHash = stackCtx.hei.hash;
+
+            if (!sessionFunctions.InitialDeleter(ref newLogRecord, ref deleteInfo))
+            {
+                // This record was allocated with a minimal Value size (unless it was a revivified larger record) so there's no room for a Filler,
+                // but we may want it for a later Delete, or for insert with a smaller Key.
+                stackCtx.SetNewRecordInvalid(ref newLogRecord.InfoRef);
+                if (!RevivificationManager.UseFreeRecordPool || !TryTransferToFreeList<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, newLogicalAddress, ref newLogRecord))
+                    OnDispose(ref newLogRecord, DisposeReason.InsertAbandoned);
+
+                if (deleteInfo.Action == DeleteAction.CancelOperation)
+                    return OperationStatus.CANCELED;
+                return OperationStatus.NOTFOUND;    // But not CreatedRecord
+            }
+
+            newLogRecord.InfoRef.SetTombstone();
+
+            // Insert the new record by CAS'ing it into the hash entry (this also detaches/drops any read-cache prefix).
+            var success = CASRecordIntoChain(newLogicalAddress, ref newLogRecord, ref stackCtx);
+            if (success)
+            {
+                // Track key overflow internally — session functions only track value heap.
+                if (newLogRecord.DataHeader.KeyIsOverflow)
+                    hlogBase.logSizeTracker?.IncrementSize(newLogRecord.KeyOverflow.HeapMemorySize);
+
+                // Note that this is the new logicalAddress; we have not retrieved the old one if it was below HeadAddress, and thus
+                // we do not know whether 'logicalAddress' belongs to 'key' or is a collision.
+                sessionFunctions.PostInitialDeleter(ref newLogRecord, ref deleteInfo);
+
+                // Success should always Seal the old record. This may be readcache or readonly, which is OK.
+                if (allocOptions.elideSourceRecord)
+                {
+                    // The CAS above replaced the source in the HashBucketEntry with a tombstone that carries the source's
+                    // PreviousAddress, so the source is now detached from the tag chain and can be freelisted.
+                    // Fire the Deleted disposal first so triggers keyed on deletion (e.g. range-index file cleanup and
+                    // Vector Set deletion) still run; that releases and un-accounts the value. The elide/freelist disposal
+                    // below then releases the key, which eviction would otherwise have accounted for.
+                    // CanElide() already excluded checkpoint-frozen records, so no IsFrozen check is needed here.
+                    OnDispose(ref srcLogRecord, DisposeReason.Deleted);
+
+                    srcLogRecord.InfoRef.SealAndInvalidate();    // The record was elided, so Invalidate
+
+                    if (stackCtx.recSrc.LogicalAddress >= GetMinRevivifiableAddress())
+                        _ = TryTransferToFreeList<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, stackCtx.recSrc.LogicalAddress, ref srcLogRecord);
+                    else
+                        OnDispose(ref srcLogRecord, DisposeReason.Elided);
+                }
+                else if (stackCtx.recSrc.HasMainLogSrc)
+                {
+                    // Dispose the superseded source record's resources, unless a checkpoint has frozen it.
+                    OnDisposeSupersededSource<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, ref srcLogRecord);
+                    srcLogRecord.InfoRef.Seal();    // Not elided so Seal without invalidate
+                }
+
+                stackCtx.ClearNewRecord();
+                operationState.logicalAddress = newLogicalAddress;
+                return OperationStatusUtils.AdvancedOpCode(OperationStatus.NOTFOUND, srcExpired ? StatusCode.CreatedRecord | StatusCode.Expired : StatusCode.CreatedRecord);
+            }
+
+            // CAS failed
+            stackCtx.SetNewRecordInvalid(ref newLogRecord.InfoRef);
+            OnDispose(ref newLogRecord, DisposeReason.InitialDeleterCASFailed);
+
+            SaveAllocationForRetry(ref operationState, newLogicalAddress, newPhysicalAddress);
+            return OperationStatus.RETRY_NOW;   // CAS failure does not require epoch refresh
+        }
+    }
+}

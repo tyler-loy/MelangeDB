@@ -10,7 +10,31 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default,
+  and two preview engines join it.
+  - **Why:** FASTER has been unmaintained upstream since August 2026.
+  - **The bake-off:** FASTER, Tsavorite, LMDB, RocksDB, ZoneTree and MelangeLog were compared under a
+    1 GiB memory cap ([docs/design/hot-store-bakeoff.md](docs/design/hot-store-bakeoff.md)).
+  - **Switching is a restart.** The store is rebuilt from the commit log on every start, so there is
+    nothing to migrate in either direction.
+  - **Logging:** EventId 1512 names the engine in use.
+
+  `Tsavorite` is microsoft/garnet's maintained fork of FASTER, with the same design.
+  - **Packaging:** it is not on NuGet, so its source is vendored, and `MelangeDB.Storage.Faster`
+    carries the assembly and Garnet's Linux native devices. That grows the package to about 5.6 MB.
+  - **Linux needs libaio** (`libaio1t64` on Debian and Ubuntu). Without it, or in a RID-specific
+    publish, the store falls back to a managed device and logs EventId 1513.
+
+  `MelangeLog` is MelangeDB's own append-only log.
+  - **Writes:** a record still in memory is updated in place; otherwise the new version is appended
+    without reading the old one.
+  - **Reads:** records that have left memory are read through memory-mapped segment files, and each
+    record carries a checksum.
+  - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on
+    writes.
+  - **Likely the future default,** once it can reclaim log space (#287) and flush in the background.
 
 ## [0.4.1] — 2026-11-23
 

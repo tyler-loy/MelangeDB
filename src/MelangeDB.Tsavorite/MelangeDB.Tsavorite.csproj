@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tsavorite, microsoft/garnet's fork of FASTER, vendored: libs/storage/Tsavorite/cs/src/core plus
+    libs/diagnostics' two assert files, unmodified, from the commit in README.md (MIT, see LICENSE).
+    Tsavorite is not published on NuGet, so MelangeDB.Storage.Faster compiles this and carries the
+    assembly, and the native devices under Device/runtimes, inside its own package. The assembly is
+    renamed MelangeDB.Tsavorite so it cannot collide with Garnet's Tsavorite.core in an application
+    that references both. Garnet's code is written without nullable annotations or implicit usings,
+    so those are off here, as Garnet's own build has them.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>MelangeDB.Tsavorite</AssemblyName>
+    <RootNamespace>Tsavorite.core</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- Three CS0649 (unassigned fields) in the object-log path; Garnet tolerates them. -->
+    <NoWarn>$(NoWarn);CS0649</NoWarn>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Garnet's Directory.Build.targets adds this global using for GarnetAsserts. -->
+    <Using Include="Garnet.Diagnostics" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The native devices ship from MelangeDB.Storage.Faster, which copies and packs them. -->
+    <None Remove="Device/runtimes/**" />
+  </ItemGroup>
+
+</Project>

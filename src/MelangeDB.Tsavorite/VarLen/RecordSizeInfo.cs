@@ -1,0 +1,155 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+
+namespace Tsavorite.core
+{
+#pragma warning disable IDE0065 // Misplaced using directive
+    using static Utility;
+
+    /// <summary>
+    /// Struct for information about the key and the fields and their sizes in a record.
+    /// </summary>
+    public struct RecordSizeInfo
+    {
+        // Bit layout for 'word':
+        //   Bit 0:   KeyIsInline
+        //   Bit 1:   ValueIsInline
+        //   Bit 2:   IsRevivifiedRecord
+        private const int KeyIsInlineBit = 1 << 0;
+        private const int ValueIsInlineBit = 1 << 1;
+        private const int IsRevivifiedRecordBit = 1 << 2;
+
+        /// <summary>Packed field containing KeyIsInline, ValueIsInline, and IsRevivifiedRecord.</summary>
+        internal int word;
+
+        /// <summary>The value length and whether optional fields are present.</summary>
+        public RecordFieldInfo FieldInfo;
+
+        /// <summary>Whether the key was within the inline max key length. Set automatically by Tsavorite based on <see cref="RecordFieldInfo.KeySize"/> key size.</summary>
+        public readonly bool KeyIsInline
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => (word & KeyIsInlineBit) != 0;
+        }
+
+        /// <summary>Whether the value was within the inline max value length.</summary>
+        public readonly bool ValueIsInline
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => (word & ValueIsInlineBit) != 0;
+        }
+
+        /// <summary>Sets <see cref="KeyIsInline"/> to true.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void SetKeyIsInline() => word |= KeyIsInlineBit;
+
+        /// <summary>Sets <see cref="ValueIsInline"/> to true.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void SetValueIsInline() => word |= ValueIsInlineBit;
+
+        /// <summary>Whether the record allocation returned a revivified record.</summary>
+        internal readonly bool IsRevivifiedRecord
+        {
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => (word & IsRevivifiedRecordBit) != 0;
+        }
+
+        /// <summary>Sets <see cref="IsRevivifiedRecord"/> to true.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void SetIsRevivifiedRecord() => word |= IsRevivifiedRecordBit;
+
+        /// <summary>Whether the value was specified to be an object.</summary>
+        public readonly bool ValueIsObject => FieldInfo.ValueIsObject;
+
+        /// <summary>Whether the key is an overflow allocation.</summary>
+        public readonly bool KeyIsOverflow => !KeyIsInline;
+
+        /// <summary>Whether the value is an overflow allocation.</summary>
+        public readonly bool ValueIsOverflow => !ValueIsInline && !FieldInfo.ValueIsObject;
+
+        /// <summary>Returns the inline length of the key (the amount it will take in the record).</summary>
+        public readonly int InlineKeySize => KeyIsInline ? FieldInfo.KeySize : ObjectIdMap.ObjectIdSize;
+
+        /// <summary>Returns the inline length of the value (the amount it will take in the record).</summary>
+        public readonly int InlineValueSize => ValueIsInline ? FieldInfo.ValueSize : ObjectIdMap.ObjectIdSize;
+
+        /// <summary>Returns whether both the key and value are inline (no overflow or object).</summary>
+        public readonly bool RecordIsInline => (word & (KeyIsInlineBit | ValueIsInlineBit)) == (KeyIsInlineBit | ValueIsInlineBit);
+
+        /// <summary>The max inline value size if this is a record in the string log.</summary>
+        public int MaxInlineValueSize { readonly get; internal set; }
+
+        /// <summary>The inline size of the record (in the main log). If Key and/or Value are overflow (or value is Object),
+        /// then their contribution to inline length is just <see cref="ObjectIdMap.ObjectIdSize"/>.</summary>
+        public int ActualInlineRecordSize { readonly get; internal set; }
+
+        /// <summary>The inline size of the record rounded up to <see cref="RecordInfo"/> alignment.</summary>
+        public int AllocatedInlineRecordSize { readonly get; internal set; }
+
+        /// <summary>Size to allocate for the 'long' offset into the Object log if this record will have objects or overflow, else 0.</summary>
+        public readonly int ObjectLogPositionSize => RecordIsInline ? 0 : LogRecord.ObjectLogPositionSize;
+
+        /// <summary>Size to allocate for all optional fields that will be included; possibly 0.</summary>
+        public readonly int OptionalSize => FieldInfo.eTagSize + FieldInfo.expirationSize + ObjectLogPositionSize;
+
+        /// <summary>Whether these values are set (default instances are used for Delete internally, for example).</summary>
+        public readonly bool IsSet => AllocatedInlineRecordSize != 0;
+
+        /// <summary>
+        /// Calculate the Record sizes based on the given <paramref name="keySize"/> and <paramref name="valueSize"/> sizes, which are adjusted for inline vs. overflow/object.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void CalculateSizes(int keySize, int valueSize)
+        {
+            // Max overflow length is bounded by kMaxStringSizeBits (512MB). Even for inline records the caller's specified key/value
+            // length must be storable in an overflow if it doesn't fit inline; reject anything larger.
+            const int maxOverflowSize = 1 << LogSettings.kMaxStringSizeBits;
+            if ((uint)FieldInfo.KeySize > maxOverflowSize)
+                ThrowTsavoriteException($"FieldInfo.KeySize ({FieldInfo.KeySize}) exceeds max overflow length ({maxOverflowSize})");
+            if ((uint)FieldInfo.ValueSize > maxOverflowSize)
+                ThrowTsavoriteException($"FieldInfo.ValueSize ({FieldInfo.ValueSize}) exceeds max overflow length ({maxOverflowSize})");
+
+            // ExtendedNamespaceSize uses the lower bits of the Namespace byte below the indicator bit at position
+            // RecordDataHeader.ExtendedNamespaceIndicatorBit; anything not strictly less than (1 << ExtendedNamespaceIndicatorBit) cannot be encoded.
+            if (FieldInfo.ExtendedNamespaceSize >= 1 << RecordDataHeader.ExtendedNamespaceIndicatorBit)
+                ThrowTsavoriteException($"FieldInfo.ExtendedNamespaceSize ({FieldInfo.ExtendedNamespaceSize}) must be less than {1 << RecordDataHeader.ExtendedNamespaceIndicatorBit}");
+
+            // With fixed-size RecordDataHeader (8 bytes containing KeyLength and ValueLength), the calculation is straightforward.
+            ActualInlineRecordSize = Constants.FixedHeaderSize + FieldInfo.ExtendedNamespaceSize + keySize + valueSize + OptionalSize;
+            AllocatedInlineRecordSize = RoundUp(ActualInlineRecordSize, Constants.kRecordAlignment);
+        }
+
+        /// <summary>
+        /// Called from Upsert or RMW methods for Span Values with the actual data size of the update value; ensures consistency between the Get*FieldInfo methods and the actual update methods.
+        /// Usually called directly to save the cost of calculating actualDataSize twice (in Get*FieldInfo and the actual update methods).
+        /// </summary>
+        [Conditional("DEBUG")]
+        public static void AssertValueDataLength(int dataSize, in RecordSizeInfo sizeInfo)
+        {
+            Debug.Assert(sizeInfo.FieldInfo.ValueSize == dataSize, $"Mismatch between expected value size {sizeInfo.FieldInfo.ValueSize} and actual value size {dataSize}");
+        }
+
+        /// <summary>Called from Upsert or RMW methods with the final record info; ensures consistency between the Get*FieldInfo methods and the actual update methods./// </summary>
+        [Conditional("DEBUG")]
+        public void AssertOptionalsIfSet(RecordDataHeader dataHeader, bool checkETag = true, bool checkExpiration = true)
+        {
+            if (!IsSet)
+                return;
+            if (checkETag)
+                Debug.Assert(FieldInfo.HasETag == dataHeader.HasETag, $"Mismatch between expected HasETag {FieldInfo.HasETag} and actual ETag {dataHeader.HasETag}");
+            if (checkExpiration)
+                Debug.Assert(FieldInfo.HasExpiration == dataHeader.HasExpiration, $"Mismatch between expected HasExpiration {FieldInfo.HasExpiration} and actual HasExpiration {dataHeader.HasExpiration}");
+        }
+
+        /// <inheritdoc/>
+        public override readonly string ToString()
+        {
+            var keyString = KeyIsInline ? "inl" : "ovf";
+            var valString = ValueIsInline ? "inl" : (ValueIsObject ? "obj" : "ovf");
+            return $"[{FieldInfo}] | Key::{keyString}, Val::{valString}, ActRecSize {ActualInlineRecordSize}, AllocRecSize {AllocatedInlineRecordSize}, OptSize {OptionalSize}";
+        }
+    }
+}

@@ -1,0 +1,69 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+
+namespace Tsavorite.core
+{
+    /// <summary>
+    /// Batch of arguments to a read operation, including key, input and output
+    /// </summary>
+    /// <typeparam name="TKey">Type of key</typeparam>
+    /// <typeparam name="TInput">Type of input</typeparam>
+    /// <typeparam name="TOutput">Type of output</typeparam>
+    public interface IReadArgBatch<TKey, TInput, TOutput>
+        where TKey : IKey, allows ref struct
+    {
+        /// <summary>
+        /// Count of keys/args/outputs.
+        /// </summary>
+        int Count { get; }
+
+        /// <summary>
+        /// Raw parameters for the batch.
+        /// </summary>
+        ReadOnlySpan<PinnedSpanByte> Parameters { get; }
+
+        /// <summary>
+        /// Initial IO size (in bytes) used when reading records in this batch from disk.
+        /// <see cref="KVSettings.UseDefaultInitialIORecordSize"/> (the default) resolves through the
+        /// session/store hierarchy. Implementations may return a per-batch size — e.g. a large size for
+        /// batches of large fixed-size records (vectors) to avoid the header-read round-trip, or a small
+        /// size for batches of tiny records to avoid over-reading.
+        /// </summary>
+        int InitialIORecordSize => KVSettings.UseDefaultInitialIORecordSize;
+
+        /// <summary>
+        /// Read-copy options for records in this batch. The default (<see cref="ReadCopyTo.Inherit"/>) resolves
+        /// through the session/store hierarchy. Implementations may return per-batch options — e.g. copy small,
+        /// frequently-read records back to the main-log tail so subsequent reads serve them from memory, while
+        /// leaving large records (raw vectors) on disk.
+        /// </summary>
+        ReadCopyOptions ReadCopyOptions => default;
+
+        /// <summary>
+        /// Get <paramref name="i"/>th key.
+        /// </summary>
+        void GetKey(int i, out TKey key);
+
+        /// <summary>
+        /// Get <paramref name="i"/>th input.
+        /// </summary>
+        void GetInput(int i, out TInput input);
+
+        /// <summary>
+        /// Get <paramref name="i"/>th output.
+        /// </summary>
+        void GetOutput(int i, out TOutput output);
+
+        /// <summary>
+        /// Set <paramref name="i"/>th output.
+        /// </summary>
+        void SetOutput(int i, TOutput output);
+
+        /// <summary>
+        /// Set <paramref name="i"/>th status.
+        /// </summary>
+        void SetStatus(int i, Status status);
+    }
+}

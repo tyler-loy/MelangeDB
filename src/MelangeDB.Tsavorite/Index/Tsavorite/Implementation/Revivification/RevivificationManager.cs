@@ -1,0 +1,76 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System.Runtime.CompilerServices;
+using System.Threading;
+
+namespace Tsavorite.core
+{
+    internal struct RevivificationManager<TStoreFunctions, TAllocator>
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        internal FreeRecordPool<TStoreFunctions, TAllocator> freeRecordPool;
+        internal readonly bool UseFreeRecordPool => freeRecordPool is not null;
+
+        internal RevivificationStats stats = new();
+
+        internal readonly bool IsEnabled => revivSuspendCount == 0;
+        internal bool restoreDeletedRecordsIfBinIsFull;
+        internal bool useFreeRecordPoolForCTT;
+
+        internal double revivifiableFraction;
+
+        internal int revivSuspendCount = -1;
+
+        public void PauseRevivification() => Interlocked.Decrement(ref revivSuspendCount);
+
+        public void ResumeRevivification() => Interlocked.Increment(ref revivSuspendCount);
+
+        public RevivificationManager(TsavoriteKV<TStoreFunctions, TAllocator> store, RevivificationSettings revivSettings, LogSettings logSettings)
+        {
+            if (revivSettings is null)
+            {
+                revivifiableFraction = RevivificationSettings.DefaultRevivifiableFraction;
+                return;
+            }
+            revivifiableFraction = revivSettings.RevivifiableFraction;
+
+            revivSettings.Verify(logSettings.MutableFraction);
+            if (!revivSettings.EnableRevivification)
+                return;
+
+            revivSuspendCount = 0;
+            if (revivSettings.FreeRecordBins?.Length > 0)
+            {
+                freeRecordPool = new FreeRecordPool<TStoreFunctions, TAllocator>(store, revivSettings);
+                restoreDeletedRecordsIfBinIsFull = revivSettings.RestoreDeletedRecordsIfBinIsFull;
+                useFreeRecordPoolForCTT = revivSettings.UseFreeRecordPoolForCopyToTail;
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal readonly long GetMinRevivifiableAddress(long tailAddress, long readOnlyAddress)
+            => tailAddress - (long)((tailAddress - readOnlyAddress) * revivifiableFraction);
+
+        // Method redirectors
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly bool TryAdd(long logicalAddress, ref LogRecord logRecord, ref RevivificationStats revivStats)
+            => UseFreeRecordPool && freeRecordPool.TryAdd(logicalAddress, ref logRecord, ref revivStats);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public readonly bool TryTake(int actualInlineRecordSize, long minAddress, out long address, ref RevivificationStats revivStats)
+        {
+            if (UseFreeRecordPool)
+                return freeRecordPool.TryTake(actualInlineRecordSize, minAddress, out address, ref revivStats);
+            address = 0;
+            return false;
+        }
+
+        public void Dispose()
+        {
+            if (UseFreeRecordPool)
+                freeRecordPool.Dispose();
+        }
+    }
+}

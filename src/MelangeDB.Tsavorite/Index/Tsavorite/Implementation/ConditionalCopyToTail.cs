@@ -1,0 +1,147 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+
+namespace Tsavorite.core
+{
+    using static LogAddress;
+
+    public unsafe partial class TsavoriteKV<TStoreFunctions, TAllocator> : TsavoriteBase
+        where TStoreFunctions : IStoreFunctions
+        where TAllocator : IAllocator<TStoreFunctions>
+    {
+        /// <summary>
+        /// Copy a record to the tail of the log after caller has verified it does not exist within a specified range.
+        /// </summary>
+        /// <param name="sessionFunctions">Callback functions.</param>
+        /// <param name="operationState">pending context created when the operation goes pending.</param>
+        /// <param name="srcLogRecord">key of the record.</param>
+        /// <param name="stackCtx">Contains information about the call context, record metadata, and so on</param>
+        /// <param name="wantIO">Whether to do IO if the search must go below HeadAddress. ReadFromImmutable, for example,
+        ///     is just an optimization to avoid future IOs, so if we need an IO here we just defer them to the next Read().</param>
+        /// <param name="maxAddress">Maximum address for determining liveness, records after this address are not considered when checking validity.</param>
+        /// <returns></returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private OperationStatus ConditionalCopyToTail<TInput, TOutput, TContext, TSessionFunctionsWrapper, TSourceLogRecord>(TSessionFunctionsWrapper sessionFunctions,
+                ref OperationState<TInput, TOutput, TContext> operationState, long keyHash, in TSourceLogRecord srcLogRecord,
+                ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, bool wantIO = true, long maxAddress = long.MaxValue)
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            var callerHasEphemeralLock = stackCtx.recSrc.HasEphemeralSLock;
+
+            // We are called by one of ReadFromImmutable, CompactionConditionalCopyToTail, or ContinuePendingConditionalCopyToTail;
+            // these have already searched to see if the record is present above minAddress, and stackCtx is set up for the first try.
+            // minAddress is the stackCtx.recSrc.LatestLogicalAddress; by the time we get here, any IO below that has been done due to
+            // PrepareConditionalCopyToTailIO, which then went to ContinuePendingConditionalCopyToTail, which evaluated whether the
+            // record was found at that level.
+            while (true)
+            {
+                // ConditionalCopyToTail is different from the usual procedures, in that if we find a source record we don't lock--we exit with success.
+                // So we only lock for tag-chain stability during search.
+                if (callerHasEphemeralLock || TryEphemeralSLock<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx, out var status))
+                {
+                    try
+                    {
+                        status = TryCopyToTail(in srcLogRecord, sessionFunctions, ref operationState, ref stackCtx);
+                    }
+                    finally
+                    {
+                        stackCtx.HandleNewRecordOnException(this);
+                        if (!callerHasEphemeralLock)
+                            EphemeralSUnlock<TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, ref stackCtx);
+                    }
+                }
+
+                // If we're here we failed TryCopyToTail, probably a failed CAS due to another record insertion.
+                if (!HandleImmediateRetryStatus(status, sessionFunctions, ref operationState))
+                    return status;
+
+                // HandleImmediateRetryStatus may have refreshed the epoch which means HeadAddress etc. may have changed. Re-traverse from the tail to the highest
+                // point we just searched (which may have gone below HeadAddress). +1 to LatestLogicalAddress because we have examined that already. Use stackCtx2 to
+                // preserve stacKCtx, both for retrying the Insert if needed and for preserving the caller's lock status, etc.
+                var minAddress = stackCtx.recSrc.LatestLogicalAddress + 1;
+                OperationStackContext<TStoreFunctions, TAllocator> stackCtx2 = new(stackCtx.hei.hash);
+                bool needIO;
+                do
+                {
+                    if (TryFindRecordInMainLogForConditionalOperation<TSourceLogRecord, TInput, TOutput, TContext, TSessionFunctionsWrapper>(
+                            sessionFunctions, srcLogRecord, ref stackCtx2, stackCtx.recSrc.LogicalAddress, minAddress, maxAddress, out status, out needIO))
+                        return OperationStatus.SUCCESS;
+                }
+                while (HandleImmediateNonPendingRetryStatus<TInput, TOutput, TContext, TSessionFunctionsWrapper>(status, sessionFunctions));
+
+                // Issue IO if necessary and desired (for ReadFromImmutable, it isn't; just exit in that case), else loop back up and retry the insert.
+                if (!wantIO)
+                {
+                    // Caller (e.g. ReadFromImmutable) called this to keep read-hot records in memory. That's already failed, so give up and we'll read it when we have to.
+                    if (stackCtx.recSrc.LogicalAddress < hlogBase.HeadAddress)
+                        return OperationStatus.SUCCESS;
+                }
+                else if (needIO)
+                    return PrepareIOForConditionalOperation(sessionFunctions, ref operationState, keyHash, in srcLogRecord, ref stackCtx2, minAddress, maxAddress);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Status CompactionConditionalCopyToTail<TInput, TOutput, TContext, TSessionFunctionsWrapper, TSourceLogRecord>(
+                TSessionFunctionsWrapper sessionFunctions, in TSourceLogRecord srcLogRecord, long currentAddress, long minAddress, long maxAddress = long.MaxValue)
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            Debug.Assert(epoch.ThisInstanceProtected(), "This is called only from Compaction so the epoch should be protected");
+            OperationState<TInput, TOutput, TContext> operationState = default;
+            // Plumb the source logical address so PostCopyToTail can name per-flush snapshot files
+            // (used by RangeIndex's BfTree compaction path).
+            operationState.originalAddress = currentAddress;
+
+            var keyHash = storeFunctions.GetKeyHashCode64(srcLogRecord);
+            OperationStackContext<TStoreFunctions, TAllocator> stackCtx = new(keyHash);
+            OperationStatus status;
+            bool needIO;
+            do
+            {
+                if (TryFindRecordInMainLogForConditionalOperation<TSourceLogRecord, TInput, TOutput, TContext, TSessionFunctionsWrapper>(sessionFunctions, srcLogRecord, ref stackCtx, currentAddress, minAddress, maxAddress, out status, out needIO))
+                    return Status.CreateFound();
+            }
+            while (sessionFunctions.Store.HandleImmediateNonPendingRetryStatus<TInput, TOutput, TContext, TSessionFunctionsWrapper>(status, sessionFunctions));
+
+            if (needIO)
+                status = PrepareIOForConditionalOperation(sessionFunctions, ref operationState, keyHash, in srcLogRecord, ref stackCtx, minAddress, maxAddress);
+            else
+                status = ConditionalCopyToTail(sessionFunctions, ref operationState, keyHash, in srcLogRecord, ref stackCtx, maxAddress: maxAddress);
+            return HandleOperationStatus(sessionFunctions.Ctx, ref operationState, status, out _);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal OperationStatus PrepareIOForConditionalOperation<TInput, TOutput, TContext, TSessionFunctionsWrapper, TSourceLogRecord>(
+                                        TSessionFunctionsWrapper sessionFunctions,
+                                        ref OperationState<TInput, TOutput, TContext> operationState, long keyHash, in TSourceLogRecord srcLogRecord,
+                                        ref OperationStackContext<TStoreFunctions, TAllocator> stackCtx, long minAddress, long maxAddress, OperationType opType = OperationType.CONDITIONAL_INSERT)
+            where TSessionFunctionsWrapper : ISessionFunctionsWrapper<TInput, TOutput, TContext, TStoreFunctions, TAllocator>
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            // If a re-pend has already moved a populated pendingState onto operationState.pendingOp, reuse it; otherwise rent a
+            // fresh op. The pendingState carries the conditional-op-only payload (keyHash, requestKey, diskLogRecord, min/maxAddress).
+            var op = operationState.pendingOp ?? sessionFunctions.Ctx.RentPendingIoContext();
+            ref var pendingState = ref op.pendingState;
+            pendingState.CopyKey(srcLogRecord, hlogBase.bufferPool, sessionFunctions);
+            pendingState.type = opType;
+            pendingState.keyHash = keyHash;
+            pendingState.minAddress = minAddress;
+            pendingState.maxAddress = maxAddress;
+
+            operationState.pendingOp = op;
+            operationState.initialEntryAddress = kInvalidAddress;
+            operationState.initialLatestLogicalAddress = stackCtx.recSrc.LatestLogicalAddress;
+            operationState.logicalAddress = stackCtx.recSrc.LogicalAddress;
+
+            // Transfer the log record to the pendingState. We do not want to dispose memory log records; those objects are still alive in the log.
+            if (!pendingState.diskLogRecord.IsSet)
+                pendingState.CopyFrom(in srcLogRecord, hlogBase.bufferPool, hlogBase.transientObjectIdMap);
+            return OperationStatus.RECORD_ON_DISK;
+        }
+    }
+}

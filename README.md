@@ -231,6 +231,7 @@ The project:
 | `src/MelangeDB.Cli` | The `melange` tool: schema export, binding generation, backup and restore. |
 | `src/MelangeDB.Mcp` | The MCP endpoint for agents, in the host's own pipeline. |
 | `src/MelangeDB.Testing` | The reducer test kit: a real engine on a hand-cranked clock. |
+| `src/MelangeDB.Tsavorite` | Tsavorite (microsoft/garnet's FASTER fork), vendored; ships inside `MelangeDB.Storage.Faster`. |
 | `clients/typescript` | `@melangedb/client`, the TypeScript client. |
 | `conformance/` | The recorded decode corpus every client is checked against. |
 | `tools/MelangeDB.Conformance` | Records the corpus and runs the live conformance suite. |

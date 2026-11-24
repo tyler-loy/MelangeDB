@@ -61,7 +61,7 @@ public class FasterLogFollowerTests : IDisposable
     {
         var registry = new SchemaRegistry([Declare()]);
         var table = registry.Get(typeof(Mob));
-        using var owner = new MelangeEngine(Options("owner-hot"), registry, null, null, new FasterHotStoreProvider());
+        using var owner = new MelangeEngine(Options("owner-hot"), registry, null, null, TestEngine.Provider());
         for (var i = 0; i < 40; i++)
         {
             var id = i;
@@ -75,7 +75,7 @@ public class FasterLogFollowerTests : IDisposable
             owner.Invoke("tail", Identity.Hash("test"), ctx => ctx.Db.Insert(new Mob { Id = (ulong)(id + 1), ChunkId = id % 4, Name = $"mob{id}" }));
         }
 
-        using var follower = new LogFollower(Options("follower-hot"), registry, originator: 0, hotStoreProvider: new FasterHotStoreProvider());
+        using var follower = new LogFollower(Options("follower-hot"), registry, originator: 0, hotStoreProvider: TestEngine.Provider());
         follower.Ceiling = owner.Log.DurableLsn;
         while (follower.Poll() > 0)
         {

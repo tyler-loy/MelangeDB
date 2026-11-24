@@ -78,7 +78,7 @@ public class BackupPortabilityTests
                         || t.RowType == typeof(ItemDefinition) || t.RowType == typeof(AutoSized) || t.RowType == typeof(NamedThing))),
                 loggerFactory: null,
                 timeProvider: null,
-                destination == StoreKind.Faster ? new FasterHotStoreProvider() : null);
+                destination == StoreKind.Faster ? TestEngine.Provider() : null);
 
             Assert.Equal(dumpBefore, DumpSorted(rebooted));
         }
