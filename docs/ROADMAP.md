@@ -169,10 +169,10 @@ other happens, the warning above stands unchanged.
 
 **The paged store's next engine.** FASTER has been unmaintained upstream since August 2026. A
 bake-off ([design/hot-store-bakeoff.md](design/hot-store-bakeoff.md)) compared it with Tsavorite,
-LMDB, RocksDB, ZoneTree and an in-house log, `MelangeLog`. `HotStore:PagedEngine` ships all three, and
+LMDB, RocksDB, ZoneTree and an in-house log, `MelangeLog`. `HotStore:PagedEngine` shipped three of them, and
 **MelangeLog is the default since 0.5.0**, once it reclaimed log space while running
-([#287](https://github.com/tyler-loy/MelangeDB/issues/287)) and flushed in the background. FASTER and
-Tsavorite remain selectable; [PERFORMANCE.md](PERFORMANCE.md) says what changed.
+([#287](https://github.com/tyler-loy/MelangeDB/issues/287)) and flushed in the background. FASTER remains
+selectable, and Tsavorite, a preview, was removed before it was released; [PERFORMANCE.md](PERFORMANCE.md) says what changed.
 
 Known deferrals, each recorded with its reasoning rather than left as an omission:
 

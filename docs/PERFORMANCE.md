@@ -34,7 +34,7 @@ between cluster nodes allocates about a quarter as much and takes a fraction of 
   production topology.
 - **MelangeLog is the only engine here that MelangeDB maintains itself.** That is the point of
   switching, and it also means the engine is younger than FASTER. The store test suite runs against
-  all three engines in CI.
+  both engines in CI.
 - **MelangeLog primary keys are limited to about 1 KiB.** See [Limits](#limits-and-behaviour-changes).
 
 ## Throughput and latency
@@ -318,8 +318,9 @@ there is nothing to migrate in either direction:
 | FASTER under the paged store | `HotStore:PagedEngine = Faster` |
 | The managed key directory and indexes | `HotStore:NativeDirectory = false` |
 
-They are independent; either can be set without the other. `Tsavorite` (FASTER's maintained fork,
-still a preview) is a third choice for `HotStore:PagedEngine`. The binary node link has no switch.
+They are independent; either can be set without the other. `Tsavorite`, a preview
+engine before 0.5.0, was removed; its bake-off numbers are in
+[design/hot-store-bakeoff.md](design/hot-store-bakeoff.md). The binary node link has no switch.
 
 ## Measuring on your hardware
 

@@ -12,7 +12,11 @@
 
 **Update, 0.5.0:** both conditions were met (compaction, a background flusher), and `MelangeLog`
 became the default in 0.5.0, together with a native key directory. Both are measured, with what
-to expect from the change, in [PERFORMANCE.md](../PERFORMANCE.md).
+to expect from the change, in [PERFORMANCE.md](../PERFORMANCE.md). **Tsavorite was removed** before
+0.5.0 shipped: as a preview that MelangeLog outperformed, it did not justify ~270 vendored source
+files, 5.5 MB of Garnet's native devices in the package, and a third CI pass per platform. Its
+numbers below stay for comparison; the adapter and the vendored source are in the history up to
+`a466dc2` (`git show a466dc2:src/MelangeDB.Storage.Faster/TsavoritePagedKv.cs`) for a rerun.
 
 ## Why
 

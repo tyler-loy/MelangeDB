@@ -94,7 +94,7 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, 
 }
 
 /// <summary>
-/// One paged-store KV space on MelangeDB's own log: Tsavorite's write path and LMDB's read path.
+/// One paged-store KV space on MelangeDB's own log: FASTER's write path and LMDB's read path.
 /// <para>
 /// <b>Log.</b> A single append-only address space. The newest <c>2^ringPageBits</c> pages of it live in
 /// a ring of native memory (<c>NativeMemory.AlignedAlloc</c>, off the GC heap); older pages live in

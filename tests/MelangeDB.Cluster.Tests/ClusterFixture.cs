@@ -284,7 +284,7 @@ internal sealed class ClusterFixture : IAsyncDisposable
             // what lets a reassigned shard's new owner open the shard's log and recover it.
             ["MelangeDb:Cluster:ShardDataPath"] = Path.Combine(_root, "shards"),
         };
-        // MELANGE_TEST_PAGED_ENGINE (faster, melangelog, tsavorite) runs every node's stores on the
+        // MELANGE_TEST_PAGED_ENGINE (faster, melangelog) runs every node's stores on the
         // paged store over that engine, as it does the store suite; unset, they stay in memory.
         var pagedEngine = Environment.GetEnvironmentVariable("MELANGE_TEST_PAGED_ENGINE") is { Length: > 0 } engineName
             ? Enum.Parse<PagedEngine>(engineName, ignoreCase: true)

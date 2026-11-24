@@ -112,7 +112,6 @@ internal static class PagedEngines
         PagedEngine.MelangeLog => new MelangeLogPagedKvFactory(
             MelangeLogTuning.Default with { ReadMode = options?.MelangeLog.ReadMode ?? MelangeLogReadMode.Mmap },
             logger: loggerFactory?.CreateLogger<MelangeLogPagedKvFactory>()),
-        PagedEngine.Tsavorite => new TsavoritePagedKvFactory(logger: loggerFactory?.CreateLogger<TsavoritePagedKvFactory>()),
         _ => throw new ArgumentOutOfRangeException(nameof(engine), engine, "Not a paged engine this build knows."),
     };
 }

@@ -488,7 +488,10 @@ So the hot tier is staged:
    Since the log is the source of truth, this is a *legitimate* projection, not a stub.
 2. `FasterHotStore` — `Microsoft.FASTER.Core` 2.6.5, published and versioned. Brings the hybrid log
    and spill-to-disk, which is the property that actually answers the RAM complaint.
-3. Vendored Tsavorite, *if and only if* benchmarks justify the source dependency.
+3. Vendored Tsavorite, *if and only if* benchmarks justify the source dependency. **Outcome:** it was
+   vendored and benchmarked ([design/hot-store-bakeoff.md](design/hot-store-bakeoff.md)), and lost to
+   an engine of our own, `MelangeLog`, the paged store's default since 0.5.0; Tsavorite was removed
+   before it shipped in a release.
 
 Doing (1) first de-risks the whole project: the transaction, log, and subscription layers can be
 built and tested end-to-end before any storage-engine work begins.

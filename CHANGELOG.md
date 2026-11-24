@@ -41,7 +41,7 @@ the commit log on every start, and either can be reverted the same way. The full
   been unmaintained upstream since August 2026. It now compacts its log while running, flushes in
   the background, grows its index incrementally, enforces disk limits, and reports itself through
   statistics, metrics and health checks. On the overnight paging soak its log held flat at about
-  2.55 GiB for 2.7 hours, where FASTER's grew from 1.4 to 22 GiB. `Faster` and `Tsavorite` remain
+  2.55 GiB for 2.7 hours, where FASTER's grew from 1.4 to 22 GiB. `Faster` remains
   selectable. Switching is a restart: the store is
   rebuilt from the log on every start, so there is nothing to migrate. MelangeLog holds primary
   keys of up to about 1 KiB; the engine refuses longer ones before they reach the log (#307).
@@ -81,7 +81,7 @@ the commit log on every start, and either can be reverted the same way. The full
 - **`MelangeDB.LoadTest link-bench`** measures the node link alone: round trip, allocation, wire bytes
   and retained heap per message shape, in both frame formats.
 - **`HotStore:PagedEngine` chooses the engine under the paged store**: `MelangeLog` (the default,
-  above), `Faster`, or `Tsavorite` (preview).
+  above) or `Faster`.
   - **Why:** FASTER has been unmaintained upstream since August 2026.
   - **The bake-off:** FASTER, Tsavorite, LMDB, RocksDB, ZoneTree and MelangeLog were compared under a
     1 GiB memory cap ([docs/design/hot-store-bakeoff.md](docs/design/hot-store-bakeoff.md)).
@@ -89,26 +89,20 @@ the commit log on every start, and either can be reverted the same way. The full
     nothing to migrate in either direction.
   - **Logging:** EventId 1512 names the engine in use.
 
-  `Tsavorite` is microsoft/garnet's maintained fork of FASTER, with the same design.
-  - **Packaging:** it is not on NuGet, so its source is vendored, and `MelangeDB.Storage.Faster`
-    carries the assembly and Garnet's Linux native devices. That grows the package to about 5.6 MB.
-  - **Linux needs libaio** (`libaio1t64` on Debian and Ubuntu). Without it, or in a RID-specific
-    publish, the store falls back to a managed device and logs EventId 1513.
-
   `MelangeLog` is MelangeDB's own append-only log.
   - **Writes:** a record still in memory is updated in place; otherwise the new version is appended
     without reading the old one.
   - **Reads:** records that have left memory are read through memory-mapped segment files, and each
     record carries a checksum.
-  - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on
-    writes.
+  - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and the
+    fastest log-structured engine on writes.
   - **Reclaims log space as it runs** (#287): `HotStore:Compaction:Enabled` (default on),
     `TriggerRatio` (default 2: compact while the log is over twice its live bytes) and
     `MaxBytesPerSecond`. A background thread copies the live records out of the segment with the
     least live data, in steps of about 1 MiB under the store lock, and deletes the segment. A store
     rewriting its 1M-row table three times over ends with its log at about twice its live data.
     EventIds 1514–1516 log it; `melange.store.compaction.reclaimed_bytes` and `relocated_bytes`
-    count it. FASTER and Tsavorite still do not reclaim.
+    count it. FASTER still does not reclaim.
   - **Flushes in the background:** a flusher thread per log space writes pages to disk as they
     leave the writable part of memory, so a write never waits on disk unless the disk has fallen a
     sixteenth of the memory budget behind. `melange.store.flush.stalls` counts those waits.
@@ -125,8 +119,17 @@ the commit log on every start, and either can be reverted the same way. The full
   lag and stalls, segment files, index size and resizes, integrity failures, and compaction's
   steps, lock time and bytes moved. Each is a `melange.store.*` instrument with a `space`
   dimension ([docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)). The gap between `log_bytes` and
-  `live_bytes` is the backlog of #287. FASTER and Tsavorite report the log's extent only;
+  `live_bytes` is the backlog of #287. FASTER reports the log's extent only;
   MelangeLog reports them all.
+
+### Removed
+
+- **The `Tsavorite` paged engine**, a preview in `main` prereleases that never shipped in a release.
+  MelangeLog outperformed it, and it carried about 270 vendored source files, 5.5 MB of Garnet's
+  native devices in `MelangeDB.Storage.Faster` (the package drops back to about 100 KB) and a CI pass
+  per platform. `HotStore:PagedEngine = Tsavorite` no longer binds; choose `MelangeLog` or `Faster`,
+  a restart with nothing to migrate. Its measurements stay in
+  [docs/design/hot-store-bakeoff.md](docs/design/hot-store-bakeoff.md).
 
 ### Fixed
 

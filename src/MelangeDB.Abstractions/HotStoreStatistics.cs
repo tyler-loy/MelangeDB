@@ -37,7 +37,7 @@ public sealed class HotStoreStatistics
 /// <summary>
 /// One paged key-value space's log: its footprint, its write mix, its flushing and its compaction.
 /// Each value is cumulative or a current reading as its documentation says; a value the engine does
-/// not track is -1. FASTER and Tsavorite report <see cref="LogBytes"/> only; MelangeLog reports all.
+/// not track is -1. FASTER reports <see cref="LogBytes"/> only; MelangeLog reports all.
 /// </summary>
 public sealed record HotStoreLogStatistics
 {
