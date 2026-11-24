@@ -179,6 +179,13 @@ public sealed class SnapshotsOptions
     public long IntervalTransactions { get; set; } = 100_000;
 
     /// <summary>
+    /// Log bytes appended since the last snapshot that trigger the next one, even short of
+    /// <see cref="IntervalTransactions"/>: what bounds the log of a node that commits rarely but in
+    /// bulk. 0 turns the byte trigger off.
+    /// </summary>
+    public long IntervalBytes { get; set; } = 256L << 20;
+
+    /// <summary>
     /// Whether a successful snapshot truncates the log behind it. Truncation never passes the
     /// slowest applier checkpoint, the slowest live event-subscriber checkpoint, or the Resume
     /// retention window, regardless of this setting.

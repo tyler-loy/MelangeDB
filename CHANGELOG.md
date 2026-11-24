@@ -10,6 +10,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Fixed
+
+- **A node that commits rarely but in bulk now snapshots, and so truncates its log.** Automatic
+  snapshots counted only transactions (`Snapshots:IntervalTransactions`, 100,000). A shard taking
+  few, large transactions never reached the count and its log grew without bound; in the overnight
+  soak, the shards just outside the world, which take only border-band mirrors, grew their logs by
+  several GiB an hour while the busy shards held flat. The new **`Snapshots:IntervalBytes`** (default
+  256 MiB, `0` off) also snapshots once that much log has been appended since the last snapshot.
+
 ### Added
 
 - **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default,

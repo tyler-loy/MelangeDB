@@ -51,6 +51,7 @@ internal static class FailoverMeasurement
                 // Snapshots are taken by the measurement, before each kill, so the tail recovery
                 // replays is the --tail it asked for and never an automatic snapshot's leftovers.
                 ["MelangeDb:Snapshots:IntervalTransactions"] = "1000000000000",
+                ["MelangeDb:Snapshots:IntervalBytes"] = "0",
                 ["MelangeDb:Cluster:FastFailoverOnLinkLoss"] = options.FastFailover ? "true" : "false",
                 ["MelangeDb:Cluster:ShardReplicas"] = options.Replicas.ToString(CultureInfo.InvariantCulture),
             });
@@ -326,6 +327,7 @@ internal static class FailoverMeasurement
         engineOptions.HotStore.Engine = options.HotStore == "faster" ? HotStoreEngine.Faster : HotStoreEngine.InMemory;
         engineOptions.Events.DeadLetterPath = Path.Combine(shardDirectory, "deadletter");
         engineOptions.Snapshots.IntervalTransactions = 1_000_000_000_000;
+        engineOptions.Snapshots.IntervalBytes = 0;
         engineOptions.Residency.ReportOnStartup = false;
         var started = Stopwatch.GetTimestamp();
         using var engine = new MelangeEngine(
