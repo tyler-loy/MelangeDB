@@ -13,7 +13,7 @@ internal sealed record Measure(string Name, double Value, string Unit);
 /// <summary>One engine's run: its numbers, and whether every row read back as written.</summary>
 internal sealed record EngineResult(string Engine, List<Measure> Measures, string? CorrectnessFailure);
 
-internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root, bool Compaction, bool IndexGrowth);
+internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root, bool Compaction, bool IndexGrowth, bool NativeDirectory);
 
 /// <summary>
 /// Drives each engine through the same <see cref="IHotStore"/> workloads, each engine in its own
@@ -38,7 +38,8 @@ internal static class Runner
             BlobBytes: Int(flags, "blob-bytes", 4096),
             Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"),
             Compaction: flags.GetValueOrDefault("compaction") != "off",
-            IndexGrowth: flags.GetValueOrDefault("index-growth") == "on");
+            IndexGrowth: flags.GetValueOrDefault("index-growth") == "on",
+            NativeDirectory: flags.GetValueOrDefault("native-directory") == "on");
 
         if (flags.TryGetValue("engine", out var single))
         {
@@ -99,7 +100,7 @@ internal static class Runner
         var root = Path.Combine(s.Root, $"{engine}-{Environment.ProcessId}");
         var options = new MelangeDbOptions
         {
-            HotStore = { Path = Path.Combine(root, "hot"), MemoryBudgetBytes = s.BudgetBytes, Compaction = { Enabled = s.Compaction } },
+            HotStore = { Path = Path.Combine(root, "hot"), MemoryBudgetBytes = s.BudgetBytes, Compaction = { Enabled = s.Compaction }, NativeDirectory = s.NativeDirectory },
             Residency = { Default = Residency.Paged },
         };
         var measures = new List<Measure>();
@@ -353,6 +354,8 @@ internal static class Runner
         using var process = Process.GetCurrentProcess();
         measures.Add(new($"managed heap {when}", GC.GetTotalMemory(false) / 1048576.0, "MiB"));
         measures.Add(new($"working set {when}", process.WorkingSet64 / 1048576.0, "MiB"));
+        if (store.Statistics().NativeDirectoryBytes is > 0 and var native)
+            measures.Add(new($"native directory {when}", native / 1048576.0, "MiB"));
         var disk = Directory.Exists(root)
             ? new DirectoryInfo(root).EnumerateFiles("*", SearchOption.AllDirectories).Sum(static f => f.Length)
             : 0;

@@ -291,6 +291,7 @@ Meter name: `MelangeDB`.
 | `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.4.2 |
 | `melange.store.writes` | counter | `{write}` | `space`, `mode` (`in_place`/`append`) | 0.4.2 |
 | `melange.store.memory_bytes` | gauge | `By` | `space` | 0.4.2 |
+| `melange.store.directory.native_bytes` | gauge | `By` | — | 0.4.2 |
 | `melange.store.flush.lag_bytes` | gauge | `By` | `space` | 0.4.2 |
 | `melange.store.segments` | gauge | `{segment}` | `space` | 0.4.2 |
 | `melange.store.index.entries` | gauge | `{entry}` | `space` | 0.4.2 |

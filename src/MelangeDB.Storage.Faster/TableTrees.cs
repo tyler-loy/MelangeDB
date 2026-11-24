@@ -52,6 +52,14 @@ internal abstract class TableTrees
 
     /// <summary>A fresh, empty version of the same kind, with <paramref name="indexes"/> indexes.</summary>
     public abstract TableTrees Empty(int indexes);
+
+    /// <summary>
+    /// Called once, when the table version holding this one has no reader left and never will:
+    /// native trees give their pages back. Managed trees have nothing to do; the GC has them.
+    /// </summary>
+    public virtual void Release()
+    {
+    }
 }
 
 /// <summary>
@@ -178,27 +186,62 @@ internal sealed class NativeTableTrees : TableTrees
     private static readonly NativeEntryProjector<RowKey> KeyOf = static (key, _) => new RowKey(key);
     private static readonly NativeEntryProjector<RowKey> PairKeyOf = static (_, key) => new RowKey(key);
 
-    private readonly NativeTree _directory;
-    private readonly NativeTree[] _indexes;
+    private readonly Holder _directoryHolder;
+    private readonly Holder[] _indexHolders;
 
-    private NativeTableTrees(NativeTree directory, NativeTree[] indexes)
+    private NativeTableTrees(Holder directory, Holder[] indexes)
     {
-        _directory = directory;
-        _indexes = indexes;
+        _directoryHolder = directory;
+        _indexHolders = indexes;
     }
+
+    private NativeTree DirectoryTree => _directoryHolder.Tree;
 
     public static NativeTableTrees Create(NativePagePool pool, int indexes) =>
         new(
-            NativeTree.Empty(pool, NativeTreeOrder.Plain),
-            [.. Enumerable.Range(0, indexes).Select(_ => NativeTree.Empty(pool, NativeTreeOrder.Pair))]);
+            new Holder(NativeTree.Empty(pool, NativeTreeOrder.Plain)),
+            [.. Enumerable.Range(0, indexes).Select(_ => new Holder(NativeTree.Empty(pool, NativeTreeOrder.Pair)))]);
 
-    public override long Count => _directory.Count;
+    private NativeTree Index(int index) => _indexHolders[index].Tree;
 
-    public override bool Contains(in RowKey key) => _directory.ContainsKey(key.Span);
+    public override void Release()
+    {
+        _directoryHolder.Release();
+        foreach (var holder in _indexHolders)
+            holder.Release();
+    }
+
+    /// <summary>
+    /// One native tree and the table-tree versions holding it. A commit that leaves a tree alone
+    /// shares it with the next version, so a tree is released when its last holder is, not when the
+    /// version that produced it is.
+    /// </summary>
+    private sealed class Holder(NativeTree tree)
+    {
+        private int _holders = 1;
+
+        public NativeTree Tree { get; } = tree;
+
+        public Holder Share()
+        {
+            Interlocked.Increment(ref _holders);
+            return this;
+        }
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _holders) == 0)
+                Tree.Release();
+        }
+    }
+
+    public override long Count => DirectoryTree.Count;
+
+    public override bool Contains(in RowKey key) => DirectoryTree.ContainsKey(key.Span);
 
     public override bool TryGetEntry(in RowKey key, [NotNullWhen(true)] out DirectoryEntry? entry)
     {
-        if (_directory.TryGet(key.Span, out var value))
+        if (DirectoryTree.TryGet(key.Span, out var value))
         {
             entry = Decode(value);
             return true;
@@ -208,23 +251,23 @@ internal sealed class NativeTableTrees : TableTrees
         return false;
     }
 
-    public override IEnumerable<RowKey> Keys => _directory.Scan(KeyOf);
+    public override IEnumerable<RowKey> Keys => DirectoryTree.Scan(KeyOf);
 
     public override IEnumerable<RowKey> KeyRange(RowKey low, RowKey high) =>
-        _directory.Range(low.ToArray(), high.ToArray(), KeyOf);
+        DirectoryTree.Range(low.ToArray(), high.ToArray(), KeyOf);
 
     public override IEnumerable<RowKey> IndexEqual(int index, RowKey value)
     {
         var bound = value.ToArray();
-        return _indexes[index].Range(bound, bound, PairKeyOf);
+        return Index(index).Range(bound, bound, PairKeyOf);
     }
 
     public override IEnumerable<RowKey> IndexRange(int index, RowKey low, RowKey high) =>
-        _indexes[index].Range(low.ToArray(), high.ToArray(), PairKeyOf);
+        Index(index).Range(low.ToArray(), high.ToArray(), PairKeyOf);
 
     public override TableTreesEdit BeginEdit(bool bulk) => new Edit(this);
 
-    public override TableTrees Empty(int indexes) => Create(_directory.Pool, indexes);
+    public override TableTrees Empty(int indexes) => Create(DirectoryTree.Pool, indexes);
 
     internal static byte[] Encode(DirectoryEntry entry)
     {
@@ -319,35 +362,35 @@ internal sealed class NativeTableTrees : TableTrees
     /// </summary>
     private sealed class Edit(NativeTableTrees from) : TableTreesEdit
     {
-        private readonly NativeTree.Edit?[] _indexes = new NativeTree.Edit?[from._indexes.Length];
+        private readonly NativeTree.Edit?[] _indexes = new NativeTree.Edit?[from._indexHolders.Length];
         private NativeTree.Edit? _directory;
 
         public override bool TryGetEntry(in RowKey key, [NotNullWhen(true)] out DirectoryEntry? entry)
         {
             var found = _directory is { } directory
                 ? directory.TryGet(key.Span, out var value)
-                : from._directory.TryGet(key.Span, out value);
+                : from.DirectoryTree.TryGet(key.Span, out value);
             entry = found ? Decode(value) : null;
             return found;
         }
 
         public override void SetEntry(RowKey key, DirectoryEntry entry) =>
-            (_directory ??= from._directory.BeginEdit()).Set(key.Span, Encode(entry));
+            (_directory ??= from.DirectoryTree.BeginEdit()).Set(key.Span, Encode(entry));
 
-        public override void RemoveEntry(RowKey key) => (_directory ??= from._directory.BeginEdit()).Remove(key.Span);
+        public override void RemoveEntry(RowKey key) => (_directory ??= from.DirectoryTree.BeginEdit()).Remove(key.Span);
 
         public override void IndexAdd(int index, RowKey value, RowKey key) =>
-            (_indexes[index] ??= from._indexes[index].BeginEdit()).Set(value.Span, key.Span);
+            (_indexes[index] ??= from.Index(index).BeginEdit()).Set(value.Span, key.Span);
 
         public override void IndexRemove(int index, RowKey value, RowKey key) =>
-            (_indexes[index] ??= from._indexes[index].BeginEdit()).Remove(value.Span, key.Span);
+            (_indexes[index] ??= from.Index(index).BeginEdit()).Remove(value.Span, key.Span);
 
         public override TableTrees Commit()
         {
-            var indexes = new NativeTree[_indexes.Length];
+            var indexes = new Holder[_indexes.Length];
             for (var i = 0; i < indexes.Length; i++)
-                indexes[i] = _indexes[i]?.Commit() ?? from._indexes[i];
-            var directory = _directory?.Commit() ?? from._directory;
+                indexes[i] = Next(from._indexHolders[i], _indexes[i]);
+            var directory = Next(from._directoryHolder, _directory);
             Array.Clear(_indexes);
             _directory = null;
             return new NativeTableTrees(directory, indexes);
@@ -358,6 +401,15 @@ internal sealed class NativeTableTrees : TableTrees
             _directory?.Dispose();
             foreach (var index in _indexes)
                 index?.Dispose();
+        }
+
+        /// <summary>The tree's holder for the next version: shared when the edit changed nothing.</summary>
+        private static Holder Next(Holder current, NativeTree.Edit? edit)
+        {
+            if (edit is null)
+                return current.Share();
+            var committed = edit.Commit();
+            return ReferenceEquals(committed, current.Tree) ? current.Share() : new Holder(committed);
         }
     }
 }

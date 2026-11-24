@@ -245,8 +245,15 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         // The key directory (paged) or the resident row map answers this — no FASTER read, no
         // out-of-line payload. The version is immutable, so no lock is needed, exactly as the
         // resident TryGetRow fast path reasons.
-        var version = state.Current;
-        return version.Contains(key);
+        var version = state.Acquire();
+        try
+        {
+            return version.Contains(key);
+        }
+        finally
+        {
+            version.Release();
+        }
     }
 
     public bool TryGetRow(TableId table, in RowKey key, out ReadOnlyMemory<byte> row)
@@ -327,16 +334,30 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         if (!_tables.TryGetValue(table, out var state))
             return [];
-        var version = state.Current;
-        return MaterializeRows(state, version, [.. version.Trees.IndexEqual(state.IndexPosition(column), value)]);
+        var version = state.Acquire();
+        try
+        {
+            return MaterializeRows(state, version, [.. version.Trees.IndexEqual(state.IndexPosition(column), value)]);
+        }
+        finally
+        {
+            version.Release();
+        }
     }
 
     public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
     {
         if (!_tables.TryGetValue(table, out var state))
             return [];
-        var version = state.Current;
-        return MaterializeRows(state, version, [.. version.Trees.IndexRange(state.IndexPosition(column), low, high)]);
+        var version = state.Acquire();
+        try
+        {
+            return MaterializeRows(state, version, [.. version.Trees.IndexRange(state.IndexPosition(column), low, high)]);
+        }
+        finally
+        {
+            version.Release();
+        }
     }
 
     public long Count(TableId table) =>
@@ -358,7 +379,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         lock (_lock)
         {
-            return _tables.TryGetValue(table, out var state) ? state.Current.Keys : [];
+            return _tables.TryGetValue(table, out var state) ? LeaseCurrent(state, static version => version.Keys) : [];
         }
     }
 
@@ -366,7 +387,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     {
         lock (_lock)
         {
-            return _tables.TryGetValue(table, out var state) ? state.Current.KeyRange(low, high) : [];
+            return _tables.TryGetValue(table, out var state) ? LeaseCurrent(state, version => version.KeyRange(low, high)) : [];
         }
     }
 
@@ -664,7 +685,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             ObjectDisposedException.ThrowIf(_disposed, this);
             var captured = new Dictionary<TableId, PinnedTable>(_tables.Count);
             foreach (var (id, state) in _tables)
-                captured.Add(id, new PinnedTable(state, state.Current, state.ResidencyEpoch));
+                captured.Add(id, new PinnedTable(state, state.Acquire(), state.ResidencyEpoch));
             var view = new ReadView(this, AppliedLsn, captured);
             _openViews.Add(view);
             return view;
@@ -760,10 +781,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public long Count(TableId table) => Pin(table) is { } pinned ? pinned.Version.RowCount : 0;
 
-        public IEnumerable<RowKey> ScanKeys(TableId table) => Pin(table) is { } pinned ? pinned.Version.Keys : [];
+        public IEnumerable<RowKey> ScanKeys(TableId table) =>
+            Pin(table) is { } pinned ? LeasePinned(pinned.Version, static version => version.Keys) : [];
 
         public IEnumerable<RowKey> ScanKeyRange(TableId table, RowKey low, RowKey high) =>
-            Pin(table) is { } pinned ? pinned.Version.KeyRange(low, high) : [];
+            Pin(table) is { } pinned ? LeasePinned(pinned.Version, version => version.KeyRange(low, high)) : [];
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> Scan(TableId table)
         {
@@ -771,21 +793,23 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 return [];
             return pinned.Version.IsResident
                 ? Resident(pinned)
-                : Materialize(pinned, pinned.Version.Trees.Keys);
+                : Materialize(pinned, LeasePinned(pinned.Version, static version => version.Trees.Keys));
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndex(TableId table, string column, RowKey value)
         {
             if (Pin(table) is not { } pinned)
                 return [];
-            return Materialize(pinned, pinned.Version.Trees.IndexEqual(pinned.Owner.IndexPosition(column), value));
+            var position = pinned.Owner.IndexPosition(column);
+            return Materialize(pinned, LeasePinned(pinned.Version, version => version.Trees.IndexEqual(position, value)));
         }
 
         public IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> ScanIndexRange(TableId table, string column, RowKey low, RowKey high)
         {
             if (Pin(table) is not { } pinned)
                 return [];
-            return Materialize(pinned, pinned.Version.Trees.IndexRange(pinned.Owner.IndexPosition(column), low, high));
+            var position = pinned.Owner.IndexPosition(column);
+            return Materialize(pinned, LeasePinned(pinned.Version, version => version.Trees.IndexRange(position, low, high)));
         }
 
         public void Dispose()
@@ -795,6 +819,8 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _disposed = true;
             store.CloseReadView(this);
             _undo.Clear();
+            foreach (var pinned in tables.Values)
+                pinned.Version.Release();
             tables.Clear();
         }
 
@@ -929,6 +955,44 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     /// lock; a paged one takes the store lock per row, because the hybrid log overwrites in place
     /// and the directory probe and record read have to be atomic against a concurrent write.
     /// </summary>
+    /// <summary>
+    /// A lazy walk over the table's current version as of the first step, holding a lease on it
+    /// until the walk ends, so its pages stay put however long the caller takes between steps.
+    /// </summary>
+    private static IEnumerable<T> LeaseCurrent<T>(TableState state, Func<TableVersion, IEnumerable<T>> walk)
+    {
+        var version = state.Acquire();
+        try
+        {
+            foreach (var item in walk(version))
+                yield return item;
+        }
+        finally
+        {
+            version.Release();
+        }
+    }
+
+    /// <summary>
+    /// A lazy walk over one captured version, holding a lease for the walk. A version already
+    /// released (its read view closed and every newer version published) refuses rather than read
+    /// freed bookkeeping.
+    /// </summary>
+    private static IEnumerable<T> LeasePinned<T>(TableVersion version, Func<TableVersion, IEnumerable<T>> walk)
+    {
+        if (!version.TryAcquire())
+            throw new ObjectDisposedException(nameof(IHotStoreReadView), "The read view this enumeration came from has been closed.");
+        try
+        {
+            foreach (var item in walk(version))
+                yield return item;
+        }
+        finally
+        {
+            version.Release();
+        }
+    }
+
     private IEnumerable<KeyValuePair<RowKey, ReadOnlyMemory<byte>>> MaterializeRows(
         TableState state, TableVersion version, RowKey[] keys)
     {
@@ -950,7 +1014,9 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                  {
                      lock (_lock)
                      {
-                         state.AddRowsScanned(ReadRowsBatched(state, version, batch, rows, skipUnreadable: true));
+                         // The current directory, under the lock: the records read here are the current
+                         // ones, and the version the keys came from may since have been released.
+                         state.AddRowsScanned(ReadRowsBatched(state, state.Current, batch, rows, skipUnreadable: true));
                          return true;
                      }
                  }))
@@ -1426,7 +1492,35 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     /// </summary>
     private sealed class TableVersion(bool isResident, RowDirectory<byte[]> residentRows, TableTrees trees)
     {
+        /// <summary>
+        /// Holders of this version: one while it is the table's current version, plus one per lease
+        /// (a lock-free read in progress, a lazy key walk, an open read view). When the count reaches
+        /// zero nothing can read the version again, and its trees are released at once: native
+        /// pages go back as soon as the last reader is done rather than whenever a collection runs.
+        /// </summary>
+        private int _holders = 1;
+
         public bool IsResident { get; } = isResident;
+
+        /// <summary>Takes a lease, unless the version has already been released.</summary>
+        public bool TryAcquire()
+        {
+            while (true)
+            {
+                var holders = Volatile.Read(ref _holders);
+                if (holders == 0)
+                    return false;
+                if (Interlocked.CompareExchange(ref _holders, holders + 1, holders) == holders)
+                    return true;
+            }
+        }
+
+        /// <summary>Gives back a lease (or, from the publisher, the current-version hold).</summary>
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _holders) == 0)
+                Trees.Release();
+        }
 
         public RowDirectory<byte[]> ResidentRows { get; } = residentRows;
 
@@ -1675,7 +1769,29 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (_pending is not { BulkRows: { } bulkRows } pending)
                 return;
             _pending = null;
-            Current = new TableVersion(pending.IsResident, bulkRows.ToImmutable(), pending.Trees.Commit());
+            Supersede(new TableVersion(pending.IsResident, bulkRows.ToImmutable(), pending.Trees.Commit()));
+        }
+
+        /// <summary>
+        /// A lease on the current version, for a read that runs without the store lock. Retries if
+        /// the version it read was superseded and released in between; the caller releases it.
+        /// </summary>
+        public TableVersion Acquire()
+        {
+            while (true)
+            {
+                var version = Current;
+                if (version.TryAcquire())
+                    return version;
+            }
+        }
+
+        /// <summary>Publishes <paramref name="next"/> and drops the current-version hold on the one it replaces.</summary>
+        private void Supersede(TableVersion next)
+        {
+            var previous = Current;
+            Current = next;
+            previous.Release();
         }
 
         /// <summary>
@@ -1687,7 +1803,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             if (_pending is not { BulkRows: null } pending)
                 return;
             _pending = null;
-            Current = new TableVersion(pending.IsResident, pending.Rows, pending.Trees.Commit());
+            Supersede(new TableVersion(pending.IsResident, pending.Rows, pending.Trees.Commit()));
         }
 
         /// <summary>The open write, opened on first use from the current version.</summary>

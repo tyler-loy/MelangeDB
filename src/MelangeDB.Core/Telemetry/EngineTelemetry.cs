@@ -130,6 +130,11 @@ internal sealed class EngineTelemetry : IDisposable
             "{write}",
             "Writes to each paged log space by mode: in_place rewrote a record in memory, append wrote a new one and left garbage for compaction.");
         _meter.CreateObservableGauge(
+            "melange.store.directory.native_bytes",
+            () => _storeStatistics?.Invoke().NativeDirectoryBytes ?? 0L,
+            "By",
+            "Native memory held by the paged store's key directory and secondary indexes under HotStore:NativeDirectory, including versions not yet collected.");
+        _meter.CreateObservableGauge(
             "melange.store.memory_bytes",
             () => LogMeasurements(static l => l.MemoryBytes),
             "By",
