@@ -796,6 +796,33 @@ public sealed class HotStoreOptions
 
     /// <summary>Reclaiming the paged tier's log space while the store runs (<c>HotStore:Compaction:*</c>).</summary>
     public HotStoreCompactionOptions Compaction { get; set; } = new();
+
+    /// <summary>Settings for the <see cref="PagedEngine.MelangeLog"/> engine (<c>HotStore:MelangeLog:*</c>).</summary>
+    public MelangeLogOptions MelangeLog { get; set; } = new();
+}
+
+/// <summary>How the MelangeLog engine reads a record that has left memory.</summary>
+public enum MelangeLogReadMode
+{
+    /// <summary>
+    /// Through a read-only memory map of the record's segment: a page fault rather than a system call
+    /// and a copy, and the faster path. A disk error on a mapped page is a signal (SIGBUS on Linux)
+    /// that ends the process, which then restarts and rebuilds.
+    /// </summary>
+    Mmap,
+
+    /// <summary>
+    /// <c>RandomAccess.Read</c> through the OS page cache: a system call and a copy per read, slower,
+    /// and a disk error is an exception the store reports (EventId 1511 for a scan) instead.
+    /// </summary>
+    Pread,
+}
+
+/// <summary>Options for the MelangeLog paged engine (<c>MelangeDb:HotStore:MelangeLog:*</c>).</summary>
+public sealed class MelangeLogOptions
+{
+    /// <summary>How records that have left memory are read; see <see cref="MelangeLogReadMode"/>.</summary>
+    public MelangeLogReadMode ReadMode { get; set; } = MelangeLogReadMode.Mmap;
 }
 
 /// <summary>
@@ -821,6 +848,20 @@ public sealed class HotStoreCompactionOptions
     /// yields the store lock between steps of about a megabyte.
     /// </summary>
     public long MaxBytesPerSecond { get; set; }
+
+    /// <summary>
+    /// A soft cap on the paged logs' combined size; zero is none. Above it, compaction runs as hard as
+    /// it can (a ratio of 1.1, ignoring <see cref="MaxBytesPerSecond"/>) and EventId 1519 warns while
+    /// the logs stay over. It does not refuse writes: live data larger than the cap is a sizing error,
+    /// and failing the store over it would only rebuild into the same state.
+    /// </summary>
+    public long MaxLogBytes { get; set; }
+
+    /// <summary>
+    /// Free space on the hot store's disk below which compaction runs as hard as it can and EventId
+    /// 1518 warns; zero turns the check off. Checked once a second.
+    /// </summary>
+    public long MinFreeDiskBytes { get; set; } = 1L << 30;
 }
 
 /// <summary>When the commit log forces appended records to stable storage.</summary>

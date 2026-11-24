@@ -103,10 +103,12 @@ internal interface IPagedKvFactory
 /// <summary>The engine behind each <see cref="PagedEngine"/> value.</summary>
 internal static class PagedEngines
 {
-    public static IPagedKvFactory For(PagedEngine engine, ILoggerFactory? loggerFactory = null) => engine switch
+    public static IPagedKvFactory For(PagedEngine engine, HotStoreOptions? options = null, ILoggerFactory? loggerFactory = null) => engine switch
     {
         PagedEngine.Faster => FasterPagedKvFactory.Instance,
-        PagedEngine.MelangeLog => new MelangeLogPagedKvFactory(),
+        PagedEngine.MelangeLog => new MelangeLogPagedKvFactory(
+            MelangeLogTuning.Default with { ReadMode = options?.MelangeLog.ReadMode ?? MelangeLogReadMode.Mmap },
+            logger: loggerFactory?.CreateLogger<MelangeLogPagedKvFactory>()),
         PagedEngine.Tsavorite => new TsavoritePagedKvFactory(logger: loggerFactory?.CreateLogger<TsavoritePagedKvFactory>()),
         _ => throw new ArgumentOutOfRangeException(nameof(engine), engine, "Not a paged engine this build knows."),
     };

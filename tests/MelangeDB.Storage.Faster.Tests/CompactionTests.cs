@@ -95,13 +95,56 @@ public sealed class CompactionTests
         AssertRows(harness, 1);
     }
 
-    private static StoreHarness MelangeLogHarness(bool compaction) =>
+    /// <summary>
+    /// A trigger ratio of 10 would let the log reach ten times its live data. Over the log cap, or
+    /// short of disk, compaction ignores it and compacts down to the floor ratio.
+    /// </summary>
+    [Theory]
+    [InlineData("cap")]
+    [InlineData("disk")]
+    public void Pressure_compacts_past_a_lax_trigger_ratio(string pressure)
+    {
+        using var harness = MelangeLogHarness(compaction: true, options =>
+        {
+            options.HotStore.Compaction.TriggerRatio = 10;
+            if (pressure == "cap")
+                options.HotStore.Compaction.MaxLogBytes = 16L << 20;
+            else
+                options.HotStore.Compaction.MinFreeDiskBytes = long.MaxValue;
+        });
+        Rewrite(harness, Rounds);
+
+        var blob = WaitFor(harness.Engine.HotStore, "blob", log => log.LogBytes <= Bound(log));
+        Assert.True(blob.ReclaimedBytes > 0, "nothing was reclaimed");
+        Assert.True(blob.LogBytes <= Bound(blob), $"blob log {blob.LogBytes >> 20} MiB against {blob.LiveBytes >> 20} MiB live");
+        AssertRows(harness, Rounds);
+    }
+
+    [Fact]
+    public void The_pread_read_mode_is_chosen_by_option()
+    {
+        using var harness = new StoreHarness(
+            StoreKind.Faster,
+            options =>
+            {
+                options.Residency.Default = Residency.Paged;
+                options.HotStore.MelangeLog.ReadMode = MelangeLogReadMode.Pread;
+            },
+            tables: [typeof(TerrainBlob)],
+            provider: new FasterHotStoreProvider(PagedEngine.MelangeLog));
+        Rewrite(harness, 3);
+        AssertRows(harness, 3);
+        Assert.True(harness.Engine.HotStore.Statistics().Tables.Single().PageFaults > 0);
+    }
+
+    private static StoreHarness MelangeLogHarness(bool compaction, Action<MelangeDbOptions>? configure = null) =>
         new(
             StoreKind.Faster,
             options =>
             {
                 options.HotStore.Compaction.Enabled = compaction;
                 options.Residency.Default = Residency.Paged;
+                configure?.Invoke(options);
             },
             tables: [typeof(TerrainBlob)],
             provider: new FasterHotStoreProvider(new MelangeLogPagedKvFactory()));

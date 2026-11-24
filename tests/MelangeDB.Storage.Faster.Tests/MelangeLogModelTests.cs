@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using MelangeDB.Core;
 using Xunit;
 
 namespace MelangeDB.Storage.Faster.Tests;

@@ -56,6 +56,10 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private static readonly TimeSpan CompactionIdle = TimeSpan.FromMilliseconds(100);
 
     private readonly HotStoreCompactionOptions _compaction;
+    private readonly string _hotStorePath;
+
+    /// <summary>The lowest compaction trigger ratio: the setting's floor, and what pressure compacts at.</summary>
+    private const double MinTriggerRatio = 1.1;
     private readonly CancellationTokenSource _compactionStop = new();
     private readonly Thread? _compactor;
 
@@ -109,8 +113,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
 
         _compaction = context.Options.HotStore.Compaction;
-        if (!(_compaction.TriggerRatio >= 1.1))
+        if (!(_compaction.TriggerRatio >= MinTriggerRatio))
             throw new ArgumentOutOfRangeException(nameof(context), _compaction.TriggerRatio, "HotStore:Compaction:TriggerRatio must be at least 1.1.");
+        if (_compaction.MaxLogBytes < 0 || _compaction.MinFreeDiskBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(context), "HotStore:Compaction:MaxLogBytes and MinFreeDiskBytes must not be negative.");
+        _hotStorePath = Path.GetFullPath(path);
         if (_compaction.MaxBytesPerSecond < 0)
             throw new ArgumentOutOfRangeException(nameof(context), _compaction.MaxBytesPerSecond, "HotStore:Compaction:MaxBytesPerSecond must not be negative.");
         if (_compaction.Enabled && (_main is ICompactingPagedKv || _blob is ICompactingPagedKv))
@@ -356,6 +363,101 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes, Logs = logs };
     }
 
+    /// <summary>
+    /// Whether compaction must run flat out: the logs over <c>HotStore:Compaction:MaxLogBytes</c>, or the
+    /// hot store's disk under <c>MinFreeDiskBytes</c>. Checked at most once a second, on the compaction
+    /// thread. Each condition warns when it starts (EventIds 1519, 1518), every five minutes while it
+    /// lasts, and logs once when it clears.
+    /// </summary>
+    private sealed class CompactionPressure(FasterHotStore store, IPagedKv[] spaces)
+    {
+        private static readonly TimeSpan CheckEvery = TimeSpan.FromSeconds(1);
+        private static readonly TimeSpan RepeatEvery = TimeSpan.FromMinutes(5);
+
+        private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+        private TimeSpan _lastCheck = -CheckEvery;
+        private TimeSpan? _overSince;
+        private TimeSpan? _lowSince;
+        private TimeSpan _overWarned;
+        private TimeSpan _lowWarned;
+        private bool _urgent;
+
+        public bool Check()
+        {
+            var now = _clock.Elapsed;
+            if (now - _lastCheck < CheckEvery)
+                return _urgent;
+            _lastCheck = now;
+
+            var options = store._compaction;
+            var over = false;
+            if (options.MaxLogBytes > 0)
+            {
+                long log = 0, live = 0;
+                foreach (var space in spaces)
+                {
+                    var statistics = space.Statistics;
+                    log += Math.Max(0, statistics.LogBytes);
+                    live += Math.Max(0, statistics.LiveBytes);
+                }
+
+                over = log > options.MaxLogBytes;
+                if (Track(over, ref _overSince, ref _overWarned, now))
+                    LogMessages.LogOverCap(store._logger, log, options.MaxLogBytes, live);
+                else if (!over && _overSince is null && _overWarned != TimeSpan.Zero)
+                {
+                    _overWarned = TimeSpan.Zero;
+                    LogMessages.LogUnderCap(store._logger, log, options.MaxLogBytes);
+                }
+            }
+
+            var low = false;
+            if (options.MinFreeDiskBytes > 0 && FreeBytes(store._hotStorePath) is { } free)
+            {
+                low = free < options.MinFreeDiskBytes;
+                if (Track(low, ref _lowSince, ref _lowWarned, now))
+                    LogMessages.DiskSpaceLow(store._logger, store._hotStorePath, free, options.MinFreeDiskBytes);
+                else if (!low && _lowSince is null && _lowWarned != TimeSpan.Zero)
+                {
+                    _lowWarned = TimeSpan.Zero;
+                    LogMessages.DiskSpaceRecovered(store._logger, store._hotStorePath, free, options.MinFreeDiskBytes);
+                }
+            }
+
+            _urgent = over || low;
+            return _urgent;
+        }
+
+        /// <summary>Tracks one condition; true when it should warn now (it began, or five minutes passed).</summary>
+        private static bool Track(bool active, ref TimeSpan? since, ref TimeSpan warned, TimeSpan now)
+        {
+            if (!active)
+            {
+                since = null;
+                return false;
+            }
+
+            since ??= now;
+            if (warned != TimeSpan.Zero && now - warned < RepeatEvery)
+                return false;
+            warned = now == TimeSpan.Zero ? TimeSpan.FromTicks(1) : now;
+            return true;
+        }
+
+        /// <summary>Free bytes on the file system holding <paramref name="path"/>, or null if it cannot be read.</summary>
+        private static long? FreeBytes(string path)
+        {
+            try
+            {
+                return new DriveInfo(OperatingSystem.IsWindows() ? Path.GetPathRoot(path)! : path).AvailableFreeSpace;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                return null;
+            }
+        }
+    }
+
     /// <summary>A space's engine statistics, named, with the compaction thread's own counters when it compacts.</summary>
     private HotStoreLogStatistics LogStatistics(int index, string space, IPagedKv kv)
     {
@@ -426,10 +528,14 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         var token = _compactionStop.Token;
         var clock = System.Diagnostics.Stopwatch.StartNew();
         var copied = 0L;
+        var pressure = new CompactionPressure(this, spaces.Select(static s => (IPagedKv)s.Space).ToArray());
         try
         {
             while (!token.IsCancellationRequested)
             {
+                // Over the log cap or short of disk, compact as hard as possible: the lowest ratio, no rate cap.
+                var urgent = pressure.Check();
+                var ratio = urgent ? MinTriggerRatio : _compaction.TriggerRatio;
                 var busy = false;
                 foreach (var (index, name, space) in spaces)
                 {
@@ -442,7 +548,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                         var held = System.Diagnostics.Stopwatch.GetTimestamp();
                         try
                         {
-                            step = space.Compact(_compaction.TriggerRatio, CompactionStepBytes);
+                            step = space.Compact(ratio, CompactionStepBytes);
                         }
                         catch (InvalidDataException fault)
                         {
@@ -474,7 +580,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 }
 
                 // Under a cap, run no faster than it allows; uncapped, still let a waiting writer in.
-                if (_compaction.MaxBytesPerSecond > 0)
+                if (_compaction.MaxBytesPerSecond > 0 && !urgent)
                 {
                     var ahead = TimeSpan.FromSeconds((double)copied / _compaction.MaxBytesPerSecond) - clock.Elapsed;
                     if (ahead > TimeSpan.Zero && token.WaitHandle.WaitOne(ahead))
@@ -1769,5 +1875,44 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
         public static void CompactionStopped(ILogger logger, Exception exception) =>
             CompactionStoppedMessage(logger, exception);
+
+        private static readonly Action<ILogger, string, long, long, Exception?> DiskSpaceLowMessage =
+            LoggerMessage.Define<string, long, long>(
+                LogLevel.Warning,
+                new EventId(1518, "PagedDiskSpaceLow"),
+                "The hot store's disk ({Path}) has {Free} bytes free, under HotStore:Compaction:MinFreeDiskBytes ({Threshold}). "
+                + "Compaction now runs as hard as it can. If the disk fills, a write to the paged store fails and the database "
+                + "closes to writes (EventId 1517).");
+
+        public static void DiskSpaceLow(ILogger logger, string path, long free, long threshold) =>
+            DiskSpaceLowMessage(logger, path, free, threshold, null);
+
+        private static readonly Action<ILogger, string, long, long, Exception?> DiskSpaceRecoveredMessage =
+            LoggerMessage.Define<string, long, long>(
+                LogLevel.Information,
+                new EventId(1518, "PagedDiskSpaceLow"),
+                "The hot store's disk ({Path}) has {Free} bytes free again, over HotStore:Compaction:MinFreeDiskBytes ({Threshold}).");
+
+        public static void DiskSpaceRecovered(ILogger logger, string path, long free, long threshold) =>
+            DiskSpaceRecoveredMessage(logger, path, free, threshold, null);
+
+        private static readonly Action<ILogger, long, long, long, Exception?> LogOverCapMessage =
+            LoggerMessage.Define<long, long, long>(
+                LogLevel.Warning,
+                new EventId(1519, "PagedLogOverCap"),
+                "The paged logs hold {LogBytes} bytes, over HotStore:Compaction:MaxLogBytes ({Cap}), with {LiveBytes} bytes live. "
+                + "Compaction now runs as hard as it can. If live bytes alone exceed the cap, it cannot get under it: raise the cap.");
+
+        public static void LogOverCap(ILogger logger, long logBytes, long cap, long liveBytes) =>
+            LogOverCapMessage(logger, logBytes, cap, liveBytes, null);
+
+        private static readonly Action<ILogger, long, long, Exception?> LogUnderCapMessage =
+            LoggerMessage.Define<long, long>(
+                LogLevel.Information,
+                new EventId(1519, "PagedLogOverCap"),
+                "The paged logs are back under HotStore:Compaction:MaxLogBytes: {LogBytes} of {Cap} bytes.");
+
+        public static void LogUnderCap(ILogger logger, long logBytes, long cap) =>
+            LogUnderCapMessage(logger, logBytes, cap, null);
     }
 }

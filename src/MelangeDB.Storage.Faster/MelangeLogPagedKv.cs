@@ -3,19 +3,12 @@ using System.IO.MemoryMappedFiles;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using MelangeDB.Core;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Win32.SafeHandles;
 
 namespace MelangeDB.Storage.Faster;
-
-/// <summary>How a <see cref="MelangeLogPagedKv"/> reads a record that has left memory.</summary>
-internal enum MelangeLogReadMode
-{
-    /// <summary>A pointer into a read-only memory map of the record's segment file: a page fault, not a system call and a copy.</summary>
-    Mmap,
-
-    /// <summary><c>RandomAccess.Read</c> into a scratch buffer: a system call and a copy, through the OS page cache.</summary>
-    Pread,
-}
 
 /// <summary>
 /// Settings the bake-off varies for <see cref="MelangeLogPagedKv"/>. Page sizes are log2 bytes and are
@@ -46,9 +39,12 @@ internal sealed record MelangeLogTuning(
 /// </summary>
 /// <param name="tuning">The bake-off's knobs; <see cref="MelangeLogTuning.Default"/> when null.</param>
 /// <param name="failFlushForTest">Fault injection: given a page about to be flushed, true makes that flush throw an <see cref="IOException"/>.</param>
-internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, Func<long, bool>? failFlushForTest = null) : IPagedKvFactory
+/// <param name="logger">Where EventId 1520 goes, once, when the platform has no prefetch hint.</param>
+internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, Func<long, bool>? failFlushForTest = null, ILogger? logger = null) : IPagedKvFactory
 {
     private readonly MelangeLogTuning _tuning = tuning ?? MelangeLogTuning.Default;
+    private readonly ILogger _logger = logger ?? NullLogger.Instance;
+    private bool _prefetchChecked;
 
     public string EngineName => "melangelog";
 
@@ -69,6 +65,13 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, 
         // small (the test suite opens hundreds of 4 MiB spaces) and at 64 MiB otherwise.
         var segmentBits = Math.Max(pageBits, Math.Min(26, budgetBits + 1));
         var name = space == PagedKvSpace.Main ? "main.mlog" : "blob.mlog";
+
+        if (!_prefetchChecked)
+        {
+            _prefetchChecked = true;
+            if (_tuning.ReadMode == MelangeLogReadMode.Mmap && _tuning.Prefetch && !MelangeLogNative.PrefetchAvailable)
+                MelangeLogEngineLog.PrefetchUnavailable(_logger);
+        }
 
         Directory.CreateDirectory(directory);
         foreach (var file in Directory.EnumerateFiles(directory, name + "*"))
@@ -1526,4 +1529,12 @@ internal static unsafe class MelangeLogNative
             return (delegate* unmanaged<nint, nuint, int, int>)function;
         return null;
     }
+}
+
+internal static partial class MelangeLogEngineLog
+{
+    [LoggerMessage(EventId = 1520, EventName = "MelangeLogPrefetchUnavailable", Level = LogLevel.Information,
+        Message = "MelangeLog found no prefetch hint on this platform (madvise or PrefetchVirtualMemory), so scans of paged " +
+            "tables fault their pages in one at a time instead of together: correct, and slower on a cold store.")]
+    public static partial void PrefetchUnavailable(ILogger logger);
 }

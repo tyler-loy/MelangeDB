@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using MelangeDB.Core;
+using MelangeDB.Storage.Faster;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace MelangeDB.HotStoreBakeoff;
@@ -101,6 +102,7 @@ internal static class Runner
             Residency = { Default = Residency.Paged },
         };
         var measures = new List<Measure>();
+        IndexGrowth(engine, root, s, measures);
         var random = new Random(42);
         var keys = new RowKey[s.Rows];
         for (var i = 0; i < s.Rows; i++)
@@ -198,10 +200,6 @@ internal static class Runner
 
             var failure = Verify(store, entity, terrain, keys, versions, blobKeys, blobVersions, s, random);
 
-            // Growing: twice the table's rows again as new keys, so a hash index sized for the table
-            // grows at least once mid-phase. The max is what one growth costs a single write.
-            Phase(measures, "growing inserts (2x table)", s.Rows * 2, n =>
-                Apply(store, lsn++, new RowOp(RowOpKind.Insert, entity.Id, SchemaKeyCodec.Encode(entity.PrimaryKey, (ulong)(s.Rows + n)), EntityRow(entity, s.Rows + n, 0))));
             return new EngineResult(engine, measures, failure);
         }
         catch (Exception exception)
@@ -218,6 +216,35 @@ internal static class Runner
             catch (IOException)
             {
             }
+        }
+    }
+
+    /// <summary>
+    /// The engine's own key-value space, before any store exists: four million small keys into a space
+    /// sized from the budget, as the store sizes it, so its hash index grows several times. The max is
+    /// what one growth costs a single write; for an index that rehashes at once, every key it holds.
+    /// </summary>
+    private static void IndexGrowth(string engine, string root, Settings s, List<Measure> measures)
+    {
+        var directory = Path.Combine(root, "growth");
+        var keys = 4_000_000;
+        using (var space = Engines.Factory(engine).Open(directory, PagedKvSpace.Main, s.BudgetBytes, Math.Max(s.BudgetBytes / 1024, 1L << 16)))
+        {
+            var key = new byte[8];
+            var value = new byte[16];
+            Phase(measures, "index growth inserts (4M keys)", keys, n =>
+            {
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, n);
+                space.Upsert(key, value);
+            });
+        }
+
+        try
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+        catch (IOException)
+        {
         }
     }
 
