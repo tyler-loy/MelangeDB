@@ -112,6 +112,77 @@ public sealed class MelangeLogModelTests
     }
 
     /// <summary>
+    /// The index grows by migrating a few slots per write, so for a while a key may be in the old
+    /// table or the new one. 40,000 keys through a 4,096-slot start is four growths, each with reads,
+    /// batched reads, deletes, rewrites and compaction running against the half-migrated index.
+    /// </summary>
+    [Fact]
+    public void The_index_grows_incrementally_under_every_operation()
+    {
+        const int keySpace = 40_000;
+        var directory = Directory.CreateTempSubdirectory("melange-mlog-grow-").FullName;
+        var random = new Random(11);
+        var model = new Dictionary<int, byte[]>();
+        static byte[] WideKey(int id)
+        {
+            var key = new byte[8];
+            BinaryPrimitives.WriteInt32BigEndian(key, 42);
+            BinaryPrimitives.WriteInt32BigEndian(key.AsSpan(4), id);
+            return key;
+        }
+
+        using (var kv = new MelangeLogPagedKv(
+                   Path.Combine(directory, "grow.mlog"), 12, 4, 16, 16, MelangeLogTuning.Default, 512))
+        {
+            for (var n = 0; n < 150_000; n++)
+            {
+                if (n % 50 == 0)
+                {
+                    kv.PrepareCompactionStep();
+                    kv.Compact(1.5, 8192);
+                }
+
+                // Inserts lead early so the key count climbs through each growth threshold.
+                var id = random.Next(Math.Min(keySpace, 1000 + n / 2));
+                switch (random.Next(10))
+                {
+                    case < 6:
+                        var value = new byte[random.Next(0, 64)];
+                        random.NextBytes(value);
+                        kv.Upsert(WideKey(id), value);
+                        model[id] = value;
+                        break;
+                    case 6:
+                        kv.Delete(WideKey(id));
+                        model.Remove(id);
+                        break;
+                    case 7:
+                        var ids = new int[random.Next(1, 30)];
+                        var keys = new byte[ids.Length][];
+                        for (var i = 0; i < ids.Length; i++)
+                            keys[i] = WideKey(ids[i] = random.Next(keySpace));
+                        var values = new byte[]?[ids.Length];
+                        _ = kv.ReadMany(keys, values);
+                        for (var i = 0; i < ids.Length; i++)
+                            Expect(model, ids[i], values[i], n);
+                        break;
+                    default:
+                        Expect(model, id, kv.Read(WideKey(id), out _), n);
+                        break;
+                }
+            }
+
+            for (var id = 0; id < keySpace; id++)
+                Expect(model, id, kv.Read(WideKey(id), out _), -1);
+            Assert.Equal(model.Count, kv.Statistics.IndexEntries);
+            Assert.True(kv.Statistics.IndexResizes >= 3, $"{kv.Statistics.IndexResizes} resizes");
+            AssertAccounting(kv);
+        }
+
+        Directory.Delete(directory, recursive: true);
+    }
+
+    /// <summary>
     /// Two keys whose hashes collide (forced, with a 3-bit mask on both halves) are one slot. That is
     /// the design: at 128 bits a real collision does not happen. A read still compares the stored key,
     /// so the second key gets an error, never the first key's value.

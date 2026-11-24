@@ -245,6 +245,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     private long _indexCount;
     private long _indexGrowAt;
 
+    // While the index grows: the table it is growing from, and the next slot of it to migrate.
+    private IndexEntry* _oldIndex;
+    private long _oldMask;
+    private long _migrateCursor;
+
     private long[] _pendingAddresses = [];
     private int[] _pendingSlots = [];
     private bool _disposed;
@@ -344,8 +349,8 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         ObjectDisposedException.ThrowIf(_disposed, this);
         faulted = false;
         var hash = Hash(key);
-        var slot = FindSlot(hash);
-        return slot < 0 ? null : ReadRecord(key, hash, AddressOf(_index[slot].Packed), _pointPread, ref faulted);
+        var entry = Find(hash);
+        return entry == null ? null : ReadRecord(key, hash, AddressOf(entry->Packed), _pointPread, ref faulted);
     }
 
     /// <summary>
@@ -368,10 +373,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         {
             values[i] = null;
             var hash = Hash(keys[i]);
-            var slot = FindSlot(hash);
-            if (slot < 0)
+            var entry = Find(hash);
+            if (entry == null)
                 continue;
-            var address = AddressOf(_index[slot].Packed);
+            var address = AddressOf(entry->Packed);
             if (address >= _headAddress)
             {
                 var faulted = false;
@@ -406,14 +411,13 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         CheckKey(key);
-        if (_indexCount >= _indexGrowAt)
-            GrowIndex();
+        MaintainIndex();
 
         var hash = Hash(key);
-        var slot = FindSlot(hash);
-        if (slot >= 0)
+        var slot = Claim(hash);
+        if (slot->Packed != 0)
         {
-            var packed = _index[slot].Packed;
+            var packed = slot->Packed;
             var current = AddressOf(packed);
             if (current >= _readOnlyAddress)
             {
@@ -442,18 +446,14 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
         Volatile.Write(ref _appendedWrites, _appendedWrites + 1);
         var (address, size) = Append(key, value, hash);
-        if (slot >= 0)
+        if (slot->Packed == 0)
         {
-            _index[slot].Packed = Pack(address, size);
+            slot->HashLow = (ulong)hash;
+            slot->HashHigh = (ulong)(hash >> 64);
+            Volatile.Write(ref _indexCount, _indexCount + 1);
         }
-        else
-        {
-            ref var entry = ref _index[~slot];
-            entry.HashLow = (ulong)hash;
-            entry.HashHigh = (ulong)(hash >> 64);
-            entry.Packed = Pack(address, size);
-            _indexCount++;
-        }
+
+        slot->Packed = Pack(address, size);
     }
 
     /// <summary>Drops the key's slot and stops counting its record as live. Reads nothing: the slot has the size.</summary>
@@ -461,14 +461,15 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         CheckKey(key);
-        var slot = FindSlot(Hash(key));
-        if (slot < 0)
+        MaintainIndex();
+        var entry = Find(Hash(key));
+        if (entry == null)
             return;
 
-        var packed = _index[slot].Packed;
+        var packed = entry->Packed;
         var address = AddressOf(packed);
         AddLive(address, SizeOf(packed, address), -1);
-        RemoveSlot(slot);
+        Remove(entry);
     }
 
     public void Dispose()
@@ -486,6 +487,9 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         _ring = null;
         NativeMemory.Free(_index);
         _index = null;
+        if (_oldIndex != null)
+            NativeMemory.Free(_oldIndex);
+        _oldIndex = null;
         foreach (var segment in _segmentTable)
             segment?.Dispose();
         _segmentTable = [];
@@ -665,8 +669,8 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         Span<byte> key = stackalloc byte[header.KeyLength];
         view.Slice(HeaderSize, header.KeyLength).CopyTo(key);
         var hash = Hash(key);
-        var slot = FindSlot(hash);
-        if (slot < 0 || AddressOf(_index[slot].Packed) != address)
+        var slot = Find(hash);
+        if (slot == null || AddressOf(slot->Packed) != address)
             return 0;
 
         var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(header.ValueLength);
@@ -681,9 +685,9 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
             if (Checksum(hash, header.ValueLength, header.Capacity, value) != header.Checksum)
                 throw Integrity($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
 
-            AddLive(address, SizeOf(_index[slot].Packed, address), -1);
+            AddLive(address, SizeOf(slot->Packed, address), -1);
             var (moved, size) = Append(key, value, hash);
-            _index[slot].Packed = Pack(moved, size);
+            slot->Packed = Pack(moved, size);
             Volatile.Write(ref _relocatedBytes, _relocatedBytes + size);
             return size;
         }
@@ -844,7 +848,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         }
 
         var address = _tail;
-        if (address + size > MaxAddress)
+        if (address + size >= MaxAddress)
             throw new InvalidOperationException($"melangelog: the log reached its {MaxAddress >> 40} TiB address limit ({_basePath}).");
 
         EnsurePage(address >> _pageBits);
@@ -1101,67 +1105,154 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
     // ---- Index ------------------------------------------------------------------------------
 
-    /// <summary>The slot holding <paramref name="hash"/>, or the complement of the empty slot it would go in.</summary>
-    private long FindSlot(UInt128 hash)
+    // The index grows incrementally. Past 75% load a table twice the size takes over; the old one
+    // stays readable, and every write migrates a few of its slots, so no single call rehashes the
+    // whole index under the store lock (at a few million keys, tens of milliseconds). A key lives in
+    // exactly one table: the new one is probed first, then the old; a write to a key still in the old
+    // table moves it across first; a key deleted from the old table, or migrated out of it, leaves a
+    // tombstone (Moved) there, so probes for the keys after it in that table still reach them.
+
+    /// <summary>Old-table slots each write migrates while the index grows.</summary>
+    private const int MigrateSlotsPerWrite = 64;
+
+    /// <summary>An old-table slot whose key was migrated or deleted: skipped by probes, never ends one.</summary>
+    private const ulong Moved = ulong.MaxValue;
+
+    /// <summary>The key's entry, in whichever table holds it, or null.</summary>
+    private IndexEntry* Find(UInt128 hash)
     {
-        var i = (long)(ulong)hash & _indexMask;
-        while (true)
-        {
-            ref var entry = ref _index[i];
-            if (entry.Packed == 0)
-                return ~i;
-            if (entry.HashLow == (ulong)hash && entry.HashHigh == (ulong)(hash >> 64))
-                return i;
-            i = (i + 1) & _indexMask;
-        }
+        var entry = Probe(_index, _indexMask, hash, out _);
+        if (entry != null || _oldIndex == null)
+            return entry;
+        return Probe(_oldIndex, _oldMask, hash, out _);
     }
 
-    /// <summary>Backward-shift deletion: no tombstones in the table, so probe lengths never degrade.</summary>
-    private void RemoveSlot(long slot)
+    /// <summary>
+    /// The key's entry in the current table, for a write: its existing one (moved across from the old
+    /// table if it was there), or the empty slot it goes in (<c>Packed == 0</c>), filled by the caller.
+    /// </summary>
+    private IndexEntry* Claim(UInt128 hash)
     {
-        var hole = slot;
-        var j = slot;
+        var entry = Probe(_index, _indexMask, hash, out var empty);
+        if (entry != null)
+            return entry;
+        if (_oldIndex != null)
+        {
+            var old = Probe(_oldIndex, _oldMask, hash, out _);
+            if (old != null)
+            {
+                *empty = *old;
+                old->Packed = Moved;
+            }
+        }
+
+        return empty;
+    }
+
+    /// <summary>Drops an entry: backward-shift in the current table, a tombstone in the old one.</summary>
+    private void Remove(IndexEntry* entry)
+    {
+        Volatile.Write(ref _indexCount, _indexCount - 1);
+        if (_oldIndex != null && entry >= _oldIndex && entry <= _oldIndex + _oldMask)
+        {
+            entry->Packed = Moved;
+            return;
+        }
+
+        var hole = entry - _index;
+        var j = hole;
         while (true)
         {
             j = (j + 1) & _indexMask;
-            ref var entry = ref _index[j];
-            if (entry.Packed == 0)
+            ref var next = ref _index[j];
+            if (next.Packed == 0)
                 break;
-            var ideal = (long)entry.HashLow & _indexMask;
+            var ideal = (long)next.HashLow & _indexMask;
             if (((j - ideal) & _indexMask) >= ((j - hole) & _indexMask))
             {
-                _index[hole] = entry;
+                _index[hole] = next;
                 hole = j;
             }
         }
 
         _index[hole] = default;
-        _indexCount--;
     }
 
-    private void GrowIndex()
+    /// <summary>
+    /// Linear probe of one table: the entry holding <paramref name="hash"/>, or null with
+    /// <paramref name="empty"/> set to the first empty slot (tombstones are passed over, never reused,
+    /// since only an old table has them and nothing is inserted into it).
+    /// </summary>
+    private static IndexEntry* Probe(IndexEntry* table, long mask, UInt128 hash, out IndexEntry* empty)
     {
-        Volatile.Write(ref _indexResizes, _indexResizes + 1);
-        var old = _index;
-        var oldCapacity = _indexMask + 1;
-        AllocateIndex(oldCapacity * 2);
-        for (long i = 0; i < oldCapacity; i++)
+        var low = (ulong)hash;
+        var high = (ulong)(hash >> 64);
+        var i = (long)low & mask;
+        while (true)
         {
-            if (old[i].Packed == 0)
+            var entry = table + i;
+            if (entry->Packed == 0)
+            {
+                empty = entry;
+                return null;
+            }
+
+            if (entry->Packed != Moved && entry->HashLow == low && entry->HashHigh == high)
+            {
+                empty = null;
+                return entry;
+            }
+
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// <summary>Before each write: a step of any migration under way, and a new one once the table is 75% full.</summary>
+    private void MaintainIndex()
+    {
+        if (_oldIndex != null)
+            Migrate(MigrateSlotsPerWrite);
+        if (_indexCount < _indexGrowAt)
+            return;
+
+        // Full again before the last growth finished (it cannot be, at 64 slots a write, but the
+        // invariant is cheap to keep): finish it first, so there are never three tables.
+        if (_oldIndex != null)
+            Migrate(long.MaxValue);
+
+        Volatile.Write(ref _indexResizes, _indexResizes + 1);
+        _oldIndex = _index;
+        _oldMask = _indexMask;
+        _migrateCursor = 0;
+        AllocateIndex((_indexMask + 1) * 2);
+    }
+
+    /// <summary>Moves up to <paramref name="slots"/> old-table slots' keys into the current table; frees the old one when done.</summary>
+    private void Migrate(long slots)
+    {
+        var end = Math.Min(_oldMask + 1, _migrateCursor + Math.Min(slots, _oldMask + 1));
+        for (; _migrateCursor < end; _migrateCursor++)
+        {
+            var old = _oldIndex + _migrateCursor;
+            if (old->Packed == 0 || old->Packed == Moved)
                 continue;
-            var j = (long)old[i].HashLow & _indexMask;
-            while (_index[j].Packed != 0)
-                j = (j + 1) & _indexMask;
-            _index[j] = old[i];
+            _ = Probe(_index, _indexMask, new UInt128(old->HashHigh, old->HashLow), out var empty);
+            *empty = *old;
+            old->Packed = Moved;
         }
 
-        NativeMemory.Free(old);
+        if (_migrateCursor > _oldMask)
+        {
+            NativeMemory.Free(_oldIndex);
+            _oldIndex = null;
+        }
     }
 
     private void AllocateIndex(long capacity)
     {
-        _index = (IndexEntry*)NativeMemory.AllocZeroed((nuint)capacity, (nuint)sizeof(IndexEntry));
-        _indexMask = capacity - 1;
+        var index = (IndexEntry*)NativeMemory.AllocZeroed((nuint)capacity, (nuint)sizeof(IndexEntry));
+        _index = index;
+        Volatile.Write(ref _indexMask, capacity - 1);
         _indexGrowAt = capacity / 4 * 3;
     }
 

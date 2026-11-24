@@ -197,6 +197,11 @@ internal static class Runner
             Footprint(measures, store, root, "after churn");
 
             var failure = Verify(store, entity, terrain, keys, versions, blobKeys, blobVersions, s, random);
+
+            // Growing: twice the table's rows again as new keys, so a hash index sized for the table
+            // grows at least once mid-phase. The max is what one growth costs a single write.
+            Phase(measures, "growing inserts (2x table)", s.Rows * 2, n =>
+                Apply(store, lsn++, new RowOp(RowOpKind.Insert, entity.Id, SchemaKeyCodec.Encode(entity.PrimaryKey, (ulong)(s.Rows + n)), EntityRow(entity, s.Rows + n, 0))));
             return new EngineResult(engine, measures, failure);
         }
         catch (Exception exception)
