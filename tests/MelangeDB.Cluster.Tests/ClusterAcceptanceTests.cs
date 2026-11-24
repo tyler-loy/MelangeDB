@@ -272,6 +272,26 @@ public class ClusterAcceptanceTests
         Assert.Equal(100, moved.Value.Gold);
     }
 
+    /// <summary>
+    /// The hub caps how long an assertion can be redeemed, not how long the session it opens lives:
+    /// a client holding a 12-hour token keeps its gateway session past Cluster:AssertionTtlSeconds.
+    /// Capping both closed every soak client as token_expired seven minutes in.
+    /// </summary>
+    [Fact]
+    public void The_hub_mints_assertions_whose_sessions_live_by_the_client_token()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var tokenExpires = now.AddHours(12);
+        var assertion = _cluster.Hub.MintAssertion(
+            ClusterFixture.Caller, isGuest: false, isSqlOwner: false, isBulkOwner: false, tokenExpires, firesLifecycle: true);
+
+        var redeemed = InternalIdentityAssertion.Validate(ClusterFixture.Secret, assertion, now, out var failure);
+        Assert.Null(failure);
+        Assert.Equal(tokenExpires.ToUnixTimeSeconds(), redeemed!.Value.ExpiresAt.ToUnixTimeSeconds());
+        Assert.Null(InternalIdentityAssertion.Validate(
+            ClusterFixture.Secret, assertion, now.AddSeconds(300 + 5), out _)); // Cluster:AssertionTtlSeconds, the default
+    }
+
     [Fact]
     public async Task The_gateway_refuses_internal_identity_assertions_from_clients()
     {

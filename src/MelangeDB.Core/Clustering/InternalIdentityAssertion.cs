@@ -17,6 +17,8 @@ public static class InternalIdentityAssertion
     /// <summary>The token prefix marking an assertion; anything else is an ordinary bearer JWT.</summary>
     public const string Prefix = "mliassert1.";
 
+    private const long MaxUnixSeconds = 253_402_300_799; // DateTimeOffset.MaxValue.ToUnixTimeSeconds()
+
     // B (bulk owner) and K (backup owner) are additive and fail-closed: an assertion minted
     // before either field existed deserializes it to false, so an old token can never confer the
     // new capability.
@@ -24,15 +26,21 @@ public static class InternalIdentityAssertion
     // the same claims the hub read off the client's real token. Additive and fail-closed like the
     // flags: an assertion minted before it existed deserializes to no claims, which is the same
     // thing a host that captures none produces.
+    // E is how long the assertion itself can be redeemed (Cluster:AssertionTtlSeconds); T is when
+    // the client token it vouches for expires, which is what the session it opens lives by. One
+    // minted before T existed reads as a session ending at E: shorter, never longer.
     private sealed record Payload(
         string I, bool G, long E, bool O, bool L, bool B, bool K = false,
-        Dictionary<string, string[]>? C = null);
+        Dictionary<string, string[]>? C = null, long? T = null);
 
     /// <summary>
-    /// Mints an assertion for one identity, valid until <paramref name="expiresAt"/>.
+    /// Mints an assertion for one identity, redeemable until <paramref name="expiresAt"/>.
     /// <paramref name="firesLifecycle"/> marks the one upstream session per client that represents
     /// the client's real session — the hub attachment — so ClientConnected/ClientDisconnected fire
     /// exactly once per client, on the hub, and never for shard attachments.
+    /// <paramref name="sessionExpiresAt"/> is when the client's own token expires: the session the
+    /// assertion opens keeps working until then (plus <c>Auth:ReauthGraceSeconds</c>), however short
+    /// the redemption window. Null ends the session at <paramref name="expiresAt"/>.
     /// </summary>
     public static string Mint(
         string secret,
@@ -43,13 +51,14 @@ public static class InternalIdentityAssertion
         DateTimeOffset expiresAt,
         bool firesLifecycle = false,
         bool isBackupOwner = false,
-        CallerClaims? claims = null)
+        CallerClaims? claims = null,
+        DateTimeOffset? sessionExpiresAt = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(secret);
         var payload = JsonSerializer.SerializeToUtf8Bytes(
             new Payload(
                 identity.ToString(), isGuest, expiresAt.ToUnixTimeSeconds(), isSqlOwner, firesLifecycle, isBulkOwner, isBackupOwner,
-                Encode(claims)));
+                Encode(claims), sessionExpiresAt?.ToUnixTimeSeconds()));
         var signature = HMACSHA256.HashData(Encoding.UTF8.GetBytes(secret), payload);
         return Prefix + Convert.ToBase64String(payload) + "." + Convert.ToBase64String(signature);
     }
@@ -61,7 +70,8 @@ public static class InternalIdentityAssertion
     /// <summary>
     /// Validates an assertion: signature first (constant-time), expiry second. Returns null with
     /// a reason on any failure — a tampered or expired assertion must read as "not authenticated",
-    /// never as a different identity.
+    /// never as a different identity. The returned <c>ExpiresAt</c> is the session's: the client
+    /// token's expiry the assertion carries, or its own redemption expiry if it carries none.
     /// </summary>
     public static (Identity Identity, bool IsGuest, bool IsSqlOwner, bool IsBulkOwner, bool IsBackupOwner, DateTimeOffset ExpiresAt, bool FiresLifecycle, CallerClaims Claims)? Validate(
         string secret,
@@ -128,7 +138,15 @@ public static class InternalIdentityAssertion
             return null;
         }
 
-        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, parsed.K, expiresAt, parsed.L, Decode(parsed.C));
+        // A token with no expiry travels as MaxValue's whole seconds; it comes back as MaxValue, the
+        // value the session's expiry check reads as "never", not as a date a grace window overflows.
+        var sessionExpiresAt = parsed.T switch
+        {
+            null => expiresAt,
+            >= MaxUnixSeconds => DateTimeOffset.MaxValue,
+            { } t => DateTimeOffset.FromUnixTimeSeconds(t),
+        };
+        return (new Identity(Convert.FromHexString(parsed.I)), parsed.G, parsed.O, parsed.B, parsed.K, sessionExpiresAt, parsed.L, Decode(parsed.C));
     }
 
     private static Dictionary<string, string[]>? Encode(CallerClaims? claims)

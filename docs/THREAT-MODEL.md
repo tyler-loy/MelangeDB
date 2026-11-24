@@ -275,9 +275,11 @@ dialing the hub's node port nor something impersonating the hub gets past the ha
 **internal identity assertion**, the signed token the hub mints saying "this connection acts as identity X."
 The gateway validates a client's IdP JWT exactly once (the IdP is still the gate), then vouches for the
 identity to shard nodes with assertions; shard nodes never see IdP tokens, which is what makes hub-issued
-guest identities and per-shard routing workable at all. Assertions expire (`Cluster:AssertionTtlSeconds`,
-never outliving the client token), are constant-time verified, and are refused at the gateway itself — a
-client cannot present one.
+guest identities and per-shard routing workable at all. An assertion can be redeemed only within
+`Cluster:AssertionTtlSeconds` (never past the client token), so a captured one goes stale in minutes; the
+session it opens carries the client token's own expiry and is closed, like any session, once that and
+`Auth:ReauthGraceSeconds` pass without a re-auth. Assertions are constant-time verified and refused at the
+gateway itself — a client cannot present one.
 
 **The boundary this draws, stated as an assumption and not an accident:** *any holder of the cluster secret
 can assert any identity.* Concretely, a compromised shard node can impersonate every player in its shards —
