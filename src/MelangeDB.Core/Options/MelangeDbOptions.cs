@@ -776,6 +776,15 @@ public sealed class HotStoreOptions
     public PagedEngine PagedEngine { get; set; } = PagedEngine.Faster;
 
     /// <summary>
+    /// Keeps the paged store's key directory and secondary indexes in native copy-on-write B+trees
+    /// instead of persistent trees on the managed heap: some tens of bytes of native memory per row
+    /// and index entry rather than about 300 bytes and five GC objects per paged row. Read once,
+    /// when the store is created; the store is rebuilt from the log on every start, so switching
+    /// needs only a restart.
+    /// </summary>
+    public bool NativeDirectory { get; set; }
+
+    /// <summary>
     /// Cap on the paging buffer pool in bytes. <b>Excludes</b> resident tables, which are
     /// accounted separately — the total declared footprint is this plus the residency report.
     /// Ignored by the in-memory engine, which does not page.

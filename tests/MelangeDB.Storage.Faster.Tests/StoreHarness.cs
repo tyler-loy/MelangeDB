@@ -53,6 +53,11 @@ internal sealed class StoreHarness : IDisposable
             CommitLog = { Path = Path.Combine(Root, "log") },
         };
         configure?.Invoke(Options);
+
+        // MELANGE_TEST_NATIVE_DIRECTORY=1 runs every harness test with the directory and indexes
+        // in native trees, the way MELANGE_TEST_PAGED_ENGINE picks the paged engine.
+        if (Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") == "1")
+            Options.HotStore.NativeDirectory = true;
         Engine = CreateEngine();
     }
 

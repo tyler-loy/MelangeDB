@@ -106,10 +106,20 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             _blob = engine.Open(path, PagedKvSpace.Blob, 1L << blobMemoryBits, hashBuckets);
         _bufferPoolCapacityBytes = _main.CapacityBytes + (_blob?.CapacityBytes ?? 0);
 
+        if (context.Options.HotStore.NativeDirectory)
+        {
+            _directoryPool = new NativePagePool();
+            _emptyTrees = NativeTableTrees.Create(_directoryPool, 0);
+        }
+        else
+        {
+            _emptyTrees = ManagedTableTrees.Create(0);
+        }
+
         foreach (var table in context.Schema.Tables)
         {
             var declared = context.Residency.GetValueOrDefault(table.Id, table.Residency);
-            _tables.Add(table.Id, new TableState(table, declared, EmptyTrees));
+            _tables.Add(table.Id, new TableState(table, declared, _emptyTrees));
         }
 
         _compaction = context.Options.HotStore.Compaction;
@@ -129,8 +139,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
 
     public ulong AppliedLsn { get; private set; }
 
-    /// <summary>The kind of ordered bookkeeping new tables start with (see <see cref="TableTrees"/>).</summary>
-    private static TableTrees EmptyTrees { get; } = ManagedTableTrees.Create(0);
+    /// <summary>The kind of ordered bookkeeping tables start with (see <see cref="TableTrees"/>).</summary>
+    private readonly TableTrees _emptyTrees;
+
+    /// <summary>The native pages of every table's directory and indexes, under <c>HotStore:NativeDirectory</c>.</summary>
+    private readonly NativePagePool? _directoryPool;
 
     /// <summary>Publishes every table's open write (a no-op for tables the write did not touch, and during recovery).</summary>
     private void PublishWrites()
@@ -387,7 +400,13 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         HotStoreLogStatistics[] logs = _blob is null
             ? [LogStatistics(0, "main", _main)]
             : [LogStatistics(0, "main", _main), LogStatistics(1, "blob", _blob)];
-        return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes, Logs = logs };
+        return new HotStoreStatistics
+        {
+            Tables = tables,
+            BufferPoolCapacityBytes = _bufferPoolCapacityBytes,
+            Logs = logs,
+            NativeDirectoryBytes = _directoryPool?.AllocatedBytes ?? 0,
+        };
     }
 
     /// <summary>

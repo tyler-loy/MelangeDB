@@ -25,6 +25,13 @@ public sealed class HotStoreStatistics
     /// is what reclamation has yet to recover.
     /// </summary>
     public IReadOnlyList<HotStoreLogStatistics> Logs { get; init; } = [];
+
+    /// <summary>
+    /// Native memory held by the key directory and secondary indexes when they live off the
+    /// managed heap (<c>HotStore:NativeDirectory</c>), including versions not yet collected; 0
+    /// otherwise.
+    /// </summary>
+    public long NativeDirectoryBytes { get; init; }
 }
 
 /// <summary>

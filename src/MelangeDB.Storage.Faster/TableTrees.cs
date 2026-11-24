@@ -161,3 +161,203 @@ internal sealed class ManagedTableTrees : TableTrees
             new ManagedTableTrees(_directory.ToImmutable(), [.. _indexes.Select(static builder => builder.ToImmutable())]);
     }
 }
+
+/// <summary>
+/// The native copy-on-write trees (<see cref="NativeTree"/>): the key directory as a plain tree
+/// from row key to an encoded <see cref="DirectoryEntry"/>, and each secondary index as a pair tree
+/// of (encoded value, row key). A paged row costs some tens of bytes of native memory and no
+/// managed objects; a version's pages are freed once the GC has collected every version, edit and
+/// enumerator that could still reach them.
+/// <para>
+/// A directory value is <c>varint blob mask, varint (index values + 1, or 0 for none), then per
+/// index value: varint length, bytes</c>.
+/// </para>
+/// </summary>
+internal sealed class NativeTableTrees : TableTrees
+{
+    private static readonly NativeEntryProjector<RowKey> KeyOf = static (key, _) => new RowKey(key);
+    private static readonly NativeEntryProjector<RowKey> PairKeyOf = static (_, key) => new RowKey(key);
+
+    private readonly NativeTree _directory;
+    private readonly NativeTree[] _indexes;
+
+    private NativeTableTrees(NativeTree directory, NativeTree[] indexes)
+    {
+        _directory = directory;
+        _indexes = indexes;
+    }
+
+    public static NativeTableTrees Create(NativePagePool pool, int indexes) =>
+        new(
+            NativeTree.Empty(pool, NativeTreeOrder.Plain),
+            [.. Enumerable.Range(0, indexes).Select(_ => NativeTree.Empty(pool, NativeTreeOrder.Pair))]);
+
+    public override long Count => _directory.Count;
+
+    public override bool Contains(in RowKey key) => _directory.ContainsKey(key.Span);
+
+    public override bool TryGetEntry(in RowKey key, [NotNullWhen(true)] out DirectoryEntry? entry)
+    {
+        if (_directory.TryGet(key.Span, out var value))
+        {
+            entry = Decode(value);
+            return true;
+        }
+
+        entry = null;
+        return false;
+    }
+
+    public override IEnumerable<RowKey> Keys => _directory.Scan(KeyOf);
+
+    public override IEnumerable<RowKey> KeyRange(RowKey low, RowKey high) =>
+        _directory.Range(low.ToArray(), high.ToArray(), KeyOf);
+
+    public override IEnumerable<RowKey> IndexEqual(int index, RowKey value)
+    {
+        var bound = value.ToArray();
+        return _indexes[index].Range(bound, bound, PairKeyOf);
+    }
+
+    public override IEnumerable<RowKey> IndexRange(int index, RowKey low, RowKey high) =>
+        _indexes[index].Range(low.ToArray(), high.ToArray(), PairKeyOf);
+
+    public override TableTreesEdit BeginEdit(bool bulk) => new Edit(this);
+
+    public override TableTrees Empty(int indexes) => Create(_directory.Pool, indexes);
+
+    internal static byte[] Encode(DirectoryEntry entry)
+    {
+        var length = VarintLength(entry.BlobMask) + VarintLength((uint)(entry.IndexValues?.Length + 1 ?? 0));
+        if (entry.IndexValues is { } values)
+        {
+            foreach (var value in values)
+                length += VarintLength((uint)value.Length) + value.Length;
+        }
+
+        var bytes = new byte[length];
+        var at = WriteVarint(bytes, 0, entry.BlobMask);
+        at = WriteVarint(bytes, at, (uint)(entry.IndexValues?.Length + 1 ?? 0));
+        if (entry.IndexValues is { } indexValues)
+        {
+            foreach (var value in indexValues)
+            {
+                at = WriteVarint(bytes, at, (uint)value.Length);
+                value.Span.CopyTo(bytes.AsSpan(at));
+                at += value.Length;
+            }
+        }
+
+        return bytes;
+    }
+
+    internal static DirectoryEntry Decode(ReadOnlySpan<byte> bytes)
+    {
+        var mask = ReadVarint(ref bytes);
+        var count = ReadVarint(ref bytes);
+        if (count == 0)
+            return new DirectoryEntry(mask, null);
+        var values = new RowKey[count - 1];
+        for (var i = 0; i < values.Length; i++)
+        {
+            var length = (int)ReadVarint(ref bytes);
+            if (length > bytes.Length)
+                throw new InvalidDataException("A native directory entry ends inside an index value.");
+            values[i] = new RowKey(bytes[..length]);
+            bytes = bytes[length..];
+        }
+
+        return new DirectoryEntry(mask, values);
+    }
+
+    private static int VarintLength(uint value)
+    {
+        var length = 1;
+        while (value >= 0x80)
+        {
+            value >>= 7;
+            length++;
+        }
+
+        return length;
+    }
+
+    private static int WriteVarint(byte[] bytes, int at, uint value)
+    {
+        while (value >= 0x80)
+        {
+            bytes[at++] = (byte)(value | 0x80);
+            value >>= 7;
+        }
+
+        bytes[at++] = (byte)value;
+        return at;
+    }
+
+    private static uint ReadVarint(ref ReadOnlySpan<byte> bytes)
+    {
+        uint value = 0;
+        for (var shift = 0; shift < 35; shift += 7)
+        {
+            if (bytes.IsEmpty)
+                throw new InvalidDataException("A native directory entry ends inside a length.");
+            var b = bytes[0];
+            bytes = bytes[1..];
+            value |= (uint)(b & 0x7F) << shift;
+            if (b < 0x80)
+                return value;
+        }
+
+        throw new InvalidDataException("A native directory entry has a malformed length.");
+    }
+
+    /// <summary>
+    /// The next version: an edit per tree, opened on first touch, so a record that changes only
+    /// the directory copies no index page. Pages the edit creates are changed in place until
+    /// commit, so a record's ops copy each page at most once, and recovery's replay is one edit
+    /// that copies nothing at all.
+    /// </summary>
+    private sealed class Edit(NativeTableTrees from) : TableTreesEdit
+    {
+        private readonly NativeTree.Edit?[] _indexes = new NativeTree.Edit?[from._indexes.Length];
+        private NativeTree.Edit? _directory;
+
+        public override bool TryGetEntry(in RowKey key, [NotNullWhen(true)] out DirectoryEntry? entry)
+        {
+            var found = _directory is { } directory
+                ? directory.TryGet(key.Span, out var value)
+                : from._directory.TryGet(key.Span, out value);
+            entry = found ? Decode(value) : null;
+            return found;
+        }
+
+        public override void SetEntry(RowKey key, DirectoryEntry entry) =>
+            (_directory ??= from._directory.BeginEdit()).Set(key.Span, Encode(entry));
+
+        public override void RemoveEntry(RowKey key) => (_directory ??= from._directory.BeginEdit()).Remove(key.Span);
+
+        public override void IndexAdd(int index, RowKey value, RowKey key) =>
+            (_indexes[index] ??= from._indexes[index].BeginEdit()).Set(value.Span, key.Span);
+
+        public override void IndexRemove(int index, RowKey value, RowKey key) =>
+            (_indexes[index] ??= from._indexes[index].BeginEdit()).Remove(value.Span, key.Span);
+
+        public override TableTrees Commit()
+        {
+            var indexes = new NativeTree[_indexes.Length];
+            for (var i = 0; i < indexes.Length; i++)
+                indexes[i] = _indexes[i]?.Commit() ?? from._indexes[i];
+            var directory = _directory?.Commit() ?? from._directory;
+            Array.Clear(_indexes);
+            _directory = null;
+            return new NativeTableTrees(directory, indexes);
+        }
+
+        public override void Dispose()
+        {
+            _directory?.Dispose();
+            foreach (var index in _indexes)
+                index?.Dispose();
+        }
+    }
+}
