@@ -359,8 +359,13 @@ internal sealed partial class HubRuntime : IDisposable
         // The captured claims travel with the identity they were read alongside: a reducer running
         // on a shard node reads what the hub read off the client's real token, so claims do not
         // quietly become empty the moment a deployment clusters.
+        // The TTL bounds redeeming the assertion, not the session it opens: that lives as long as
+        // the client's token, as it would connected to a single node. Capping the session too
+        // closed every gateway session TTL + Auth:ReauthGraceSeconds after it attached, whatever
+        // the client's token said, unless the client happened to re-authenticate first.
         return InternalIdentityAssertion.Mint(
-            Cluster.Secret, identity, isGuest, isSqlOwner, isBulkOwner, expires, firesLifecycle, isBackupOwner, claims);
+            Cluster.Secret, identity, isGuest, isSqlOwner, isBulkOwner, expires, firesLifecycle, isBackupOwner, claims,
+            sessionExpiresAt: tokenExpiresAt);
     }
 
     /// <summary>
