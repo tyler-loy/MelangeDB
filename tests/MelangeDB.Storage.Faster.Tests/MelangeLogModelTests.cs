@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using MelangeDB.Core;
 using Xunit;
 
 namespace MelangeDB.Storage.Faster.Tests;
@@ -6,25 +7,27 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// <summary>
 /// melangelog against a dictionary, under randomized upserts, deletes, reads and batched reads. Tiny
 /// pages, ring and segments put every path under load: eviction, records spanning pages and segments,
-/// in-place shrink and regrow (#137), blind appends over flushed records, and, with a 3-bit hash mask,
-/// hash chains shared by many keys, tombstones included. The store suite runs the engine through the
-/// whole store (MELANGE_TEST_PAGED_ENGINE=melangelog); this drives the key-value space on its own.
+/// in-place shrink and regrow (#137), and blind appends over flushed records, with the live-byte
+/// accounting checked against the log at the end. The store suite runs the engine through the whole
+/// store (MELANGE_TEST_PAGED_ENGINE=melangelog); this drives the key-value space on its own.
 /// </summary>
 public sealed class MelangeLogModelTests
 {
-    public static TheoryData<string, bool, ulong> Modes => new()
+    public static TheoryData<string, bool, bool, int> Modes => new()
     {
-        { "Mmap", false, ulong.MaxValue },
-        { "Mmap", false, 0x7UL },
-        { "Mmap", true, ulong.MaxValue },
-        { "Mmap", true, 0x7UL },
-        { "Pread", false, ulong.MaxValue },
-        { "Pread", false, 0x7UL },
+        { "Mmap", false, false, 3 },
+        { "Mmap", false, true, 3 },
+        { "Mmap", true, true, 3 },
+        { "Pread", false, false, 3 },
+        { "Pread", false, true, 3 },
+
+        // A two-page ring: the tail page is the only mutable one, and every new page waits on the flusher.
+        { "Mmap", false, true, 1 },
     };
 
     [Theory]
     [MemberData(nameof(Modes))]
-    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread, ulong hashMask)
+    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread, bool compact, int ringPageBits)
     {
         var mode = Enum.Parse<MelangeLogReadMode>(readMode);
         const int keySpace = 600;
@@ -33,12 +36,22 @@ public sealed class MelangeLogModelTests
         var random = new Random(7);
         var model = new Dictionary<int, byte[]>();
 
-        // 4 KiB pages, an 8-page ring, 16 KiB segments: a 20 KiB value spans pages and segments.
+        // 4 KiB pages, an 8-page ring (or 2), 16 KiB segments: a 20 KiB value spans pages and segments.
         using (var kv = new MelangeLogPagedKv(
-                   Path.Combine(directory, "check.mlog"), 12, 3, 14, 16, MelangeLogTuning.Default with { ReadMode = mode }, 512, pointPread, hashMask))
+                   Path.Combine(directory, "check.mlog"), 12, ringPageBits, 14, 16, MelangeLogTuning.Default with { ReadMode = mode }, 512, pointPread))
         {
             for (var n = 0; n < ops; n++)
             {
+                // Compaction as hard as it goes: any garbage past 10% triggers it, a few KiB a step,
+                // so segments are walked and dropped while every other path runs around them.
+                if (compact && n % 25 == 0)
+                {
+                    kv.PrepareCompactionStep();
+                    kv.Compact(1.1, 4096);
+                    if (n % 1000 == 0)
+                        AssertAccounting(kv);
+                }
+
                 var id = random.Next(keySpace);
                 var key = Key(id);
                 switch (random.Next(10))
@@ -70,12 +83,145 @@ public sealed class MelangeLogModelTests
 
             for (var id = 0; id < keySpace; id++)
                 Expect(model, id, kv.Read(Key(id), out _), ops);
-            if (hashMask == ulong.MaxValue)
-                Assert.Equal(model.Count, kv.Addresses.IndexEntries);
+            Assert.Equal(model.Count, kv.Addresses.IndexEntries);
+            AssertAccounting(kv);
+
+            // Every live byte is some current record's: delete them all and nothing is left counted.
+            foreach (var id in model.Keys)
+                kv.Delete(Key(id));
+            AssertAccounting(kv);
+            Assert.Equal(0, kv.Statistics.LiveBytes);
+            Assert.All(kv.SegmentAccounting, static segment => Assert.Equal(0, segment.Live));
+
+            // Nothing live: compaction drops every segment that has been flushed.
+            if (compact)
+            {
+                while (kv.Compact(1.1, 1 << 20).MoreWork)
+                {
+                }
+
+                var flushed = kv.Addresses.Head >> 14;
+                Assert.All(kv.SegmentAccounting.Take((int)flushed), static segment => Assert.True(segment.Dropped));
+                Assert.True(kv.Statistics.ReclaimedBytes > 0);
+                Assert.True(kv.Statistics.RelocatedBytes > 0);
+                Assert.True(kv.Statistics.LogBytes <= kv.Addresses.Tail - (flushed << 14));
+            }
         }
 
         Assert.Empty(Directory.EnumerateFiles(directory));
         Directory.Delete(directory);
+    }
+
+    /// <summary>
+    /// The index grows by migrating a few slots per write, so for a while a key may be in the old
+    /// table or the new one. 40,000 keys through a 4,096-slot start is four growths, each with reads,
+    /// batched reads, deletes, rewrites and compaction running against the half-migrated index.
+    /// </summary>
+    [Fact]
+    public void The_index_grows_incrementally_under_every_operation()
+    {
+        const int keySpace = 40_000;
+        var directory = Directory.CreateTempSubdirectory("melange-mlog-grow-").FullName;
+        var random = new Random(11);
+        var model = new Dictionary<int, byte[]>();
+        static byte[] WideKey(int id)
+        {
+            var key = new byte[8];
+            BinaryPrimitives.WriteInt32BigEndian(key, 42);
+            BinaryPrimitives.WriteInt32BigEndian(key.AsSpan(4), id);
+            return key;
+        }
+
+        using (var kv = new MelangeLogPagedKv(
+                   Path.Combine(directory, "grow.mlog"), 12, 4, 16, 16, MelangeLogTuning.Default, 512))
+        {
+            for (var n = 0; n < 150_000; n++)
+            {
+                if (n % 50 == 0)
+                {
+                    kv.PrepareCompactionStep();
+                    kv.Compact(1.5, 8192);
+                }
+
+                // Inserts lead early so the key count climbs through each growth threshold.
+                var id = random.Next(Math.Min(keySpace, 1000 + n / 2));
+                switch (random.Next(10))
+                {
+                    case < 6:
+                        var value = new byte[random.Next(0, 64)];
+                        random.NextBytes(value);
+                        kv.Upsert(WideKey(id), value);
+                        model[id] = value;
+                        break;
+                    case 6:
+                        kv.Delete(WideKey(id));
+                        model.Remove(id);
+                        break;
+                    case 7:
+                        var ids = new int[random.Next(1, 30)];
+                        var keys = new byte[ids.Length][];
+                        for (var i = 0; i < ids.Length; i++)
+                            keys[i] = WideKey(ids[i] = random.Next(keySpace));
+                        var values = new byte[]?[ids.Length];
+                        _ = kv.ReadMany(keys, values);
+                        for (var i = 0; i < ids.Length; i++)
+                            Expect(model, ids[i], values[i], n);
+                        break;
+                    default:
+                        Expect(model, id, kv.Read(WideKey(id), out _), n);
+                        break;
+                }
+            }
+
+            for (var id = 0; id < keySpace; id++)
+                Expect(model, id, kv.Read(WideKey(id), out _), -1);
+            Assert.Equal(model.Count, kv.Statistics.IndexEntries);
+            Assert.True(kv.Statistics.IndexResizes >= 3, $"{kv.Statistics.IndexResizes} resizes");
+            AssertAccounting(kv);
+        }
+
+        Directory.Delete(directory, recursive: true);
+    }
+
+    /// <summary>
+    /// Two keys whose hashes collide (forced, with a 3-bit mask on both halves) are one slot. That is
+    /// the design: at 128 bits a real collision does not happen. A read still compares the stored key,
+    /// so the second key gets an error, never the first key's value.
+    /// </summary>
+    [Fact]
+    public void A_forced_hash_collision_is_detected_not_returned()
+    {
+        var directory = Directory.CreateTempSubdirectory("melange-mlog-collision-").FullName;
+        using (var kv = new MelangeLogPagedKv(
+                   Path.Combine(directory, "check.mlog"), 12, 3, 14, 16, MelangeLogTuning.Default, 512, hashMaskForTest: 0x7UL))
+        {
+            kv.Upsert(Key(0), [1, 2, 3]);
+            var other = Enumerable.Range(1, 10_000).First(id =>
+            {
+                try
+                {
+                    return kv.Read(Key(id), out _) is not null;
+                }
+                catch (InvalidDataException)
+                {
+                    return true;
+                }
+            });
+
+            Assert.Throws<InvalidDataException>(() => kv.Read(Key(other), out _));
+            Assert.Throws<InvalidDataException>(() => kv.Upsert(Key(other), [4]));
+        }
+
+        Directory.Delete(directory, recursive: true);
+    }
+
+    /// <summary>The segments' live counts add up to the space's, and none is negative.</summary>
+    private static void AssertAccounting(MelangeLogPagedKv kv)
+    {
+        var segments = kv.SegmentAccounting;
+        Assert.All(segments, static segment => Assert.True(segment.Live >= 0, $"segment live bytes {segment.Live}"));
+        Assert.Equal(kv.Statistics.LiveBytes, segments.Sum(static segment => segment.Live));
+        Assert.True(kv.Statistics.LiveBytes <= kv.Statistics.LogBytes);
     }
 
     private static void Expect(Dictionary<int, byte[]> model, int id, byte[]? actual, int op)

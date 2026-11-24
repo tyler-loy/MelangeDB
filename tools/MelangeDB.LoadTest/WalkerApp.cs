@@ -102,6 +102,19 @@ public sealed class WalkerReducers
         }
     }
 
+    /// <summary>Soak churn: rewrites ballast rows <paramref name="firstId"/>.. with a payload stamped <paramref name="version"/>.</summary>
+    [Reducer]
+    public void ChurnBallast(ReducerContext ctx, uint chunkId, long firstId, int count, int payloadBytes, long version)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var payload = new byte[payloadBytes];
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(payload, firstId + i);
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(8), version);
+            ctx.Db.Ballast.Update(new Ballast { Id = firstId + i, ChunkId = chunkId, Payload = payload });
+        }
+    }
+
     /// <summary>
     /// Hub-side: records which shard owns the caller's rows. Called once by each client to place
     /// its spawn (so the world starts populated across shards, not queued behind one), then kept

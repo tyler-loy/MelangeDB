@@ -11,6 +11,6 @@ internal static class TestEngine
 {
     public static IHotStoreProvider Provider() =>
         Environment.GetEnvironmentVariable("MELANGE_TEST_PAGED_ENGINE") is { Length: > 0 } name
-            ? new FasterHotStoreProvider(PagedEngines.For(Enum.Parse<PagedEngine>(name, ignoreCase: true)))
+            ? new FasterHotStoreProvider(Enum.Parse<PagedEngine>(name, ignoreCase: true))
             : new FasterHotStoreProvider();
 }

@@ -146,10 +146,21 @@ public class MemoryBoundTests
         // pressure; glibc keeps freed arena pages mapped for reuse, so Linux RSS has the same
         // problem (observed as a 79 MiB "growth" on a CI runner). Trimming first makes the
         // number the pages actually needed, which is what the assertions are about.
+        // musl has no malloc_trim, and needs none: its allocator returns freed pages as it goes.
         if (OperatingSystem.IsWindows())
+        {
             _ = EmptyWorkingSet(process.Handle);
+        }
         else if (OperatingSystem.IsLinux())
-            _ = malloc_trim(0);
+        {
+            try
+            {
+                _ = malloc_trim(0);
+            }
+            catch (EntryPointNotFoundException)
+            {
+            }
+        }
 
         process.Refresh();
         return (ResidentBytes(process), GC.GetTotalMemory(forceFullCollection: true));
