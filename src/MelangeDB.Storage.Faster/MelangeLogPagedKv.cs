@@ -1354,7 +1354,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     private static void CheckKey(ReadOnlySpan<byte> key)
     {
         if (key.Length > MaxKeyLength)
-            throw new ArgumentException($"Keys are at most {MaxKeyLength} bytes.", nameof(key));
+            throw new ArgumentException(
+                $"MelangeLog keys are at most {MaxKeyLength} bytes, and this one is {key.Length}: a row with a primary key this long " +
+                "cannot be stored on this engine. New writes are refused before the commit log; a log that already holds such a row " +
+                "(written under another engine) starts with HotStore:PagedEngine set to Faster.",
+                nameof(key));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
