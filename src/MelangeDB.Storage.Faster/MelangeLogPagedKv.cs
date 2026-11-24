@@ -44,7 +44,9 @@ internal sealed record MelangeLogTuning(
 /// Opens <see cref="MelangeLogPagedKv"/> spaces: <c>main.mlog.N</c> / <c>blob.mlog.N</c> segment files
 /// in the store directory, swept on open and deleted on close.
 /// </summary>
-internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) : IPagedKvFactory
+/// <param name="tuning">The bake-off's knobs; <see cref="MelangeLogTuning.Default"/> when null.</param>
+/// <param name="failFlushForTest">Fault injection: given a page about to be flushed, true makes that flush throw an <see cref="IOException"/>.</param>
+internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, Func<long, bool>? failFlushForTest = null) : IPagedKvFactory
 {
     private readonly MelangeLogTuning _tuning = tuning ?? MelangeLogTuning.Default;
 
@@ -83,7 +85,8 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
             hashBucketsHint,
             _tuning,
             readGuessBytes: space == PagedKvSpace.Main ? 2048 : 8448,
-            preadPointReads: space == PagedKvSpace.Blob && _tuning.BlobPointReadsViaPread);
+            preadPointReads: space == PagedKvSpace.Blob && _tuning.BlobPointReadsViaPread,
+            failFlushForTest: failFlushForTest);
     }
 }
 
@@ -196,6 +199,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     private readonly byte[] _scratch;
     private readonly bool _batchPread;
     private readonly bool _pointPread;
+    private readonly Func<long, bool>? _failFlushForTest;
 
     private byte* _ring;
     private long _tail = FirstAddress;
@@ -242,10 +246,13 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     /// ANDed into both halves of every key hash; a small mask forces collisions, which a read must
     /// detect (self-check only).
     /// </param>
+    /// <param name="failFlushForTest">Fault injection: given a page about to be flushed, true makes that flush throw.</param>
     internal MelangeLogPagedKv(
         string basePath, int pageBits, int ringPageBits, int segmentBits, long hashBucketsHint,
-        MelangeLogTuning tuning, int readGuessBytes, bool preadPointReads = false, ulong hashMaskForTest = ulong.MaxValue)
+        MelangeLogTuning tuning, int readGuessBytes, bool preadPointReads = false, ulong hashMaskForTest = ulong.MaxValue,
+        Func<long, bool>? failFlushForTest = null)
     {
+        _failFlushForTest = failFlushForTest;
         if (pageBits < 12 || ringPageBits < 1 || segmentBits < pageBits)
             throw new ArgumentOutOfRangeException(nameof(pageBits), "Need 4 KiB+ pages, two+ ring pages, and segments no smaller than a page.");
 
@@ -986,6 +993,8 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
                     var pages = Math.Min(target - flushed, Math.Min(ringRun, segmentRun));
                     var address = flushed << _pageBits;
                     var segment = SegmentForFlush(address >> _segmentBits);
+                    if (_failFlushForTest?.Invoke(flushed) == true)
+                        throw new IOException($"injected flush failure at page {flushed}");
                     RandomAccess.Write(
                         segment.Handle,
                         new ReadOnlySpan<byte>(RingSlot(flushed), checked((int)(pages << _pageBits))),
@@ -993,6 +1002,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
                     flushed += pages;
                     Volatile.Write(ref _flushedPage, flushed);
                     _flushDone.Set();
+
+                    // The segment after the one being written is made ahead, off every writer's path:
+                    // creating, preallocating and mapping a file is the slow part, and a full disk
+                    // then fails here, between pages, not partway through one.
+                    SegmentForFlush(((flushed << _pageBits) >> _segmentBits) + 1);
                 }
             }
         }
@@ -1233,7 +1247,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
         public Segment(string path, long size, bool map, bool randomAdvice)
         {
             _path = path;
-            Handle = File.OpenHandle(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete);
+            // Preallocated for real (fallocate on Linux), not just sized: a sparse file takes its
+            // blocks at write time, so a full disk would surface mid-flush, or, for a write the page
+            // cache took, at writeback where nothing hears it. Here it fails the segment's creation.
+            Handle = File.OpenHandle(path, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Read | FileShare.Delete, FileOptions.None, preallocationSize: size);
             try
             {
                 RandomAccess.SetLength(Handle, size);

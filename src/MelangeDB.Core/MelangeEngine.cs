@@ -61,6 +61,7 @@ public sealed partial class MelangeEngine : IDisposable
 
     /// <summary>Set by <see cref="Drain"/>; read and written only under <see cref="_writeLock"/>.</summary>
     private bool _closed;
+    private Exception? _projectionFailure;
 
     /// <summary>Cumulative Stopwatch ticks of write-lock work; see <see cref="WriteLockBusyTicks"/>.</summary>
     private long _writeLockBusyTicks;
@@ -551,6 +552,12 @@ public sealed partial class MelangeEngine : IDisposable
     internal Exception? LogFailure => _log.Failure;
 
     /// <summary>
+    /// Why applying a committed record to the hot store (or another inline applier) failed, if it
+    /// has: the engine refuses writes from then on, and the melange-log health check reports it.
+    /// </summary>
+    internal Exception? ProjectionFailure => Volatile.Read(ref _projectionFailure);
+
+    /// <summary>
     /// Applies a live change to the durability keys. Not a plain options copy: a policy change is
     /// a durability boundary, and the log makes everything appended under the outgoing policy
     /// durable before the new one takes effect. See <see cref="FileCommitLog.ApplyDurabilityPolicy"/>.
@@ -941,7 +948,7 @@ public sealed partial class MelangeEngine : IDisposable
                 // filtered out by the sequencer itself.
                 _sequencer.Observe(record, Schema);
                 NotifyCommitObservers(record);
-                Appliers.NotifyAppended(record);
+                ApplyAppended(record);
                 AfterCommit(timestamp);
             }
             finally
@@ -1139,7 +1146,7 @@ public sealed partial class MelangeEngine : IDisposable
             var record = _log.Append(new CommitRequest(timestamp, caller, BulkReducerName, ReadOnlyMemory<byte>.Empty, ops));
             stage.Commit();
             NotifyCommitObservers(record);
-            Appliers.NotifyAppended(record);
+            ApplyAppended(record);
             AfterCommit(timestamp);
             activity?.SetTag("melange.outcome", "commit");
             activity?.SetTag("melange.writeset.rows", ops.Count);
@@ -1579,6 +1586,15 @@ public sealed partial class MelangeEngine : IDisposable
 
     private TransientRejectionException ClosedRejection(string reducerName, Exception? innerException)
     {
+        if (Volatile.Read(ref _projectionFailure) is { } failure && !Volatile.Read(ref _disposed))
+        {
+            return new TransientRejectionException(
+                $"This database stopped accepting writes when applying a committed record to its hot store failed " +
+                $"({failure.Message}); '{reducerName}' was not committed. Retry against the next process, which " +
+                "rebuilds the store from the commit log.",
+                innerException ?? failure);
+        }
+
         var message = Volatile.Read(ref _disposed)
             ? $"This engine has been disposed (its shard was released, or its node is stopping); '{reducerName}' " +
               "was not committed. Retry: the call is routed to wherever the shard is now."
@@ -1721,6 +1737,33 @@ public sealed partial class MelangeEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Hands an appended record to the inline appliers, the hot store first among them. One that
+    /// throws has left its projection part-applied, at a record the log already holds: a store that
+    /// cannot take a write (its disk failed or filled) cannot be trusted with the next. So the engine
+    /// closes to writes, as a poisoned log does (EventId 1517, and the melange-log health check goes
+    /// unhealthy so the host is rotated), and the caller hears the truth: the record was appended
+    /// and is not acknowledged. A restart rebuilds the store from the log.
+    /// </summary>
+    private void ApplyAppended(CommitRecord record)
+    {
+        try
+        {
+            Appliers.NotifyAppended(record);
+        }
+        catch (Exception exception)
+        {
+            if (Interlocked.CompareExchange(ref _projectionFailure, exception, null) is null)
+                LogMessages.ProjectionFailed(_logger, record.Lsn, exception);
+            Volatile.Write(ref _closed, true);
+            throw new CommitOutcomeUnknownException(
+                $"LSN {record.Lsn} was appended to the commit log, but applying it to the hot store failed " +
+                $"({exception.Message}), so this database now refuses writes until it restarts and rebuilds the " +
+                "store from the log. The write may or may not become durable: read current state before retrying.",
+                exception);
+        }
+    }
+
     private void NotifyCommitObservers(CommitRecord record)
     {
         foreach (var observer in _commitObservers)
@@ -1819,7 +1862,7 @@ public sealed partial class MelangeEngine : IDisposable
                 var postCommitStarted = Stopwatch.GetTimestamp();
                 stage.Commit();
                 NotifyCommitObservers(record);
-                Appliers.NotifyAppended(record);
+                ApplyAppended(record);
                 AfterCommit(timestamp);
                 postCommitMs = Elapsed(postCommitStarted);
                 committedLsn = record.Lsn;
@@ -1964,7 +2007,7 @@ public sealed partial class MelangeEngine : IDisposable
                     var postCommitStarted = Stopwatch.GetTimestamp();
                     stage.Commit();
                     NotifyCommitObservers(record);
-                    Appliers.NotifyAppended(record);
+                    ApplyAppended(record);
                     AfterCommit(record.Timestamp);
                     postCommitMs = Elapsed(postCommitStarted);
                     committedLsn = record.Lsn;
@@ -2390,6 +2433,18 @@ public sealed partial class MelangeEngine : IDisposable
 
         public static void SnapshotFailed(ILogger logger, Exception failure) =>
             SnapshotFailedMessage(logger, failure);
+
+        private static readonly Action<ILogger, ulong, Exception?> ProjectionFailedMessage =
+            LoggerMessage.Define<ulong>(
+                LogLevel.Critical,
+                new EventId(1517, "HotStoreApplyFailed"),
+                "Applying LSN {Lsn} to the hot store failed after it was appended to the commit log. The store may hold " +
+                "part of that transaction, so this database refuses every write from now on and its melange-log health " +
+                "check reports unhealthy; restart it, and the store rebuilds from the commit log. Reads until then may " +
+                "see the partial transaction.");
+
+        public static void ProjectionFailed(ILogger logger, ulong lsn, Exception failure) =>
+            ProjectionFailedMessage(logger, lsn, failure);
 
         private static readonly Action<ILogger, ulong, Exception?> SnapshotAlreadyRunningMessage =
             LoggerMessage.Define<ulong>(

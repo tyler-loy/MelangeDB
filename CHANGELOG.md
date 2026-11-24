@@ -57,6 +57,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 - **Promoting a paged table to resident left its paged records in the log** until the next restart.
   They are now deleted as the table moves.
+- **A hot store that failed to apply a committed record left the database taking writes.** The
+  record was already in the commit log, the caller got a generic error, and the next commit
+  replayed into the part-applied store. Now the database closes to writes, as it does when the log
+  is poisoned. The caller gets `CommitOutcomeUnknownException` (the write may or may not be
+  durable), later writes get `TransientRejectionException`, EventId 1517 logs it at Critical, and
+  the `melange-log` health check reports unhealthy so the host is rotated. A restart rebuilds the
+  store from the log. This applies to every hot-store engine; MelangeLog reaches it when a disk
+  write fails, and it now preallocates segment files so a full disk fails there rather than
+  partway through a write.
 
 ## [0.4.1] — 2026-11-23
 
