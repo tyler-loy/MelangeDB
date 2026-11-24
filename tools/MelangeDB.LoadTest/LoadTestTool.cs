@@ -15,13 +15,14 @@ public static class LoadTestTool
 {
     public static async Task<int> RunAsync(string[] args, TextWriter output, CancellationToken ct = default)
     {
-        if (args.Length == 0 || args[0] is not ("serve" or "drive" or "all" or "failover"))
+        if (args.Length == 0 || args[0] is not ("serve" or "drive" or "all" or "failover" or "link-bench"))
         {
             output.WriteLine("Usage: MelangeDB.LoadTest <serve|drive|all|failover> [flags] — see docs/LOAD-TESTING.md.");
             output.WriteLine("  serve  host the hub + shard nodes (prints GATEWAY, STATS, READY)");
             output.WriteLine("  drive  connect players and generate load: --address ws://host:port/gateway");
             output.WriteLine("  all    serve in a child process, then drive against it");
             output.WriteLine("  failover  kill a crowded shard's owner and time the reassignment window: --rows 10000,100000");
+            output.WriteLine("  link-bench  the node link alone over loopback: round trip, allocation, wire bytes per message shape");
             output.WriteLine("  presets: --smoke (small, <30 s)  --soak (5 min, leak watching)");
             return 2;
         }
@@ -36,6 +37,7 @@ public static class LoadTestTool
                 "serve" => await ServeAsync(options, output, ct).ConfigureAwait(false),
                 "drive" => (await LoadTestDriver.RunAsync(options, output, ct).ConfigureAwait(false)).Pass ? 0 : 1,
                 "failover" => await FailoverMeasurement.RunAsync(options, output, ct).ConfigureAwait(false),
+                "link-bench" => await LinkBench.RunAsync(options, output, ct).ConfigureAwait(false),
                 _ => await AllAsync(options, output, ct).ConfigureAwait(false),
             };
         }
