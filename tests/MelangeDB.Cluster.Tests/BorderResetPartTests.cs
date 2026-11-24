@@ -151,7 +151,7 @@ public class BorderResetPartTests
         Assert.Contains("exceeds the node link's", refused.Message);
 
         var echoed = await sender.RequestAsync("echo", new[] { 1, 2, 3 }, TestContext.Current.CancellationToken);
-        Assert.Equal(3, echoed!.Value.GetArrayLength());
+        Assert.Equal(3, echoed!.Value.Json.GetArrayLength());
         Assert.True(sender.IsAlive && receiver.IsAlive);
     }
 }

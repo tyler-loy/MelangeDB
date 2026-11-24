@@ -523,7 +523,9 @@ and single-process clusters.
 **Node link** — The one mutually authenticated TCP connection between a shard node and the hub: registration
 and heartbeats, replication of `Replicated` write sets, event forwarding, and handoff saga steps. Both ends
 prove possession of the cluster secret over exchanged nonces at connect. Cluster-internal traffic only — the
-client plane is websockets through the gateway.
+client plane is websockets through the gateway. Frames are length-prefixed JSON; row data (border batches,
+replica batches, handoff rows, event payloads, bulk rows) rides after the JSON in a binary attachment once
+both ends have said at authentication that they read one, and as base64 inside the JSON otherwise.
 
 **Node-local engine** — The ordinary DI-registered engine on a shard node, which owns no shard and therefore
 holds only `Local` tables. Shard state lives in the per-shard engines the node opens and closes as
