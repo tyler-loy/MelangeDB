@@ -325,7 +325,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                 state.RowsScanned));
         }
 
-        return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes };
+        var main = _main.Usage;
+        HotStoreLogStatistics[] logs = _blob is null
+            ? [new("main", main.LogBytes, main.LiveBytes)]
+            : [new("main", main.LogBytes, main.LiveBytes), new("blob", _blob.Usage.LogBytes, _blob.Usage.LiveBytes)];
+        return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes, Logs = logs };
     }
 
     public void ApplyResidency(string tableName, Residency residency)
@@ -998,9 +1002,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     }
 
     /// <summary>
-    /// Pins a paged table wholly into managed memory — one deliberate faulting pass over its rows.
-    /// The hybrid-log records it leaves behind are unreachable (the directory is the authority)
-    /// and vanish at the next start's rebuild, so they are not tombstoned here.
+    /// Pins a paged table wholly into managed memory — one deliberate faulting pass over its rows —
+    /// then deletes the paged records it read. Nothing could read them again (the directory is the
+    /// authority, and a read view pinned on the paged tier refuses reads once the tier changes), but
+    /// left in place they would count as live in the engine's log forever, and the log space they
+    /// hold could never be reclaimed.
     /// </summary>
     private void Promote(TableState table)
     {
@@ -1010,6 +1016,19 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         {
             if (ReadRow(table, key) is { } bytes)
                 rows.Add((key, bytes));
+        }
+
+        foreach (var key in keys)
+        {
+            if (!table.TryGetDirectory(key, out var entry))
+                continue;
+            _main.Delete(StoreKey(table.Schema.Id, key));
+            var mask = entry.BlobMask;
+            for (var ordinal = 0; mask != 0; ordinal++, mask >>= 1)
+            {
+                if ((mask & 1) != 0)
+                    _blob!.Delete(BlobKey(table.Schema.Id, key, ordinal));
+            }
         }
 
         table.BeginResident();

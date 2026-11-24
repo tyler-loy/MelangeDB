@@ -52,6 +52,9 @@ internal sealed class RocksDbPagedKv : IPagedKv
 
     public long CapacityBytes { get; }
 
+    /// <summary>Not measured for bake-off-only engines.</summary>
+    public PagedKvUsage Usage => new(-1, -1);
+
     public byte[]? Read(ReadOnlySpan<byte> key, out bool faulted)
     {
         faulted = false; // A block-cache miss is not visible per read without statistics on.

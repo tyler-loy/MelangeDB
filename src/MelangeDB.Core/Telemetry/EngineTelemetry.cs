@@ -99,6 +99,29 @@ internal sealed class EngineTelemetry : IDisposable
             () => StoreMeasurements(static t => t.RowsScanned),
             "{row}",
             "Rows returned by full table scans.");
+        _meter.CreateObservableGauge(
+            "melange.store.log_bytes",
+            () => LogMeasurements(static l => l.LogBytes),
+            "By",
+            "Extent of each paged log space (main, blob): live records plus superseded ones not yet reclaimed.");
+        _meter.CreateObservableGauge(
+            "melange.store.live_bytes",
+            () => LogMeasurements(static l => l.LiveBytes),
+            "By",
+            "Bytes of each paged log space that current records occupy; absent for an engine that cannot tell.");
+    }
+
+    /// <summary>One measurement per paged log space, skipping values the engine reports as unknown (-1).</summary>
+    private IEnumerable<Measurement<long>> LogMeasurements(Func<HotStoreLogStatistics, long> select)
+    {
+        if (_storeStatistics is null)
+            yield break;
+        foreach (var log in _storeStatistics().Logs)
+        {
+            var value = select(log);
+            if (value >= 0)
+                yield return new Measurement<long>(value, new KeyValuePair<string, object?>("space", log.Space));
+        }
     }
 
     /// <summary>

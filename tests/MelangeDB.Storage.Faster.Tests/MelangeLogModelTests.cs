@@ -6,25 +6,22 @@ namespace MelangeDB.Storage.Faster.Tests;
 /// <summary>
 /// melangelog against a dictionary, under randomized upserts, deletes, reads and batched reads. Tiny
 /// pages, ring and segments put every path under load: eviction, records spanning pages and segments,
-/// in-place shrink and regrow (#137), blind appends over flushed records, and, with a 3-bit hash mask,
-/// hash chains shared by many keys, tombstones included. The store suite runs the engine through the
-/// whole store (MELANGE_TEST_PAGED_ENGINE=melangelog); this drives the key-value space on its own.
+/// in-place shrink and regrow (#137), and blind appends over flushed records, with the live-byte
+/// accounting checked against the log at the end. The store suite runs the engine through the whole
+/// store (MELANGE_TEST_PAGED_ENGINE=melangelog); this drives the key-value space on its own.
 /// </summary>
 public sealed class MelangeLogModelTests
 {
-    public static TheoryData<string, bool, ulong> Modes => new()
+    public static TheoryData<string, bool> Modes => new()
     {
-        { "Mmap", false, ulong.MaxValue },
-        { "Mmap", false, 0x7UL },
-        { "Mmap", true, ulong.MaxValue },
-        { "Mmap", true, 0x7UL },
-        { "Pread", false, ulong.MaxValue },
-        { "Pread", false, 0x7UL },
+        { "Mmap", false },
+        { "Mmap", true },
+        { "Pread", false },
     };
 
     [Theory]
     [MemberData(nameof(Modes))]
-    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread, ulong hashMask)
+    public void Every_read_returns_what_the_model_holds(string readMode, bool pointPread)
     {
         var mode = Enum.Parse<MelangeLogReadMode>(readMode);
         const int keySpace = 600;
@@ -35,7 +32,7 @@ public sealed class MelangeLogModelTests
 
         // 4 KiB pages, an 8-page ring, 16 KiB segments: a 20 KiB value spans pages and segments.
         using (var kv = new MelangeLogPagedKv(
-                   Path.Combine(directory, "check.mlog"), 12, 3, 14, 16, MelangeLogTuning.Default with { ReadMode = mode }, 512, pointPread, hashMask))
+                   Path.Combine(directory, "check.mlog"), 12, 3, 14, 16, MelangeLogTuning.Default with { ReadMode = mode }, 512, pointPread))
         {
             for (var n = 0; n < ops; n++)
             {
@@ -70,12 +67,60 @@ public sealed class MelangeLogModelTests
 
             for (var id = 0; id < keySpace; id++)
                 Expect(model, id, kv.Read(Key(id), out _), ops);
-            if (hashMask == ulong.MaxValue)
-                Assert.Equal(model.Count, kv.Addresses.IndexEntries);
+            Assert.Equal(model.Count, kv.Addresses.IndexEntries);
+            AssertAccounting(kv);
+
+            // Every live byte is some current record's: delete them all and nothing is left counted.
+            foreach (var id in model.Keys)
+                kv.Delete(Key(id));
+            AssertAccounting(kv);
+            Assert.Equal(0, kv.Usage.LiveBytes);
+            Assert.All(kv.SegmentAccounting, static segment => Assert.Equal(0, segment.Live));
         }
 
         Assert.Empty(Directory.EnumerateFiles(directory));
         Directory.Delete(directory);
+    }
+
+    /// <summary>
+    /// Two keys whose hashes collide (forced, with a 3-bit mask on both halves) are one slot. That is
+    /// the design: at 128 bits a real collision does not happen. A read still compares the stored key,
+    /// so the second key gets an error, never the first key's value.
+    /// </summary>
+    [Fact]
+    public void A_forced_hash_collision_is_detected_not_returned()
+    {
+        var directory = Directory.CreateTempSubdirectory("melange-mlog-collision-").FullName;
+        using (var kv = new MelangeLogPagedKv(
+                   Path.Combine(directory, "check.mlog"), 12, 3, 14, 16, MelangeLogTuning.Default, 512, hashMaskForTest: 0x7UL))
+        {
+            kv.Upsert(Key(0), [1, 2, 3]);
+            var other = Enumerable.Range(1, 10_000).First(id =>
+            {
+                try
+                {
+                    return kv.Read(Key(id), out _) is not null;
+                }
+                catch (InvalidDataException)
+                {
+                    return true;
+                }
+            });
+
+            Assert.Throws<InvalidDataException>(() => kv.Read(Key(other), out _));
+            Assert.Throws<InvalidDataException>(() => kv.Upsert(Key(other), [4]));
+        }
+
+        Directory.Delete(directory, recursive: true);
+    }
+
+    /// <summary>The segments' live counts add up to the space's, and none is negative.</summary>
+    private static void AssertAccounting(MelangeLogPagedKv kv)
+    {
+        var segments = kv.SegmentAccounting;
+        Assert.All(segments, static segment => Assert.True(segment.Live >= 0, $"segment live bytes {segment.Live}"));
+        Assert.Equal(kv.Usage.LiveBytes, segments.Sum(static segment => segment.Live));
+        Assert.True(kv.Usage.LiveBytes <= kv.Usage.LogBytes);
     }
 
     private static void Expect(Dictionary<int, byte[]> model, int id, byte[]? actual, int op)

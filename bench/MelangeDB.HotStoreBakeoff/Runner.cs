@@ -122,7 +122,7 @@ internal static class Runner
             store.LoadSnapshot(lsn++, Enumerable.Range(0, s.Rows).Select(i => new SnapshotRow(entity.Id, keys[i], EntityRow(entity, i, 0))));
             (store as IBulkRecovery)?.CompleteRecovery();
             measures.Add(new("rebuild", clock.Elapsed.TotalSeconds, "s"));
-            Footprint(measures, root, "after rebuild");
+            Footprint(measures, store, root, "after rebuild");
 
             void Update(int i)
             {
@@ -187,7 +187,13 @@ internal static class Runner
             clock.Restart();
             var blobScanned = store.Scan(terrain.Id).LongCount();
             measures.Add(new("blob full scan", blobScanned / clock.Elapsed.TotalSeconds, "rows/s"));
-            Footprint(measures, root, "at end");
+            Footprint(measures, store, root, "at end");
+
+            // Churn: the entity table rewritten three times over, uniformly, so nearly every update
+            // supersedes a record that has left memory. An append-only log grows by a row per update
+            // until something reclaims it (#287); log against live bytes after this is that number.
+            Phase(measures, "churn updates (3x table)", s.Rows * 3, _ => Update(random.Next(s.Rows)));
+            Footprint(measures, store, root, "after churn");
 
             var failure = Verify(store, entity, terrain, keys, versions, blobKeys, blobVersions, s, random);
             return new EngineResult(engine, measures, failure);
@@ -302,7 +308,7 @@ internal static class Runner
         measures.Add(new($"{name} max", Micros(ticks[^1]), "us"));
     }
 
-    private static void Footprint(List<Measure> measures, string root, string when)
+    private static void Footprint(List<Measure> measures, IHotStore store, string root, string when)
     {
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -314,6 +320,13 @@ internal static class Runner
             ? new DirectoryInfo(root).EnumerateFiles("*", SearchOption.AllDirectories).Sum(static f => f.Length)
             : 0;
         measures.Add(new($"disk {when}", disk / 1048576.0, "MiB"));
+        foreach (var log in store.Statistics().Logs)
+        {
+            if (log.LogBytes >= 0)
+                measures.Add(new($"{log.Space} log {when}", log.LogBytes / 1048576.0, "MiB"));
+            if (log.LiveBytes >= 0)
+                measures.Add(new($"{log.Space} live {when}", log.LiveBytes / 1048576.0, "MiB"));
+        }
     }
 
     private static void PrintTable(List<EngineResult> results)

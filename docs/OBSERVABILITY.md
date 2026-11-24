@@ -284,6 +284,8 @@ Meter name: `MelangeDB`.
 | `melange.store.resident_bytes` | gauge | `By` | `table` | 07 |
 | `melange.store.page_faults` | counter | `{fault}` | `table` | 07 |
 | `melange.store.scan_rows` | counter | `{row}` | `table` | 07 |
+| `melange.store.log_bytes` | gauge | `By` | `space` | 0.4.2 |
+| `melange.store.live_bytes` | gauge | `By` | `space` | 0.4.2 |
 | `melange.subscriptions.active` | gauge | `{sub}` | `table` | 03 |
 | `melange.subscription.delta_rows` | counter | `{row}` | `table` | 03 |
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |

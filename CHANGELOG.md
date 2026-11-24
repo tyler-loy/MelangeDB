@@ -35,6 +35,18 @@ All packages ship together at one version; there is no per-package versioning. S
   - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on
     writes.
   - **Likely the future default,** once it can reclaim log space (#287) and flush in the background.
+  - **Exact without reads:** its index keys each record by a 128-bit hash and records its size, so a
+    delete reads nothing, and the log knows which bytes are live without reading them back.
+
+- **`melange.store.log_bytes` and `melange.store.live_bytes` gauges** (dimension `space`: `main` or
+  `blob`), from the new `HotStoreStatistics.Logs`. The paged tier's logs keep superseded records
+  until space is reclaimed (#287), and the gap between the two gauges is that backlog. FASTER and
+  Tsavorite report the log's extent only; MelangeLog reports both.
+
+### Fixed
+
+- **Promoting a paged table to resident left its paged records in the log** until the next restart.
+  They are now deleted as the table moves.
 
 ## [0.4.1] — 2026-11-23
 

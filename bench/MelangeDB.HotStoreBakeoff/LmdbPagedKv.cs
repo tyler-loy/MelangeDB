@@ -66,6 +66,9 @@ internal sealed class LmdbPagedKv : IPagedKv
 
     public long CapacityBytes { get; }
 
+    /// <summary>Not measured for bake-off-only engines.</summary>
+    public PagedKvUsage Usage => new(-1, -1);
+
     public byte[]? Read(ReadOnlySpan<byte> key, out bool faulted)
     {
         faulted = false; // The OS page cache decides; LMDB cannot tell a fault from a hit.

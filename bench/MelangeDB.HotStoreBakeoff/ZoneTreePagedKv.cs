@@ -55,6 +55,9 @@ internal sealed class ZoneTreePagedKv : IPagedKv
 
     public long CapacityBytes { get; }
 
+    /// <summary>Not measured for bake-off-only engines.</summary>
+    public PagedKvUsage Usage => new(-1, -1);
+
     public byte[]? Read(ReadOnlySpan<byte> key, out bool faulted)
     {
         faulted = false; // Segment caches are internal; a disk read is not visible per call.

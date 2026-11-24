@@ -58,8 +58,10 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
 
         var budgetBits = BitOperations.Log2((ulong)memoryBudgetBytes);
 
-        // At least eight pages in the ring, so eviction is fine-grained; at least 4 KiB a page.
-        var pageBits = Math.Max(12, Math.Min(space == PagedKvSpace.Main ? _tuning.MainPageBits : _tuning.BlobPageBits, budgetBits - 3));
+        // At least eight pages in the ring, so eviction is fine-grained; at least 4 KiB a page, and
+        // never smaller than the OS page (16 KiB on some arm64 kernels), which the ring is aligned to.
+        var minPageBits = Math.Max(12, BitOperations.Log2((uint)Environment.SystemPageSize));
+        var pageBits = Math.Max(minPageBits, Math.Min(space == PagedKvSpace.Main ? _tuning.MainPageBits : _tuning.BlobPageBits, budgetBits - 3));
 
         // Segments are preallocated and mapped whole, so keep them near the space's size when it is
         // small (the test suite opens hundreds of 4 MiB spaces) and at 64 MiB otherwise.
@@ -76,7 +78,7 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
         return new MelangeLogPagedKv(
             Path.Combine(directory, name),
             pageBits,
-            ringPageBits: budgetBits - pageBits,
+            ringPageBits: Math.Max(1, budgetBits - pageBits),
             segmentBits,
             hashBucketsHint,
             _tuning,
@@ -91,16 +93,20 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
 /// <b>Log.</b> A single append-only address space. The newest <c>2^ringPageBits</c> pages of it live in
 /// a ring of native memory (<c>NativeMemory.AlignedAlloc</c>, off the GC heap); older pages live in
 /// segment files. A record is <see cref="RecordHeader"/> + key + value, 8-byte aligned. A record that
-/// fits a page never straddles one (the tail skips to the next page instead); a larger one starts on
-/// a page boundary and runs across as many pages as it needs. So a record's header and key are always
-/// contiguous, and a page never straddles a segment.
+/// fits a page never straddles one: the tail skips to the next page instead, leaving a pad marker
+/// (a header with <see cref="PadKeyLength"/>) wherever the skipped gap can hold one, so a scan of the
+/// log can always tell a record from the bytes a reused ring slot left behind. A larger record starts
+/// on a page boundary and runs across as many pages as it needs, segments included; each segment
+/// records where its first record starts. So a record's header and key are always contiguous, and a
+/// page never straddles a segment.
 /// </para>
 /// <para>
-/// <b>Writes.</b> An upsert whose newest record is still in the ring and has the capacity rewrites it
-/// in place, setting the new length (the #137 contract: a shorter value reads back at exactly its
+/// <b>Writes.</b> An upsert whose record is still in the ring and has the capacity rewrites it in
+/// place, setting the new length (the #137 contract: a shorter value reads back at exactly its
 /// length). Anything else is a blind append at the tail: a record that has left memory is never read
-/// to be replaced. When the tail needs a page and the ring is full, the oldest page is written to its
-/// segment with <c>RandomAccess.Write</c> on the calling thread, and evicted.
+/// to be replaced, and a delete reads nothing at all. When the tail needs a page and the ring is full,
+/// the oldest page is written to its segment with <c>RandomAccess.Write</c> on the calling thread,
+/// and evicted.
 /// </para>
 /// <para>
 /// <b>Reads.</b> A record in the ring is read straight from it. One below the ring is read through a
@@ -111,24 +117,45 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null) 
 /// fallbacks the bake-off measured.
 /// </para>
 /// <para>
-/// <b>Index.</b> Open addressing with linear probing in native memory: 64-bit key hash (XxHash3) to the
-/// newest record's address, grown 2× by rehash past 75% load, with no ceiling. A blind append cannot
-/// check that the record it supersedes has the same key, so each record carries the address of the
-/// one it superseded (<see cref="RecordHeader.Prev"/>): a hash's records form a chain, newest first,
-/// and a read walks it until the key matches. Distinct keys share a chain only on a full 64-bit hash
-/// collision, so a read is one hop in practice, but a collision is still exact.
+/// <b>Index.</b> Open addressing with linear probing in native memory, grown 2× by rehash past 75%
+/// load, with no ceiling. A slot holds the key's 128-bit hash (XxHash128, seeded per space at random)
+/// and its one record's address and size. The hash is the key's identity: blind appends and deletes
+/// never read the record they replace, so a 64-bit hash would need chains to tell colliding keys
+/// apart, and a chain makes "is this record still current" a disk read. At 128 bits a collision is
+/// as likely as two random GUIDs matching. Reads still compare the stored key, so one would throw
+/// rather than return another key's row.
 /// </para>
 /// <para>
-/// Every call arrives under the store's lock, one at a time, so nothing here is thread-safe. Nothing
-/// is durable: the store is rebuilt from the commit log on every start.
+/// <b>Accounting.</b> The slot's size is what makes space reclamation cheap. Every append adds a
+/// record's bytes to the live count of each segment it touches; superseding or deleting it subtracts
+/// them, from the slot, with no read. Live bytes against the log's extent is the garbage a compactor
+/// has to reclaim (#287), and a segment whose live count reaches zero holds nothing current.
+/// </para>
+/// <para>
+/// Every call arrives under the store's lock, one at a time, so nothing here is thread-safe, except
+/// <see cref="Usage"/>, which statistics read without the lock. Nothing is durable: the store is
+/// rebuilt from the commit log on every start.
 /// </para>
 /// </summary>
 internal sealed unsafe class MelangeLogPagedKv : IPagedKv
 {
-    internal const int HeaderSize = 24;
+    internal const int HeaderSize = 16;
+
+    /// <summary>The key length of a pad marker: no record has one, since a header with it fails validation.</summary>
+    internal const int PadKeyLength = -1;
+
     private const long FirstAddress = 64;
     private const int MaxKeyLength = 1024;
-    private const long OsPage = 4096;
+
+    // A slot packs the record's address and size, both in 8-byte units (records are 8-byte aligned):
+    // 40 bits of address, an 8 TiB log; 24 bits of size, records up to 128 MiB, larger ones marked
+    // with the all-ones size and measured from their header instead.
+    private const int AddressBits = 40;
+    private const ulong AddressMask = (1UL << AddressBits) - 1;
+    private const long MaxAddress = 1L << (AddressBits + 3);
+    private const ulong SizeUnknown = (1UL << (64 - AddressBits)) - 1;
+
+    private static readonly long OsPage = Math.Max(4096, Environment.SystemPageSize);
 
     private readonly string _basePath;
     private readonly MelangeLogTuning _tuning;
@@ -141,8 +168,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     private readonly long _segmentSize;
     private readonly long _segmentOffsetMask;
     private readonly int _readGuess;
+    private readonly long _hashSeed;
     private readonly ulong _hashMask;
     private readonly List<Segment> _segments = [];
+    private readonly List<SegmentInfo> _segmentInfo = [];
     private readonly byte[] _scratch;
     private readonly bool _batchPread;
     private readonly bool _pointPread;
@@ -152,6 +181,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     private long _headPage;
     private long _headAddress;
     private long _tailPage;
+    private long _liveBytes;
 
     private IndexEntry* _index;
     private long _indexMask;
@@ -162,7 +192,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     private int[] _pendingSlots = [];
     private bool _disposed;
 
-    /// <param name="hashMaskForTest">ANDed into every key hash; a small mask forces collisions (self-check only).</param>
+    /// <param name="hashMaskForTest">
+    /// ANDed into both halves of every key hash; a small mask forces collisions, which a read must
+    /// detect (self-check only).
+    /// </param>
     internal MelangeLogPagedKv(
         string basePath, int pageBits, int ringPageBits, int segmentBits, long hashBucketsHint,
         MelangeLogTuning tuning, int readGuessBytes, bool preadPointReads = false, ulong hashMaskForTest = ulong.MaxValue)
@@ -181,13 +214,14 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         _segmentSize = 1L << segmentBits;
         _segmentOffsetMask = _segmentSize - 1;
         _readGuess = Math.Min(_pageSize, Math.Max(readGuessBytes, HeaderSize + MaxKeyLength));
+        _hashSeed = Random.Shared.NextInt64();
         _hashMask = hashMaskForTest;
         _batchPread = tuning.ReadMode == MelangeLogReadMode.Pread;
         _pointPread = _batchPread || preadPointReads;
         _scratch = _pointPread ? new byte[_readGuess] : [];
 
         CapacityBytes = _ringPages << pageBits;
-        _ring = (byte*)NativeMemory.AlignedAlloc((nuint)CapacityBytes, (nuint)OsPage);
+        _ring = (byte*)NativeMemory.AlignedAlloc((nuint)CapacityBytes, (nuint)Math.Min(OsPage, _pageSize));
 
         var capacity = (long)BitOperations.RoundUpToPowerOf2((ulong)Math.Clamp(hashBucketsHint * 2, 1L << 12, 1L << 30));
         AllocateIndex(capacity);
@@ -195,8 +229,15 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
 
     public long CapacityBytes { get; }
 
+    /// <summary>The log's extent, and the bytes of it current records occupy. Plain 64-bit reads, safe off the lock.</summary>
+    public PagedKvUsage Usage => new(Volatile.Read(ref _tail) - FirstAddress, Volatile.Read(ref _liveBytes));
+
     /// <summary>Diagnostics: the log tail, the lowest in-memory address, and the live index entries.</summary>
     internal (long Tail, long Head, long IndexEntries) Addresses => (_tail, _headAddress, _indexCount);
+
+    /// <summary>Diagnostics: each segment's live bytes and first record address, by segment number.</summary>
+    internal IReadOnlyList<(long Live, long FirstRecord)> SegmentAccounting =>
+        _segmentInfo.Select(static info => (info.Live, info.FirstRecord)).ToArray();
 
     public byte[]? Read(ReadOnlySpan<byte> key, out bool faulted)
     {
@@ -204,7 +245,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         faulted = false;
         var hash = Hash(key);
         var slot = FindSlot(hash);
-        return slot < 0 ? null : ReadChain(key, hash, _index[slot].Address, _pointPread, ref faulted);
+        return slot < 0 ? null : ReadRecord(key, hash, AddressOf(_index[slot].Packed), _pointPread, ref faulted);
     }
 
     /// <summary>
@@ -222,7 +263,6 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
             _pendingSlots = new int[keys.Length];
         }
 
-        var faults = 0;
         var pending = 0;
         for (var i = 0; i < keys.Length; i++)
         {
@@ -231,13 +271,11 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
             var slot = FindSlot(hash);
             if (slot < 0)
                 continue;
-            var address = _index[slot].Address;
+            var address = AddressOf(_index[slot].Packed);
             if (address >= _headAddress)
             {
                 var faulted = false;
-                values[i] = ReadChain(keys[i], hash, address, _batchPread, ref faulted);
-                if (faulted)
-                    faults++;
+                values[i] = ReadRecord(keys[i], hash, address, _batchPread, ref faulted);
                 continue;
             }
 
@@ -246,7 +284,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         }
 
         if (pending == 0)
-            return faults;
+            return 0;
 
         var addresses = _pendingAddresses.AsSpan(0, pending);
         var slots = _pendingSlots.AsSpan(0, pending);
@@ -258,10 +296,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         {
             var key = keys[slots[j]];
             var faulted = true;
-            values[slots[j]] = ReadChain(key, Hash(key), addresses[j], _batchPread, ref faulted);
+            values[slots[j]] = ReadRecord(key, Hash(key), addresses[j], _batchPread, ref faulted);
         }
 
-        return faults + pending;
+        return pending;
     }
 
     public void Upsert(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
@@ -273,93 +311,62 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
 
         var hash = Hash(key);
         var slot = FindSlot(hash);
-        long prev = 0;
         if (slot >= 0)
         {
-            var head = _index[slot].Address;
-            prev = head;
-            if (head >= _headAddress)
+            var packed = _index[slot].Packed;
+            var current = AddressOf(packed);
+            if (current >= _headAddress)
             {
-                var record = RingPointer(head);
+                var record = RingPointer(current);
                 ref var header = ref Unsafe.AsRef<RecordHeader>(record);
-                ValidateHeader(head, header);
-                if (header.KeyLength == key.Length && new ReadOnlySpan<byte>(record + HeaderSize, key.Length).SequenceEqual(key))
-                {
-                    if (header.ValueLength >= 0 && header.Capacity >= value.Length)
-                    {
-                        // In place: the record is in the ring, so it has not been flushed yet and nothing
-                        // on disk goes stale. Setting the length is what makes a shrink read back exact.
-                        header.ValueLength = value.Length;
-                        header.Checksum = Checksum(hash, value.Length, header.Capacity, header.Prev, value);
-                        WriteInPlace(head + HeaderSize + key.Length, value);
-                        return;
-                    }
+                ValidateHeader(current, header);
+                if (header.KeyLength != key.Length || !new ReadOnlySpan<byte>(record + HeaderSize, key.Length).SequenceEqual(key))
+                    throw Collision(current);
 
-                    // The new version replaces this one in the chain rather than linking to it.
-                    prev = header.Prev;
+                if (header.Capacity >= value.Length)
+                {
+                    // In place: the record is in the ring, so it has not been flushed yet and nothing
+                    // on disk goes stale. Setting the length is what makes a shrink read back exact.
+                    // Its size, and so the accounting, is unchanged.
+                    header.ValueLength = value.Length;
+                    header.Checksum = Checksum(hash, value.Length, header.Capacity, value);
+                    WriteInPlace(current + HeaderSize + key.Length, value);
+                    return;
                 }
             }
+
+            // The new version supersedes this one: its bytes stop being live wherever they are.
+            AddLive(current, SizeOf(packed, current), -1);
         }
 
-        var address = Append(key, value, hash, prev, tombstone: false);
+        var (address, size) = Append(key, value, hash);
         if (slot >= 0)
         {
-            _index[slot].Address = address;
+            _index[slot].Packed = Pack(address, size);
         }
         else
         {
             ref var entry = ref _index[~slot];
-            entry.Hash = hash;
-            entry.Address = address;
+            entry.HashLow = (ulong)hash;
+            entry.HashHigh = (ulong)(hash >> 64);
+            entry.Packed = Pack(address, size);
             _indexCount++;
         }
     }
 
-    /// <summary>
-    /// Drops the key's index entry. Unlike an upsert, a delete reads the chain (from the ring or the
-    /// map) to confirm the key is there and that no other key shares its hash; if one does, which
-    /// takes a full 64-bit collision, it appends a tombstone instead so the other key stays reachable.
-    /// </summary>
+    /// <summary>Drops the key's slot and stops counting its record as live. Reads nothing: the slot has the size.</summary>
     public void Delete(ReadOnlySpan<byte> key)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         CheckKey(key);
-        var hash = Hash(key);
-        var slot = FindSlot(hash);
+        var slot = FindSlot(Hash(key));
         if (slot < 0)
             return;
 
-        var head = _index[slot].Address;
-        bool found = false, live = false, otherKeys = false, faulted = false;
-        for (var address = head; address != 0;)
-        {
-            var view = RecordView(address, _batchPread, ref faulted);
-            var header = MemoryMarshal.Read<RecordHeader>(view);
-            ValidateHeader(address, header);
-            if (header.KeyLength == key.Length && view.Slice(HeaderSize, key.Length).SequenceEqual(key))
-            {
-                if (!found)
-                {
-                    found = true;
-                    live = header.ValueLength >= 0;
-                }
-            }
-            else
-            {
-                otherKeys = true;
-            }
-
-            if (found && otherKeys)
-                break;
-            address = header.Prev;
-        }
-
-        if (!found || !live)
-            return;
-        if (!otherKeys)
-            RemoveSlot(slot);
-        else
-            _index[slot].Address = Append(key, default, hash, head, tombstone: true);
+        var packed = _index[slot].Packed;
+        var address = AddressOf(packed);
+        AddLive(address, SizeOf(packed, address), -1);
+        RemoveSlot(slot);
     }
 
     public void Dispose()
@@ -379,35 +386,24 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
 
     // ---- Reads ------------------------------------------------------------------------------
 
-    private byte[]? ReadChain(ReadOnlySpan<byte> key, ulong hash, long address, bool pread, ref bool faulted)
+    private byte[] ReadRecord(ReadOnlySpan<byte> key, UInt128 hash, long address, bool pread, ref bool faulted)
     {
-        while (address != 0)
-        {
-            var view = RecordView(address, pread, ref faulted);
-            var header = MemoryMarshal.Read<RecordHeader>(view);
-            ValidateHeader(address, header);
-            if (header.KeyLength != key.Length || !view.Slice(HeaderSize, key.Length).SequenceEqual(key))
-            {
-                address = header.Prev;
-                continue;
-            }
+        var view = RecordView(address, pread, ref faulted);
+        var header = MemoryMarshal.Read<RecordHeader>(view);
+        ValidateHeader(address, header);
+        if (header.KeyLength != key.Length || !view.Slice(HeaderSize, key.Length).SequenceEqual(key))
+            throw Collision(address);
 
-            if (header.ValueLength < 0)
-                return null;
+        var value = GC.AllocateUninitializedArray<byte>(header.ValueLength);
+        var valueOffset = HeaderSize + key.Length;
+        if (view.Length >= valueOffset + value.Length)
+            view.Slice(valueOffset, value.Length).CopyTo(value);
+        else
+            CopyOut(address + valueOffset, value, pread, ref faulted);
 
-            var value = GC.AllocateUninitializedArray<byte>(header.ValueLength);
-            var valueOffset = HeaderSize + key.Length;
-            if (view.Length >= valueOffset + value.Length)
-                view.Slice(valueOffset, value.Length).CopyTo(value);
-            else
-                CopyOut(address + valueOffset, value, pread, ref faulted);
-
-            if (Checksum(hash, header.ValueLength, header.Capacity, header.Prev, value) != header.Checksum)
-                throw new InvalidDataException($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
-            return value;
-        }
-
-        return null;
+        if (Checksum(hash, header.ValueLength, header.Capacity, value) != header.Checksum)
+            throw new InvalidDataException($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
+        return value;
     }
 
     /// <summary>
@@ -426,7 +422,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
             return new ReadOnlySpan<byte>(MappedPointer(address), inPage);
 
         var length = Math.Min(inPage, _readGuess);
-        var buffer = _scratch.AsSpan(0, length);
+        var buffer = _scratch.Length >= length ? _scratch.AsSpan(0, length) : new byte[length];
         ReadFromFile(address, buffer);
         return buffer;
     }
@@ -500,30 +496,33 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
 
     // ---- Writes -----------------------------------------------------------------------------
 
-    private long Append(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, ulong hash, long prev, bool tombstone)
+    private (long Address, long Size) Append(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, UInt128 hash)
     {
         var size = (HeaderSize + key.Length + (long)value.Length + 7) & ~7L;
         var capacity = checked((int)(size - HeaderSize - key.Length));
-        var valueLength = tombstone ? -1 : value.Length;
 
         // A record that fits a page never straddles one; a bigger one starts on a page boundary.
         var offset = _tail & _pageOffsetMask;
         if (size <= _pageSize ? offset + size > _pageSize : offset != 0)
+        {
+            MarkPad(_tail, _pageSize - offset);
             _tail = (_tail | _pageOffsetMask) + 1;
+        }
 
         var address = _tail;
+        if (address + size > MaxAddress)
+            throw new InvalidOperationException($"melangelog: the log reached its {MaxAddress >> 40} TiB address limit ({_basePath}).");
+
         EnsurePage(address >> _pageBits);
         var record = RingPointer(address);
         Unsafe.AsRef<RecordHeader>(record) = new RecordHeader
         {
             KeyLength = key.Length,
-            ValueLength = valueLength,
+            ValueLength = value.Length,
             Capacity = capacity,
-            Checksum = Checksum(hash, valueLength, capacity, prev, value),
-            Prev = prev,
+            Checksum = Checksum(hash, value.Length, capacity, value),
         };
         key.CopyTo(new Span<byte>(record + HeaderSize, key.Length));
-        _tail = address + size;
 
         // The value, page by page: only a record bigger than a page touches more than one.
         var at = address + HeaderSize + key.Length;
@@ -536,7 +535,64 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
             value = value[count..];
         }
 
-        return address;
+        // The tail moves only once the record is whole, so a header is never validated against a
+        // tail that does not yet cover it.
+        Volatile.Write(ref _tail, address + size);
+        NoteRecordSpan(address, size);
+        AddLive(address, size, +1);
+        return (address, size);
+    }
+
+    /// <summary>
+    /// Marks the <paramref name="length"/> bytes the tail is about to skip, so nothing reading the log
+    /// in order mistakes what a reused ring slot left there for a record. A gap too short for a header
+    /// (8 bytes, given 8-byte alignment and 16-byte headers) needs no marker: a reader skips to the
+    /// next page from anywhere a header cannot fit.
+    /// </summary>
+    private void MarkPad(long address, long length)
+    {
+        if (length < HeaderSize)
+            return;
+        Unsafe.AsRef<RecordHeader>(RingPointer(address)) = new RecordHeader
+        {
+            KeyLength = PadKeyLength,
+            Capacity = (int)(length - HeaderSize),
+        };
+    }
+
+    /// <summary>
+    /// A record that runs past its segment's end covers the start of the next ones: each of those
+    /// records where its first record actually begins, the end of this one or, for a segment it
+    /// covers whole, the segment's end (no record starts there).
+    /// </summary>
+    private void NoteRecordSpan(long address, long size)
+    {
+        var first = address >> _segmentBits;
+        var end = address + size;
+        var last = (end - 1) >> _segmentBits;
+        for (var segment = first + 1; segment <= last; segment++)
+            Info(segment).FirstRecord = Math.Min(end, (segment + 1) << _segmentBits);
+    }
+
+    /// <summary>Adds (or, with -1, removes) a record's bytes to the live count of each segment it touches.</summary>
+    private void AddLive(long address, long size, int sign)
+    {
+        Volatile.Write(ref _liveBytes, _liveBytes + sign * size);
+        while (size > 0)
+        {
+            var segment = address >> _segmentBits;
+            var inSegment = Math.Min(size, ((segment + 1) << _segmentBits) - address);
+            Info(segment).Live += sign * inSegment;
+            address += inSegment;
+            size -= inSegment;
+        }
+    }
+
+    private SegmentInfo Info(long segment)
+    {
+        while (_segmentInfo.Count <= segment)
+            _segmentInfo.Add(new SegmentInfo(Math.Max(FirstAddress, (long)_segmentInfo.Count << _segmentBits)));
+        return _segmentInfo[(int)segment];
     }
 
     /// <summary>Rewrites a value in a record that is wholly in the ring (its first page is, so every later one is).</summary>
@@ -593,15 +649,15 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     // ---- Index ------------------------------------------------------------------------------
 
     /// <summary>The slot holding <paramref name="hash"/>, or the complement of the empty slot it would go in.</summary>
-    private long FindSlot(ulong hash)
+    private long FindSlot(UInt128 hash)
     {
-        var i = (long)hash & _indexMask;
+        var i = (long)(ulong)hash & _indexMask;
         while (true)
         {
             ref var entry = ref _index[i];
-            if (entry.Address == 0)
+            if (entry.Packed == 0)
                 return ~i;
-            if (entry.Hash == hash)
+            if (entry.HashLow == (ulong)hash && entry.HashHigh == (ulong)(hash >> 64))
                 return i;
             i = (i + 1) & _indexMask;
         }
@@ -616,9 +672,9 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         {
             j = (j + 1) & _indexMask;
             ref var entry = ref _index[j];
-            if (entry.Address == 0)
+            if (entry.Packed == 0)
                 break;
-            var ideal = (long)entry.Hash & _indexMask;
+            var ideal = (long)entry.HashLow & _indexMask;
             if (((j - ideal) & _indexMask) >= ((j - hole) & _indexMask))
             {
                 _index[hole] = entry;
@@ -637,10 +693,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         AllocateIndex(oldCapacity * 2);
         for (long i = 0; i < oldCapacity; i++)
         {
-            if (old[i].Address == 0)
+            if (old[i].Packed == 0)
                 continue;
-            var j = (long)old[i].Hash & _indexMask;
-            while (_index[j].Address != 0)
+            var j = (long)old[i].HashLow & _indexMask;
+            while (_index[j].Packed != 0)
                 j = (j + 1) & _indexMask;
             _index[j] = old[i];
         }
@@ -655,18 +711,44 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
         _indexGrowAt = capacity / 4 * 3;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Pack(long address, long size)
+    {
+        var units = (ulong)(size >> 3);
+        return ((ulong)address >> 3) | (Math.Min(units, SizeUnknown) << AddressBits);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long AddressOf(ulong packed) => (long)(packed & AddressMask) << 3;
+
+    /// <summary>A slot's record size: from the slot, or, for a record too large to pack, from its header.</summary>
+    private long SizeOf(ulong packed, long address)
+    {
+        var units = packed >> AddressBits;
+        if (units != SizeUnknown)
+            return (long)units << 3;
+        var faulted = false;
+        var header = MemoryMarshal.Read<RecordHeader>(RecordView(address, _pointPread, ref faulted));
+        ValidateHeader(address, header);
+        return HeaderSize + header.KeyLength + (long)header.Capacity;
+    }
+
     // ---- Helpers ----------------------------------------------------------------------------
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private ulong Hash(ReadOnlySpan<byte> key) => XxHash3.HashToUInt64(key) & _hashMask;
+    private UInt128 Hash(ReadOnlySpan<byte> key)
+    {
+        var hash = XxHash128.HashToUInt128(key, _hashSeed);
+        return _hashMask == ulong.MaxValue ? hash : new UInt128((ulong)(hash >> 64) & _hashMask, (ulong)hash & _hashMask);
+    }
 
     /// <summary>
-    /// Binds the value bytes to the key (through its hash), the lengths and the chain link, so a torn,
-    /// misdirected or bit-rotted record throws rather than reading back as somebody's row.
+    /// Binds the value bytes to the key (through its hash) and the lengths, so a torn, misdirected or
+    /// bit-rotted record throws rather than reading back as somebody's row.
     /// </summary>
-    private static uint Checksum(ulong keyHash, int valueLength, int capacity, long prev, ReadOnlySpan<byte> value)
+    private static uint Checksum(UInt128 keyHash, int valueLength, int capacity, ReadOnlySpan<byte> value)
     {
-        var seed = keyHash ^ ((((ulong)(uint)valueLength << 32) | (uint)capacity) * 0x9E3779B97F4A7C15UL) ^ (ulong)prev;
+        var seed = (ulong)keyHash ^ (ulong)(keyHash >> 64) ^ ((((ulong)(uint)valueLength << 32) | (uint)capacity) * 0x9E3779B97F4A7C15UL);
         return (uint)XxHash3.HashToUInt64(value, unchecked((long)seed));
     }
 
@@ -674,15 +756,16 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
     {
         if (header.KeyLength is < 0 or > MaxKeyLength
             || header.Capacity < 0
-            || header.ValueLength < -1
+            || header.ValueLength < 0
             || header.ValueLength > header.Capacity
-            || header.Prev < 0
-            || header.Prev >= address
             || address + HeaderSize + header.KeyLength + header.Capacity > _tail)
         {
             throw new InvalidDataException($"melangelog: corrupt record header at {address} ({_basePath}).");
         }
     }
+
+    private InvalidDataException Collision(long address) =>
+        new($"melangelog: the record at {address} holds a different key with the same 128-bit hash ({_basePath}).");
 
     private static void CheckKey(ReadOnlySpan<byte> key)
     {
@@ -701,25 +784,36 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv
 
     /// <summary>
     /// A record's fixed header. <see cref="Capacity"/> is the value room the record was laid out with
-    /// (its length rounded up to the record's 8-byte alignment); an in-place write may use all of it.
-    /// <see cref="ValueLength"/> -1 is a tombstone. <see cref="Prev"/> is the record this one superseded
-    /// in its hash chain, 0 for none.
+    /// (its length rounded up to the record's 8-byte alignment); an in-place write may use all of it,
+    /// and the record's size is always <c>HeaderSize + KeyLength + Capacity</c>. A pad marker has
+    /// <see cref="PadKeyLength"/> and the gap's remaining bytes as its capacity.
     /// </summary>
-    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct RecordHeader
     {
         public int KeyLength;
         public int ValueLength;
         public int Capacity;
         public uint Checksum;
-        public long Prev;
     }
 
+    /// <summary>
+    /// A key's 128-bit hash, and its record's address and size packed (0 = empty slot): 24 bytes. Two
+    /// <c>ulong</c> halves rather than a <c>UInt128</c>, whose 16-byte alignment would pad it to 32.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     private struct IndexEntry
     {
-        public ulong Hash;
-        public long Address; // 0 = empty slot
+        public ulong HashLow;
+        public ulong HashHigh;
+        public ulong Packed;
+    }
+
+    /// <summary>Per segment: the bytes of current records in it, and where its first record starts.</summary>
+    private sealed class SegmentInfo(long firstRecord)
+    {
+        public long Live;
+        public long FirstRecord = firstRecord;
     }
 
     /// <summary>
@@ -822,9 +916,14 @@ internal static unsafe class MelangeLogNative
     public const int MadvRandom = 1;
     private const int MadvWillNeed = 3;
 
-    private static readonly delegate* unmanaged<nint, nuint, int, int> s_madvise = Resolve("libc.so.6", "madvise", OperatingSystem.IsLinux());
+    // madvise from the process's own symbol scope, which has whichever C library the host links
+    // (glibc or musl); libc.so.6 by name is glibc's alone.
+    private static readonly delegate* unmanaged<nint, nuint, int, int> s_madvise = OperatingSystem.IsLinux() ? ResolveMadvise() : null;
     private static readonly delegate* unmanaged<nint, nuint, nint*, uint, int> s_prefetchVirtualMemory =
         (delegate* unmanaged<nint, nuint, nint*, uint, int>)Resolve("kernel32.dll", "PrefetchVirtualMemory", OperatingSystem.IsWindows());
+
+    /// <summary>Whether this platform has a prefetch hint at all (Linux madvise, or Windows PrefetchVirtualMemory).</summary>
+    public static bool PrefetchAvailable => s_madvise != null || s_prefetchVirtualMemory != null;
 
     public static void Advise(byte* start, long length, int advice)
     {
@@ -846,6 +945,13 @@ internal static unsafe class MelangeLogNative
             var range = stackalloc nint[2] { start, length };
             _ = s_prefetchVirtualMemory(-1, 1, range, 0);
         }
+    }
+
+    private static delegate* unmanaged<nint, nuint, int, int> ResolveMadvise()
+    {
+        if (NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "madvise", out var function))
+            return (delegate* unmanaged<nint, nuint, int, int>)function;
+        return Resolve("libc.so.6", "madvise", platform: true);
     }
 
     private static delegate* unmanaged<nint, nuint, int, int> Resolve(string library, string export, bool platform)

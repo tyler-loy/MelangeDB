@@ -46,7 +46,20 @@ internal interface IPagedKv : IDisposable
 
     /// <summary>The memory this space may hold data in (its buffer pool or in-memory log), for statistics.</summary>
     long CapacityBytes { get; }
+
+    /// <summary>
+    /// How much log this space holds against how much of it is live. Read <b>without</b> the store
+    /// lock (statistics are), so it is advisory and may be a call behind.
+    /// </summary>
+    PagedKvUsage Usage { get; }
 }
+
+/// <summary>
+/// One space's log footprint. <see cref="LogBytes"/> is the log's extent (in memory and on disk);
+/// <see cref="LiveBytes"/> is the part of it that current records occupy, or -1 when the engine
+/// cannot tell. The gap between them is superseded and deleted records waiting to be reclaimed.
+/// </summary>
+internal readonly record struct PagedKvUsage(long LogBytes, long LiveBytes);
 
 /// <summary>
 /// Opens the key-value spaces of one store. The store is a projection rebuilt from the commit log

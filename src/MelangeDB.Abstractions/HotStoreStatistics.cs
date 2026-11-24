@@ -16,7 +16,22 @@ public sealed class HotStoreStatistics
     /// footprint is this plus the sum of <see cref="HotStoreTableStatistics.ResidentBytes"/>.
     /// </summary>
     public required long BufferPoolCapacityBytes { get; init; }
+
+    /// <summary>
+    /// The paged tier's logs, one per key-value space (<c>main</c> for row records, <c>blob</c> for
+    /// out-of-line bytes columns); empty for a store that does not page. An append-only log keeps
+    /// superseded and deleted records until space is reclaimed, so the gap between a log's
+    /// <see cref="HotStoreLogStatistics.LogBytes"/> and its <see cref="HotStoreLogStatistics.LiveBytes"/>
+    /// is what reclamation has yet to recover.
+    /// </summary>
+    public IReadOnlyList<HotStoreLogStatistics> Logs { get; init; } = [];
 }
+
+/// <summary>One paged key-value space's log footprint.</summary>
+/// <param name="Space">The space: <c>main</c> or <c>blob</c>.</param>
+/// <param name="LogBytes">The log's extent, in memory and on disk.</param>
+/// <param name="LiveBytes">The bytes of that log current records occupy, or -1 when the engine cannot tell.</param>
+public readonly record struct HotStoreLogStatistics(string Space, long LogBytes, long LiveBytes);
 
 /// <summary>One table's store-side statistics.</summary>
 /// <param name="Table">The table's id.</param>
