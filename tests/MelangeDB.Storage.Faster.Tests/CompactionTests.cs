@@ -218,6 +218,21 @@ public sealed class CompactionTests
         }
     }
 
+    /// <summary>
+    /// The segment files' bytes. Compaction runs on its own thread and deletes a segment it has
+    /// emptied, so a file can vanish between being listed and being measured: it counts as zero,
+    /// which is what compaction just made it.
+    /// </summary>
     private static long DiskBytes(StoreHarness harness) =>
-        new DirectoryInfo(harness.Options.HotStore.Path).EnumerateFiles("*.mlog*", SearchOption.AllDirectories).Sum(static f => f.Length);
+        new DirectoryInfo(harness.Options.HotStore.Path).EnumerateFiles("*.mlog*", SearchOption.AllDirectories).Sum(static f =>
+        {
+            try
+            {
+                return f.Length;
+            }
+            catch (FileNotFoundException)
+            {
+                return 0L;
+            }
+        });
 }
