@@ -38,6 +38,15 @@ All packages ship together at one version; there is no per-package versioning. S
     to 1.1 MB allocated, 763 KB to 520 KB on the wire, and nothing held after a full collection.
   - **Mixed versions:** a node advertises binary frames at authentication and each end switches only
     once the other has said it reads them, so an older hub or node keeps exchanging JSON.
+- **A primary key too long for MelangeLog no longer makes the database unstartable (#307).**
+  - **What happened:** MelangeLog holds keys of at most 1 KiB. A longer one reached the commit log,
+    failed when the store applied it (closing the database to writes), and failed again on every
+    replay, so the database could not start.
+  - **Fix:** the engine now refuses such a write before anything is appended, as an ordinary
+    reducer error. The store declares its limit through the new `IHotStore.MaxKeyBytes`, which is
+    unlimited by default.
+  - **Recovering a log that already holds such a record:** start once on
+    `HotStore:PagedEngine = Faster`, which has no key limit.
 
 ### Added
 

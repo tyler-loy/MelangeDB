@@ -94,6 +94,13 @@ public interface IHotStore : IHotStoreReader
     HotStoreStatistics Statistics();
 
     /// <summary>
+    /// The longest encoded primary key this store can hold. The engine rejects a write with a
+    /// longer key before it reaches the commit log: a record the store cannot apply would otherwise
+    /// close the database to writes, and fail again on every replay. Unlimited by default.
+    /// </summary>
+    int MaxKeyBytes => int.MaxValue;
+
+    /// <summary>
     /// Bootstraps the projection from a snapshot at <paramref name="lsn"/>: streams every row in,
     /// then sets <see cref="AppliedLsn"/> to the snapshot LSN so replay resumes at the record
     /// after it. Called at most once, on an empty store, before any <see cref="Apply"/>. The row
