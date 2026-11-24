@@ -27,7 +27,7 @@ internal sealed class TsavoritePagedKvFactory : IPagedKvFactory
 
     private readonly TsavoriteDevice _device;
     private readonly ILogger _logger;
-    private bool _fellBack;
+    private bool? _nativeUsable;
 
     public TsavoritePagedKvFactory(TsavoriteDevice device = TsavoriteDevice.PlatformDefault, ILogger? logger = null)
     {
@@ -115,26 +115,80 @@ internal sealed class TsavoritePagedKvFactory : IPagedKvFactory
     /// <summary>
     /// The native device through the page cache, or, when it cannot load, the managed device through
     /// the page cache: logged once (EventId 1513), never fatal. It cannot load when the host has no
-    /// libaio (Debian and Ubuntu: <c>libaio1t64</c>), on an architecture Garnet ships no build for, or
-    /// in a RID-specific publish, which puts native files in the application root where Tsavorite does
-    /// not look for them. The managed device writes at about 60% of the native one's rate.
+    /// libaio (Debian and Ubuntu: <c>libaio1t64</c>); on a read-only file system where it needs to
+    /// write its libaio compatibility symlink beside the library; on an architecture Garnet ships no
+    /// build for; or in a RID-specific publish, which puts native files in the application root where
+    /// Tsavorite does not look for them. The managed device writes at about 60% of the native one's rate.
     /// </summary>
     private IDevice NativeOrManaged(string path)
     {
-        if (!_fellBack)
+        _nativeUsable ??= ProbeNative(Path.GetDirectoryName(path)!);
+        return _nativeUsable == true
+            ? Devices.CreateLogDevice(path, DeviceType.Native, deleteOnClose: true, disableFileBuffering: false)
+            : new RandomAccessLocalStorageDevice(path, deleteOnClose: true, disableFileBuffering: false, osReadBuffering: true);
+    }
+
+    /// <summary>
+    /// Whether the native device works here, decided by doing what it would do: one sector written
+    /// and waited for, in a scratch file. Constructing the device proves nothing. It loads its
+    /// library lazily, on the first write, which in a running store is a page flush on a thread-pool
+    /// thread, where a load failure ends the process. The probe runs that first write on this thread,
+    /// where the failure can be caught.
+    /// </summary>
+    private bool ProbeNative(string directory)
+    {
+        var probePath = Path.Combine(directory, "probe.native");
+        try
         {
-            try
+            using var device = Devices.CreateLogDevice(probePath, DeviceType.Native, deleteOnClose: true, disableFileBuffering: false);
+            var sector = (int)Math.Max(device.SectorSize, 512);
+            unsafe
             {
-                return Devices.CreateLogDevice(path, DeviceType.Native, deleteOnClose: true, disableFileBuffering: false);
+                var buffer = System.Runtime.InteropServices.NativeMemory.AlignedAlloc((nuint)sector, (nuint)sector);
+                try
+                {
+                    using var done = new ManualResetEventSlim();
+                    Exception? failure = null;
+                    uint error = 0;
+                    device.WriteAsync((IntPtr)buffer, 0, (uint)sector, (code, _, _, exception) =>
+                    {
+                        error = code;
+                        failure = exception;
+                        done.Set();
+                    }, null);
+                    if (!done.Wait(TimeSpan.FromSeconds(10)))
+                        throw new TimeoutException("the native device's probe write did not complete in 10 s");
+                    if (failure is not null)
+                        throw failure;
+                    if (error != 0)
+                        throw new IOException($"the native device's probe write failed with error {error}");
+                }
+                finally
+                {
+                    System.Runtime.InteropServices.NativeMemory.AlignedFree(buffer);
+                }
             }
-            catch (Exception exception) when (exception is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException or TsavoriteException or TypeInitializationException)
+
+            return true;
+        }
+        catch (Exception exception)
+        {
+            TsavoriteEngineLog.NativeDeviceUnavailable(_logger, exception.GetBaseException().Message);
+            return false;
+        }
+        finally
+        {
+            foreach (var file in Directory.EnumerateFiles(directory, "probe.native*"))
             {
-                _fellBack = true;
-                TsavoriteEngineLog.NativeDeviceUnavailable(_logger, exception.GetBaseException().Message);
+                try
+                {
+                    File.Delete(file);
+                }
+                catch (IOException)
+                {
+                }
             }
         }
-
-        return new RandomAccessLocalStorageDevice(path, deleteOnClose: true, disableFileBuffering: false, osReadBuffering: true);
     }
 
     /// <summary>Removes a previous run's segment files (<c>main.hlog.0</c>, <c>main.hlog.1</c>, ...) for this space.</summary>
