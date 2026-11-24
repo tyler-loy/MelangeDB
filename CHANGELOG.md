@@ -48,10 +48,13 @@ All packages ship together at one version; there is no per-package versioning. S
   - **Exact without reads:** its index keys each record by a 128-bit hash and records its size, so a
     delete reads nothing, and the log knows which bytes are live without reading them back.
 
-- **`melange.store.log_bytes` and `melange.store.live_bytes` gauges** (dimension `space`: `main` or
-  `blob`), from the new `HotStoreStatistics.Logs`. The paged tier's logs keep superseded records
-  until space is reclaimed (#287), and the gap between the two gauges is that backlog. FASTER and
-  Tsavorite report the log's extent only; MelangeLog reports both.
+- **Paged log statistics and instruments.** `HotStoreStatistics.Logs` reports each paged space
+  (`main`, `blob`): log against live bytes, in-place against appended writes, memory held, flush
+  lag and stalls, segment files, index size and resizes, integrity failures, and compaction's
+  steps, lock time and bytes moved. Each is a `melange.store.*` instrument with a `space`
+  dimension ([docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)). The gap between `log_bytes` and
+  `live_bytes` is the backlog of #287. FASTER and Tsavorite report the log's extent only;
+  MelangeLog reports them all.
 
 ### Fixed
 

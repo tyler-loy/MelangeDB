@@ -47,7 +47,7 @@ internal sealed class TsavoritePagedKv : IPagedKv
     public long CapacityBytes { get; }
 
     /// <summary>The hybrid log's extent. Tsavorite cannot say how much of it is live.</summary>
-    public PagedKvUsage Usage => new(_store.Log.TailAddress - _store.Log.BeginAddress, -1);
+    public HotStoreLogStatistics Statistics => new() { LogBytes = _store.Log.TailAddress - _store.Log.BeginAddress };
 
     /// <summary>Diagnostics: the log tail and the lowest in-memory address (reads below it fault).</summary>
     internal (long Tail, long Head) LogAddresses => (_store.Log.TailAddress, _store.Log.HeadAddress);

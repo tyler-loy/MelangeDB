@@ -89,7 +89,7 @@ public sealed class MelangeLogModelTests
             foreach (var id in model.Keys)
                 kv.Delete(Key(id));
             AssertAccounting(kv);
-            Assert.Equal(0, kv.Usage.LiveBytes);
+            Assert.Equal(0, kv.Statistics.LiveBytes);
             Assert.All(kv.SegmentAccounting, static segment => Assert.Equal(0, segment.Live));
 
             // Nothing live: compaction drops every segment that has been flushed.
@@ -101,9 +101,9 @@ public sealed class MelangeLogModelTests
 
                 var flushed = kv.Addresses.Head >> 14;
                 Assert.All(kv.SegmentAccounting.Take((int)flushed), static segment => Assert.True(segment.Dropped));
-                Assert.True(kv.Usage.ReclaimedBytes > 0);
-                Assert.True(kv.Usage.RelocatedBytes > 0);
-                Assert.True(kv.Usage.LogBytes <= kv.Addresses.Tail - (flushed << 14));
+                Assert.True(kv.Statistics.ReclaimedBytes > 0);
+                Assert.True(kv.Statistics.RelocatedBytes > 0);
+                Assert.True(kv.Statistics.LogBytes <= kv.Addresses.Tail - (flushed << 14));
             }
         }
 
@@ -148,8 +148,8 @@ public sealed class MelangeLogModelTests
     {
         var segments = kv.SegmentAccounting;
         Assert.All(segments, static segment => Assert.True(segment.Live >= 0, $"segment live bytes {segment.Live}"));
-        Assert.Equal(kv.Usage.LiveBytes, segments.Sum(static segment => segment.Live));
-        Assert.True(kv.Usage.LiveBytes <= kv.Usage.LogBytes);
+        Assert.Equal(kv.Statistics.LiveBytes, segments.Sum(static segment => segment.Live));
+        Assert.True(kv.Statistics.LiveBytes <= kv.Statistics.LogBytes);
     }
 
     private static void Expect(Dictionary<int, byte[]> model, int id, byte[]? actual, int op)

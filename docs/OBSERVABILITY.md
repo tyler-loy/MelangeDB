@@ -289,6 +289,16 @@ Meter name: `MelangeDB`.
 | `melange.store.compaction.reclaimed_bytes` | counter | `By` | `space` | 0.4.2 |
 | `melange.store.compaction.relocated_bytes` | counter | `By` | `space` | 0.4.2 |
 | `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.4.2 |
+| `melange.store.writes` | counter | `{write}` | `space`, `mode` (`in_place`/`append`) | 0.4.2 |
+| `melange.store.memory_bytes` | gauge | `By` | `space` | 0.4.2 |
+| `melange.store.flush.lag_bytes` | gauge | `By` | `space` | 0.4.2 |
+| `melange.store.segments` | gauge | `{segment}` | `space` | 0.4.2 |
+| `melange.store.index.entries` | gauge | `{entry}` | `space` | 0.4.2 |
+| `melange.store.index.capacity` | gauge | `{slot}` | `space` | 0.4.2 |
+| `melange.store.index.resizes` | counter | `{resize}` | `space` | 0.4.2 |
+| `melange.store.integrity_failures` | counter | `{record}` | `space` | 0.4.2 |
+| `melange.store.compaction.steps` | counter | `{step}` | `space` | 0.4.2 |
+| `melange.store.compaction.lock_time` | counter | `s` | `space` | 0.4.2 |
 | `melange.subscriptions.active` | gauge | `{sub}` | `table` | 03 |
 | `melange.subscription.delta_rows` | counter | `{row}` | `table` | 03 |
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |
@@ -416,6 +426,26 @@ corresponds to a documented silent failure mode:
 - **`melange.log.pinned_records`** — the log is the system of record, so anything that still needs old records
   keeps them, and a holder that stops checkpointing fills a disk with a log that will not compact. Alert on
   this one number; drill into `melange.log.truncation_floor`'s `floor` tag for the name.
+
+### The paged log, for MelangeLog
+
+The `melange.store.*` instruments with a `space` dimension describe the paged tier's logs (`main`
+for row records, `blob` for out-of-line bytes columns). FASTER and Tsavorite report
+`log_bytes` only; MelangeLog reports them all. Read them in pairs:
+
+- **`log_bytes` against `live_bytes`** is the garbage compaction has yet to reclaim. With the
+  default `HotStore:Compaction:TriggerRatio` of 2 it settles near twice the live bytes, plus the
+  in-memory ring and a few segments. A ratio that keeps climbing means compaction cannot keep up:
+  check `compaction.lock_time`, and `MaxBytesPerSecond` if set.
+- **`writes{mode=append}` against `writes{mode=in_place}`** is how much of the write rate makes
+  garbage. Updates to rows still in memory rewrite in place; updates to rows that have left it append.
+- **`compaction.lock_time` over `compaction.steps`** is the average time writers and readers waited
+  behind one compaction step; `compaction.relocated_bytes` is its write cost.
+- **`flush.lag_bytes` and `flush.stalls`**: a lag that sits at its ceiling, with stalls climbing,
+  is a disk slower than the write rate.
+- **`index.resizes`** each held the store lock while the index rehashed.
+- **`integrity_failures`** should stay at zero; anything else is a bad disk or a bug, and the rows
+  involved come back intact from the commit log on restart.
 
 **Reading the two truncation gauges.** `melange.log.truncation_floor` reports, per named holder, the highest LSN
 it permits compaction to remove — as of the last truncation *decision*, not as of the scrape. Floor providers

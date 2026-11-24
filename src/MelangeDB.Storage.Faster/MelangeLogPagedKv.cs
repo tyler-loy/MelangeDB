@@ -117,7 +117,7 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, 
 /// The read-only boundary trails the tail by the ring less an eighth of it, so the flusher works that
 /// far ahead of eviction. A writer that needs a page evicts the head only once it is flushed, and waits
 /// for the flusher only when it has fallen that far behind: disk slower than writes. That wait is
-/// counted (<see cref="PagedKvUsage.FlushStalls"/>). A flush that fails is rethrown to every writer
+/// counted (<see cref="HotStoreLogStatistics.FlushStalls"/>). A flush that fails is rethrown to every writer
 /// that needs a page from then on.
 /// </para>
 /// <para>
@@ -153,7 +153,7 @@ internal sealed class MelangeLogPagedKvFactory(MelangeLogTuning? tuning = null, 
 /// </para>
 /// <para>
 /// Every call arrives under the store's lock, one at a time, so nothing here is thread-safe, except
-/// <see cref="Usage"/>, which statistics read without the lock. Nothing is durable: the store is
+/// <see cref="Statistics"/>, which statistics read without the lock. Nothing is durable: the store is
 /// rebuilt from the commit log on every start.
 /// </para>
 /// </summary>
@@ -223,6 +223,10 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
     private volatile Exception? _flushFault;
     private long _reclaimedBytes;
     private long _relocatedBytes;
+    private long _inPlaceWrites;
+    private long _appendedWrites;
+    private long _indexResizes;
+    private long _integrityFailures;
 
     // Compaction's place: the segment being compacted (-1 for none), the next address to read in it,
     // whether the record spanning into it from before still needs checking, and the segment itself,
@@ -287,13 +291,43 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
     public long CapacityBytes { get; }
 
-    /// <summary>The log's extent, and the bytes of it current records occupy. Plain 64-bit reads, safe off the lock.</summary>
-    public PagedKvUsage Usage => new(
-        Volatile.Read(ref _tail) - FirstAddress - Volatile.Read(ref _reclaimedBytes),
-        Volatile.Read(ref _liveBytes),
-        Volatile.Read(ref _reclaimedBytes),
-        Volatile.Read(ref _relocatedBytes),
-        Volatile.Read(ref _flushStalls));
+    /// <summary>
+    /// The space's log statistics. Plain 64-bit reads of fields the writer, flusher and compactor
+    /// publish, so safe off the lock and at worst a call behind; the segment count walks the
+    /// published segment table.
+    /// </summary>
+    public HotStoreLogStatistics Statistics
+    {
+        get
+        {
+            var tail = Volatile.Read(ref _tail);
+            var reclaimed = Volatile.Read(ref _reclaimedBytes);
+            var segments = 0;
+            foreach (var segment in Volatile.Read(ref _segmentTable))
+            {
+                if (segment is not null)
+                    segments++;
+            }
+
+            return new HotStoreLogStatistics
+            {
+                LogBytes = tail - FirstAddress - reclaimed,
+                LiveBytes = Volatile.Read(ref _liveBytes),
+                ReclaimedBytes = reclaimed,
+                RelocatedBytes = Volatile.Read(ref _relocatedBytes),
+                InPlaceWrites = Volatile.Read(ref _inPlaceWrites),
+                AppendedWrites = Volatile.Read(ref _appendedWrites),
+                MemoryBytes = Math.Max(0, tail - Volatile.Read(ref _headAddress)),
+                FlushLagBytes = Math.Max(0, Volatile.Read(ref _readOnlyPage) - Volatile.Read(ref _flushedPage)) << _pageBits,
+                FlushStalls = Volatile.Read(ref _flushStalls),
+                SegmentFiles = segments,
+                IndexEntries = Volatile.Read(ref _indexCount),
+                IndexCapacity = Volatile.Read(ref _indexMask) + 1,
+                IndexResizes = Volatile.Read(ref _indexResizes),
+                IntegrityFailures = Volatile.Read(ref _integrityFailures),
+            };
+        }
+    }
 
     /// <summary>Diagnostics: the log tail, the lowest in-memory address, and the live index entries.</summary>
     internal (long Tail, long Head, long IndexEntries) Addresses => (_tail, _headAddress, _indexCount);
@@ -391,6 +425,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
                     // In place: the record is in the ring's mutable region, so the flusher has not
                     // taken it and nothing on disk goes stale. Setting the length is what makes a
                     // shrink read back exact. Its size, and so the accounting, is unchanged.
+                    Volatile.Write(ref _inPlaceWrites, _inPlaceWrites + 1);
                     header.ValueLength = value.Length;
                     header.Checksum = Checksum(hash, value.Length, header.Capacity, value);
                     WriteInPlace(current + HeaderSize + key.Length, value);
@@ -402,6 +437,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
             AddLive(current, SizeOf(packed, current), -1);
         }
 
+        Volatile.Write(ref _appendedWrites, _appendedWrites + 1);
         var (address, size) = Append(key, value, hash);
         if (slot >= 0)
         {
@@ -534,7 +570,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
                 if (header.KeyLength == PadKeyLength)
                 {
                     if (header.Capacity != inPage - HeaderSize)
-                        throw new InvalidDataException($"melangelog: corrupt pad marker at {address} ({_basePath}).");
+                        throw Integrity($"melangelog: corrupt pad marker at {address} ({_basePath}).");
                     _victimCursor = address + inPage;
                     continue;
                 }
@@ -632,7 +668,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
             else
                 CopyOut(address + valueOffset, value, _batchPread, ref faulted);
             if (Checksum(hash, header.ValueLength, header.Capacity, value) != header.Checksum)
-                throw new InvalidDataException($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
+                throw Integrity($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
 
             AddLive(address, SizeOf(_index[slot].Packed, address), -1);
             var (moved, size) = Append(key, value, hash);
@@ -689,7 +725,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
             CopyOut(address + valueOffset, value, pread, ref faulted);
 
         if (Checksum(hash, header.ValueLength, header.Capacity, value) != header.Checksum)
-            throw new InvalidDataException($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
+            throw Integrity($"melangelog: checksum mismatch in the record at {address} ({_basePath}).");
         return value;
     }
 
@@ -1094,6 +1130,7 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
 
     private void GrowIndex()
     {
+        Volatile.Write(ref _indexResizes, _indexResizes + 1);
         var old = _index;
         var oldCapacity = _indexMask + 1;
         AllocateIndex(oldCapacity * 2);
@@ -1166,8 +1203,15 @@ internal sealed unsafe class MelangeLogPagedKv : IPagedKv, ICompactingPagedKv
             || header.ValueLength > header.Capacity
             || address + HeaderSize + header.KeyLength + header.Capacity > _tail)
         {
-            throw new InvalidDataException($"melangelog: corrupt record header at {address} ({_basePath}).");
+            throw Integrity($"melangelog: corrupt record header at {address} ({_basePath}).");
         }
+    }
+
+    /// <summary>A record that failed its integrity check: counted, then thrown.</summary>
+    private InvalidDataException Integrity(string message)
+    {
+        Volatile.Write(ref _integrityFailures, _integrityFailures + 1);
+        return new InvalidDataException(message);
     }
 
     private InvalidDataException DroppedSegment(long address) =>

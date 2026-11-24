@@ -33,6 +33,16 @@ public sealed class CompactionTests
         Assert.True(blob.ReclaimedBytes > 0);
         Assert.True(DiskBytes(harness) <= Bound(blob) + 3 * SegmentBytes, $"disk {DiskBytes(harness) >> 20} MiB");
 
+        // What an operator sees: every write accounted for, compaction's lock time, the files, the index.
+        Assert.Equal((long)Rows * Rounds, blob.InPlaceWrites + blob.AppendedWrites);
+        Assert.True(blob.CompactionSteps > 0);
+        Assert.True(blob.CompactionLockTime > TimeSpan.Zero);
+        Assert.Equal(DiskBytes(harness) / SegmentBytes, store.Statistics().Logs.Sum(static l => l.SegmentFiles));
+        Assert.Equal(Rows, blob.IndexEntries);
+        Assert.True(blob.IndexCapacity > blob.IndexEntries);
+        Assert.Equal(0, blob.IntegrityFailures);
+        Assert.True(blob.MemoryBytes is > 0 and <= 4L << 20);
+
         AssertRows(harness, Rounds);
         harness.Restart();
         AssertRows(harness, Rounds);

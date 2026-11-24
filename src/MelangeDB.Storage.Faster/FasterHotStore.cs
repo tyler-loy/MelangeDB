@@ -59,6 +59,10 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     private readonly CancellationTokenSource _compactionStop = new();
     private readonly Thread? _compactor;
 
+    // Per space (0 main, 1 blob): compaction steps taken, and the time they held the store lock.
+    private readonly long[] _compactionSteps = new long[2];
+    private readonly long[] _compactionLockTicks = new long[2];
+
     /// <summary>Reused buffer for composed store and blob keys; see <see cref="StoreKey"/>.</summary>
     private byte[] _keyScratch = new byte[64];
     private bool _disposed;
@@ -347,13 +351,23 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
         }
 
         HotStoreLogStatistics[] logs = _blob is null
-            ? [LogStatistics("main", _main.Usage)]
-            : [LogStatistics("main", _main.Usage), LogStatistics("blob", _blob.Usage)];
+            ? [LogStatistics(0, "main", _main)]
+            : [LogStatistics(0, "main", _main), LogStatistics(1, "blob", _blob)];
         return new HotStoreStatistics { Tables = tables, BufferPoolCapacityBytes = _bufferPoolCapacityBytes, Logs = logs };
     }
 
-    private static HotStoreLogStatistics LogStatistics(string space, PagedKvUsage usage) =>
-        new(space, usage.LogBytes, usage.LiveBytes, usage.ReclaimedBytes, usage.RelocatedBytes, usage.FlushStalls);
+    /// <summary>A space's engine statistics, named, with the compaction thread's own counters when it compacts.</summary>
+    private HotStoreLogStatistics LogStatistics(int index, string space, IPagedKv kv)
+    {
+        var statistics = kv.Statistics with { Space = space };
+        return kv is ICompactingPagedKv
+            ? statistics with
+            {
+                CompactionSteps = Volatile.Read(ref _compactionSteps[index]),
+                CompactionLockTime = TimeSpan.FromTicks(Volatile.Read(ref _compactionLockTicks[index])),
+            }
+            : statistics;
+    }
 
     public void ApplyResidency(string tableName, Residency residency)
     {
@@ -403,11 +417,11 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
     /// </summary>
     private void CompactionLoop()
     {
-        var spaces = new List<(string Name, ICompactingPagedKv Space)>(2);
+        var spaces = new List<(int Index, string Name, ICompactingPagedKv Space)>(2);
         if (_main is ICompactingPagedKv main)
-            spaces.Add(("main", main));
+            spaces.Add((0, "main", main));
         if (_blob is ICompactingPagedKv blob)
-            spaces.Add(("blob", blob));
+            spaces.Add((1, "blob", blob));
 
         var token = _compactionStop.Token;
         var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -417,7 +431,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
             while (!token.IsCancellationRequested)
             {
                 var busy = false;
-                foreach (var (name, space) in spaces)
+                foreach (var (index, name, space) in spaces)
                 {
                     space.PrepareCompactionStep();
                     CompactionStep step;
@@ -425,6 +439,7 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                     {
                         if (_disposed)
                             return;
+                        var held = System.Diagnostics.Stopwatch.GetTimestamp();
                         try
                         {
                             step = space.Compact(_compaction.TriggerRatio, CompactionStepBytes);
@@ -435,7 +450,16 @@ public sealed class FasterHotStore : IHotStore, IResidencyControl, IReadViewSour
                             busy = true;
                             continue;
                         }
+                        finally
+                        {
+                            var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(held).Ticks;
+                            Volatile.Write(ref _compactionLockTicks[index], _compactionLockTicks[index] + elapsed);
+                        }
                     }
+
+                    // A step that found nothing due is a probe, not compaction: only work is counted.
+                    if (step.MoreWork || step.SegmentsDropped > 0)
+                        Volatile.Write(ref _compactionSteps[index], _compactionSteps[index] + 1);
 
                     if (step.SegmentsDropped > 0)
                         LogMessages.LogSpaceReclaimed(_logger, name, step.ReclaimedBytes, step.SegmentsDropped);

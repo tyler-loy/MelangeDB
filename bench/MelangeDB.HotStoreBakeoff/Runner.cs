@@ -327,6 +327,14 @@ internal static class Runner
                 measures.Add(new($"{log.Space} log {when}", log.LogBytes / 1048576.0, "MiB"));
             if (log.LiveBytes >= 0)
                 measures.Add(new($"{log.Space} live {when}", log.LiveBytes / 1048576.0, "MiB"));
+            if (log.CompactionSteps > 0)
+            {
+                measures.Add(new($"{log.Space} compaction steps {when}", log.CompactionSteps, "steps"));
+                measures.Add(new($"{log.Space} compaction lock per step {when}", log.CompactionLockTime.TotalMicroseconds / log.CompactionSteps, "us"));
+            }
+
+            if (log.InPlaceWrites >= 0 && log.InPlaceWrites + log.AppendedWrites > 0)
+                measures.Add(new($"{log.Space} in-place writes {when}", 100.0 * log.InPlaceWrites / (log.InPlaceWrites + log.AppendedWrites), "%"));
         }
     }
 
