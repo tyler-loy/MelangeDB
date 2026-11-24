@@ -332,6 +332,7 @@ internal sealed class LoadTestServer : IAsyncDisposable
             ["MelangeDb:Cluster:FailureTimeoutMs"] = FailureTimeoutMs.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:HotStore:Engine"] = _options.HotStore == "faster" ? "Faster" : "InMemory",
             ["MelangeDb:HotStore:PagedEngine"] = PagedEngineName(_options.PagedEngine),
+            ["MelangeDb:HotStore:MemoryBudgetBytes"] = ((_options.BudgetMb ?? 128) * (1L << 20)).ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:BorderBandChunks"] = _options.BandChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMarginChunks"] = _options.MarginChunks.ToString(System.Globalization.CultureInfo.InvariantCulture),
             ["MelangeDb:Cluster:HandoffMinIntervalMs"] = _options.HandoffMinIntervalMs.ToString(System.Globalization.CultureInfo.InvariantCulture),

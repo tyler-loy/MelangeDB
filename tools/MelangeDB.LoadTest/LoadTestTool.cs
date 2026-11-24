@@ -155,6 +155,7 @@ public static class LoadTestTool
         "--listen", options.Listen,
         "--hot-store", options.HotStore,
         "--paged-engine", options.PagedEngine,
+        .. (options.BudgetMb is { } budget ? ["--budget-mb", budget.ToString(CultureInfo.InvariantCulture)] : Array.Empty<string>()),
         .. (options.LockSplit ? ["--lock-split"] : Array.Empty<string>()),
         .. (options.HeartbeatMs is { } heartbeat ? ["--heartbeat-ms", heartbeat.ToString(CultureInfo.InvariantCulture)] : Array.Empty<string>()),
         .. (options.FailureTimeoutMs is { } timeout ? ["--failure-timeout-ms", timeout.ToString(CultureInfo.InvariantCulture)] : Array.Empty<string>()),

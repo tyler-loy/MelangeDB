@@ -325,6 +325,8 @@ internal static class FailoverMeasurement
         engineOptions.HotStore.Path = Path.Combine(shardDirectory, "hot");
         engineOptions.HotStore.Engine = options.HotStore == "faster" ? HotStoreEngine.Faster : HotStoreEngine.InMemory;
         engineOptions.HotStore.PagedEngine = Enum.Parse<PagedEngine>(LoadTestServer.PagedEngineName(options.PagedEngine));
+        if (options.BudgetMb is { } budget)
+            engineOptions.HotStore.MemoryBudgetBytes = budget * (1L << 20);
         engineOptions.Events.DeadLetterPath = Path.Combine(shardDirectory, "deadletter");
         engineOptions.Snapshots.IntervalTransactions = 1_000_000_000_000;
         engineOptions.Residency.ReportOnStartup = false;

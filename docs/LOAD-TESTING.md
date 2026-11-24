@@ -86,6 +86,7 @@ noted.
 | `--fsync-interval-ms` | 50 | `CommitLog:FsyncIntervalMs` when interval. |
 | `--hot-store` | inmemory | `HotStore:Engine`: `inmemory` or `faster`. |
 | `--paged-engine` | faster | `HotStore:PagedEngine` under `--hot-store faster`: `faster`, `melangelog` or `tsavorite`. |
+| `--budget-mb` | 128 | `HotStore:MemoryBudgetBytes` in MiB. Set it below the world's data to make the paged store page, and, under `melangelog`, append and compact as it would on a world larger than memory. |
 | `--heartbeat-ms` | 250 (`failover`: 1000) | `Cluster:HeartbeatIntervalMs`. `failover` defaults to the library's value, because the window it measures is the one a deployment on defaults gets. |
 | `--failure-timeout-ms` | 15000 (`failover`: 10000) | `Cluster:FailureTimeoutMs`. Same reasoning. |
 | `--fast-failover` | off | `failover`: sets `Cluster:FastFailoverOnLinkLoss`, so a killed node is declared dead when its link drops rather than at the failure timeout. The harness kills a process, the case the option is for. |

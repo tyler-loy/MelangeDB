@@ -91,6 +91,9 @@ public sealed class LoadTestOptions
     /// <summary>HotStore:PagedEngine for every node, when <see cref="HotStore"/> is "faster": "faster", "melangelog" or "tsavorite".</summary>
     public string PagedEngine { get; set; } = "faster";
 
+    /// <summary>HotStore:MemoryBudgetBytes for every node, in MiB; null keeps the library's 128 MiB.</summary>
+    public int? BudgetMb { get; set; }
+
     // ---- failover: the reassignment-window measurement ----
 
     /// <summary>Ballast rows on the measured shard, one run per entry — the shard-heat sweep.</summary>
@@ -299,6 +302,7 @@ public sealed class LoadTestOptions
 
                         options.PagedEngine = value;
                         break;
+                    case "--budget-mb": options.BudgetMb = int.Parse(value, CultureInfo.InvariantCulture); break;
                     case "--rows":
                         options.FailoverRows = value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                             .Select(static v => int.Parse(v, CultureInfo.InvariantCulture)).ToArray();
