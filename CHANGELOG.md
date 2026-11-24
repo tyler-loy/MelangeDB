@@ -21,6 +21,12 @@ All packages ship together at one version; there is no per-package versioning. S
     The TTL still bounds how long the assertion itself can be redeemed.
   - **Mixed versions:** an assertion from an older hub carries no token expiry, and the session ends
     with the assertion as before, so a rolling upgrade is never more permissive.
+- **A node that commits rarely but in bulk now snapshots, and so truncates its log.** Automatic
+  snapshots counted only transactions (`Snapshots:IntervalTransactions`, 100,000). A shard taking
+  few, large transactions never reached the count and its log grew without bound; in the overnight
+  soak, the shards just outside the world, which take only border-band mirrors, grew their logs by
+  several GiB an hour while the busy shards held flat. The new **`Snapshots:IntervalBytes`** (default
+  256 MiB, `0` off) also snapshots once that much log has been appended since the last snapshot.
 ### Changed
 
 - **Node links carry row data as binary, not base64 JSON.** Border batches, replica batches, handoff
