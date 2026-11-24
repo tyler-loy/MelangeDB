@@ -28,16 +28,20 @@ internal sealed class StoreHarness : IDisposable
 
     private readonly Type[] _tables;
     private readonly TimeProvider? _timeProvider;
+    private readonly IHotStoreProvider? _provider;
 
     public StoreHarness(
         StoreKind kind,
         Action<MelangeDbOptions>? configure = null,
         Type[]? tables = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IHotStoreProvider? provider = null,
+        bool directoryOverride = true)
     {
         Kind = kind;
         _tables = tables ?? DefaultTables;
         _timeProvider = timeProvider;
+        _provider = provider;
         Root = Directory.CreateTempSubdirectory("melange-faster-test-").FullName;
         Options = new MelangeDbOptions
         {
@@ -50,6 +54,12 @@ internal sealed class StoreHarness : IDisposable
             CommitLog = { Path = Path.Combine(Root, "log") },
         };
         configure?.Invoke(Options);
+
+        // MELANGE_TEST_NATIVE_DIRECTORY=0 (or 1) runs every harness test with the managed (or native)
+        // directory and indexes, the way MELANGE_TEST_PAGED_ENGINE picks the paged engine. A test
+        // that sets both kinds itself opts out.
+        if (directoryOverride && Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") is "0" or "1")
+            Options.HotStore.NativeDirectory = Environment.GetEnvironmentVariable("MELANGE_TEST_NATIVE_DIRECTORY") == "1";
         Engine = CreateEngine();
     }
 
@@ -108,5 +118,5 @@ internal sealed class StoreHarness : IDisposable
             new SchemaRegistry(new MelangeDB.Generated.MelangeModel().Tables().Where(t => _tables.Contains(t.RowType))),
             loggerFactory: null,
             _timeProvider,
-            Kind == StoreKind.Faster ? TestEngine.Provider() : null);
+            Kind == StoreKind.Faster ? _provider ?? TestEngine.Provider() : null);
 }

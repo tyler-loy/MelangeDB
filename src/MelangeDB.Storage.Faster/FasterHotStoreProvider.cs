@@ -11,6 +11,7 @@ namespace MelangeDB.Storage.Faster;
 public sealed class FasterHotStoreProvider : IHotStoreProvider
 {
     private readonly IPagedKvFactory? _engine;
+    private readonly PagedEngine? _pagedEngine;
 
     /// <summary>The paged store over the engine <c>HotStore:PagedEngine</c> names.</summary>
     public FasterHotStoreProvider()
@@ -20,12 +21,17 @@ public sealed class FasterHotStoreProvider : IHotStoreProvider
     /// <summary>The paged store over a given engine, whatever the options say: the tests' and the bake-off's override.</summary>
     internal FasterHotStoreProvider(IPagedKvFactory engine) => _engine = engine;
 
+    /// <summary>The paged store over a given engine kind, configured from the options as the default provider does.</summary>
+    internal FasterHotStoreProvider(PagedEngine engine) => _pagedEngine = engine;
+
     public HotStoreEngine Engine => HotStoreEngine.Faster;
 
     public IHotStore Create(HotStoreContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
-        return new FasterHotStore(context, _engine ?? PagedEngines.For(context.Options.HotStore.PagedEngine, context.LoggerFactory));
+        return new FasterHotStore(
+            context,
+            _engine ?? PagedEngines.For(_pagedEngine ?? context.Options.HotStore.PagedEngine, context.Options.HotStore, context.LoggerFactory));
     }
 }
 

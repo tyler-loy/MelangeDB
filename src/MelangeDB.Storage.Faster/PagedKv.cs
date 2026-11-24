@@ -46,7 +46,40 @@ internal interface IPagedKv : IDisposable
 
     /// <summary>The memory this space may hold data in (its buffer pool or in-memory log), for statistics.</summary>
     long CapacityBytes { get; }
+
+    /// <summary>
+    /// The space's log statistics, <see cref="HotStoreLogStatistics.Space"/> left for the store to
+    /// name. Read <b>without</b> the store lock (statistics are), so advisory and possibly a call behind.
+    /// </summary>
+    HotStoreLogStatistics Statistics { get; }
 }
+
+/// <summary>
+/// A space that reclaims its own log while the store runs (#287): superseded and deleted records are
+/// dropped by copying a segment's live records forward and deleting the segment. The store drives it
+/// from one background thread, in bounded steps under the store lock, so writers and readers
+/// interleave between steps.
+/// </summary>
+internal interface ICompactingPagedKv
+{
+    /// <summary>
+    /// <b>Off</b> the store lock, on the compaction thread only: brings the pages the next step will
+    /// read into memory, so that step's reads under the lock are copies, not disk waits. Touches only
+    /// the segment being compacted, which nothing but a step on this same thread can delete.
+    /// </summary>
+    void PrepareCompactionStep();
+
+    /// <summary>
+    /// Under the store lock: one step of at most about <paramref name="byteBudget"/> bytes copied.
+    /// Compacts only while the log exceeds <paramref name="triggerRatio"/> times its live bytes (a
+    /// segment with nothing live is deleted regardless). Throws <see cref="InvalidDataException"/>
+    /// for a segment it cannot read, which it then leaves alone for good.
+    /// </summary>
+    CompactionStep Compact(double triggerRatio, long byteBudget);
+}
+
+/// <summary>What one <see cref="ICompactingPagedKv.Compact"/> step did, and whether there is more to do now.</summary>
+internal readonly record struct CompactionStep(bool MoreWork, long RelocatedBytes, long ReclaimedBytes, int SegmentsDropped);
 
 /// <summary>
 /// Opens the key-value spaces of one store. The store is a projection rebuilt from the commit log
@@ -70,10 +103,12 @@ internal interface IPagedKvFactory
 /// <summary>The engine behind each <see cref="PagedEngine"/> value.</summary>
 internal static class PagedEngines
 {
-    public static IPagedKvFactory For(PagedEngine engine, ILoggerFactory? loggerFactory = null) => engine switch
+    public static IPagedKvFactory For(PagedEngine engine, HotStoreOptions? options = null, ILoggerFactory? loggerFactory = null) => engine switch
     {
         PagedEngine.Faster => FasterPagedKvFactory.Instance,
-        PagedEngine.MelangeLog => new MelangeLogPagedKvFactory(),
+        PagedEngine.MelangeLog => new MelangeLogPagedKvFactory(
+            MelangeLogTuning.Default with { ReadMode = options?.MelangeLog.ReadMode ?? MelangeLogReadMode.Mmap },
+            logger: loggerFactory?.CreateLogger<MelangeLogPagedKvFactory>()),
         PagedEngine.Tsavorite => new TsavoritePagedKvFactory(logger: loggerFactory?.CreateLogger<TsavoritePagedKvFactory>()),
         _ => throw new ArgumentOutOfRangeException(nameof(engine), engine, "Not a paged engine this build knows."),
     };

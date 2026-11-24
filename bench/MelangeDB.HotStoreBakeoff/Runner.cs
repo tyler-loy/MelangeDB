@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using MelangeDB.Core;
+using MelangeDB.Storage.Faster;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace MelangeDB.HotStoreBakeoff;
@@ -12,7 +13,7 @@ internal sealed record Measure(string Name, double Value, string Unit);
 /// <summary>One engine's run: its numbers, and whether every row read back as written.</summary>
 internal sealed record EngineResult(string Engine, List<Measure> Measures, string? CorrectnessFailure);
 
-internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root);
+internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root, bool Compaction, bool IndexGrowth, bool NativeDirectory);
 
 /// <summary>
 /// Drives each engine through the same <see cref="IHotStore"/> workloads, each engine in its own
@@ -35,7 +36,10 @@ internal static class Runner
             ColdReads: Int(flags, "cold-reads", 50_000),
             BlobRows: Int(flags, "blob-rows", 50_000),
             BlobBytes: Int(flags, "blob-bytes", 4096),
-            Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"));
+            Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"),
+            Compaction: flags.GetValueOrDefault("compaction") != "off",
+            IndexGrowth: flags.GetValueOrDefault("index-growth") == "on",
+            NativeDirectory: flags.GetValueOrDefault("native-directory") != "off");
 
         if (flags.TryGetValue("engine", out var single))
         {
@@ -96,10 +100,12 @@ internal static class Runner
         var root = Path.Combine(s.Root, $"{engine}-{Environment.ProcessId}");
         var options = new MelangeDbOptions
         {
-            HotStore = { Path = Path.Combine(root, "hot"), MemoryBudgetBytes = s.BudgetBytes },
+            HotStore = { Path = Path.Combine(root, "hot"), MemoryBudgetBytes = s.BudgetBytes, Compaction = { Enabled = s.Compaction }, NativeDirectory = s.NativeDirectory },
             Residency = { Default = Residency.Paged },
         };
         var measures = new List<Measure>();
+        if (s.IndexGrowth)
+            IndexGrowth(engine, root, s, measures);
         var random = new Random(42);
         var keys = new RowKey[s.Rows];
         for (var i = 0; i < s.Rows; i++)
@@ -122,7 +128,7 @@ internal static class Runner
             store.LoadSnapshot(lsn++, Enumerable.Range(0, s.Rows).Select(i => new SnapshotRow(entity.Id, keys[i], EntityRow(entity, i, 0))));
             (store as IBulkRecovery)?.CompleteRecovery();
             measures.Add(new("rebuild", clock.Elapsed.TotalSeconds, "s"));
-            Footprint(measures, root, "after rebuild");
+            Footprint(measures, store, root, "after rebuild");
 
             void Update(int i)
             {
@@ -187,9 +193,16 @@ internal static class Runner
             clock.Restart();
             var blobScanned = store.Scan(terrain.Id).LongCount();
             measures.Add(new("blob full scan", blobScanned / clock.Elapsed.TotalSeconds, "rows/s"));
-            Footprint(measures, root, "at end");
+            Footprint(measures, store, root, "at end");
+
+            // Churn: the entity table rewritten three times over, uniformly, so nearly every update
+            // supersedes a record that has left memory. An append-only log grows by a row per update
+            // until something reclaims it (#287); log against live bytes after this is that number.
+            Phase(measures, "churn updates (3x table)", s.Rows * 3, _ => Update(random.Next(s.Rows)));
+            Footprint(measures, store, root, "after churn");
 
             var failure = Verify(store, entity, terrain, keys, versions, blobKeys, blobVersions, s, random);
+
             return new EngineResult(engine, measures, failure);
         }
         catch (Exception exception)
@@ -206,6 +219,37 @@ internal static class Runner
             catch (IOException)
             {
             }
+        }
+    }
+
+    /// <summary>
+    /// <c>--index-growth on</c>. The engine's own key-value space, before any store exists: four
+    /// million small keys into a space sized from the budget, as the store sizes it, so its hash index
+    /// grows several times. The max is what one growth costs a single write; for an index that
+    /// rehashes at once, every key it holds. Off by default: it leaves the container's page cache and
+    /// memory in a different state for the phases after it (cold reads measured 100k/s lower).
+    /// </summary>
+    private static void IndexGrowth(string engine, string root, Settings s, List<Measure> measures)
+    {
+        var directory = Path.Combine(root, "growth");
+        var keys = 4_000_000;
+        using (var space = Engines.Factory(engine).Open(directory, PagedKvSpace.Main, s.BudgetBytes, Math.Max(s.BudgetBytes / 1024, 1L << 16)))
+        {
+            var key = new byte[8];
+            var value = new byte[16];
+            Phase(measures, "index growth inserts (4M keys)", keys, n =>
+            {
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(key, n);
+                space.Upsert(key, value);
+            });
+        }
+
+        try
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+        catch (IOException)
+        {
         }
     }
 
@@ -302,7 +346,7 @@ internal static class Runner
         measures.Add(new($"{name} max", Micros(ticks[^1]), "us"));
     }
 
-    private static void Footprint(List<Measure> measures, string root, string when)
+    private static void Footprint(List<Measure> measures, IHotStore store, string root, string when)
     {
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -310,10 +354,27 @@ internal static class Runner
         using var process = Process.GetCurrentProcess();
         measures.Add(new($"managed heap {when}", GC.GetTotalMemory(false) / 1048576.0, "MiB"));
         measures.Add(new($"working set {when}", process.WorkingSet64 / 1048576.0, "MiB"));
+        if (store.Statistics().NativeDirectoryBytes is > 0 and var native)
+            measures.Add(new($"native directory {when}", native / 1048576.0, "MiB"));
         var disk = Directory.Exists(root)
             ? new DirectoryInfo(root).EnumerateFiles("*", SearchOption.AllDirectories).Sum(static f => f.Length)
             : 0;
         measures.Add(new($"disk {when}", disk / 1048576.0, "MiB"));
+        foreach (var log in store.Statistics().Logs)
+        {
+            if (log.LogBytes >= 0)
+                measures.Add(new($"{log.Space} log {when}", log.LogBytes / 1048576.0, "MiB"));
+            if (log.LiveBytes >= 0)
+                measures.Add(new($"{log.Space} live {when}", log.LiveBytes / 1048576.0, "MiB"));
+            if (log.CompactionSteps > 0)
+            {
+                measures.Add(new($"{log.Space} compaction steps {when}", log.CompactionSteps, "steps"));
+                measures.Add(new($"{log.Space} compaction lock per step {when}", log.CompactionLockTime.TotalMicroseconds / log.CompactionSteps, "us"));
+            }
+
+            if (log.InPlaceWrites >= 0 && log.InPlaceWrites + log.AppendedWrites > 0)
+                measures.Add(new($"{log.Space} in-place writes {when}", 100.0 * log.InPlaceWrites / (log.InPlaceWrites + log.AppendedWrites), "%"));
+        }
     }
 
     private static void PrintTable(List<EngineResult> results)

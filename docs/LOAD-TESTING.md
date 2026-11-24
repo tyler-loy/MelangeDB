@@ -85,6 +85,10 @@ noted.
 | `--fsync` | interval | `CommitLog:FsyncPolicy`: `interval` or `commit`. Interval is the capacity default; per-commit measures the disk's fsync ceiling instead. |
 | `--fsync-interval-ms` | 50 | `CommitLog:FsyncIntervalMs` when interval. |
 | `--hot-store` | inmemory | `HotStore:Engine`: `inmemory` or `faster`. |
+| `--paged-engine` | faster | `HotStore:PagedEngine` under `--hot-store faster`: `faster`, `melangelog` or `tsavorite`. |
+| `--budget-mb` | 128 | `HotStore:MemoryBudgetBytes` in MiB. The walkers' own rows are a few hundred bytes each and update in place, so they never leave memory, even at 8 MiB. To make the paged store page, and, under `melangelog`, append and compact, add `--ballast-rows`. |
+| `--ballast-rows` | 0 | serve/all: seed this many paged `Ballast` rows of `--row-bytes` across every block at start, for a working set larger than the budget. Seeding goes through the shards' reducers, so rows near a block edge are mirrored into the neighbouring shards like any other partitioned row. |
+| `--ballast-churn` | 0 | serve/all, with `--ballast-rows`: rewrite this many ballast rows a second for the whole run, 50 to a transaction, so a paged log accrues superseded versions. The serve console's 30-second line adds the hot store's summed log, live and reclaimed bytes, segment files and compaction steps over the primary shards, and the rewrite count. |
 | `--heartbeat-ms` | 250 (`failover`: 1000) | `Cluster:HeartbeatIntervalMs`. `failover` defaults to the library's value, because the window it measures is the one a deployment on defaults gets. |
 | `--failure-timeout-ms` | 15000 (`failover`: 10000) | `Cluster:FailureTimeoutMs`. Same reasoning. |
 | `--fast-failover` | off | `failover`: sets `Cluster:FastFailoverOnLinkLoss`, so a killed node is declared dead when its link drops rather than at the failure timeout. The harness kills a process, the case the option is for. |
@@ -94,7 +98,7 @@ noted.
 | `--stay-in-block` | off | drive: every player roams inside the block it spawned in, so no one crosses into another shard and the run has no handoffs. Seam walkers are off with it. Set against the same run without it, it separates handoff cost from stepping and re-scoping. |
 | `--workstation-gc` | off | all: start the serve process with workstation GC (`DOTNET_gcServer=0`). The tool is built with Server GC, which is what a host on the Web SDK runs; this reproduces runs from before phase 31, which all used workstation GC. For a standalone serve, set `DOTNET_gcServer` yourself. The summary records the serve side's GC mode and core count either way. |
 | `--port` / `--listen` | 0 / 127.0.0.1 | Hub bind (gateway + stats). `--listen 0.0.0.0` accepts a remote driver. |
-| `--data` | temp dir | Data root for logs and hot stores; the temp default is deleted on exit. |
+| `--data` | temp dir | Data root for logs and hot stores; the temp default is deleted on exit. `all` passes it to the serve process it starts. |
 | `--out` | — | Time-series file; `.json` writes JSON, anything else CSV. |
 | `--sample-seconds` | 10 | Periodic console/series sample interval. |
 | `--no-stats` | — | Don't poll the serve side's stats endpoint. |
@@ -102,7 +106,7 @@ noted.
 | `--soak` | — | Preset: 300 s measured, 15 s warm-up. Combine with `--players`. |
 | `--in-process-server` | — | `all` only: serve on a background task in the driver's process. For the smoke test and debugging; it contaminates the measurement and the tool says so. |
 | `--rows` | 10000,100000,1000000 | `failover`: ballast rows on the measured shard, one sweep entry each. |
-| `--row-bytes` | 256 | `failover`: payload bytes per ballast row (minimum 8). |
+| `--row-bytes` | 256 | `failover`, and serve/all with `--ballast-rows`: payload bytes per ballast row (minimum 8; 16 under churn). |
 | `--tail` | 10000 | `failover`: records committed after the pre-kill snapshot, which recovery replays. |
 | `--replicas` | 1 | `failover`: `Cluster:ShardReplicas`. With 1 the survivor promotes its warm replica, and the run reports how many kills promoted and how far behind the replica was; 0 measures the cold reopen. |
 | `--repeat` | 3 | `failover`: kills per sweep entry. |
@@ -854,5 +858,39 @@ ladder held for five minutes.
   whether the flattening completes is the follow-up the time series exists for.
 - 315 cache inconsistencies over 2,100 swaps (~0.15 per swap) — the residual swap-window artifact
   described under caveats.
+
+### Paging soak — MelangeLog against FASTER under constant rewrites, 2026-11-24
+
+`all --players 100 --nodes 4 --soak --hot-store faster --paged-engine <engine> --budget-mb 8
+--ballast-rows 400000 --row-bytes 1024 --ballast-churn 1000`: 400,000 rows of 1 KiB, about 50 times
+the budget, 1,000 of them rewritten a second, under the walker load. MelangeLog ran 2.7 h, then
+FASTER 1.8 h, back to back on the same machine.
+
+| | MelangeLog | FASTER |
+|---|---|---|
+| Primary shards' paged log | **flat at ~2.55 GiB** from minute 20 to the end | 1.4 GiB → **22 GiB**, linear |
+| Hot-store disk, primaries and replicas | 5.4 → 5.5 GiB | 0 → **53.5 GiB** (~29 GiB/h) |
+| Reclaimed by compaction | 36.7 GiB over 44,530 steps | — (FASTER does not compact) |
+| Ballast rewrites failed | 0 of 9.87 M | 0 of 6.56 M |
+| Call → delta p50 / p99 / max | 2.9 / 211 / 2,352 ms | 3.1 / 470 / 19,417 ms |
+| Rejected calls | 4,244 | 34,325 |
+| Replica staleness, max | 1.1 s | 14.9 s |
+| Disconnects / inconsistencies / nodes declared dead | 0 / 0 / 0 | 0 / 0 / 0 |
+
+- **Live bytes are three times the raw ballast, and that is right.** 400,000 rows at 1,104 B a
+  record (main plus blob, headers and alignment) is 421 MiB; the primaries report 1,297 MiB live.
+  With a 3-chunk band on 8-chunk blocks, a row within three chunks of a block edge is mirrored into
+  that neighbour: six columns and six rows in eight qualify, so a row is stored
+  (1 + 6/8)² = 3.06 times on average. `CompactionTests.Live_bytes_count_each_row_once` checks a
+  single store counts each row once.
+- **Disk is the live bytes times the trigger ratio times the replicas**: 1.3 GiB × 2 × 2 ≈ 5.2 GiB,
+  against 5.4–5.5 GiB measured.
+- **The commit log grew about 5.7 GiB/h on both engines**, the same either way, and is under
+  investigation.
+- **Memory**: with churn, both servers held 4–5 GiB of GC heap and about 10 GiB of working set from
+  the first minutes, flat after that; without churn the heap is ~250 MiB. Whether that is Server
+  GC's latitude on a 32-core host or retention is being checked under a heap limit.
+- Both runs ended with one `token_expired` and one overflow resync per client, the same counts on
+  both engines and on the walker-only soaks; under investigation, and not storage.
 
 Re-run these on your hardware; the shapes hold even where the numbers move.
