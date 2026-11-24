@@ -333,6 +333,9 @@ For Tsavorite, should it be needed:
   threshold.
 - **Page cache setting.** Decide whether the page cache should be a setting (`HotStore:OsCache`).
 
+What these results mean for a deployment on 0.5.0's defaults, with the later native-directory and
+overnight soak numbers, is in [PERFORMANCE.md](../PERFORMANCE.md).
+
 Out of scope here, and worth a later look on its own: engine-native capabilities this harness
 deliberately did not use. The main one: MelangeLog could keep each record's address in the store's
 key directory and drop its own index, and later move that directory off the managed heap (about

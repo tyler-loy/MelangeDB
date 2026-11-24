@@ -203,6 +203,8 @@ Running it:
   [SECURITY.md](SECURITY.md).
 - **[LOAD-TESTING.md](docs/LOAD-TESTING.md)**: the load rig, what it measures, and the recorded
   numbers.
+- **[PERFORMANCE.md](docs/PERFORMANCE.md)**: what to expect from the paged store and node links,
+  sizing disk and memory, the limits, and how to measure on your own hardware.
 
 The project:
 
