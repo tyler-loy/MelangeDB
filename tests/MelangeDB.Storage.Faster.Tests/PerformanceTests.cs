@@ -96,8 +96,17 @@ public class PerformanceTests(Xunit.ITestOutputHelper output)
             harness.Engine.BulkInsert(StoreHarness.Caller, rows);
         }
 
-        var inMemoryMs = TimeScan(inMemory);
-        var fasterMs = TimeScan(faster);
+        // Interleaved, best of ten each: the two loops tier up under the same JIT and share whatever
+        // the machine is doing. Timed one after the other, best of five, the ratio of two millisecond
+        // scans swung from 0.5x to 7x on CI runners with the code unchanged.
+        var inMemoryMs = double.MaxValue;
+        var fasterMs = double.MaxValue;
+        for (var round = 0; round < 10; round++)
+        {
+            inMemoryMs = Math.Min(inMemoryMs, TimeScan(inMemory));
+            fasterMs = Math.Min(fasterMs, TimeScan(faster));
+        }
+
         var factor = fasterMs / Math.Max(inMemoryMs, 0.001);
         output.WriteLine($"in-memory scan of {rowCount} rows: {inMemoryMs:F2}ms");
         output.WriteLine($"FASTER resident scan of {rowCount} rows: {fasterMs:F2}ms");
@@ -109,19 +118,13 @@ public class PerformanceTests(Xunit.ITestOutputHelper output)
     {
         var table = harness.Engine.Schema.Get(typeof(ItemDefinition)).Id;
         var store = harness.Engine.HotStore;
-        var best = double.MaxValue;
-        for (var attempt = 0; attempt < 5; attempt++)
-        {
-            var stopwatch = Stopwatch.StartNew();
-            long total = 0;
-            foreach (var pair in store.Scan(table))
-                total += pair.Value.Length;
-            stopwatch.Stop();
-            Assert.True(total > 0);
-            best = Math.Min(best, stopwatch.Elapsed.TotalMilliseconds);
-        }
-
-        return best;
+        var stopwatch = Stopwatch.StartNew();
+        long total = 0;
+        foreach (var pair in store.Scan(table))
+            total += pair.Value.Length;
+        stopwatch.Stop();
+        Assert.True(total > 0);
+        return stopwatch.Elapsed.TotalMilliseconds;
     }
 }
 
