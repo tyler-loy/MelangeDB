@@ -12,7 +12,7 @@ internal sealed record Measure(string Name, double Value, string Unit);
 /// <summary>One engine's run: its numbers, and whether every row read back as written.</summary>
 internal sealed record EngineResult(string Engine, List<Measure> Measures, string? CorrectnessFailure);
 
-internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root);
+internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root, bool Compaction);
 
 /// <summary>
 /// Drives each engine through the same <see cref="IHotStore"/> workloads, each engine in its own
@@ -35,7 +35,8 @@ internal static class Runner
             ColdReads: Int(flags, "cold-reads", 50_000),
             BlobRows: Int(flags, "blob-rows", 50_000),
             BlobBytes: Int(flags, "blob-bytes", 4096),
-            Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"));
+            Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"),
+            Compaction: flags.GetValueOrDefault("compaction") != "off");
 
         if (flags.TryGetValue("engine", out var single))
         {
@@ -96,7 +97,7 @@ internal static class Runner
         var root = Path.Combine(s.Root, $"{engine}-{Environment.ProcessId}");
         var options = new MelangeDbOptions
         {
-            HotStore = { Path = Path.Combine(root, "hot"), MemoryBudgetBytes = s.BudgetBytes },
+            HotStore = { Path = Path.Combine(root, "hot"), MemoryBudgetBytes = s.BudgetBytes, Compaction = { Enabled = s.Compaction } },
             Residency = { Default = Residency.Paged },
         };
         var measures = new List<Measure>();
