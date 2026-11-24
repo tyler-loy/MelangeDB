@@ -47,6 +47,7 @@ public sealed partial class MelangeEngine : IDisposable
     private IReadViewSource? _readViewSource;
     private int _snapshotUnavailableReported;
     private long _commitsSinceSnapshot;
+    private long _bytesSinceSnapshot;
 
     /// <summary>Set to 1 while a snapshot is writing, so two never race on the same temporary file.</summary>
     private int _snapshotWriting;
@@ -956,7 +957,7 @@ public sealed partial class MelangeEngine : IDisposable
                 _sequencer.Observe(record, Schema);
                 NotifyCommitObservers(record);
                 ApplyAppended(record);
-                AfterCommit(timestamp);
+                AfterCommit(timestamp, record.SerializedLength);
             }
             finally
             {
@@ -1154,7 +1155,7 @@ public sealed partial class MelangeEngine : IDisposable
             stage.Commit();
             NotifyCommitObservers(record);
             ApplyAppended(record);
-            AfterCommit(timestamp);
+            AfterCommit(timestamp, record.SerializedLength);
             activity?.SetTag("melange.outcome", "commit");
             activity?.SetTag("melange.writeset.rows", ops.Count);
             _telemetry?.RecordTransaction(BulkReducerName, "commit", Elapsed(started), ops.Count);
@@ -1308,6 +1309,7 @@ public sealed partial class MelangeEngine : IDisposable
         // lock, so it keeps the old behaviour and writes under it. Everything else writes from a pin.
         var view = _readViewSource?.OpenReadView();
         _commitsSinceSnapshot = 0;
+        _bytesSinceSnapshot = 0;
         return new PendingSnapshot(lsn, header, view);
     }
 
@@ -1698,14 +1700,22 @@ public sealed partial class MelangeEngine : IDisposable
 
     /// <summary>
     /// Post-commit bookkeeping under the write lock: the tail timestamp for the next snapshot's
-    /// downtime anchor, and the automatic snapshot trigger. A snapshot failure must not fail the
-    /// committed transaction — the commit is durable in the log regardless.
+    /// downtime anchor, and the automatic snapshot trigger — every <c>Snapshots:IntervalTransactions</c>
+    /// commits, or sooner once <c>Snapshots:IntervalBytes</c> of log have been appended since the last
+    /// one. Without the byte trigger, a shard that commits rarely but in bulk (a border band's
+    /// mirror, a blob-heavy table) never reached the count, never snapshotted, and never truncated
+    /// its log. A snapshot failure must not fail the committed transaction — the commit is durable
+    /// in the log regardless.
     /// </summary>
-    private void AfterCommit(Timestamp timestamp)
+    private void AfterCommit(Timestamp timestamp, long recordBytes)
     {
         _tailTimestamp = timestamp;
         _commitsSinceSnapshot++;
-        if (!_options.Snapshots.Enabled || _commitsSinceSnapshot < _options.Snapshots.IntervalTransactions)
+        _bytesSinceSnapshot += recordBytes;
+        var snapshots = _options.Snapshots;
+        if (!snapshots.Enabled
+            || (_commitsSinceSnapshot < snapshots.IntervalTransactions
+                && (snapshots.IntervalBytes <= 0 || _bytesSinceSnapshot < snapshots.IntervalBytes)))
             return;
         try
         {
@@ -1716,6 +1726,7 @@ public sealed partial class MelangeEngine : IDisposable
         catch (Exception exception)
         {
             _commitsSinceSnapshot = 0; // Back off a full interval rather than failing every commit.
+            _bytesSinceSnapshot = 0;
             LogMessages.SnapshotFailed(_logger, exception);
         }
     }
@@ -1870,7 +1881,7 @@ public sealed partial class MelangeEngine : IDisposable
                 stage.Commit();
                 NotifyCommitObservers(record);
                 ApplyAppended(record);
-                AfterCommit(timestamp);
+                AfterCommit(timestamp, record.SerializedLength);
                 postCommitMs = Elapsed(postCommitStarted);
                 committedLsn = record.Lsn;
             }
@@ -2015,7 +2026,7 @@ public sealed partial class MelangeEngine : IDisposable
                     stage.Commit();
                     NotifyCommitObservers(record);
                     ApplyAppended(record);
-                    AfterCommit(record.Timestamp);
+                    AfterCommit(record.Timestamp, record.SerializedLength);
                     postCommitMs = Elapsed(postCommitStarted);
                     committedLsn = record.Lsn;
                 }
@@ -2436,7 +2447,7 @@ public sealed partial class MelangeEngine : IDisposable
                 LogLevel.Error,
                 new EventId(1504, "SnapshotFailed"),
                 "Automatic snapshot failed; the committed transaction is durable and unaffected. " +
-                "The next attempt is one full Snapshots:IntervalTransactions away.");
+                "The next attempt is one full Snapshots:IntervalTransactions (or IntervalBytes) away.");
 
         public static void SnapshotFailed(ILogger logger, Exception failure) =>
             SnapshotFailedMessage(logger, failure);
@@ -2459,7 +2470,7 @@ public sealed partial class MelangeEngine : IDisposable
                 new EventId(1509, "SnapshotAlreadyRunning"),
                 "Snapshot at LSN {Lsn} skipped: another snapshot is still writing. Snapshots write " +
                 "outside the write lock, so an interval short enough to overlap one is the signal — " +
-                "raise Snapshots:IntervalTransactions rather than treating this as an error.");
+                "raise Snapshots:IntervalTransactions (or IntervalBytes) rather than treating this as an error.");
 
         public static void SnapshotAlreadyRunning(ILogger logger, ulong lsn) =>
             SnapshotAlreadyRunningMessage(logger, lsn, null);
