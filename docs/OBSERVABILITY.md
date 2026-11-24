@@ -284,22 +284,22 @@ Meter name: `MelangeDB`.
 | `melange.store.resident_bytes` | gauge | `By` | `table` | 07 |
 | `melange.store.page_faults` | counter | `{fault}` | `table` | 07 |
 | `melange.store.scan_rows` | counter | `{row}` | `table` | 07 |
-| `melange.store.log_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.live_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.compaction.reclaimed_bytes` | counter | `By` | `space` | 0.4.2 |
-| `melange.store.compaction.relocated_bytes` | counter | `By` | `space` | 0.4.2 |
-| `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.4.2 |
-| `melange.store.writes` | counter | `{write}` | `space`, `mode` (`in_place`/`append`) | 0.4.2 |
-| `melange.store.memory_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.directory.native_bytes` | gauge | `By` | — | 0.4.2 |
-| `melange.store.flush.lag_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.segments` | gauge | `{segment}` | `space` | 0.4.2 |
-| `melange.store.index.entries` | gauge | `{entry}` | `space` | 0.4.2 |
-| `melange.store.index.capacity` | gauge | `{slot}` | `space` | 0.4.2 |
-| `melange.store.index.resizes` | counter | `{resize}` | `space` | 0.4.2 |
-| `melange.store.integrity_failures` | counter | `{record}` | `space` | 0.4.2 |
-| `melange.store.compaction.steps` | counter | `{step}` | `space` | 0.4.2 |
-| `melange.store.compaction.lock_time` | counter | `s` | `space` | 0.4.2 |
+| `melange.store.log_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.live_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.compaction.reclaimed_bytes` | counter | `By` | `space` | 0.5.0 |
+| `melange.store.compaction.relocated_bytes` | counter | `By` | `space` | 0.5.0 |
+| `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.5.0 |
+| `melange.store.writes` | counter | `{write}` | `space`, `mode` (`in_place`/`append`) | 0.5.0 |
+| `melange.store.memory_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.directory.native_bytes` | gauge | `By` | — | 0.5.0 |
+| `melange.store.flush.lag_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.segments` | gauge | `{segment}` | `space` | 0.5.0 |
+| `melange.store.index.entries` | gauge | `{entry}` | `space` | 0.5.0 |
+| `melange.store.index.capacity` | gauge | `{slot}` | `space` | 0.5.0 |
+| `melange.store.index.resizes` | counter | `{resize}` | `space` | 0.5.0 |
+| `melange.store.integrity_failures` | counter | `{record}` | `space` | 0.5.0 |
+| `melange.store.compaction.steps` | counter | `{step}` | `space` | 0.5.0 |
+| `melange.store.compaction.lock_time` | counter | `s` | `space` | 0.5.0 |
 | `melange.subscriptions.active` | gauge | `{sub}` | `table` | 03 |
 | `melange.subscription.delta_rows` | counter | `{row}` | `table` | 03 |
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |
@@ -718,7 +718,7 @@ host to register into, so the first one landed with phase 02's host integration 
 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
-| `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**); or the hot store failed to apply a committed record, which closes the database to writes the same way (EventId 1517, 0.4.2) | 02 |
+| `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**); or the hot store failed to apply a committed record, which closes the database to writes the same way (EventId 1517, 0.5.0) | 02 |
 | `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form. **Degraded** while an applier reports a condition lag cannot show (`IApplierCondition`): the Postgres applier does so while `__melange_archive_dead_letter` holds rows, because a dead-lettered row leaves the checkpoint advancing and the lag at zero (road-to-0.3 phase 25) | 08 |
 | `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
 | `melange-capacity` | Two provision attempts failed or expired and the loop has stopped asking (**shipped, 14**) — EventId 1738 in health-endpoint form, cleared when a ticket-named node joins. Degraded while a ticket is outstanding; healthy off the hub or with no provisioner registered. | 14 |

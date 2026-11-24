@@ -244,7 +244,7 @@ public enum HotStoreEngine
 /// </summary>
 public enum PagedEngine
 {
-    /// <summary>Microsoft.FASTER.Core, the default before 0.4.2. Unmaintained upstream since August 2026.</summary>
+    /// <summary>Microsoft.FASTER.Core, the default before 0.5.0. Unmaintained upstream since August 2026.</summary>
     Faster,
 
     /// <summary>

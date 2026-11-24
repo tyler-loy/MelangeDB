@@ -10,6 +10,10 @@
   vendored or native dependencies. Before it becomes the default it must reclaim log space (#287) and
   flush in the background. Tsavorite is the fallback if that slips.
 
+**Update, 0.5.0:** both conditions were met (compaction, a background flusher), and `MelangeLog`
+became the default in 0.5.0, together with a native key directory. Both are measured, with what
+to expect from the change, in [PERFORMANCE.md](../PERFORMANCE.md).
+
 ## Why
 
 The paged hot store keeps paged rows in `Microsoft.FASTER.Core` 2.6.5. FASTER's repository has said
