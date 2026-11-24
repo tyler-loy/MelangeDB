@@ -13,7 +13,7 @@ internal sealed record Measure(string Name, double Value, string Unit);
 /// <summary>One engine's run: its numbers, and whether every row read back as written.</summary>
 internal sealed record EngineResult(string Engine, List<Measure> Measures, string? CorrectnessFailure);
 
-internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root, bool Compaction);
+internal sealed record Settings(int Rows, long BudgetBytes, int HotSet, int Ops, int ColdReads, int BlobRows, int BlobBytes, string Root, bool Compaction, bool IndexGrowth);
 
 /// <summary>
 /// Drives each engine through the same <see cref="IHotStore"/> workloads, each engine in its own
@@ -37,7 +37,8 @@ internal static class Runner
             BlobRows: Int(flags, "blob-rows", 50_000),
             BlobBytes: Int(flags, "blob-bytes", 4096),
             Root: flags.GetValueOrDefault("root") ?? Path.Combine(Path.GetTempPath(), "melange-bakeoff"),
-            Compaction: flags.GetValueOrDefault("compaction") != "off");
+            Compaction: flags.GetValueOrDefault("compaction") != "off",
+            IndexGrowth: flags.GetValueOrDefault("index-growth") == "on");
 
         if (flags.TryGetValue("engine", out var single))
         {
@@ -102,7 +103,8 @@ internal static class Runner
             Residency = { Default = Residency.Paged },
         };
         var measures = new List<Measure>();
-        IndexGrowth(engine, root, s, measures);
+        if (s.IndexGrowth)
+            IndexGrowth(engine, root, s, measures);
         var random = new Random(42);
         var keys = new RowKey[s.Rows];
         for (var i = 0; i < s.Rows; i++)
@@ -220,9 +222,11 @@ internal static class Runner
     }
 
     /// <summary>
-    /// The engine's own key-value space, before any store exists: four million small keys into a space
-    /// sized from the budget, as the store sizes it, so its hash index grows several times. The max is
-    /// what one growth costs a single write; for an index that rehashes at once, every key it holds.
+    /// <c>--index-growth on</c>. The engine's own key-value space, before any store exists: four
+    /// million small keys into a space sized from the budget, as the store sizes it, so its hash index
+    /// grows several times. The max is what one growth costs a single write; for an index that
+    /// rehashes at once, every key it holds. Off by default: it leaves the container's page cache and
+    /// memory in a different state for the phases after it (cold reads measured 100k/s lower).
     /// </summary>
     private static void IndexGrowth(string engine, string root, Settings s, List<Measure> measures)
     {
