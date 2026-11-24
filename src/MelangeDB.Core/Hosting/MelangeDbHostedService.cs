@@ -229,6 +229,7 @@ internal sealed partial class MelangeDbHostedService : IHostedService
         live.Events.SubscriberExpirySeconds = next.Events.SubscriberExpirySeconds;
         live.Snapshots.Enabled = next.Snapshots.Enabled;
         live.Snapshots.IntervalTransactions = next.Snapshots.IntervalTransactions;
+        live.Snapshots.IntervalBytes = next.Snapshots.IntervalBytes;
         live.Snapshots.TruncateLog = next.Snapshots.TruncateLog;
     }
 
