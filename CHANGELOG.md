@@ -21,6 +21,12 @@ All packages ship together at one version; there is no per-package versioning. S
     The TTL still bounds how long the assertion itself can be redeemed.
   - **Mixed versions:** an assertion from an older hub carries no token expiry, and the session ends
     with the assertion as before, so a rolling upgrade is never more permissive.
+- **A node that commits rarely but in bulk now snapshots, and so truncates its log.** Automatic
+  snapshots counted only transactions (`Snapshots:IntervalTransactions`, 100,000). A shard taking
+  few, large transactions never reached the count and its log grew without bound; in the overnight
+  soak, the shards just outside the world, which take only border-band mirrors, grew their logs by
+  several GiB an hour while the busy shards held flat. The new **`Snapshots:IntervalBytes`** (default
+  256 MiB, `0` off) also snapshots once that much log has been appended since the last snapshot.
 - **A primary key too long for MelangeLog no longer makes the database unstartable (#307).**
   - **What happened:** MelangeLog holds keys of at most 1 KiB. A longer one reached the commit log,
     failed when the store applied it (closing the database to writes), and failed again on every
