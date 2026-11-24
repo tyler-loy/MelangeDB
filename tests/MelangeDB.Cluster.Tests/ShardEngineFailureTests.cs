@@ -11,6 +11,31 @@ namespace MelangeDB.Cluster.Tests;
 /// </summary>
 public sealed class ShardEngineFailureTests
 {
+    /// <summary>
+    /// The suite runs on the engine MELANGE_TEST_PAGED_ENGINE names, not quietly in memory: a shard's
+    /// store reports paged logs only when paged, and live bytes only under MelangeLog.
+    /// </summary>
+    [Fact]
+    public async Task Shards_run_on_the_paged_engine_the_suite_was_asked_for()
+    {
+        await using var fixture = await ClusterFixture.StartAsync(shardNodes: 1);
+        var node = await fixture.EnsureShardOwnedAsync(73);
+        var logs = node.Runtime.TryGetShard(new ShardKey(73))!.Engine.HotStore.Statistics().Logs;
+        switch (Environment.GetEnvironmentVariable("MELANGE_TEST_PAGED_ENGINE")?.ToLowerInvariant())
+        {
+            case null or "":
+                Assert.Empty(logs);
+                break;
+            case "melangelog":
+                Assert.Contains(logs, static log => log.LiveBytes >= 0);
+                break;
+            default:
+                Assert.NotEmpty(logs);
+                Assert.All(logs, static log => Assert.Equal(-1, log.LiveBytes));
+                break;
+        }
+    }
+
     [Fact]
     public async Task A_shard_whose_engine_closed_itself_is_reopened_from_its_log()
     {
