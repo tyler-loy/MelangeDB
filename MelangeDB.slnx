@@ -29,6 +29,7 @@
   </Folder>
   <Folder Name="/bench/">
     <Project Path="bench/MelangeDB.Benchmarks/MelangeDB.Benchmarks.csproj" />
+    <Project Path="bench/MelangeDB.HotStoreBakeoff/MelangeDB.HotStoreBakeoff.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/MelangeDB.Conformance.Adapter.CSharp/MelangeDB.Conformance.Adapter.CSharp.csproj" />

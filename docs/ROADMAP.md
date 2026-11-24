@@ -167,6 +167,13 @@ capability rather than merely in size. Running it would compare two different ga
 is a legitimate outcome that has to be *recorded* rather than reached by drift. Until one or the
 other happens, the warning above stands unchanged.
 
+**The paged store's next engine.** FASTER has been unmaintained upstream since August 2026. A
+bake-off ([design/hot-store-bakeoff.md](design/hot-store-bakeoff.md)) compared it with Tsavorite,
+LMDB, RocksDB, ZoneTree and an in-house log, `MelangeLog`. `HotStore:PagedEngine` now ships FASTER
+(the default), Tsavorite and MelangeLog. MelangeLog is the likely next default. It first needs to
+reclaim log space ([#287](https://github.com/tyler-loy/MelangeDB/issues/287)), a gap the FASTER
+store has today too, and to flush in the background.
+
 Known deferrals, each recorded with its reasoning rather than left as an omission:
 
 - **Joins in subscriptions.** Incrementally maintaining them is differential-dataflow territory; an
