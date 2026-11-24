@@ -1,4 +1,5 @@
 using System.Net.WebSockets;
+using MelangeDB.Core;
 using MelangeDB.Protocol;
 using Xunit;
 
@@ -62,6 +63,45 @@ public class AuthLeakTests
             while (true)
                 await raw.ReceiveAsync(TestContext.Current.CancellationToken);
         });
+    }
+
+    /// <summary>
+    /// A clustered node's sessions arrive through the gateway on a hub-minted assertion whose own
+    /// expiry is the short Cluster:AssertionTtlSeconds. The session lives by the client's token,
+    /// not by that: past the TTL and the grace window it still works, and it is closed only once
+    /// the client's token has expired and the grace passed too.
+    /// </summary>
+    [Fact]
+    public async Task A_session_opened_by_an_assertion_lives_by_the_client_token_not_the_assertion_ttl()
+    {
+        const string secret = "auth-leak-cluster-secret";
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?>
+        {
+            ["MelangeDb:Auth:ReauthGraceSeconds"] = "30",
+            ["MelangeDb:Transport:HeartbeatTimeoutMs"] = "10000000",
+            ["MelangeDb:Cluster:Role"] = "Shard",
+            ["MelangeDb:Cluster:NodeName"] = "auth-leak-tests",
+            ["MelangeDb:Cluster:Secret"] = secret,
+        }, manualTime: true);
+        var time = host.Time!;
+        var assertion = InternalIdentityAssertion.Mint(
+            secret, TestTokens.IdentityOf("gateway-client"), isGuest: false, isSqlOwner: false, isBulkOwner: false,
+            time.GetUtcNow().AddSeconds(300), sessionExpiresAt: time.GetUtcNow().AddSeconds(3600));
+
+        await using var raw = new RawSocketClient();
+        await raw.ConnectAsync(host.WsUri, TestContext.Current.CancellationToken, assertion);
+
+        // Past the assertion's TTL and the grace window: the session still answers, with no error first.
+        time.Advance(TimeSpan.FromSeconds(300 + 30 + 16));
+        await raw.SendAsync(new PingFrame(7), TestContext.Current.CancellationToken);
+        var answer = await raw.ReceiveUntilAsync<Frame>(
+            TestContext.Current.CancellationToken, static f => f is PongFrame or ErrorFrame);
+        Assert.Equal(new PongFrame(7), answer);
+
+        // Past the client token's own expiry and grace: closed, as any expired session is.
+        time.Advance(TimeSpan.FromSeconds(3600 - 300 + 16));
+        var error = await raw.ReceiveUntilAsync<ErrorFrame>(TestContext.Current.CancellationToken);
+        Assert.Equal(MelangeErrorCodes.TokenExpired, error.Code);
     }
 
     [Fact]

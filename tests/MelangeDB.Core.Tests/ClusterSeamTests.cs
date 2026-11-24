@@ -294,6 +294,36 @@ public class InternalIdentityAssertionTests
         Assert.True(result.Value.FiresLifecycle);
     }
 
+    /// <summary>
+    /// The redemption window and the session's life are different clocks: an assertion redeemable
+    /// for five minutes opens a session that lives as long as the client's token. Before they were
+    /// separate, every session through the gateway was closed as token_expired TTL + grace after it
+    /// attached, whatever the client's token said.
+    /// </summary>
+    [Fact]
+    public void An_assertion_redeemable_briefly_opens_a_session_that_lives_as_long_as_the_client_token()
+    {
+        var now = DateTimeOffset.UnixEpoch.AddDays(10_000);
+        var token = InternalIdentityAssertion.Mint(
+            "secret", Player, isGuest: false, isSqlOwner: false, isBulkOwner: false, now.AddMinutes(5),
+            sessionExpiresAt: now.AddHours(12));
+
+        var redeemed = InternalIdentityAssertion.Validate("secret", token, now.AddMinutes(4), out _);
+        Assert.Equal(now.AddHours(12), redeemed!.Value.ExpiresAt);
+
+        // Redemption still ends at five minutes: a captured assertion does not become a 12-hour one.
+        Assert.Null(InternalIdentityAssertion.Validate("secret", token, now.AddMinutes(6), out var failure));
+        Assert.Contains("expired", failure);
+
+        // An assertion without the client's expiry ends its session with its own; a token that never
+        // expires comes back as never, not as a date a grace window would overflow.
+        var bare = InternalIdentityAssertion.Mint("secret", Player, false, false, false, now.AddMinutes(5));
+        Assert.Equal(now.AddMinutes(5), InternalIdentityAssertion.Validate("secret", bare, now, out _)!.Value.ExpiresAt);
+        var forever = InternalIdentityAssertion.Mint(
+            "secret", Player, false, false, false, now.AddMinutes(5), sessionExpiresAt: DateTimeOffset.MaxValue);
+        Assert.Equal(DateTimeOffset.MaxValue, InternalIdentityAssertion.Validate("secret", forever, now, out _)!.Value.ExpiresAt);
+    }
+
     [Fact]
     public void Captured_claims_ride_the_assertion_so_a_shard_node_reads_what_the_hub_read()
     {

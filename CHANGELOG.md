@@ -12,6 +12,15 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ### Fixed
 
+- **A clustered client is no longer dropped about seven minutes after it connects.** The session a
+  hub-minted assertion opened on a node expired with the assertion: `Cluster:AssertionTtlSeconds`
+  (300 s) plus `Auth:ReauthGraceSeconds` (120 s) after attaching, whatever the client's token said.
+  Clients that never re-authenticated were closed as `token_expired` and resynced; the overnight
+  soaks showed it as one `token_expired` and one resync per client.
+  - **The fix:** the assertion now carries the client token's expiry, and the session lives by it.
+    The TTL still bounds how long the assertion itself can be redeemed.
+  - **Mixed versions:** an assertion from an older hub carries no token expiry, and the session ends
+    with the assertion as before, so a rolling upgrade is never more permissive.
 - **A node that commits rarely but in bulk now snapshots, and so truncates its log.** Automatic
   snapshots counted only transactions (`Snapshots:IntervalTransactions`, 100,000). A shard taking
   few, large transactions never reached the count and its log grew without bound; in the overnight
