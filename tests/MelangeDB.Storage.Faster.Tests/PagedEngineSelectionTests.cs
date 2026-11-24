@@ -10,9 +10,9 @@ namespace MelangeDB.Storage.Faster.Tests;
 public sealed class PagedEngineSelectionTests
 {
     [Fact]
-    public void The_default_engine_is_faster()
+    public void The_default_engine_is_melangelog()
     {
-        Assert.Equal(PagedEngine.Faster, new MelangeDbOptions().HotStore.PagedEngine);
+        Assert.Equal(PagedEngine.MelangeLog, new MelangeDbOptions().HotStore.PagedEngine);
     }
 
     [Fact]

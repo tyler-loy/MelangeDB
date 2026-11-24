@@ -91,7 +91,7 @@ noted.
 | `--fsync` | interval | `CommitLog:FsyncPolicy`: `interval` or `commit`. Interval is the capacity default; per-commit measures the disk's fsync ceiling instead. |
 | `--fsync-interval-ms` | 50 | `CommitLog:FsyncIntervalMs` when interval. |
 | `--hot-store` | inmemory | `HotStore:Engine`: `inmemory` or `faster`. |
-| `--paged-engine` | faster | `HotStore:PagedEngine` under `--hot-store faster`: `faster`, `melangelog` or `tsavorite`. |
+| `--paged-engine` | melangelog | `HotStore:PagedEngine` under `--hot-store faster`: `faster`, `melangelog` or `tsavorite`. |
 | `--budget-mb` | 128 | `HotStore:MemoryBudgetBytes` in MiB. The walkers' own rows are a few hundred bytes each and update in place, so they never leave memory, even at 8 MiB. To make the paged store page, and, under `melangelog`, append and compact, add `--ballast-rows`. |
 | `--ballast-rows` | 0 | serve/all: seed this many paged `Ballast` rows of `--row-bytes` across every block at start, for a working set larger than the budget. Seeding goes through the shards' reducers, so rows near a block edge are mirrored into the neighbouring shards like any other partitioned row. |
 | `--ballast-churn` | 0 | serve/all, with `--ballast-rows`: rewrite this many ballast rows a second for the whole run, 50 to a transaction, so a paged log accrues superseded versions. The serve console's 30-second line adds the hot store's summed log, live and reclaimed bytes, segment files and compaction steps over the primary shards, and the rewrite count. |

@@ -244,12 +244,12 @@ public enum HotStoreEngine
 /// </summary>
 public enum PagedEngine
 {
-    /// <summary>Microsoft.FASTER.Core, the default. Unmaintained upstream since August 2026.</summary>
+    /// <summary>Microsoft.FASTER.Core, the default before 0.4.2. Unmaintained upstream since August 2026.</summary>
     Faster,
 
     /// <summary>
     /// MelangeDB's own append-only log: in-place updates in memory, blind appends otherwise, and reads
-    /// of flushed records through memory-mapped segments. Preview; the likely successor to FASTER.
+    /// of flushed records through memory-mapped segments, compacted while the store runs. The default.
     /// </summary>
     MelangeLog,
     /// <summary>
@@ -780,7 +780,7 @@ public sealed class HotStoreOptions
     /// The engine under the paged store, when <see cref="Engine"/> selects it; see
     /// <see cref="Core.PagedEngine"/>. Read once, when the store is created.
     /// </summary>
-    public PagedEngine PagedEngine { get; set; } = PagedEngine.Faster;
+    public PagedEngine PagedEngine { get; set; } = PagedEngine.MelangeLog;
 
     /// <summary>
     /// Keeps the paged store's key directory and secondary indexes in native copy-on-write B+trees

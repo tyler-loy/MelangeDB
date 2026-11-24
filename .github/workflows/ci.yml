@@ -84,7 +84,7 @@ jobs:
           fi
 
       # The store suite once more per selectable paged engine (HotStore:PagedEngine). The Release
-      # run above covers FASTER, the default. libaio is what Tsavorite's native Linux device links;
+      # run above covers MelangeLog, the default. libaio is what Tsavorite's native Linux device links;
       # with it installed this exercises the native device rather than the managed fallback.
       - name: Test (Release, paged store on each engine)
         shell: bash
@@ -92,7 +92,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libaio1t64
           # Every engine runs before the step fails, so one engine's failure cannot hide another's.
           failed=0
-          for engine in melangelog tsavorite; do
+          for engine in faster tsavorite; do
             MELANGE_TEST_PAGED_ENGINE=$engine dotnet test tests/MelangeDB.Storage.Faster.Tests/MelangeDB.Storage.Faster.Tests.csproj -c Release --no-build --filter "Category!=Stress" 2>&1 | tee -a test-release-engines.log || failed=1
           done
           # The managed key directory and indexes (HotStore:NativeDirectory=false), on MelangeLog.

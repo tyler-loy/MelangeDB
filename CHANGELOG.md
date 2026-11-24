@@ -47,6 +47,13 @@ All packages ship together at one version; there is no per-package versioning. S
     unlimited by default.
   - **Recovering a log that already holds such a record:** start once on
     `HotStore:PagedEngine = Faster`, which has no key limit.
+- **MelangeLog is the default paged engine** (`HotStore:PagedEngine`). It now compacts its log while
+  running, flushes in the background, grows its index incrementally, enforces disk limits, and
+  reports itself through statistics, metrics and health checks. On the overnight paging soak its
+  log held flat at about 2.55 GiB for 2.7 hours, where FASTER's grew from 1.4 to 22 GiB. `Faster`
+  (unmaintained upstream) and `Tsavorite` remain selectable. Switching is a restart: the store is
+  rebuilt from the log on every start, so there is nothing to migrate. MelangeLog holds primary
+  keys of up to about 1 KiB; the engine refuses longer ones before they reach the log (#307).
 
 ### Added
 
