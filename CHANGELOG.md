@@ -10,6 +10,12 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-25
+
+Subscription fan-out through column and row policies gets much cheaper. Equal column masks share
+their work, and a row policy that reads the caller's own row decodes it once per commit record.
+Nothing changes on the wire, on disk, or in the public API, so upgrading needs no migration.
+
 ### Changed
 
 - **A column policy no longer costs a column set and a projected row per subscriber (#315).** Every
