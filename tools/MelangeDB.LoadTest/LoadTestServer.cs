@@ -626,7 +626,6 @@ internal sealed class LoadTestServer : IAsyncDisposable
     internal static string PagedEngineName(string flag) => flag switch
     {
         "melangelog" => "MelangeLog",
-        "tsavorite" => "Tsavorite",
         _ => "Faster",
     };
 }

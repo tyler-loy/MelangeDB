@@ -7,10 +7,10 @@ namespace MelangeDB.HotStoreBakeoff;
 public static class Engines
 {
     /// <summary>
-    /// The engines a default run compares, FASTER (the shipped one) first. The Tsavorite device variants
-    /// (lmdb-writemap, lmdb-bigtxn, lmdb-page16k, lmdb-page64k, lmdb-tuned, lmdb-tuned64k, tsavorite-buffered, tsavorite-unbuffered, tsavorite-uring, tsavorite-ra, tsavorite-ra-buffered) and melangelog variants (melangelog-pread, melangelog-random, melangelog-noprefetch, melangelog-pointpread) run when named with <c>--engines</c>.
+    /// The engines a default run compares, FASTER (the shipped one) first. The variants
+    /// (lmdb-writemap, lmdb-bigtxn, lmdb-page16k, lmdb-page64k, lmdb-tuned, lmdb-tuned64k) and melangelog variants (melangelog-pread, melangelog-random, melangelog-noprefetch, melangelog-pointpread) run when named with <c>--engines</c>.
     /// </summary>
-    public static IReadOnlyList<string> Names { get; } = ["faster", "tsavorite", "melangelog", "lmdb", "rocksdb", "zonetree"];
+    public static IReadOnlyList<string> Names { get; } = ["faster", "melangelog", "lmdb", "rocksdb", "zonetree"];
 
     /// <summary>The paged hot store over <paramref name="engine"/>'s key-value spaces.</summary>
     public static IHotStoreProvider Provider(string engine) => new FasterHotStoreProvider(Factory(engine));
@@ -18,12 +18,6 @@ public static class Engines
     internal static IPagedKvFactory Factory(string engine) => engine switch
     {
         "faster" => FasterPagedKvFactory.Instance,
-        "tsavorite" => new TsavoritePagedKvFactory(),
-        "tsavorite-uring" => new TsavoritePagedKvFactory(TsavoriteDevice.NativeUring),
-        "tsavorite-buffered" => new TsavoritePagedKvFactory(TsavoriteDevice.NativeBuffered),
-        "tsavorite-unbuffered" => new TsavoritePagedKvFactory(TsavoriteDevice.NativeUnbuffered),
-        "tsavorite-ra" => new TsavoritePagedKvFactory(TsavoriteDevice.RandomAccess),
-        "tsavorite-ra-buffered" => new TsavoritePagedKvFactory(TsavoriteDevice.RandomAccessBuffered),
         "melangelog" => new MelangeLogPagedKvFactory(),
         "melangelog-pread" => new MelangeLogPagedKvFactory(MelangeLogTuning.Default with { ReadMode = MelangeLogReadMode.Pread }),
         "melangelog-random" => new MelangeLogPagedKvFactory(MelangeLogTuning.Default with { RandomAdvice = true }),

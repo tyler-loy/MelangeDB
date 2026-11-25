@@ -3,19 +3,11 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Description>The paged IHotStore: a hybrid log with spill-to-disk. HotStore:PagedEngine picks the engine: Microsoft.FASTER.Core (the default), Tsavorite (vendored from microsoft/garnet), or MelangeDB's own log. See docs/design/hot-store-bakeoff.md.</Description>
-    <!-- Carries the vendored Tsavorite assembly inside this package (see the target below). -->
-    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);PackVendoredTsavorite</TargetsForTfmSpecificBuildOutput>
+    <Description>The paged IHotStore: a hybrid log with spill-to-disk. HotStore:PagedEngine picks the engine: MelangeDB's own log (the default) or Microsoft.FASTER.Core. See docs/design/hot-store-bakeoff.md.</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\MelangeDB.Core\MelangeDB.Core.csproj" />
-    <!-- Not a package of its own: Tsavorite is not on NuGet, so its vendored build ships inside this one
-         (PackVendoredTsavorite below). While packing, PrivateAssets keeps it out of the nuspec's
-         dependencies. Otherwise the reference stays ordinary, because a private one also drops the
-         assembly from referencing projects' deps.json, and the runtime then cannot load it. -->
-    <ProjectReference Include="..\MelangeDB.Tsavorite\MelangeDB.Tsavorite.csproj" PrivateAssets="all" Condition="'$(_IsPacking)' == 'true'" />
-    <ProjectReference Include="..\MelangeDB.Tsavorite\MelangeDB.Tsavorite.csproj" Condition="'$(_IsPacking)' != 'true'" />
   </ItemGroup>
 
   <ItemGroup>
@@ -30,20 +22,5 @@
     <!-- XxHash3, for melangelog's index and record checksums. -->
     <PackageReference Include="System.IO.Hashing" Version="10.0.12" />
   </ItemGroup>
-
-  <ItemGroup>
-    <!-- Tsavorite's prebuilt Linux native devices, in the RID layout it resolves at load time
-         (runtimes/<rid>/native/libnative_device*.so beside the assembly): copied to the output of
-         anything that references this project, and packed at the same paths. -->
-    <Content Include="..\MelangeDB.Tsavorite\Device\runtimes\**" LinkBase="runtimes" CopyToOutputDirectory="PreserveNewest" Pack="true" PackagePath="runtimes" />
-    <None Include="..\MelangeDB.Tsavorite\LICENSE" Pack="true" PackagePath="third-party/Tsavorite/" Visible="false" />
-    <None Include="..\MelangeDB.Tsavorite\README.md" Pack="true" PackagePath="third-party/Tsavorite/" Visible="false" />
-  </ItemGroup>
-
-  <Target Name="PackVendoredTsavorite">
-    <ItemGroup>
-      <BuildOutputInPackage Include="$(OutputPath)MelangeDB.Tsavorite.dll" />
-    </ItemGroup>
-  </Target>
 
 </Project>

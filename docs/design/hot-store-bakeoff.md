@@ -10,6 +10,14 @@
   vendored or native dependencies. Before it becomes the default it must reclaim log space (#287) and
   flush in the background. Tsavorite is the fallback if that slips.
 
+**Update, 0.5.0:** both conditions were met (compaction, a background flusher), and `MelangeLog`
+became the default in 0.5.0, together with a native key directory. Both are measured, with what
+to expect from the change, in [PERFORMANCE.md](../PERFORMANCE.md). **Tsavorite was removed** before
+0.5.0 shipped: as a preview that MelangeLog outperformed, it did not justify ~270 vendored source
+files, 5.5 MB of Garnet's native devices in the package, and a third CI pass per platform. Its
+numbers below stay for comparison; the adapter and the vendored source are in the history up to
+`a466dc2` (`git show a466dc2:src/MelangeDB.Storage.Faster/TsavoritePagedKv.cs`) for a rerun.
+
 ## Why
 
 The paged hot store keeps paged rows in `Microsoft.FASTER.Core` 2.6.5. FASTER's repository has said
@@ -332,6 +340,9 @@ For Tsavorite, should it be needed:
 - **Index sizing.** Size the index from the row count, rather than relying on the raised overflow
   threshold.
 - **Page cache setting.** Decide whether the page cache should be a setting (`HotStore:OsCache`).
+
+What these results mean for a deployment on 0.5.0's defaults, with the later native-directory and
+overnight soak numbers, is in [PERFORMANCE.md](../PERFORMANCE.md).
 
 Out of scope here, and worth a later look on its own: engine-native capabilities this harness
 deliberately did not use. The main one: MelangeLog could keep each record's address in the store's

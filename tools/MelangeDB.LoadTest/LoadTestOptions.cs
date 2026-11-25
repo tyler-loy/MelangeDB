@@ -88,7 +88,7 @@ public sealed class LoadTestOptions
     /// <summary>HotStore:Engine for every node: "inmemory" or "faster".</summary>
     public string HotStore { get; set; } = "inmemory";
 
-    /// <summary>HotStore:PagedEngine for every node, when <see cref="HotStore"/> is "faster": "faster", "melangelog" or "tsavorite".</summary>
+    /// <summary>HotStore:PagedEngine for every node, when <see cref="HotStore"/> is "faster": "faster" or "melangelog".</summary>
     public string PagedEngine { get; set; } = "melangelog";
 
     /// <summary>HotStore:MemoryBudgetBytes for every node, in MiB; null keeps the library's 128 MiB.</summary>
@@ -302,9 +302,9 @@ public sealed class LoadTestOptions
                         options.HotStore = value;
                         break;
                     case "--paged-engine":
-                        if (value is not ("faster" or "melangelog" or "tsavorite"))
+                        if (value is not ("faster" or "melangelog"))
                         {
-                            error.WriteLine($"--paged-engine takes 'faster', 'melangelog' or 'tsavorite', not '{value}'.");
+                            error.WriteLine($"--paged-engine takes 'faster' or 'melangelog', not '{value}'.");
                             return null;
                         }
 

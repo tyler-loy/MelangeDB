@@ -10,25 +10,42 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
-### Fixed
+## [0.5.0] — 2026-11-24
 
-- **A clustered client is no longer dropped about seven minutes after it connects.** The session a
-  hub-minted assertion opened on a node expired with the assertion: `Cluster:AssertionTtlSeconds`
-  (300 s) plus `Auth:ReauthGraceSeconds` (120 s) after attaching, whatever the client's token said.
-  Clients that never re-authenticated were closed as `token_expired` and resynced; the overnight
-  soaks showed it as one `token_expired` and one resync per client.
-  - **The fix:** the assertion now carries the client token's expiry, and the session lives by it.
-    The TTL still bounds how long the assertion itself can be redeemed.
-  - **Mixed versions:** an assertion from an older hub carries no token expiry, and the session ends
-    with the assertion as before, so a rolling upgrade is never more permissive.
-- **A node that commits rarely but in bulk now snapshots, and so truncates its log.** Automatic
-  snapshots counted only transactions (`Snapshots:IntervalTransactions`, 100,000). A shard taking
-  few, large transactions never reached the count and its log grew without bound; in the overnight
-  soak, the shards just outside the world, which take only border-band mirrors, grew their logs by
-  several GiB an hour while the busy shards held flat. The new **`Snapshots:IntervalBytes`** (default
-  256 MiB, `0` off) also snapshots once that much log has been appended since the last snapshot.
+The paged hot store gets a new default engine and moves its bookkeeping off the managed heap, and
+cluster node links stop sending row data as base64 JSON. [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+says what to expect from each, how to measure it on your own hardware, and how to switch back.
+
+### Upgrading
+
+Both store changes take effect on a restart with nothing to migrate: the hot store is rebuilt from
+the commit log on every start, and either can be reverted the same way. The full checklist is in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md#upgrading-to-050).
+
+- **Primary keys over about 1 KiB keep you on FASTER.** MelangeLog holds keys of up to about
+  1,019 bytes once encoded. A log that already holds a longer key cannot be rebuilt into it: set
+  `HotStore:PagedEngine = Faster` before upgrading such a deployment (#307).
+- **The GC heap shrinks and native memory grows.** The key directory and indexes of paged tables are
+  now native memory (`melange.store.directory.native_bytes`), outside `DOTNET_GCHeapHardLimit` but
+  inside a container's limit. Alerts on GC heap size may need adjusting.
+- **Disk use changes shape.** MelangeLog preallocates 64 MiB segment files and settles near twice the
+  live data per copy, where FASTER grew with write volume until a restart.
+- **Rare-but-bulk committers now snapshot** every 256 MiB of log (`Snapshots:IntervalBytes`), and
+  each snapshot writes the whole hot store.
+- **Mixed-version clusters keep working.** Binary node-link frames and the new assertion field are
+  negotiated, so a rolling upgrade needs no ordering.
+
 ### Changed
 
+- **MelangeLog is the default paged engine** (`HotStore:PagedEngine`), replacing FASTER, which has
+  been unmaintained upstream since August 2026. It now compacts its log while running, flushes in
+  the background, grows its index incrementally, enforces disk limits, and reports itself through
+  statistics, metrics and health checks. On the overnight paging soak its log held flat at about
+  2.55 GiB for 2.7 hours, where FASTER's grew from 1.4 to 22 GiB. `Faster` remains
+  selectable. Switching is a restart: the store is
+  rebuilt from the log on every start, so there is nothing to migrate. MelangeLog holds primary
+  keys of up to about 1 KiB; the engine refuses longer ones before they reach the log (#307).
+  What to expect, with the measurements behind it: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 - **Node links carry row data as binary, not base64 JSON.** Border batches, replica batches, handoff
   rows, event payloads and bulk rows now travel after a frame's JSON in a binary attachment, encoded
   in one pass into a bounded buffer pool.
@@ -38,22 +55,6 @@ All packages ship together at one version; there is no per-package versioning. S
     to 1.1 MB allocated, 763 KB to 520 KB on the wire, and nothing held after a full collection.
   - **Mixed versions:** a node advertises binary frames at authentication and each end switches only
     once the other has said it reads them, so an older hub or node keeps exchanging JSON.
-- **A primary key too long for MelangeLog no longer makes the database unstartable (#307).**
-  - **What happened:** MelangeLog holds keys of at most 1 KiB. A longer one reached the commit log,
-    failed when the store applied it (closing the database to writes), and failed again on every
-    replay, so the database could not start.
-  - **Fix:** the engine now refuses such a write before anything is appended, as an ordinary
-    reducer error. The store declares its limit through the new `IHotStore.MaxKeyBytes`, which is
-    unlimited by default.
-  - **Recovering a log that already holds such a record:** start once on
-    `HotStore:PagedEngine = Faster`, which has no key limit.
-- **MelangeLog is the default paged engine** (`HotStore:PagedEngine`). It now compacts its log while
-  running, flushes in the background, grows its index incrementally, enforces disk limits, and
-  reports itself through statistics, metrics and health checks. On the overnight paging soak its
-  log held flat at about 2.55 GiB for 2.7 hours, where FASTER's grew from 1.4 to 22 GiB. `Faster`
-  (unmaintained upstream) and `Tsavorite` remain selectable. Switching is a restart: the store is
-  rebuilt from the log on every start, so there is nothing to migrate. MelangeLog holds primary
-  keys of up to about 1 KiB; the engine refuses longer ones before they reach the log (#307).
 
 ### Added
 
@@ -79,8 +80,8 @@ All packages ship together at one version; there is no per-package versioning. S
   [docs/LOAD-TESTING.md](docs/LOAD-TESTING.md#paging-soak--melangelog-against-faster-under-constant-rewrites-2026-11-24).
 - **`MelangeDB.LoadTest link-bench`** measures the node link alone: round trip, allocation, wire bytes
   and retained heap per message shape, in both frame formats.
-- **`HotStore:PagedEngine` chooses the engine under the paged store.** `Faster` stays the default,
-  and two preview engines join it.
+- **`HotStore:PagedEngine` chooses the engine under the paged store**: `MelangeLog` (the default,
+  above) or `Faster`.
   - **Why:** FASTER has been unmaintained upstream since August 2026.
   - **The bake-off:** FASTER, Tsavorite, LMDB, RocksDB, ZoneTree and MelangeLog were compared under a
     1 GiB memory cap ([docs/design/hot-store-bakeoff.md](docs/design/hot-store-bakeoff.md)).
@@ -88,26 +89,20 @@ All packages ship together at one version; there is no per-package versioning. S
     nothing to migrate in either direction.
   - **Logging:** EventId 1512 names the engine in use.
 
-  `Tsavorite` is microsoft/garnet's maintained fork of FASTER, with the same design.
-  - **Packaging:** it is not on NuGet, so its source is vendored, and `MelangeDB.Storage.Faster`
-    carries the assembly and Garnet's Linux native devices. That grows the package to about 5.6 MB.
-  - **Linux needs libaio** (`libaio1t64` on Debian and Ubuntu). Without it, or in a RID-specific
-    publish, the store falls back to a managed device and logs EventId 1513.
-
   `MelangeLog` is MelangeDB's own append-only log.
   - **Writes:** a record still in memory is updated in place; otherwise the new version is appended
     without reading the old one.
   - **Reads:** records that have left memory are read through memory-mapped segment files, and each
     record carries a checksum.
-  - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and Tsavorite on
-    writes.
+  - **Measured:** under the cap it matched LMDB on reads (5× FASTER's cold reads) and the
+    fastest log-structured engine on writes.
   - **Reclaims log space as it runs** (#287): `HotStore:Compaction:Enabled` (default on),
     `TriggerRatio` (default 2: compact while the log is over twice its live bytes) and
     `MaxBytesPerSecond`. A background thread copies the live records out of the segment with the
     least live data, in steps of about 1 MiB under the store lock, and deletes the segment. A store
     rewriting its 1M-row table three times over ends with its log at about twice its live data.
     EventIds 1514–1516 log it; `melange.store.compaction.reclaimed_bytes` and `relocated_bytes`
-    count it. FASTER and Tsavorite still do not reclaim.
+    count it. FASTER still does not reclaim.
   - **Flushes in the background:** a flusher thread per log space writes pages to disk as they
     leave the writable part of memory, so a write never waits on disk unless the disk has fallen a
     sixteenth of the memory budget behind. `melange.store.flush.stalls` counts those waits.
@@ -116,7 +111,6 @@ All packages ship together at one version; there is no per-package versioning. S
     and 1518. `HotStore:MelangeLog:ReadMode` chooses `Mmap` (default) or `Pread`, under which a disk
     read error is an exception rather than a signal that ends the process.
   - **The index grows incrementally:** a full index no longer rehashes inside one write.
-  - **Likely the future default.**
   - **Exact without reads:** its index keys each record by a 128-bit hash and records its size, so a
     delete reads nothing, and the log knows which bytes are live without reading them back.
 
@@ -125,11 +119,44 @@ All packages ship together at one version; there is no per-package versioning. S
   lag and stalls, segment files, index size and resizes, integrity failures, and compaction's
   steps, lock time and bytes moved. Each is a `melange.store.*` instrument with a `space`
   dimension ([docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)). The gap between `log_bytes` and
-  `live_bytes` is the backlog of #287. FASTER and Tsavorite report the log's extent only;
+  `live_bytes` is the backlog of #287. FASTER reports the log's extent only;
   MelangeLog reports them all.
+
+### Removed
+
+- **The `Tsavorite` paged engine**, a preview in `main` prereleases that never shipped in a release.
+  MelangeLog outperformed it, and it carried about 270 vendored source files, 5.5 MB of Garnet's
+  native devices in `MelangeDB.Storage.Faster` (the package drops back to about 100 KB) and a CI pass
+  per platform. `HotStore:PagedEngine = Tsavorite` no longer binds; choose `MelangeLog` or `Faster`,
+  a restart with nothing to migrate. Its measurements stay in
+  [docs/design/hot-store-bakeoff.md](docs/design/hot-store-bakeoff.md).
 
 ### Fixed
 
+- **A clustered client is no longer dropped about seven minutes after it connects.** The session a
+  hub-minted assertion opened on a node expired with the assertion: `Cluster:AssertionTtlSeconds`
+  (300 s) plus `Auth:ReauthGraceSeconds` (120 s) after attaching, whatever the client's token said.
+  Clients that never re-authenticated were closed as `token_expired` and resynced; the overnight
+  soaks showed it as one `token_expired` and one resync per client.
+  - **The fix:** the assertion now carries the client token's expiry, and the session lives by it.
+    The TTL still bounds how long the assertion itself can be redeemed.
+  - **Mixed versions:** an assertion from an older hub carries no token expiry, and the session ends
+    with the assertion as before, so a rolling upgrade is never more permissive.
+- **A node that commits rarely but in bulk now snapshots, and so truncates its log.** Automatic
+  snapshots counted only transactions (`Snapshots:IntervalTransactions`, 100,000). A shard taking
+  few, large transactions never reached the count and its log grew without bound; in the overnight
+  soak, the shards just outside the world, which take only border-band mirrors, grew their logs by
+  several GiB an hour while the busy shards held flat. The new **`Snapshots:IntervalBytes`** (default
+  256 MiB, `0` off) also snapshots once that much log has been appended since the last snapshot.
+- **A primary key too long for MelangeLog no longer makes the database unstartable (#307).**
+  - **What happened:** MelangeLog holds keys of at most 1 KiB. A longer one reached the commit log,
+    failed when the store applied it (closing the database to writes), and failed again on every
+    replay, so the database could not start.
+  - **Fix:** the engine now refuses such a write before anything is appended, as an ordinary
+    reducer error. The store declares its limit through the new `IHotStore.MaxKeyBytes`, which is
+    unlimited by default.
+  - **Recovering a log that already holds such a record:** start once on
+    `HotStore:PagedEngine = Faster`, which has no key limit.
 - **Promoting a paged table to resident left its paged records in the log** until the next restart.
   They are now deleted as the table moves.
 - **A shard node now reopens a shard whose engine closed itself to writes** (its hot store failed to

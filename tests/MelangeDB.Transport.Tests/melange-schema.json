@@ -1,6 +1,6 @@
 {
   "format": 2,
-  "generator": "0.4.2.0",
+  "generator": "0.5.0.0",
   "schemaHash": "7b13f9862ca01eccca496ceda85f8a59c0e058a353ceccb52cd84af20b3497f8",
   "module": "MelangeDB.Transport.Tests",
   "enums": [

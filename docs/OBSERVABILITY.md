@@ -284,22 +284,22 @@ Meter name: `MelangeDB`.
 | `melange.store.resident_bytes` | gauge | `By` | `table` | 07 |
 | `melange.store.page_faults` | counter | `{fault}` | `table` | 07 |
 | `melange.store.scan_rows` | counter | `{row}` | `table` | 07 |
-| `melange.store.log_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.live_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.compaction.reclaimed_bytes` | counter | `By` | `space` | 0.4.2 |
-| `melange.store.compaction.relocated_bytes` | counter | `By` | `space` | 0.4.2 |
-| `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.4.2 |
-| `melange.store.writes` | counter | `{write}` | `space`, `mode` (`in_place`/`append`) | 0.4.2 |
-| `melange.store.memory_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.directory.native_bytes` | gauge | `By` | — | 0.4.2 |
-| `melange.store.flush.lag_bytes` | gauge | `By` | `space` | 0.4.2 |
-| `melange.store.segments` | gauge | `{segment}` | `space` | 0.4.2 |
-| `melange.store.index.entries` | gauge | `{entry}` | `space` | 0.4.2 |
-| `melange.store.index.capacity` | gauge | `{slot}` | `space` | 0.4.2 |
-| `melange.store.index.resizes` | counter | `{resize}` | `space` | 0.4.2 |
-| `melange.store.integrity_failures` | counter | `{record}` | `space` | 0.4.2 |
-| `melange.store.compaction.steps` | counter | `{step}` | `space` | 0.4.2 |
-| `melange.store.compaction.lock_time` | counter | `s` | `space` | 0.4.2 |
+| `melange.store.log_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.live_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.compaction.reclaimed_bytes` | counter | `By` | `space` | 0.5.0 |
+| `melange.store.compaction.relocated_bytes` | counter | `By` | `space` | 0.5.0 |
+| `melange.store.flush.stalls` | counter | `{stall}` | `space` | 0.5.0 |
+| `melange.store.writes` | counter | `{write}` | `space`, `mode` (`in_place`/`append`) | 0.5.0 |
+| `melange.store.memory_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.directory.native_bytes` | gauge | `By` | — | 0.5.0 |
+| `melange.store.flush.lag_bytes` | gauge | `By` | `space` | 0.5.0 |
+| `melange.store.segments` | gauge | `{segment}` | `space` | 0.5.0 |
+| `melange.store.index.entries` | gauge | `{entry}` | `space` | 0.5.0 |
+| `melange.store.index.capacity` | gauge | `{slot}` | `space` | 0.5.0 |
+| `melange.store.index.resizes` | counter | `{resize}` | `space` | 0.5.0 |
+| `melange.store.integrity_failures` | counter | `{record}` | `space` | 0.5.0 |
+| `melange.store.compaction.steps` | counter | `{step}` | `space` | 0.5.0 |
+| `melange.store.compaction.lock_time` | counter | `s` | `space` | 0.5.0 |
 | `melange.subscriptions.active` | gauge | `{sub}` | `table` | 03 |
 | `melange.subscription.delta_rows` | counter | `{row}` | `table` | 03 |
 | `melange.subscription.rejected` | counter | `{sub}` | `reason` | 03 |
@@ -431,7 +431,7 @@ corresponds to a documented silent failure mode:
 ### The paged log, for MelangeLog
 
 The `melange.store.*` instruments with a `space` dimension describe the paged tier's logs (`main`
-for row records, `blob` for out-of-line bytes columns). FASTER and Tsavorite report
+for row records, `blob` for out-of-line bytes columns). FASTER reports
 `log_bytes` only; MelangeLog reports them all. Read them in pairs:
 
 - **`log_bytes` against `live_bytes`** is the garbage compaction has yet to reclaim. With the
@@ -521,7 +521,7 @@ names the *governing* floor rather than the anonymous LSN it respected: floor na
 pinned behind the head, and the log file's size in bytes — `1504 SnapshotFailed` (an automatic snapshot failing must not fail the committed transaction),
 `1505 AutoResidencyDemoted` — an `Auto` table crossing its threshold is the cliff arriving, and it announces
 itself — `1506 StaleSnapshotIgnored`, `1507 ResidencyChangeFailed`, `1508 ResidencyChanged` — the careful
-per-table override being applied at runtime (07) — `1512 PagedEngine`, Information, once per store at construction: which engine (`HotStore:PagedEngine`) holds the paged rows — `1517 HotStoreApplyFailed`, Critical, from the engine, with the exception: applying a record to the hot store failed after the record was appended to the commit log (for MelangeLog, a failed disk write or a full disk). The store may hold part of that transaction, so the engine refuses every write from then on (callers get `TransientRejectionException`; the transaction that hit it gets `CommitOutcomeUnknownException`) and the `melange-log` health check reports unhealthy. Restart: the store rebuilds from the commit log — `1518 PagedDiskSpaceLow`, Warning, when the hot store's disk falls under `HotStore:Compaction:MinFreeDiskBytes` (every five minutes while it stays there; Information once it recovers): compaction runs flat out — `1519 PagedLogOverCap`, Warning, when the paged logs exceed `HotStore:Compaction:MaxLogBytes` (same cadence; Information once back under): compaction runs flat out, and if the live bytes alone exceed the cap it cannot get under it — `1520 MelangeLogPrefetchUnavailable`, Information, once: the platform has no prefetch hint (madvise or PrefetchVirtualMemory), so MelangeLog's scans fault their pages one at a time — `1514 PagedLogSpaceReclaimed`, Debug, each time compaction deletes log segments (`HotStore:Compaction:*`): the space and the bytes given back — `1515 PagedCompactionSkippedSegment`, Warning: compaction could not read a segment (a corrupt record header or checksum) and leaves it in place for good, since deleting it could lose a live row; its space comes back at the next restart, which rebuilds the store from the commit log — `1516 PagedCompactionStopped`, Error, with the exception: compaction failed outside a segment read (an I/O error, say) and has stopped for this store, which carries on with its disk growing until a restart — `1513 TsavoriteNativeDeviceUnavailable`, Warning, once per store: Tsavorite's native Linux device failed a one-sector probe write when the store opened (no libaio; a read-only file system, where Tsavorite cannot write the libaio compatibility symlink it needs on some distributions; an architecture Garnet ships no build for; or a RID-specific publish that moved the native library), so the store writes through the managed device, correct and about 40% slower on writes — `1511 UnreadableRowSkipped` — Error-level, a paged row whose stored projection could not be read (its out-of-line blob payload disagreed with its main record, or a payload was missing) was skipped by a scan rather than throwing and taking the scanning connection down with it; the row is intact in the commit log, so a restart rebuilds it. Names the table, the key, and the reason so the one row can be found without bisecting the table. — `1509 SnapshotAlreadyRunning`, Debug-level, the
+per-table override being applied at runtime (07) — `1512 PagedEngine`, Information, once per store at construction: which engine (`HotStore:PagedEngine`) holds the paged rows — `1517 HotStoreApplyFailed`, Critical, from the engine, with the exception: applying a record to the hot store failed after the record was appended to the commit log (for MelangeLog, a failed disk write or a full disk). The store may hold part of that transaction, so the engine refuses every write from then on (callers get `TransientRejectionException`; the transaction that hit it gets `CommitOutcomeUnknownException`) and the `melange-log` health check reports unhealthy. Restart: the store rebuilds from the commit log — `1518 PagedDiskSpaceLow`, Warning, when the hot store's disk falls under `HotStore:Compaction:MinFreeDiskBytes` (every five minutes while it stays there; Information once it recovers): compaction runs flat out — `1519 PagedLogOverCap`, Warning, when the paged logs exceed `HotStore:Compaction:MaxLogBytes` (same cadence; Information once back under): compaction runs flat out, and if the live bytes alone exceed the cap it cannot get under it — `1520 MelangeLogPrefetchUnavailable`, Information, once: the platform has no prefetch hint (madvise or PrefetchVirtualMemory), so MelangeLog's scans fault their pages one at a time — `1514 PagedLogSpaceReclaimed`, Debug, each time compaction deletes log segments (`HotStore:Compaction:*`): the space and the bytes given back — `1515 PagedCompactionSkippedSegment`, Warning: compaction could not read a segment (a corrupt record header or checksum) and leaves it in place for good, since deleting it could lose a live row; its space comes back at the next restart, which rebuilds the store from the commit log — `1516 PagedCompactionStopped`, Error, with the exception: compaction failed outside a segment read (an I/O error, say) and has stopped for this store, which carries on with its disk growing until a restart — `1513`, retired in 0.5.0 with the Tsavorite engine (it was never in a release) — `1511 UnreadableRowSkipped` — Error-level, a paged row whose stored projection could not be read (its out-of-line blob payload disagreed with its main record, or a payload was missing) was skipped by a scan rather than throwing and taking the scanning connection down with it; the row is intact in the commit log, so a restart rebuilds it. Names the table, the key, and the reason so the one row can be found without bisecting the table. — `1509 SnapshotAlreadyRunning`, Debug-level, the
 only signal that snapshots now write outside the write lock: an interval short enough for two to
 overlap is a configuration to raise, not an error to chase; and `1510 LogTruncationPinned` — a truncation that
 removed **nothing** because a floor pinned it, naming the holder, its LSN, the head, the pinned record count,
@@ -718,7 +718,7 @@ host to register into, so the first one landed with phase 02's host integration 
 
 | Check | Unhealthy when | Phase |
 | --- | --- | --- |
-| `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**); or the hot store failed to apply a committed record, which closes the database to writes the same way (EventId 1517, 0.4.2) | 02 |
+| `melange-log` | The commit log is unwritable or out of disk — concretely, before startup opens it, or once a failed append has poisoned it (**shipped, 02**); or the hot store failed to apply a committed record, which closes the database to writes the same way (EventId 1517, 0.5.0) | 02 |
 | `melange-applier` | Any applier's lag exceeds `HealthChecks:ApplierLagThreshold` (**shipped, 08**) — the silent-stall alarm in health-endpoint form; `melange.applier.lag` is its metric form. **Degraded** while an applier reports a condition lag cannot show (`IApplierCondition`): the Postgres applier does so while `__melange_archive_dead_letter` holds rows, because a dead-lettered row leaves the checkpoint advancing and the lag at zero (road-to-0.3 phase 25) | 08 |
 | `melange-shard` | This node's shard ownership is contested — its hub lease expired and it has self-fenced (**shipped, 09**). Degraded while registered but owning nothing; healthy on hubs and single-node deployments, where ownership is not a question. | 09 |
 | `melange-capacity` | Two provision attempts failed or expired and the loop has stopped asking (**shipped, 14**) — EventId 1738 in health-endpoint form, cleared when a ticket-named node joins. Degraded while a ticket is outstanding; healthy off the hub or with no provisioner registered. | 14 |

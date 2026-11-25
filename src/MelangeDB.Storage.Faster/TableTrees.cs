@@ -174,8 +174,9 @@ internal sealed class ManagedTableTrees : TableTrees
 /// The native copy-on-write trees (<see cref="NativeTree"/>): the key directory as a plain tree
 /// from row key to an encoded <see cref="DirectoryEntry"/>, and each secondary index as a pair tree
 /// of (encoded value, row key). A paged row costs some tens of bytes of native memory and no
-/// managed objects; a version's pages are freed once the GC has collected every version, edit and
-/// enumerator that could still reach them.
+/// managed objects. A version's pages are freed as soon as the last version, edit and enumerator
+/// holding them releases them (<see cref="Holder"/>); the GC is only a backstop for a holder that is
+/// never released.
 /// <para>
 /// A directory value is <c>varint blob mask, varint (index values + 1, or 0 for none), then per
 /// index value: varint length, bytes</c>.
