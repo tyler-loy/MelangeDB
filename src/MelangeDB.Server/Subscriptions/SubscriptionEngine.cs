@@ -34,6 +34,8 @@ internal sealed class SubscriptionEngine
     // per-record scratch so nothing has to be cleared between commits; the sink map is reused.
     private readonly Dictionary<SubscriptionGroup.GroupKey, SubscriptionGroup> _groups = [];
     private readonly Dictionary<IDeltaSink, List<ServerSubscription>> _touched = [];
+    private readonly ColumnSetMemo _columnSets = new();
+    private readonly WireRowMemo _wire = new();
     private long _opCounter;
     private long _recordCounter;
 
@@ -123,6 +125,15 @@ internal sealed class SubscriptionEngine
 
     /// <summary>The number of groups, for tests: identical queries must collapse into one.</summary>
     internal int GroupCount => _groups.Count;
+
+    /// <summary>
+    /// Column-policy sets the fan-out has built, for tests: subscribers whose policies return
+    /// equal masks must share one, however many there are (#315).
+    /// </summary>
+    internal long ColumnSetsBuilt => _columnSets.SetsBuilt;
+
+    /// <summary>Projected rows the fan-out has built, for tests: one per distinct column set per op.</summary>
+    internal long ProjectionsBuilt => _wire.ProjectionsBuilt;
 
     /// <summary>
     /// The commits that land while an initial set is read off the write lock. Begun under the same
@@ -307,7 +318,8 @@ internal sealed class SubscriptionEngine
     {
 
         var recordStamp = ++_recordCounter;
-        var wire = default(WireRowMemo);
+        var wire = _wire;
+        _columnSets.Clear();
         var before = default(DecodedRow);
         var after = default(DecodedRow);
 
@@ -343,7 +355,7 @@ internal sealed class SubscriptionEngine
             // column map is serialized, never mutated.
             var key = op.Key.ToArray();
             var schema = subscriptions[0].Schema;
-            (wire ??= new WireRowMemo()).Reset(schema, op.Row);
+            wire.Reset(schema, op.Row);
 
             // The pre-image and the new row, each decoded at most once for every subscriber on the
             // table: every predicate on an indexed column and every row or column policy reads the
@@ -551,27 +563,26 @@ internal sealed class SubscriptionEngine
 
         if (newVisible && !oldVisible)
         {
-            var inserted = subscription.VisibleColumns(after);
-            return new WireRowOp(RowOpKind.Insert, key, wire.For(inserted), subscription.MaskFor(inserted));
+            var inserted = subscription.VisibleColumns(after, _columnSets);
+            return new WireRowOp(RowOpKind.Insert, key, wire.For(inserted), subscription.MaskFor(inserted, _columnSets));
         }
 
         if (newVisible && oldVisible)
         {
-            var newColumns = subscription.VisibleColumns(after);
+            var newColumns = subscription.VisibleColumns(after, _columnSets);
             if (newColumns is not null)
             {
                 // A restricted subscription must not emit when only invisible columns changed:
                 // beyond wasted bandwidth, an update frame for a [ServerOnly]-column change is a
                 // timing oracle. A mask that itself changed still emits, with the new columns.
-                var oldColumns = subscription.VisibleColumns(before);
-                if (ColumnsEqual(oldColumns, newColumns)
-                    && RowWire.ProjectedEqual(subscription.Schema, before.Span, after.Span, newColumns))
+                var oldColumns = subscription.VisibleColumns(before, _columnSets);
+                if (ColumnsEqual(oldColumns, newColumns) && wire.ProjectedEqual(newColumns, before.Span))
                 {
                     return null;
                 }
             }
 
-            return new WireRowOp(RowOpKind.Update, key, wire.For(newColumns), subscription.MaskFor(newColumns));
+            return new WireRowOp(RowOpKind.Update, key, wire.For(newColumns), subscription.MaskFor(newColumns, _columnSets));
         }
 
         if (!newVisible && oldVisible)
@@ -591,22 +602,42 @@ internal sealed class SubscriptionEngine
     /// Projections still cost a copy, so they are still memoized, keyed on the column set by
     /// reference: <see cref="ServerSubscription.ShareWireColumns"/> converges equal projections
     /// onto one instance at registration, so two hundred players running the same client share one
-    /// projected copy. A per-row column-policy mask is a fresh set on every call and so misses
-    /// deliberately — it is genuinely per row, and paying a set comparison to discover that would
-    /// cost more than the copy it saves.
+    /// projected copy. Column-policy sets come from <see cref="ColumnSetMemo"/>, which hands every
+    /// subscriber whose policies return equal masks the same instance, so they hit here too: one
+    /// projection per distinct mask per op rather than one per subscriber (#315).
     /// </para>
     /// </summary>
     private sealed class WireRowMemo
     {
         private readonly Dictionary<object, ReadOnlyMemory<byte>> _projected = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<object, bool> _unchanged = new(ReferenceEqualityComparer.Instance);
         private TableSchema _schema = null!;
         private ReadOnlyMemory<byte> _row;
+
+        /// <summary>Projections built since this memo was created. Tests read it.</summary>
+        public long ProjectionsBuilt { get; private set; }
 
         public void Reset(TableSchema schema, ReadOnlyMemory<byte> row)
         {
             _schema = schema;
             _row = row;
             _projected.Clear();
+            _unchanged.Clear();
+        }
+
+        /// <summary>
+        /// Whether the op left every column of <paramref name="columns"/> as it was in
+        /// <paramref name="before"/> (the op's pre-image), memoized per set like the projection.
+        /// </summary>
+        public bool ProjectedEqual(IReadOnlySet<string> columns, ReadOnlySpan<byte> before)
+        {
+            if (!_unchanged.TryGetValue(columns, out var equal))
+            {
+                equal = RowWire.ProjectedEqual(_schema, before, _row.Span, columns);
+                _unchanged[columns] = equal;
+            }
+
+            return equal;
         }
 
         public ReadOnlyMemory<byte> For(IReadOnlySet<string>? columns)
@@ -618,12 +649,15 @@ internal sealed class SubscriptionEngine
 
             var built = RowWire.Project(_schema, _row, columns);
             _projected[columns] = built;
+            ProjectionsBuilt++;
             return built;
         }
     }
 
     private static bool ColumnsEqual(IReadOnlySet<string>? left, IReadOnlySet<string>? right)
     {
+        if (ReferenceEquals(left, right))
+            return true;
         if (left is null || right is null)
             return left is null && right is null;
         return left.Count == right.Count && left.SetEquals(right);

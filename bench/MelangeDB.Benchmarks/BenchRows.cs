@@ -289,4 +289,116 @@ internal struct RangeRow
     public byte[] Payload;
 }
 
+/// <summary>
+/// A hundred-column entity with an owner: the column-policy fan-out's subject (#315), where the
+/// cost of a visible-column set grows with the column count.
+/// </summary>
+[Table(Public = true)]
+internal struct PolicyRow
+{
+    [PrimaryKey]
+    public ulong Id;
+
+    public Identity Owner;
+    public float X;
+    public float Y;
+    public float Z;
+    public int C00;
+    public int C01;
+    public int C02;
+    public int C03;
+    public int C04;
+    public int C05;
+    public int C06;
+    public int C07;
+    public int C08;
+    public int C09;
+    public int C10;
+    public int C11;
+    public int C12;
+    public int C13;
+    public int C14;
+    public int C15;
+    public int C16;
+    public int C17;
+    public int C18;
+    public int C19;
+    public int C20;
+    public int C21;
+    public int C22;
+    public int C23;
+    public int C24;
+    public int C25;
+    public int C26;
+    public int C27;
+    public int C28;
+    public int C29;
+    public int C30;
+    public int C31;
+    public int C32;
+    public int C33;
+    public int C34;
+    public int C35;
+    public int C36;
+    public int C37;
+    public int C38;
+    public int C39;
+    public int C40;
+    public int C41;
+    public int C42;
+    public int C43;
+    public int C44;
+    public int C45;
+    public int C46;
+    public int C47;
+    public int C48;
+    public int C49;
+    public int C50;
+    public int C51;
+    public int C52;
+    public int C53;
+    public int C54;
+    public int C55;
+    public int C56;
+    public int C57;
+    public int C58;
+    public int C59;
+    public int C60;
+    public int C61;
+    public int C62;
+    public int C63;
+    public int C64;
+    public int C65;
+    public int C66;
+    public int C67;
+    public int C68;
+    public int C69;
+    public int C70;
+    public int C71;
+    public int C72;
+    public int C73;
+    public int C74;
+    public int C75;
+    public int C76;
+    public int C77;
+    public int C78;
+    public int C79;
+    public int C80;
+    public int C81;
+    public int C82;
+    public int C83;
+    public int C84;
+    public int C85;
+    public int C86;
+    public int C87;
+    public int C88;
+    public int C89;
+    public int C90;
+    public int C91;
+    public int C92;
+    public int C93;
+    public int C94;
+    public int C95;
+}
+
 #pragma warning restore CS0649

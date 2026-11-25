@@ -241,6 +241,18 @@ internal sealed class ServerSubscription
         return visible;
     }
 
+    /// <summary>
+    /// The fan-out's form of <see cref="VisibleColumns(DecodedRow)"/>: the same columns, but a set
+    /// shared through <paramref name="memo"/> with every subscriber whose column policies return
+    /// equal masks for this row, valid until the memo is cleared for the next commit record.
+    /// </summary>
+    public IReadOnlySet<string>? VisibleColumns(DecodedRow row, ColumnSetMemo memo)
+    {
+        if (Evaluator is not { HasColumnPolicies: true } evaluator || Context is null)
+            return StaticWireColumns;
+        return evaluator.VisibleColumns(row, Context, StaticWireColumns ?? memo.AllColumns(Schema), memo);
+    }
+
     private HashSet<string> FreshWireColumns() =>
         StaticWireColumns is not null
             ? new HashSet<string>(StaticWireColumns, StringComparer.Ordinal)
@@ -254,6 +266,10 @@ internal sealed class ServerSubscription
     /// </summary>
     public ReadOnlyMemory<byte> MaskFor(IReadOnlySet<string>? visible) =>
         ReferenceEquals(visible, StaticWireColumns) ? default : RowWire.Mask(Descriptor.Columns, visible!);
+
+    /// <summary><see cref="MaskFor(IReadOnlySet{string})"/> for a set <paramref name="memo"/> handed out, computed once per set.</summary>
+    public ReadOnlyMemory<byte> MaskFor(IReadOnlySet<string>? visible, ColumnSetMemo memo) =>
+        ReferenceEquals(visible, StaticWireColumns) ? default : memo.WireMask(visible!, Descriptor);
 
     /// <summary>
     /// One row's wire form for this subscription: descriptor-shaped bytes and its column mask. The

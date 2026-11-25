@@ -5,4 +5,11 @@
     <Description>Attributes, identities, and core interfaces for MelangeDB. Dependency-free.</Description>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- The fan-out shares visible-column sets between subscribers whose column policies return
+         the same mask, and keys them on ColumnMask's content, which stays internal. -->
+    <InternalsVisibleTo Include="MelangeDB.Server" />
+    <InternalsVisibleTo Include="MelangeDB.Transport.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -64,6 +64,14 @@ internal abstract class TablePolicyEvaluator
 
     /// <summary><see cref="IntersectColumns(ReadOnlySpan{byte}, PolicyContext, HashSet{string})"/> over a shared decode.</summary>
     public abstract void IntersectColumns(DecodedRow row, PolicyContext ctx, HashSet<string> visible);
+
+    /// <summary>
+    /// The fan-out's form of <see cref="IntersectColumns(DecodedRow, PolicyContext, HashSet{string})"/>:
+    /// each column policy's mask is applied to <paramref name="start"/> through
+    /// <paramref name="memo"/>, so subscribers whose policies answer alike share one set. The
+    /// result may be <paramref name="start"/> itself, and must not be modified.
+    /// </summary>
+    public abstract IReadOnlySet<string> VisibleColumns(DecodedRow row, PolicyContext ctx, IReadOnlySet<string> start, ColumnSetMemo memo);
 }
 
 internal sealed class TablePolicyEvaluator<TRow> : TablePolicyEvaluator
@@ -112,6 +120,14 @@ internal sealed class TablePolicyEvaluator<TRow> : TablePolicyEvaluator
         if (_columnPolicies.Length == 0)
             return;
         Intersect(in Unsafe.Unbox<TRow>(row.Typed), ctx, visible);
+    }
+
+    public override IReadOnlySet<string> VisibleColumns(DecodedRow row, PolicyContext ctx, IReadOnlySet<string> start, ColumnSetMemo memo)
+    {
+        var visible = start;
+        foreach (var policy in _columnPolicies)
+            visible = memo.Apply(visible, policy.VisibleTo(in Unsafe.Unbox<TRow>(row.Typed), ctx));
+        return visible;
     }
 
     private bool AnyAdmits(in TRow typed, PolicyContext ctx)

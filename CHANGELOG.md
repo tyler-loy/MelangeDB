@@ -10,6 +10,17 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Changed
+
+- **A column policy no longer costs a column set and a projected row per subscriber (#315).** Every
+  subscriber on a table with an `IColumnPolicy` got a fresh visible-column set per op, built by
+  copying and filtering the table's columns, so the row was projected, its wire mask built and
+  its columns compared once per subscriber, all under the engine's write lock. Subscribers whose
+  masks are equal (same mode, same column names) now share one set, one projection and one wire
+  mask per op, whether the policy returns a cached `ColumnMask` or builds one per call. Several
+  column policies share each step of their intersection. What each subscriber receives is
+  unchanged.
+
 ## [0.5.0] — 2026-11-24
 
 The paged hot store gets a new default engine and moves its bookkeeping off the managed heap, and
