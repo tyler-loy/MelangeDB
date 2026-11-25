@@ -59,8 +59,12 @@ public interface IRowPolicy<TRow>
 /// while a column policy is evaluated per row on the delta path.
 /// </summary>
 /// <remarks>
-/// Policies are resolved once per server and must be thread-safe. Return cached
-/// <see cref="ColumnMask"/> instances where possible; the mask is evaluated per row per caller.
+/// Policies are resolved once per server and must be thread-safe. The mask is asked for per row
+/// per caller, so keep <see cref="VisibleTo"/> cheap. What the fan-out does with the answer is
+/// shared: callers given equal masks for a row (the same mode and the same column names, in the
+/// same order) share one column set and one projected row, so a policy with a few distinct
+/// answers costs about that many projections per row, however many callers watch it. Returning a
+/// cached <see cref="ColumnMask"/> instance still saves building one per call.
 /// </remarks>
 public interface IColumnPolicy<TRow>
     where TRow : struct
@@ -124,6 +128,48 @@ public readonly struct ColumnMask
             _ => new ColumnMask(ModeOnly, (_columns ?? []).Where(c => !columns.Contains(c, StringComparer.Ordinal)).ToArray()),
         };
     }
+
+    /// <summary>Whether this mask admits every column: <see cref="All"/>, or an empty exception list.</summary>
+    internal bool AdmitsAll => _mode == ModeAllExcept && (_columns is null || _columns.Length == 0);
+
+    /// <summary>
+    /// Whether <paramref name="other"/> admits exactly what this mask admits, judged by its mode
+    /// and its column names in order. The fan-out keys shared column sets on this, so it compares
+    /// content rather than the array reference: a policy that writes
+    /// <c>ColumnMask.All.Except(nameof(Row.X))</c> builds a new array on every call, and two masks
+    /// of different modes may hold one array. Names in another order compare unequal, which only
+    /// costs a cache miss.
+    /// </summary>
+    internal bool SameAs(in ColumnMask other)
+    {
+        if (_mode != other._mode)
+            return false;
+        if (ReferenceEquals(_columns, other._columns))
+            return true;
+        if (_columns is null || other._columns is null)
+            return false;
+        return _columns.AsSpan().SequenceEqual(other._columns);
+    }
+
+    /// <summary>A hash consistent with <see cref="SameAs"/>.</summary>
+    internal int ContentHash()
+    {
+        var hash = new HashCode();
+        hash.Add(_mode);
+        if (_columns is not null)
+        {
+            foreach (var column in _columns)
+                hash.Add(column, StringComparer.Ordinal);
+        }
+
+        return hash.ToHashCode();
+    }
+
+    /// <summary>
+    /// This mask over a private copy of its column array, for a cache to hold: the array came from
+    /// the policy, which could change it later.
+    /// </summary>
+    internal ColumnMask Detached() => _columns is null ? this : new ColumnMask(_mode, (string[])_columns.Clone());
 
     /// <summary>Whether this mask admits <paramref name="column"/>.</summary>
     public bool Admits(string column) => _mode switch
