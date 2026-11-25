@@ -330,6 +330,27 @@ internal sealed class TransactionDb : IDbView
         }
     }
 
+    /// <summary>
+    /// <see cref="Find{TRow}(object)"/> through <paramref name="found"/>, a cache of this table's
+    /// rows already looked up, keyed by encoded primary key, misses included. Only for a caller that
+    /// knows the state underneath cannot change while the cache lives
+    /// (<see cref="CommittedReadView.BeginRecord"/>). The guard still runs on every call; a hit
+    /// skips only the store read and the decode.
+    /// </summary>
+    internal TRow? Find<TRow>(object primaryKey, Dictionary<RowKey, TRow?> found)
+        where TRow : struct
+    {
+        ArgumentNullException.ThrowIfNull(primaryKey);
+        var schema = Resolve<TRow>(TableAccess.Read);
+        var key = SchemaKeyCodec.Encode(schema.PrimaryKey, primaryKey);
+        if (found.TryGetValue(key, out var cached))
+            return cached;
+
+        var row = FindByEncodedKey<TRow>(schema, key);
+        found[key] = row;
+        return row;
+    }
+
     private TRow? FindByEncodedKey<TRow>(TableSchema schema, RowKey key)
         where TRow : struct
     {

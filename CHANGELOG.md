@@ -20,6 +20,14 @@ All packages ship together at one version; there is no per-package versioning. S
   mask per op, whether the policy returns a cached `ColumnMask` or builds one per call. Several
   column policies share each step of their intersection. What each subscriber receives is
   unchanged.
+- **A policy's `Find` reads are cached for the length of one commit record's fan-out (#315).** A
+  row policy that reads the caller's own row (`ctx.Db.Find<T>(ctx.Caller)`) read and decoded it
+  from the store for both sides of every op, for every subscriber. Committed state cannot change
+  while a record fans out, so primary-key lookups through the policy view on the fan-out's
+  thread now remember what they found, misses included, until the record is done: each row is
+  decoded once per record. Reads from other threads (ad-hoc SQL, handoffs) are unaffected. A
+  cached row's reference-typed columns are shared between lookups, so a policy must not modify
+  them.
 
 ## [0.5.0] — 2026-11-24
 

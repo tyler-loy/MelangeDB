@@ -18,10 +18,13 @@ internal static class BenchSchema
 {
     private static readonly IReadOnlyList<TableSchema> Generated = LoadGenerated();
 
-    public static SchemaRegistry For(string tableName) =>
-        new([Generated.FirstOrDefault(t => t.Name == tableName)
+    public static SchemaRegistry For(string tableName) => For([tableName]);
+
+    /// <summary>A registry holding several generated tables, for a suite whose policies read across them.</summary>
+    public static SchemaRegistry For(params string[] tableNames) =>
+        new([.. tableNames.Select(tableName => Generated.FirstOrDefault(t => t.Name == tableName)
             ?? throw new InvalidOperationException(
-                $"No generated schema for '{tableName}'. Tables: {string.Join(", ", Generated.Select(t => t.Name))}.")]);
+                $"No generated schema for '{tableName}'. Tables: {string.Join(", ", Generated.Select(t => t.Name))}."))]);
 
     private static IReadOnlyList<TableSchema> LoadGenerated()
     {
@@ -399,6 +402,80 @@ internal struct PolicyRow
     public int C93;
     public int C94;
     public int C95;
+}
+
+/// <summary>
+/// A caller's own record, which a row policy on <see cref="PolicyRow"/> reads to judge visibility:
+/// wide, like the player row a game's policy reads, so a lookup is a full decode.
+/// </summary>
+[Table(Public = true)]
+internal struct ViewerRow
+{
+    [PrimaryKey]
+    public Identity Id;
+
+    public int Room;
+    public string Name;
+    public int V00;
+    public int V01;
+    public int V02;
+    public int V03;
+    public int V04;
+    public int V05;
+    public int V06;
+    public int V07;
+    public int V08;
+    public int V09;
+    public int V10;
+    public int V11;
+    public int V12;
+    public int V13;
+    public int V14;
+    public int V15;
+    public int V16;
+    public int V17;
+    public int V18;
+    public int V19;
+    public int V20;
+    public int V21;
+    public int V22;
+    public int V23;
+    public int V24;
+    public int V25;
+    public int V26;
+    public int V27;
+    public int V28;
+    public int V29;
+    public int V30;
+    public int V31;
+    public int V32;
+    public int V33;
+    public int V34;
+    public int V35;
+    public int V36;
+    public int V37;
+    public int V38;
+    public int V39;
+    public int V40;
+    public int V41;
+    public int V42;
+    public int V43;
+    public int V44;
+    public int V45;
+    public int V46;
+    public int V47;
+    public int V48;
+    public int V49;
+    public int V50;
+    public int V51;
+    public int V52;
+    public int V53;
+    public int V54;
+    public int V55;
+    public int V56;
+    public int V57;
+    public int V58;
+    public int V59;
 }
 
 #pragma warning restore CS0649

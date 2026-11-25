@@ -301,6 +301,11 @@ internal sealed class SubscriptionEngine
         foreach (var catchUp in _catchUps)
             catchUp.Records.Add(record);
 
+        // Policies read committed state through this view, and it cannot change until the record
+        // has fanned out, so the view caches their Find lookups for the record: a policy reading
+        // the caller's own row decodes it once per record, not twice per op (#315).
+        var reads = _engine.CommittedView as CommittedReadView;
+        reads?.BeginRecord();
         try
         {
             FanoutCore(record);
@@ -311,6 +316,10 @@ internal sealed class SubscriptionEngine
             // frames must not survive into the next one's.
             _touched.Clear();
             throw;
+        }
+        finally
+        {
+            reads?.EndRecord();
         }
     }
 
