@@ -42,7 +42,11 @@ public sealed class PolicyContext
 /// <remarks>
 /// Policies are resolved once per server and must be thread-safe. Evaluation runs on the commit
 /// fan-out path under the engine's write lock — keep it cheap, and read only through
-/// <see cref="PolicyContext.Db"/> or injected services.
+/// <see cref="PolicyContext.Db"/> or injected services. During the fan-out, a primary-key
+/// <c>Find</c> through <see cref="PolicyContext.Db"/> is cached until the commit record has fanned
+/// out, so reading the caller's own row costs one decode per record however many ops it judges.
+/// Rows it returns may share reference-typed columns (arrays, lists) with that cache: never
+/// modify them.
 /// </remarks>
 public interface IRowPolicy<TRow>
     where TRow : struct
