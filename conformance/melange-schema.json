@@ -1,6 +1,6 @@
 {
   "format": 2,
-  "generator": "0.5.1.0",
+  "generator": "0.5.2.0",
   "schemaHash": "8c99ab9ed45aac6951ad242708df6d6aba435524c42d7df6f5a4d2af37b9efbd",
   "module": "MelangeDB.Conformance",
   "enums": [
