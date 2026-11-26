@@ -62,6 +62,27 @@ internal static class DurableFile
     }
 
     /// <summary>
+    /// Renames <paramref name="source"/> over <paramref name="destination"/> atomically against a
+    /// process crash, without making it durable against power loss: no flush, no directory fsync.
+    /// For a sidecar rewritten often whose loss costs little, such as the event checkpoints, which
+    /// are saved after every delivered event and whose loss means only redelivery. On Windows it
+    /// renames with POSIX semantics as <see cref="Replace"/> does, so a reader holding the
+    /// destination open with <see cref="FileShare.Delete"/> does not refuse it (#321); a reader
+    /// that does not share delete still does, and that throws.
+    /// </summary>
+    public static void ReplaceUnflushed(string source, string destination)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            if (!Windows.TryReplaceAsPosix(source, destination, flush: false))
+                File.Move(source, destination, overwrite: true);
+            return;
+        }
+
+        File.Move(source, destination, overwrite: true);
+    }
+
+    /// <summary>
     /// Fsyncs a directory, making the entries created, renamed, or deleted in it durable. A no-op on
     /// Windows, where <see cref="Replace"/> gets the same guarantee from the rename itself.
     /// </summary>
@@ -119,7 +140,7 @@ internal static class DurableFile
         /// <c>MOVEFILE_WRITE_THROUGH</c> does it. Returns false when the filesystem or Windows
         /// version has no POSIX rename (FAT, or before Windows 10 1709), for the caller to fall back.
         /// </summary>
-        public static bool TryReplaceAsPosix(string source, string destination)
+        public static bool TryReplaceAsPosix(string source, string destination, bool flush = true)
         {
             using var handle = CreateFileW(Path.GetFullPath(source), Delete | Synchronize | GenericWrite, ShareAll, 0, OpenExisting, 0, 0);
             if (handle.IsInvalid)
@@ -143,7 +164,7 @@ internal static class DurableFile
                 throw Failed(error, source, destination);
             }
 
-            if (!FlushFileBuffers(handle))
+            if (flush && !FlushFileBuffers(handle))
                 throw Failed(Marshal.GetLastPInvokeError(), source, destination);
             return true;
         }
