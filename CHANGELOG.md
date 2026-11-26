@@ -10,6 +10,21 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Fixed
+
+- **On Windows, an online backup could stop an event subscriber for good, or fail itself**
+  ([#321](https://github.com/tyler-loy/MelangeDB/issues/321)). The bus replaces
+  `melange.events.json` after every delivered event, and the backup read it with a handle that
+  refused the replace. The replace then threw out of the subscriber's dispatch loop, and that
+  subscriber received nothing more until a restart; or the backup opened the file mid-replace and
+  failed. The backup now reads it with a handle that shares delete and retries a sharing
+  violation, and the bus replaces it with the POSIX-semantics rename the snapshot already uses. A
+  save that still fails, because some other process holds the file, retries briefly and then
+  keeps the checkpoints in memory for the next save (EventIds 1406 and 1407): a lost save only
+  means redelivery. A dispatch loop no longer ends on any failure outside a handler; it logs
+  EventId 1408 and resumes from its checkpoint after a backoff. The hourly checkpoint sweep, which
+  could fail the same way on a timer thread, is covered too.
+
 ## [0.5.1] — 2026-11-25
 
 Subscription fan-out through column and row policies gets much cheaper. Equal column masks share

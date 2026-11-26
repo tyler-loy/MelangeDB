@@ -39,6 +39,9 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
     private EventCheckpointStore? _store;
     private DeadLetterStore? _deadLetters;
     private ITimer? _sweepTimer;
+
+    /// <summary>Whether the last checkpoint save failed; guarded by <see cref="_checkpointLock"/>.</summary>
+    private bool _saveFailing;
     private int _windowEventCount;
     private ulong _windowStartLsn = 1;
     private ulong _publishedHead;
@@ -162,7 +165,7 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
                     _subscribers.Add(subscriber);
                 }
 
-                _store.Save();
+                SaveCheckpointsLocked();
             }
 
             lock (_windowLock)
@@ -224,7 +227,8 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
 
         lock (_checkpointLock)
         {
-            _store?.Save();
+            if (_store is not null)
+                SaveCheckpointsLocked();
         }
 
         _cts.Dispose();
@@ -297,19 +301,41 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
     private async Task RunSubscriberAsync(Subscriber subscriber)
     {
         var ct = _cts.Token;
-        try
+        var failures = 0;
+        while (true)
         {
-            while (true)
+            try
             {
                 // The timeout is the durability backstop, not the delivery path: the commit-time
                 // kick can arrive before the record's fsync completes, and the drain's capped log
                 // read then stops short — on a quiet engine nothing would ever re-kick.
                 await subscriber.Signal.WaitAsync(TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
                 await DrainAsync(subscriber, ct).ConfigureAwait(false);
+                failures = 0;
             }
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception exception)
+            {
+                // Nothing may end this loop but the bus stopping (#321): a dead loop is a subscriber
+                // that silently receives nothing more until a restart. Handler failures never get
+                // here (they retry, then dead-letter); this is the drain's own machinery failing,
+                // a log read for one. The checkpoint stops short of the failure, so the next drain
+                // starts from it again.
+                failures++;
+                var delay = BackoffDelay(1_000, failures);
+                LogMessages.DispatchLoopFailed(_logger, subscriber.Name, delay.TotalMilliseconds, exception);
+                try
+                {
+                    await Task.Delay(delay, _time, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+            }
         }
     }
 
@@ -486,7 +512,28 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
             }
 
             if (persist)
-                _store.Save();
+                SaveCheckpointsLocked();
+        }
+    }
+
+    /// <summary>
+    /// Writes the checkpoint sidecar; the caller holds <see cref="_checkpointLock"/>. A failed
+    /// save leaves the checkpoints in memory for the next one to write (#321), and only the change
+    /// is logged: 1406 when saving starts failing, 1407 when it works again, never once per event.
+    /// </summary>
+    private void SaveCheckpointsLocked()
+    {
+        var failure = _store!.Save();
+        if (failure is not null)
+        {
+            if (!_saveFailing)
+                LogMessages.CheckpointSaveFailed(_logger, _store.FilePath, failure);
+            _saveFailing = true;
+        }
+        else if (_saveFailing)
+        {
+            _saveFailing = false;
+            LogMessages.CheckpointSaveRecovered(_logger, _store.FilePath);
         }
     }
 
@@ -530,7 +577,7 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
             }
 
             if (dirty)
-                _store.Save();
+                SaveCheckpointsLocked();
         }
 
         _sweepTimer?.Change(SweepPeriod(options.SubscriberExpirySeconds), SweepPeriod(options.SubscriberExpirySeconds));
@@ -624,6 +671,35 @@ public sealed class MelangeEventBus : ICommitObserver, IEventInbox, IDisposable
 
         public static void SubscriberLostPlace(ILogger logger, string subscriber, ulong evictedLsn, ulong head) =>
             SubscriberLostPlaceMessage(logger, subscriber, evictedLsn, head, null);
+
+        private static readonly Action<ILogger, string, Exception?> CheckpointSaveFailedMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Warning,
+                new EventId(1406, "EventCheckpointSaveFailed"),
+                "Could not save the event subscriber checkpoints to '{Path}': another process holds the file, or the disk " +
+                "refused the write. Delivery continues and the checkpoints stay in memory; the next save writes them. A " +
+                "restart before then redelivers events handled since the last save.");
+
+        public static void CheckpointSaveFailed(ILogger logger, string path, Exception failure) =>
+            CheckpointSaveFailedMessage(logger, path, failure);
+
+        private static readonly Action<ILogger, string, Exception?> CheckpointSaveRecoveredMessage =
+            LoggerMessage.Define<string>(
+                LogLevel.Information,
+                new EventId(1407, "EventCheckpointSaveRecovered"),
+                "The event subscriber checkpoints were saved to '{Path}' again after failing.");
+
+        public static void CheckpointSaveRecovered(ILogger logger, string path) =>
+            CheckpointSaveRecoveredMessage(logger, path, null);
+
+        private static readonly Action<ILogger, string, double, Exception?> DispatchLoopFailedMessage =
+            LoggerMessage.Define<string, double>(
+                LogLevel.Error,
+                new EventId(1408, "EventDispatchLoopFailed"),
+                "Event subscriber '{Subscriber}''s dispatch loop failed outside any handler; it resumes from its checkpoint in {DelayMs:F0}ms.");
+
+        public static void DispatchLoopFailed(ILogger logger, string subscriber, double delayMs, Exception failure) =>
+            DispatchLoopFailedMessage(logger, subscriber, delayMs, failure);
     }
 }
 

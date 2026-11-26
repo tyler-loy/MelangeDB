@@ -96,8 +96,8 @@ internal static class OnlineEngineCapture
             // Atomic-swap sidecar: a concurrent rewrite hands us the old or the new file, both
             // complete. Entries past the fence clamp at restore, like every rewound checkpoint.
             var eventsPath = Path.Combine(Path.GetDirectoryName(engine.LogFile.FilePath)!, "melange.events.json");
-            if (File.Exists(eventsPath))
-                DataDirectoryCapture.WriteSidecarFrame(writer, "melange.events.json", File.ReadAllBytes(eventsPath));
+            if (ReadLiveSidecar(eventsPath) is { } events)
+                DataDirectoryCapture.WriteSidecarFrame(writer, "melange.events.json", events);
 
             // The shape history is LSN-keyed and epoch-independent, so the live engine's copy is
             // exactly what the archive needs — and entries only ever append at boot, so a live
@@ -115,6 +115,43 @@ internal static class OnlineEngineCapture
             snapshot?.Dispose();
         }
     }
+
+    /// <summary>Tries at reading a sidecar the live engine is replacing: the first, then retries.</summary>
+    private const int SidecarReadAttempts = 10;
+
+    /// <summary>
+    /// Reads a sidecar the live engine replaces atomically (the event checkpoints, after every
+    /// delivered event), or null if there is none. Two Windows hazards, both #321: a handle that
+    /// does not share delete makes the engine's replace fail, so this one shares it, as
+    /// <see cref="OpenLiveSnapshot"/> does; and an open that lands in the middle of a replace fails
+    /// with a sharing violation, so it retries briefly. Either way the bytes are the old file or
+    /// the new one, both complete.
+    /// </summary>
+    internal static byte[]? ReadLiveSidecar(string path)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                using var stream = OpenLiveSidecar(path);
+                var bytes = new byte[stream.Length];
+                stream.ReadExactly(bytes);
+                return bytes;
+            }
+            catch (FileNotFoundException)
+            {
+                return null;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException && attempt < SidecarReadAttempts)
+            {
+                Thread.Sleep(5 * attempt);
+            }
+        }
+    }
+
+    /// <summary>A read handle on a live sidecar that never blocks the engine replacing it.</summary>
+    internal static FileStream OpenLiveSidecar(string path) =>
+        new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
     /// <summary>
     /// Opens the snapshot sharing write and delete: a snapshot completing mid-stream atomically
