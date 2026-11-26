@@ -241,6 +241,72 @@ public class EventBusTests : IDisposable
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 
+    /// <summary>
+    /// #321. Something else holding the checkpoint sidecar open, as a backup reading it does,
+    /// makes the replace fail on Windows. That save is lost, which costs at most a redelivery,
+    /// but it used to throw out of the dispatch loop and end it: the subscriber silently got
+    /// nothing more until a restart. (On Linux the replace succeeds and this passes trivially.)
+    /// </summary>
+    [Fact]
+    public async Task A_checkpoint_save_that_loses_the_file_to_another_reader_never_stops_delivery()
+    {
+        using var host = await StartHostAsync();
+        var probe = Probe(host);
+        var sidecar = Path.Combine(_root, "log", "melange.events.json");
+        host.Reducers().Call("PublishNote", TestApp.Caller, "before");
+        await WaitDeliveredAsync(probe, 2);
+
+        // FileShare.Read only, exactly what File.ReadAllBytes opens with. The open itself can land
+        // in the middle of one of the bus's replaces, as a backup's can, so it retries.
+        using (await OpenUntilAvailableAsync(sidecar))
+        {
+            host.Reducers().Call("PublishNote", TestApp.Caller, "during");
+            await WaitDeliveredAsync(probe, 2);
+            if (OperatingSystem.IsWindows())
+                await EventProbe.WaitUntilAsync(() => _logs.Has(1406), "no EventCheckpointSaveFailed (1406) log entry");
+        }
+
+        var lsn = host.Reducers().Call("PublishNote", TestApp.Caller, "after");
+        await WaitDeliveredAsync(probe, 2);
+        Assert.Contains("audit:after", probe.Received);
+        Assert.Contains("failing:after", probe.Received);
+
+        // The next save after the handle closed caught the file up.
+        await EventProbe.WaitUntilAsync(
+            () => SidecarLsns(sidecar) is { } lsns && lsns.All(saved => saved >= lsn),
+            "the sidecar never caught up after the reader let go");
+        await host.StopAsync(TestContext.Current.CancellationToken);
+    }
+
+    private static async Task<FileStream> OpenUntilAvailableAsync(string path)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException && attempt < 100)
+            {
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+            }
+        }
+    }
+
+    /// <summary>The sidecar's checkpoints, or null while a replace has it.</summary>
+    private static ulong[]? SidecarLsns(string path)
+    {
+        try
+        {
+            return [.. JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllBytes(path))!
+                .Values.Select(entry => entry.GetProperty("Lsn").GetUInt64())];
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     [Fact]
     public async Task A_subscriber_down_for_N_transactions_catches_up_from_its_checkpoint_on_restart()
     {

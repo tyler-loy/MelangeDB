@@ -40,12 +40,38 @@ internal sealed class EventCheckpointStore
     /// <summary>All entries, keyed by subscriber name. Mutated by the bus under its own lock.</summary>
     public Dictionary<string, Entry> Entries { get; } = [];
 
-    /// <summary>Persists the entries, replacing the file atomically.</summary>
-    public void Save()
+    /// <summary>Tries per save: the first, then retries a few milliseconds apart.</summary>
+    private const int SaveAttempts = 4;
+
+    /// <summary>
+    /// Persists the entries, replacing the file atomically. Returns the failure rather than
+    /// throwing when the file stays unavailable (#321): on Windows a replace fails while any other
+    /// handle holds the file without <see cref="FileShare.Delete"/>, as a backup reading it, an
+    /// antivirus scan or an indexer can. A lost save costs at most a redelivery, so the caller
+    /// keeps its checkpoints in memory and the next save writes them; a save must never take down
+    /// a dispatch loop or the sweep timer.
+    /// </summary>
+    public Exception? Save()
     {
         var temp = _path + ".tmp";
-        File.WriteAllBytes(temp, JsonSerializer.SerializeToUtf8Bytes(Entries, SerializerOptions));
-        File.Move(temp, _path, overwrite: true);
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(Entries, SerializerOptions);
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                File.WriteAllBytes(temp, bytes);
+                DurableFile.ReplaceUnflushed(temp, _path);
+                return null;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                if (attempt >= SaveAttempts)
+                    return exception;
+
+                // A reader's window is short: a backup copies a few kilobytes and lets go.
+                Thread.Sleep(5 * attempt);
+            }
+        }
     }
 
     internal sealed class Entry
