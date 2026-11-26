@@ -25,6 +25,24 @@ All packages ship together at one version; there is no per-package versioning. S
   EventId 1408 and resumes from its checkpoint after a backoff. The hourly checkpoint sweep, which
   could fail the same way on a timer thread, is covered too.
 
+- **A transfer that failed before its import left the player stuck**
+  ([#320](https://github.com/tyler-loy/MelangeDB/issues/320)). The hub counted every failure
+  outside the import step as unresolved. These are the failures:
+  - the origin answering the freeze with an error: an `IHandoffSet.Collect` that threw, an empty
+    transfer set or a fenced owner;
+  - a freeze that timed out;
+  - no live link to the origin or the destination.
+
+  An unresolved transfer notifies the gateway only when a reconciler reports the outcome. A freeze
+  that never landed has no reconciler, so the gateway held the player's calls until it refused
+  them, and the player's only way out was to reconnect. When the freeze had landed but the
+  destination was down, the player stayed frozen until the destination came back. The import is
+  only sent after the freeze, so a failure before it means the destination imported nothing.
+  Such a transfer now counts as aborted: the hub asks the origin to drop any freeze, tells the
+  gateway to release the held calls to the origin, and logs EventId 1766. A transfer that fails
+  at the import itself is unchanged, since the import may have landed. An app's `IHandoffSet` can
+  therefore refuse a transfer by throwing from `Collect`.
+
 ## [0.5.1] — 2026-11-25
 
 Subscription fan-out through column and row policies gets much cheaper. Equal column masks share
