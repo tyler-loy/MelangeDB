@@ -10,6 +10,13 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-11-26
+
+Two fixes for things that could leave the server stuck. On Windows, an online backup can no longer
+stop an event subscriber or fail on the checkpoint file it shares with the event bus. A player
+transfer that fails before its import now aborts and releases the player's held calls. Nothing
+changes on the wire, on disk, or in the public API, so upgrading needs no migration.
+
 ### Fixed
 
 - **On Windows, an online backup could stop an event subscriber for good, or fail itself**
