@@ -10,6 +10,76 @@ namespace MelangeDB.Cluster.Tests;
 /// </summary>
 public class HandoffRecoveryTests
 {
+    /// <summary>
+    /// #320. The origin answers the freeze with an error, here because it holds no rows for the
+    /// player (an IHandoffSet that throws, or a fenced owner, answer the same way). Nothing froze
+    /// and nothing was imported, so the saga is aborted and the gateway is told: before the fix it
+    /// ended unresolved, no reconciler ever reported it, and the gateway held the player's calls
+    /// until it refused them.
+    /// </summary>
+    [Fact]
+    public async Task A_freeze_the_origin_refuses_aborts_and_tells_the_gateway()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(shardNodes: 2, heartbeatMs: 150, failureTimeoutMs: 60_000);
+        var player = TestTokens.IdentityOf("rowless-traveller");
+        await cluster.EnsureShardOwnedAsync(1);
+        await cluster.EnsureShardOwnedAsync(2);
+        var gateway = new RecordingObserver();
+        using var registration = cluster.Hub.Handoffs.Register(player, gateway);
+
+        var refused = await Assert.ThrowsAnyAsync<Exception>(() => cluster.Coordinator.TransferPlayerAsync(
+            player, new ShardKey(1), new ShardKey(2), TestContext.Current.CancellationToken));
+        Assert.Contains("transfer set", refused.Message);
+
+        Assert.Equal(["started", "closed False"], gateway.Events);
+    }
+
+    /// <summary>
+    /// #320. The freeze landed, but the destination's owner is unreachable, so the import is never
+    /// sent. The hub aborts the freeze at once. Before the fix the saga ended unresolved: the
+    /// origin's reconciler could not resolve it while the destination stayed down, so the player
+    /// was frozen, writable nowhere, for as long as that lasted.
+    /// </summary>
+    [Fact]
+    public async Task A_destination_unreachable_after_the_freeze_aborts_it_at_once()
+    {
+        await using var cluster = await ClusterFixture.StartAsync(shardNodes: 2, heartbeatMs: 150, failureTimeoutMs: 60_000);
+        var player = TestTokens.IdentityOf("stranded-traveller");
+        var originOwner = await cluster.EnsureShardOwnedAsync(1);
+        var destinationOwner = await cluster.EnsureShardOwnedAsync(2);
+        Assert.NotEqual(originOwner.Name, destinationOwner.Name);
+        var origin = originOwner.Runtime.TryGetShard(new ShardKey(1))!;
+        origin.ReducerHost.Call("GrantGold", player, 1u, 500);
+        var gateway = new RecordingObserver();
+        using var registration = cluster.Hub.Handoffs.Register(player, gateway);
+
+        // The long failure timeout keeps the dead node the destination's owner.
+        await cluster.StopNodeAsync(destinationOwner.Name);
+        await ClusterFixture.WaitUntilAsync(
+            () => !cluster.Hub.HasLiveLink(destinationOwner.Name), "the hub saw the destination's link go");
+
+        await Assert.ThrowsAnyAsync<Exception>(() => cluster.Coordinator.TransferPlayerAsync(
+            player, new ShardKey(1), new ShardKey(2), TestContext.Current.CancellationToken));
+
+        Assert.Empty(origin.PendingFreezes);
+        origin.ReducerHost.Call("GrantGold", player, 1u, 1);
+        Assert.Equal(501, origin.Engine.CommittedView.Find<PlayerState>(player)!.Value.Gold);
+        Assert.Equal(["started", "closed False"], gateway.Events);
+    }
+
+    private sealed class RecordingObserver : IPlayerHandoffObserver
+    {
+        public System.Collections.Concurrent.ConcurrentQueue<string> Events { get; } = new();
+
+        public void OnApproach(ShardKey from, ShardKey to) => Events.Enqueue("approach");
+
+        public void OnStarted(ShardKey from, ShardKey to) => Events.Enqueue("started");
+
+        public void OnDestinationAuthoritative(ShardKey from, ShardKey to) => Events.Enqueue("authoritative");
+
+        public void OnClosed(ShardKey from, ShardKey to, bool success) => Events.Enqueue($"closed {success}");
+    }
+
     [Fact]
     public async Task Killing_the_destination_before_its_import_aborts_and_the_player_stays_on_the_origin()
     {

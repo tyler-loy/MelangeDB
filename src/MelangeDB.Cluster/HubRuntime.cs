@@ -409,10 +409,17 @@ internal sealed partial class HubRuntime : IDisposable
         Handoffs.NotifyStarted(player, from, to);
         var completed = false;
         var aborted = false;
+
+        // Whether the import may be in flight. Until it is, the destination cannot hold the player,
+        // so every failure before that point is a definite abort (#320); only the import step can
+        // end unresolved.
+        var importSent = false;
+        ShardAssignment? origin = null;
+        NodeLink? originLink = null;
         try
         {
-            var origin = _membership.GetAssignment(from);
-            var originLink = origin?.NodeName is { } originNode
+            origin = _membership.GetAssignment(from);
+            originLink = origin?.NodeName is { } originNode
                 ? LinkOf(originNode)
                     ?? throw new InvalidOperationException(
                         $"No live link to '{originNode}', the owner of {from}; the player cannot be frozen, so the transfer cannot start.")
@@ -433,6 +440,8 @@ internal sealed partial class HubRuntime : IDisposable
             var destinationLink = LinkOf(destination.NodeName!)
                 ?? throw new InvalidOperationException($"No live link to '{destination.NodeName}', the owner of {to}.");
 
+            // The test hook stands in for the import step's own failures, so it counts as sent.
+            importSent = true;
             if (HandoffStepHook is { } beforeImport)
                 await beforeImport("import").ConfigureAwait(false);
             var importStarted = Stopwatch.GetTimestamp();
@@ -453,13 +462,8 @@ internal sealed partial class HubRuntime : IDisposable
             {
                 // The destination *replied* with an error: the import definitively did not
                 // persist, so aborting the origin's freeze is safe and the player stays put.
-                if (originLink is not null && origin is not null)
-                {
-                    await originLink.RequestAsync(
-                        "handoff-abort", new HandoffRelease(handoffId, from.Value, origin.FencingToken), ct).ConfigureAwait(false);
-                }
-
                 aborted = true;
+                await AbortFreezeAsync(originLink, origin, handoffId, from, ct).ConfigureAwait(false);
                 LogHandoffAborted(_logger, handoffId, player.ToString(), from.Value, to.Value);
                 throw;
             }
@@ -498,6 +502,18 @@ internal sealed partial class HubRuntime : IDisposable
             _handoffDuration.Record(sagaElapsed.TotalMilliseconds);
             LogHandoffCompleted(_logger, handoffId, player.ToString(), from.Value, to.Value);
         }
+        catch (Exception failure) when (!importSent)
+        {
+            // Failed before the import was sent: no origin link, a freeze the origin refused (an
+            // IHandoffSet that threw, an empty transfer set, a fenced owner), a freeze that timed
+            // out, or a destination nobody can reach. The destination never heard of the player, so
+            // it stays on the origin, and the gateway must be told, or it holds the player's calls
+            // until it refuses them, forever: no reconciler reports a freeze that never landed.
+            aborted = true;
+            await AbortFreezeAsync(originLink, origin, handoffId, from, ct).ConfigureAwait(false);
+            LogHandoffAbortedBeforeImport(_logger, handoffId, player.ToString(), from.Value, to.Value, failure);
+            throw;
+        }
         finally
         {
             _sagas.TryRemove(handoffId, out _);
@@ -510,6 +526,29 @@ internal sealed partial class HubRuntime : IDisposable
 
             // An unresolved exit notifies nothing: the gateway keeps queueing until this node's
             // or the origin's reconciler learns the truth and reports it (handoff-resolved).
+        }
+    }
+
+    /// <summary>
+    /// Asks the origin to drop a freeze for a saga that will import nothing, best effort. The abort
+    /// is idempotent, so it costs nothing when no freeze landed. When it cannot get through, a
+    /// freeze that did land is the origin's reconciler's to resolve: it asks this hub, learns the
+    /// destination never imported, aborts and reports it. Until then the player's calls are refused
+    /// as frozen, which is a short, visible failure rather than a hang.
+    /// </summary>
+    private static async Task AbortFreezeAsync(
+        NodeLink? originLink, ShardAssignment? origin, string handoffId, ShardKey from, CancellationToken ct)
+    {
+        if (originLink is null || origin is null)
+            return;
+        try
+        {
+            await originLink.RequestAsync(
+                "handoff-abort", new HandoffRelease(handoffId, from.Value, origin.FencingToken), ct).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The origin's reconciler covers it, as above.
         }
     }
 
@@ -1519,6 +1558,9 @@ internal sealed partial class HubRuntime : IDisposable
     private NodeLink? LinkOf(string nodeName) =>
         _linksByNode.TryGetValue(nodeName, out var link) && link.IsAlive ? link : null;
 
+    /// <summary>Whether this hub holds a live link to the node. For tests.</summary>
+    internal bool HasLiveLink(string nodeName) => LinkOf(nodeName) is not null;
+
     private async Task AcceptLoopAsync()
     {
         var ct = _stopped.Token;
@@ -2259,6 +2301,12 @@ internal sealed partial class HubRuntime : IDisposable
     [LoggerMessage(EventId = 1706, EventName = "HandoffAborted", Level = LogLevel.Warning,
         Message = "Handoff {HandoffId}: import failed; player {Player} stays on shard {FromShard} (destination was {ToShard}).")]
     private static partial void LogHandoffAborted(ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard);
+
+    [LoggerMessage(EventId = 1766, EventName = "HandoffAbortedBeforeImport", Level = LogLevel.Warning,
+        Message = "Handoff {HandoffId}: failed before any import was sent, so nothing was imported; player {Player} stays on " +
+            "shard {FromShard} (destination was {ToShard}).")]
+    private static partial void LogHandoffAbortedBeforeImport(
+        ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard, Exception failure);
 
     [LoggerMessage(EventId = 1710, EventName = "HandoffUnresolved", Level = LogLevel.Warning,
         Message = "Handoff {HandoffId}: the import request to shard {ToShard}'s owner timed out or the link died — the " +

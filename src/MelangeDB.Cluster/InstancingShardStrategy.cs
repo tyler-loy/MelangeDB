@@ -73,9 +73,16 @@ public interface IHandoffCollector
 
 /// <summary>
 /// Selects the rows that follow a player between shards — the "player-owned tables share the
-/// player's shard key" convention made concrete. Called on the origin shard's engine, after the
-/// player is frozen, with a read-only view of that shard.
+/// player's shard key" convention made concrete. Called on the origin shard's engine, with a
+/// read-only view of that shard, under the engine's write lock: the rows it adds are frozen in the
+/// same hold, so no write lands between collecting them and freezing them.
 /// </summary>
+/// <remarks>
+/// Throwing from <see cref="Collect"/> refuses the transfer. Nothing is frozen and nothing is
+/// imported, so the player stays where it is, the transfer counts as aborted, and the player's
+/// gateway stops holding its calls (EventId 1766). Use it for a transfer whose premise no longer
+/// holds once the origin looks, such as an entity that has already moved on.
+/// </remarks>
 public interface IHandoffSet
 {
     /// <summary>Adds every row that must move with <paramref name="player"/> out of <paramref name="shard"/>.</summary>
