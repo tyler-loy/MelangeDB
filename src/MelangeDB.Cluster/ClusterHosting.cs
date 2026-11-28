@@ -113,7 +113,16 @@ public static class MelangeClusterServiceCollectionExtensions
     public static IServiceCollection AddMelangeCluster(this IServiceCollection services)
     {
         ArgumentNullException.ThrowIfNull(services);
-        services.TryAddSingleton<IMembershipStore, InMemoryMembershipStore>();
+        // A hub keeps membership beside its own commit log, so a restart on kept data remembers the
+        // terms and originators it minted (#314). Only a hub uses the store; anything else gets
+        // the in-memory one and touches no file.
+        services.TryAddSingleton<IMembershipStore>(static provider =>
+        {
+            var options = provider.GetRequiredService<IOptionsMonitor<MelangeDbOptions>>().CurrentValue;
+            return options.Cluster.Role == ClusterRole.Hub
+                ? new FileMembershipStore(Path.Combine(options.CommitLog.Path, FileMembershipStore.FileName))
+                : new InMemoryMembershipStore();
+        });
         services.Replace(ServiceDescriptor.Singleton<IEventTransport, ClusterEventTransport>());
         services.TryAddSingleton<HubRuntime>();
         services.TryAddSingleton<ShardNodeRuntime>();

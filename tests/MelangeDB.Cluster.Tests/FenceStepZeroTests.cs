@@ -154,6 +154,9 @@ public class FenceStepZeroTests
 
         public IReadOnlyList<ShardAssignment> AssignUnowned(DateTimeOffset now) => _inner.AssignUnowned(now);
 
+        public ShardAssignment? RaiseTerm(ShardKey shard, string nodeName, long heldToken, long logTerm) =>
+            _inner.RaiseTerm(shard, nodeName, heldToken, logTerm);
+
         public ShardAssignment Reassign(ShardKey shard, string toNode, DateTimeOffset now) => _inner.Reassign(shard, toNode, now);
 
         public bool RemoveShard(ShardKey shard) => _inner.RemoveShard(shard);

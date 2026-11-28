@@ -89,7 +89,9 @@ internal static class LogSegments
         {
             throw new StaleTermException(
                 $"'{logDirectory}' is at ownership term {current}, and this owner holds term {requested}: another node " +
-                "has owned the shard since. A previous owner never writes again; reopen under the current fencing token.");
+                "has owned the shard since. A previous owner never writes again; reopen under the current fencing token.",
+                current,
+                requested);
         }
 
         var activePath = Path.Combine(logDirectory, manifest.ActiveSegment.File);
@@ -356,4 +358,28 @@ internal sealed class TailGapException : InvalidOperationException
 /// owner, which must never write again. Not transient for that owner; the shard's current owner
 /// holds the current term.
 /// </summary>
-public sealed class StaleTermException(string message) : InvalidOperationException(message);
+/// <remarks>
+/// It can also mean the membership store forgot the terms it minted, such as an in-memory store
+/// after a hub restart, or a store restored from an older backup (#314). A cluster node reports
+/// <see cref="LogTerm"/> to the hub, which raises the shard's fencing token past it.
+/// </remarks>
+public sealed class StaleTermException : InvalidOperationException
+{
+    public StaleTermException(string message)
+        : base(message)
+    {
+    }
+
+    public StaleTermException(string message, long logTerm, long ownerTerm)
+        : base(message)
+    {
+        LogTerm = logTerm;
+        OwnerTerm = ownerTerm;
+    }
+
+    /// <summary>The term the log directory is already at: the highest term that has written it.</summary>
+    public long LogTerm { get; }
+
+    /// <summary>The lower term the refused owner held.</summary>
+    public long OwnerTerm { get; }
+}

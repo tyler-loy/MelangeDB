@@ -1610,7 +1610,8 @@ internal sealed partial class HubRuntime : IDisposable
             case "heartbeat":
                 RecordHeartbeat(session.NodeName);
                 _membership.Heartbeat(session.NodeName, _time.GetUtcNow());
-                if (body?.Read<HeartbeatRequest>() is { Loads.Length: > 0 } heartbeat)
+                var heartbeat = body?.Read<HeartbeatRequest>();
+                if (heartbeat is { Loads.Length: > 0 })
                 {
                     Load.Record(session.NodeName, heartbeat.Loads, _time.GetUtcNow());
                     foreach (var load in heartbeat.Loads)
@@ -1619,6 +1620,10 @@ internal sealed partial class HubRuntime : IDisposable
                             _ceilings[load.Shard] = (load.DurableLsn, session.NodeName);
                     }
                 }
+
+                // Before the reply is built, so a raised term reaches the node in this reply.
+                if (heartbeat?.StaleTerms is { Length: > 0 } staleTerms)
+                    RaiseStaleTerms(session.NodeName, staleTerms);
 
                 // A node returning from a partition is alive again; shards orphaned while it was
                 // suspected dead get owners before the reply reports this node's assignments.
@@ -2301,6 +2306,41 @@ internal sealed partial class HubRuntime : IDisposable
     [LoggerMessage(EventId = 1706, EventName = "HandoffAborted", Level = LogLevel.Warning,
         Message = "Handoff {HandoffId}: import failed; player {Player} stays on shard {FromShard} (destination was {ToShard}).")]
     private static partial void LogHandoffAborted(ILogger logger, string handoffId, string player, ulong fromShard, ulong toShard);
+
+    /// <summary>
+    /// Takes a node's reports of shards whose logs refused to open because they are already at a
+    /// higher ownership term than the node holds (#314). The store minted that term and has since
+    /// forgotten it, so the shard is refused by every node until its token passes the log's term.
+    /// The store raises it only for a report that is still current: the shard is still the node's,
+    /// under the token the node tried.
+    /// </summary>
+    private void RaiseStaleTerms(string nodeName, StaleTermDto[] reports)
+    {
+        foreach (var report in reports)
+        {
+            try
+            {
+                if (_membership.RaiseTerm(new ShardKey(report.Shard), nodeName, report.HeldToken, report.LogTerm) is { } raised)
+                    LogShardTermRaised(_logger, report.Shard, nodeName, report.HeldToken, report.LogTerm, raised.FencingToken);
+            }
+            catch (Exception exception)
+            {
+                // The node reports again on its next heartbeat; the heartbeat itself must not fail.
+                LogShardTermRaiseFailed(_logger, report.Shard, nodeName, exception.Message, exception);
+            }
+        }
+    }
+
+    [LoggerMessage(EventId = 1767, EventName = "ShardTermRaised", Level = LogLevel.Warning,
+        Message = "Shard {Shard}: node '{NodeName}' found its log at ownership term {LogTerm}, past the token {HeldToken} the " +
+            "membership store holds, so the store had forgotten a term it minted; the token is now {FencingToken} and the node " +
+            "reopens the shard under it. Expected once per moved shard after a hub restart on an in-memory store, or a store " +
+            "restored from an older backup.")]
+    private static partial void LogShardTermRaised(ILogger logger, ulong shard, string nodeName, long heldToken, long logTerm, long fencingToken);
+
+    [LoggerMessage(EventId = 1768, EventName = "ShardTermRaiseFailed", Level = LogLevel.Warning,
+        Message = "Shard {Shard}: could not raise its fencing token for node '{NodeName}' ({Reason}); the node reports it again on its next heartbeat.")]
+    private static partial void LogShardTermRaiseFailed(ILogger logger, ulong shard, string nodeName, string reason, Exception exception);
 
     [LoggerMessage(EventId = 1766, EventName = "HandoffAbortedBeforeImport", Level = LogLevel.Warning,
         Message = "Handoff {HandoffId}: failed before any import was sent, so nothing was imported; player {Player} stays on " +

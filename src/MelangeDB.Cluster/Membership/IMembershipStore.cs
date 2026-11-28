@@ -17,7 +17,9 @@ public sealed record ShardAssignment(ShardKey Shard, string? NodeName, long Fenc
 /// The cluster's ownership registry: which nodes exist, which node owns each shard under which
 /// fencing token, and each shard's originator id. Owned and written exclusively by the hub —
 /// shard nodes learn assignments over their node links, never by reading the store. Postgres-backed
-/// in production (the hub already has Postgres); in-memory for tests and single-process clusters.
+/// in production (the hub already has Postgres). Otherwise the hub keeps it in a file beside its
+/// own data (<see cref="FileMembershipStore"/>, the default), so a restart forgets neither the terms
+/// nor the originators it minted; the in-memory store is for tests.
 /// Implementations must be safe for concurrent use.
 /// </summary>
 public interface IMembershipStore
@@ -80,6 +82,22 @@ public interface IMembershipStore
     /// node that is not registered and alive.
     /// </summary>
     ShardAssignment SetReplica(ShardKey shard, string? replicaNode);
+
+    /// <summary>
+    /// Raises <paramref name="shard"/>'s fencing token to <c><paramref name="logTerm"/> + 1</c>,
+    /// keeping its owner and replica, when <paramref name="nodeName"/> still owns it under
+    /// <paramref name="heldToken"/>. The owner reports this when the shard's log refused to open
+    /// because it is already at <paramref name="logTerm"/>: a term this store minted and no longer
+    /// remembers, such as after an in-memory store's hub restarted or a store was restored from
+    /// an older backup (#314). The new term is still strictly higher than any that wrote the log,
+    /// so the fence's guarantee holds.
+    /// <para>
+    /// Returns the raised assignment, or null when the report is out of date: the shard is unknown,
+    /// has moved, or its token is no longer <paramref name="heldToken"/> or is already past
+    /// <paramref name="logTerm"/>.
+    /// </para>
+    /// </summary>
+    ShardAssignment? RaiseTerm(ShardKey shard, string nodeName, long heldToken, long logTerm);
 
     /// <summary>
     /// Forgets a shard entirely — the counterpart <see cref="EnsureShard"/> never had. Returns

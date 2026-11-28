@@ -148,6 +148,27 @@ public class PostgresMembershipTests
     }
 
     [Fact]
+    public void A_term_report_raises_the_owners_token_past_the_log_only_while_current()
+    {
+        _postgres.SkipUnlessAvailable();
+        var (store, _) = CreateStore();
+        store.RegisterNode("a", "http://a", T0);
+        store.RegisterNode("b", "http://b", T0);
+        var shard = new ShardKey(7);
+        var before = store.EnsureShard(shard, T0);
+        var owner = before.NodeName!;
+        var other = owner == "a" ? "b" : "a";
+
+        Assert.Null(store.RaiseTerm(shard, other, 1, 4)); // Not the owner.
+        Assert.Null(store.RaiseTerm(shard, owner, 2, 4)); // Not the token it holds.
+        Assert.Null(store.RaiseTerm(shard, owner, 1, 1)); // The log is not past it.
+
+        var raised = store.RaiseTerm(shard, owner, heldToken: 1, logTerm: 4);
+        Assert.Equal(before with { FencingToken = 5 }, raised);
+        Assert.Equal(raised, store.GetAssignment(shard));
+    }
+
+    [Fact]
     public void Heartbeats_only_succeed_for_registered_nodes()
     {
         _postgres.SkipUnlessAvailable();

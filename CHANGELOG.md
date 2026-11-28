@@ -10,6 +10,28 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Fixed
+
+- **A cluster restarted on its kept data refused every shard that had changed owner**
+  ([#314](https://github.com/tyler-loy/MelangeDB/issues/314)). The default membership store was
+  in-memory, so a restarted hub minted every shard's fencing token at 1 again, below the term
+  that had already written a moved shard's log, and every node refused to open it. The hub now
+  keeps membership in `melange.membership.json` beside its commit log (`FileMembershipStore`, the
+  new default when no Postgres store is registered). Each ownership change is written durably
+  before it is handed out, so a restart remembers every term. It also remembers every originator:
+  the in-memory store handed them out again in first-use order, so a shard could take an
+  originator another shard had already minted ids under, and both would then mint the same ids.
+  As a backstop for any store that does forget, the shard's owner reports the term its log is
+  at, and the hub raises the token past it (EventIds 1767 and 1768). The fence still refuses a
+  stale writer: the new token is higher than any term that wrote the log.
+
+### Changed
+
+- **`IMembershipStore` has a new member, `RaiseTerm`.** A custom store must implement it; the
+  in-memory, file and Postgres stores do. `StaleTermException` now carries the log's term and the
+  refused owner's term. `InMemoryMembershipStore` remains available for tests: register it
+  yourself to keep the old behaviour.
+
 ## [0.5.2] — 2026-11-26
 
 Two fixes for things that could leave the server stuck. On Windows, an online backup can no longer

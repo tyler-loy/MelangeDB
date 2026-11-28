@@ -318,6 +318,26 @@ public sealed class PostgresMembershipStore : IMembershipStore
         return next;
     }
 
+    public ShardAssignment? RaiseTerm(ShardKey shard, string nodeName, long heldToken, long logTerm)
+    {
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+        LockShards(connection, transaction);
+        var assignment = ReadAssignment(connection, transaction, shard);
+        if (assignment is null
+            || assignment.NodeName != nodeName
+            || assignment.FencingToken != heldToken
+            || assignment.FencingToken >= logTerm)
+        {
+            return null;
+        }
+
+        var next = assignment with { FencingToken = logTerm + 1 };
+        WriteAssignment(connection, transaction, next);
+        transaction.Commit();
+        return next;
+    }
+
     /// <summary>A change of owner: a new term, and no replica on the new owner's own node.</summary>
     private static ShardAssignment WithOwner(ShardAssignment assignment, string? owner) => assignment with
     {
