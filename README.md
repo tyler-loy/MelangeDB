@@ -198,6 +198,8 @@ Running it:
 - **[OBSERVABILITY.md](docs/OBSERVABILITY.md)**: every span, metric and log EventId.
 - **[BACKUP.md](docs/BACKUP.md)**: the `.mbak` archive and the `melange backup`, `restore` and
   `backup verify` commands.
+- **[INSPECT.md](docs/INSPECT.md)**: `melange inspect`, reading a data directory or an archive as a
+  record of who called what, when, and what it wrote.
 - **[THREAT-MODEL.md](docs/THREAT-MODEL.md)**: what a server can enforce against an untrusted
   client, and what it deliberately doesn't. To *report* a vulnerability, see
   [SECURITY.md](SECURITY.md).

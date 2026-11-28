@@ -21,6 +21,12 @@ All packages ship together at one version; there is no per-package versioning. S
   only up to the head it found at open, and reports what moved since (`CheckForChanges`). Its
   facts (epoch, lineage, provenance, truncation base, snapshot LSN, head, torn tail) and
   `ExplainUnreachable` say why an LSN cannot be read. The `melange inspect` verbs are built on it.
+- **`melange inspect log` and `melange inspect record`**: the commit log as a readable record
+  ([docs/INSPECT.md](docs/INSPECT.md)). `log` lists commits (LSN, time, caller, reducer, writes,
+  events) in an LSN window, filtered by reducer, caller or table. `record` shows one commit in
+  full: its decoded arguments, every row it wrote with its key, and its events. `--manifest` names
+  the arguments of client-callable reducers. Both print the source's facts before the answer,
+  take `--json`, and read a live server's directory safely.
 
 ### Fixed
 
