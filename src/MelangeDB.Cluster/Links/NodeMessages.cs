@@ -64,8 +64,18 @@ internal sealed record ShardLoadDto(
     bool Draining = false,
     ulong DurableLsn = 0);
 
-/// <summary>The heartbeat's body: every owned shard's current load sample.</summary>
-internal sealed record HeartbeatRequest(ShardLoadDto[] Loads);
+/// <summary>
+/// The heartbeat's body: every owned shard's current load sample, and the shards this node could
+/// not open because their logs are at a higher ownership term than it was given (#314). A hub from
+/// before the reports ignores them.
+/// </summary>
+internal sealed record HeartbeatRequest(ShardLoadDto[] Loads, StaleTermDto[]? StaleTerms = null);
+
+/// <summary>
+/// One shard whose log refused to open: the node held <see cref="HeldToken"/>, and the log is
+/// already at <see cref="LogTerm"/>.
+/// </summary>
+internal sealed record StaleTermDto(ulong Shard, long HeldToken, long LogTerm);
 
 /// <summary>
 /// The hub asking a shard's owner to quiesce it for a planned drain: take a fresh snapshot (so

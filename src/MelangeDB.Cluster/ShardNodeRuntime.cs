@@ -38,6 +38,10 @@ internal sealed partial class ShardNodeRuntime : IDisposable
     /// </summary>
     private readonly Dictionary<ShardKey, Task> _opening = [];
 
+    // Shards whose logs refused to open at a higher ownership term than this node was given,
+    // reported on every heartbeat until the hub raises the token (#314). Under _shardsLock.
+    private readonly Dictionary<ShardKey, StaleTermDto> _staleTerms = [];
+
     /// <summary>The hub's latest assignment list as this node last received it, for opens that complete after it changed.</summary>
     private Dictionary<ShardKey, ShardAssignment> _assigned = [];
 
@@ -503,7 +507,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                     continue;
                 var loads = CollectLoads();
                 var sent = _time.GetTimestamp();
-                var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(loads), ct).ConfigureAwait(false);
+                var beat = await link.RequestAsync("heartbeat", new HeartbeatRequest(loads, StaleTermReports()), ct).ConfigureAwait(false);
                 RenewLease(sent);
                 var beatReply = beat!.Value.Read<HeartbeatReply>()!;
                 ApplyAssignments(beatReply.Assignments);
@@ -783,6 +787,15 @@ internal sealed partial class ShardNodeRuntime : IDisposable
             // would park what it opened and the two would alternate. The next heartbeat retries.
             var leaseValid = LeaseValid();
             _assigned = leaseValid ? assigned : [];
+
+            // A report is only worth sending while the shard is still this node's under the token
+            // that was refused; once the hub raises it, the next open tries the new one.
+            foreach (var (shard, stale) in _staleTerms.ToList())
+            {
+                if (!assigned.TryGetValue(shard, out var current) || current.FencingToken != stale.HeldToken)
+                    _staleTerms.Remove(shard);
+            }
+
             foreach (var assignment in leaseValid ? assigned.Values : Enumerable.Empty<ShardAssignment>())
             {
                 if (_shards.ContainsKey(assignment.Shard) || _opening.ContainsKey(assignment.Shard) || reopenNextBeat.Contains(assignment.Shard))
@@ -806,6 +819,35 @@ internal sealed partial class ShardNodeRuntime : IDisposable
 
         foreach (var runtime in closed)
             runtime.Dispose();
+    }
+
+    /// <summary>The stale-term reports for the next heartbeat, or null when there are none.</summary>
+    private StaleTermDto[]? StaleTermReports()
+    {
+        lock (_shardsLock)
+        {
+            return _staleTerms.Count == 0 ? null : [.. _staleTerms.Values];
+        }
+    }
+
+    /// <summary>The term fence's refusal anywhere in an open's failure, however recovery wrapped it.</summary>
+    private static StaleTermException? FindStaleTerm(Exception exception)
+    {
+        for (Exception? current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is StaleTermException { LogTerm: > 0 } stale)
+                return stale;
+            if (current is AggregateException aggregate)
+            {
+                foreach (var inner in aggregate.InnerExceptions)
+                {
+                    if (FindStaleTerm(inner) is { } found)
+                        return found;
+                }
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -867,6 +909,7 @@ internal sealed partial class ShardNodeRuntime : IDisposable
                 // The token the hub holds now, not the one recovery started under: a heartbeat
                 // that bumped it while recovery ran must not be lost.
                 runtime.FencingToken = current.FencingToken;
+                _staleTerms.Remove(shard);
                 PublishLocked(shard, runtime);
                 if (runtime.Engine.WarmStartedFrom is { } from)
                     LogShardPromoted(_logger, shard.Value, NodeName, openMs, from, runtime.Engine.Log.HeadLsn);
@@ -880,6 +923,14 @@ internal sealed partial class ShardNodeRuntime : IDisposable
         catch (Exception exception)
         {
             LogShardOpenFailed(_logger, shard.Value, NodeName, exception.Message);
+            if (FindStaleTerm(exception) is { } stale)
+            {
+                lock (_shardsLock)
+                {
+                    if (_assigned.TryGetValue(shard, out var tried) && tried.FencingToken == stale.OwnerTerm)
+                        _staleTerms[shard] = new StaleTermDto(shard.Value, stale.OwnerTerm, stale.LogTerm);
+                }
+            }
         }
         finally
         {

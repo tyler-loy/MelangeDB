@@ -93,4 +93,99 @@ public class MembershipStoreTests
         Assert.Null(promoted.ReplicaNode);
         Assert.Equal(promoted, store.GetAssignment(shard));
     }
+
+    [Fact]
+    public void A_raised_term_passes_the_log_and_keeps_the_owner()
+    {
+        var store = new InMemoryMembershipStore();
+        store.RegisterNode("a", "http://a", T0);
+        store.RegisterNode("b", "http://b", T0);
+        var shard = new ShardKey(7);
+        var before = store.EnsureShard(shard, T0);
+        var owner = before.NodeName!;
+
+        var raised = store.RaiseTerm(shard, owner, heldToken: 1, logTerm: 4);
+
+        Assert.Equal(before with { FencingToken = 5 }, raised);
+        Assert.Equal(raised, store.GetAssignment(shard));
+    }
+
+    [Fact]
+    public void An_out_of_date_term_report_changes_nothing()
+    {
+        var store = new InMemoryMembershipStore();
+        store.RegisterNode("a", "http://a", T0);
+        store.RegisterNode("b", "http://b", T0);
+        var shard = new ShardKey(7);
+        var owner = store.EnsureShard(shard, T0).NodeName!;
+        var other = owner == "a" ? "b" : "a";
+
+        Assert.Null(store.RaiseTerm(new ShardKey(8), owner, 1, 4)); // Unknown shard.
+        Assert.Null(store.RaiseTerm(shard, other, 1, 4)); // Not the owner.
+        Assert.Null(store.RaiseTerm(shard, owner, 2, 4)); // Not the token it holds.
+        Assert.Null(store.RaiseTerm(shard, owner, 1, 1)); // The log is not past it.
+        Assert.Equal(1, store.GetAssignment(shard)!.FencingToken);
+    }
+
+    [Fact]
+    public void The_file_store_remembers_terms_originators_replicas_and_nodes_when_reopened()
+    {
+        var directory = Directory.CreateTempSubdirectory("melange-membership-").FullName;
+        try
+        {
+            var path = Path.Combine(directory, FileMembershipStore.FileName);
+            var store = new FileMembershipStore(path);
+            store.RegisterNode("a", "http://a", T0);
+            store.RegisterNode("b", "http://b", T0);
+            var first = store.EnsureShard(new ShardKey(1), T0);
+            store.EnsureShard(new ShardKey(2), T0);
+            store.EnsureShard(new ShardKey(3), T0);
+            store.RemoveShard(new ShardKey(3));
+            var other = first.NodeName == "a" ? "b" : "a";
+            store.Reassign(new ShardKey(1), other, T0);
+            store.SetReplica(new ShardKey(1), first.NodeName);
+            store.MarkDead("b", T0);
+
+            var reopened = new FileMembershipStore(path);
+
+            Assert.Equal(store.AllAssignments(), reopened.AllAssignments());
+            Assert.Equal(store.Nodes(), reopened.Nodes());
+
+            // The originator high-water mark survives too: shard 3's retired prefix is not reused.
+            var fourth = reopened.EnsureShard(new ShardKey(4), T0);
+            Assert.Equal(4, fourth.Originator);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void A_change_the_file_store_cannot_persist_is_not_handed_out()
+    {
+        var directory = Directory.CreateTempSubdirectory("melange-membership-").FullName;
+        try
+        {
+            var path = Path.Combine(directory, FileMembershipStore.FileName);
+            var store = new FileMembershipStore(path);
+            store.RegisterNode("a", "http://a", T0);
+            store.EnsureShard(new ShardKey(1), T0);
+
+            // A directory where the temp file goes makes every write fail.
+            Directory.CreateDirectory(path + ".tmp");
+            Assert.ThrowsAny<SystemException>(() => store.EnsureShard(new ShardKey(2), T0));
+            Assert.ThrowsAny<SystemException>(() => store.RegisterNode("b", "http://b", T0));
+            Assert.Null(store.GetAssignment(new ShardKey(2)));
+            Assert.DoesNotContain(store.Nodes(), static n => n.NodeName == "b");
+
+            // Once the file can be written again, the originator it failed to hand out is reused.
+            Directory.Delete(path + ".tmp");
+            Assert.Equal(2, store.EnsureShard(new ShardKey(2), T0).Originator);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
 }

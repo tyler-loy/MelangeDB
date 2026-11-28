@@ -68,6 +68,9 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
     public WebApplication HubApp { get; private set; } = null!;
 
+    /// <summary>Leaves the data directory behind on dispose, so a second fixture can boot over it.</summary>
+    public bool KeepData { get; set; }
+
     public List<ClusterNode> Nodes { get; } = [];
 
     public HubRuntime Hub => HubApp.Services.GetRequiredService<HubRuntime>();
@@ -493,6 +496,8 @@ internal sealed class ClusterFixture : IAsyncDisposable
 
         await HubApp.StopAsync();
         await HubApp.DisposeAsync();
+        if (KeepData)
+            return;
         try
         {
             Directory.Delete(_root, recursive: true);

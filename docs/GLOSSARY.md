@@ -399,7 +399,10 @@ calls by. Ignored on a single node.
 bumped on every reassignment: a message carrying an older token is from a previous owner and is rejected at
 every saga step. Paired with lease-based self-fencing, it is what ensures a node wrongly suspected of being
 dead cannot keep writing rows it no longer owns. Tokens persist in the membership store, so a restarted hub
-can never re-mint an old one.
+can never re-mint an old one. A store that has forgotten them anyway (an in-memory store, or one restored
+from an older backup) is corrected by the shard's owner: its log refuses the lower token, the node reports
+the log's term on its next heartbeat, and the hub raises the token past it
+([#314](https://github.com/tyler-loy/MelangeDB/issues/314)).
 
 **First-chunk rule** — The one exception to delta-outranks-bulk in the sender's lane priority: the first
 chunk of a not-yet-started initial set precedes any committed delta on the wire. Until that chunk is out, a
@@ -517,8 +520,9 @@ and never migrates.
 **Membership store (`IMembershipStore`)** — The cluster's ownership registry: which nodes exist, which node
 owns each shard under which fencing token, and each shard's originator id. Owned and written exclusively by
 the hub; shard nodes learn assignments over their node links, never by reading the store. Postgres-backed in
-production (the hub already has Postgres — the settled alternative to introducing Raft), in-memory for tests
-and single-process clusters.
+production (the hub already has Postgres — the settled alternative to introducing Raft). Otherwise, by default,
+a file beside the hub's commit log (`FileMembershipStore`, `melange.membership.json`), so a hub restarted on
+its kept data remembers every term and originator it minted. In-memory for tests.
 
 **Node link** — The one mutually authenticated TCP connection between a shard node and the hub: registration
 and heartbeats, replication of `Replicated` write sets, event forwarding, and handoff saga steps. Both ends

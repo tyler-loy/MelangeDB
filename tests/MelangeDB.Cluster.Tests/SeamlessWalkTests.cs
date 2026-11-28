@@ -299,8 +299,11 @@ public class SeamlessWalkTests
         {
             await client.CallReducerAsync("Move", [Chunks.Id(4, 2)], TestContext.Current.CancellationToken);
             await client.CallReducerAsync("Move", [Chunks.Id(5, 2)], TestContext.Current.CancellationToken);
+            // This test's reason, not just any failure: the capture is process-wide, and a test in
+            // parallel can count an aborted transfer first.
             await ClusterFixture.WaitUntilAsync(
-                () => metrics.Of("melange.handoff.failed").Any(), "the stuck transfer was counted");
+                () => metrics.Of("melange.handoff.failed").Any(static m => (string?)m.Tags["reason"] == "unresolved"),
+                "the stuck transfer was counted");
         }
         finally
         {

@@ -689,7 +689,8 @@ bigger term and needs no coordination layer at all.
   [LOAD-TESTING.md](LOAD-TESTING.md).
 - ~~**Cluster membership.**~~ **Settled in phase 09: Postgres-backed, not Raft.** The ownership registry —
   nodes, per-shard owner, fencing token, and originator id — lives in the hub's own Postgres
-  (`AddPostgresClusterMembership()`; in-memory for tests), the hub is its sole writer, failure detection is
+  (`AddPostgresClusterMembership()`; without it, `melange.membership.json` beside the hub's commit log; in-memory
+  for tests), the hub is its sole writer, failure detection is
   heartbeat silence past `Cluster:FailureTimeoutMs`, and a dead node's shards reassign under bumped fencing
   tokens while the suspect self-fences on the same clock. See docs/road-to-0.1/plan-phase-09.md for the rationale.
 - ~~**Client protocol during dual attachment.**~~ **Settled in phase 09: the dual attachment is

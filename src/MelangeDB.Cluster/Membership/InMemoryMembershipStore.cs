@@ -2,15 +2,38 @@ namespace MelangeDB.Cluster;
 
 /// <summary>
 /// The in-memory membership store: correct, hub-local, and gone with the hub process. The right
-/// choice for tests and single-process clusters; production deployments use the Postgres-backed
-/// store so a hub restart does not forget which fencing tokens it minted.
+/// choice for tests. A hub that restarts on kept shard data needs the store to remember the terms
+/// and originators it minted: <see cref="FileMembershipStore"/> (the default) or the
+/// Postgres-backed store.
 /// </summary>
 public sealed class InMemoryMembershipStore : IMembershipStore
 {
     private readonly Lock _lock = new();
     private readonly Dictionary<string, NodeRecord> _nodes = new(StringComparer.Ordinal);
     private readonly Dictionary<ShardKey, ShardAssignment> _shards = [];
+    private readonly Action<MembershipState>? _persist;
     private ushort _nextOriginator = 1; // 0 is the hub's.
+
+    public InMemoryMembershipStore()
+    {
+    }
+
+    /// <summary>
+    /// A store that starts from <paramref name="state"/> and hands every change to
+    /// <paramref name="persist"/> before it takes effect: a change whose persist throws is undone,
+    /// so nothing is handed out that the persisted state does not hold.
+    /// </summary>
+    internal InMemoryMembershipStore(MembershipState? state, Action<MembershipState> persist)
+    {
+        _persist = persist;
+        if (state is null)
+            return;
+        foreach (var node in state.Nodes)
+            _nodes[node.NodeName] = node;
+        foreach (var shard in state.Shards)
+            _shards[shard.Shard] = shard;
+        _nextOriginator = state.NextOriginator;
+    }
 
     public NodeRecord RegisterNode(string nodeName, string publicAddress, DateTimeOffset now)
     {
@@ -18,7 +41,10 @@ public sealed class InMemoryMembershipStore : IMembershipStore
         lock (_lock)
         {
             var record = new NodeRecord(nodeName, publicAddress, now, Alive: true);
-            _nodes[nodeName] = record;
+            var changed = !_nodes.TryGetValue(nodeName, out var previous)
+                || previous.PublicAddress != publicAddress
+                || !previous.Alive;
+            Mutate(changed, () => _nodes[nodeName] = record);
             return record;
         }
     }
@@ -29,7 +55,9 @@ public sealed class InMemoryMembershipStore : IMembershipStore
         {
             if (!_nodes.TryGetValue(nodeName, out var record))
                 return false;
-            _nodes[nodeName] = record with { LastSeen = now, Alive = true };
+
+            // Only a revival is persisted: LastSeen moves every beat and nothing reads it back.
+            Mutate(!record.Alive, () => _nodes[nodeName] = record with { LastSeen = now, Alive = true });
             return true;
         }
     }
@@ -50,8 +78,12 @@ public sealed class InMemoryMembershipStore : IMembershipStore
                 return existing;
             if (_nextOriginator == 0)
                 throw new InvalidOperationException("The 16-bit originator space is exhausted.");
-            var assignment = new ShardAssignment(shard, LeastLoadedNode(), FencingToken: 1, _nextOriginator++);
-            _shards[shard] = assignment;
+            var assignment = new ShardAssignment(shard, LeastLoadedNode(), FencingToken: 1, _nextOriginator);
+            Mutate(true, () =>
+            {
+                _shards[shard] = assignment;
+                _nextOriginator++;
+            });
             return assignment;
         }
     }
@@ -84,25 +116,28 @@ public sealed class InMemoryMembershipStore : IMembershipStore
     {
         lock (_lock)
         {
-            if (_nodes.TryGetValue(nodeName, out var record))
-                _nodes[nodeName] = record with { Alive = false, LastSeen = now };
-
-            // A dead node keeps no replicas; the hub places new ones.
-            foreach (var replicated in _shards.Values.Where(a => a.ReplicaNode == nodeName).ToList())
-                _shards[replicated.Shard] = replicated with { ReplicaNode = null };
-
-            // A shard with a live replica goes to the replica's node, which promotes its warm
-            // projection; the rest take the cold path on the least-loaded node.
             var changed = new List<ShardAssignment>();
-            foreach (var assignment in _shards.Values.Where(a => a.NodeName == nodeName).ToList())
+            Mutate(true, () =>
             {
-                var replica = assignment.ReplicaNode is { } candidate && _nodes.TryGetValue(candidate, out var node) && node.Alive
-                    ? candidate
-                    : null;
-                var next = WithOwner(assignment, replica ?? LeastLoadedNode(except: nodeName));
-                _shards[assignment.Shard] = next;
-                changed.Add(next);
-            }
+                if (_nodes.TryGetValue(nodeName, out var record))
+                    _nodes[nodeName] = record with { Alive = false, LastSeen = now };
+
+                // A dead node keeps no replicas; the hub places new ones.
+                foreach (var replicated in _shards.Values.Where(a => a.ReplicaNode == nodeName).ToList())
+                    _shards[replicated.Shard] = replicated with { ReplicaNode = null };
+
+                // A shard with a live replica goes to the replica's node, which promotes its warm
+                // projection; the rest take the cold path on the least-loaded node.
+                foreach (var assignment in _shards.Values.Where(a => a.NodeName == nodeName).ToList())
+                {
+                    var replica = assignment.ReplicaNode is { } candidate && _nodes.TryGetValue(candidate, out var node) && node.Alive
+                        ? candidate
+                        : null;
+                    var next = WithOwner(assignment, replica ?? LeastLoadedNode(except: nodeName));
+                    _shards[assignment.Shard] = next;
+                    changed.Add(next);
+                }
+            });
 
             return changed;
         }
@@ -112,15 +147,19 @@ public sealed class InMemoryMembershipStore : IMembershipStore
     {
         lock (_lock)
         {
+            var unowned = _shards.Values.Where(static a => a.NodeName is null).ToList();
             var changed = new List<ShardAssignment>();
-            foreach (var assignment in _shards.Values.Where(static a => a.NodeName is null).ToList())
+            Mutate(unowned.Count > 0 && LeastLoadedNode() is not null, () =>
             {
-                if (LeastLoadedNode() is not { } owner)
-                    break;
-                var next = WithOwner(assignment, owner);
-                _shards[assignment.Shard] = next;
-                changed.Add(next);
-            }
+                foreach (var assignment in unowned)
+                {
+                    if (LeastLoadedNode() is not { } owner)
+                        break;
+                    var next = WithOwner(assignment, owner);
+                    _shards[assignment.Shard] = next;
+                    changed.Add(next);
+                }
+            });
 
             return changed;
         }
@@ -136,7 +175,7 @@ public sealed class InMemoryMembershipStore : IMembershipStore
             if (!_nodes.TryGetValue(toNode, out var node) || !node.Alive)
                 throw new InvalidOperationException($"Node '{toNode}' is not registered and alive; a drain must never assign to a corpse.");
             var next = WithOwner(assignment, toNode);
-            _shards[shard] = next;
+            Mutate(true, () => _shards[shard] = next);
             return next;
         }
     }
@@ -156,7 +195,25 @@ public sealed class InMemoryMembershipStore : IMembershipStore
             }
 
             var next = assignment with { ReplicaNode = replicaNode };
-            _shards[shard] = next;
+            Mutate(next != assignment, () => _shards[shard] = next);
+            return next;
+        }
+    }
+
+    public ShardAssignment? RaiseTerm(ShardKey shard, string nodeName, long heldToken, long logTerm)
+    {
+        lock (_lock)
+        {
+            if (!_shards.TryGetValue(shard, out var assignment)
+                || assignment.NodeName != nodeName
+                || assignment.FencingToken != heldToken
+                || assignment.FencingToken >= logTerm)
+            {
+                return null;
+            }
+
+            var next = assignment with { FencingToken = logTerm + 1 };
+            Mutate(true, () => _shards[shard] = next);
             return next;
         }
     }
@@ -184,7 +241,46 @@ public sealed class InMemoryMembershipStore : IMembershipStore
         lock (_lock)
         {
             // _nextOriginator is untouched on purpose: it is a high-water mark, not a free list.
-            return _shards.Remove(shard);
+            var removed = false;
+            Mutate(_shards.ContainsKey(shard), () => removed = _shards.Remove(shard));
+            return removed;
+        }
+    }
+
+    /// <summary>
+    /// Applies a change under <see cref="_lock"/>. With a persist hook and <paramref name="changes"/>
+    /// set, the new state is persisted before the change is returned to anyone, and a failed
+    /// persist rolls it back and throws.
+    /// </summary>
+    private void Mutate(bool changes, Action change)
+    {
+        if (_persist is null || !changes)
+        {
+            change();
+            return;
+        }
+
+        var nodes = new Dictionary<string, NodeRecord>(_nodes, StringComparer.Ordinal);
+        var shards = new Dictionary<ShardKey, ShardAssignment>(_shards);
+        var nextOriginator = _nextOriginator;
+        change();
+        try
+        {
+            _persist(new MembershipState([.. _nodes.Values], [.. _shards.Values], _nextOriginator));
+        }
+        catch
+        {
+            _nodes.Clear();
+            foreach (var (name, node) in nodes)
+                _nodes[name] = node;
+            _shards.Clear();
+            foreach (var (key, assignment) in shards)
+                _shards[key] = assignment;
+            _nextOriginator = nextOriginator;
+            throw;
         }
     }
 }
+
+/// <summary>Everything a membership store must not forget, as <see cref="FileMembershipStore"/> persists it.</summary>
+internal sealed record MembershipState(NodeRecord[] Nodes, ShardAssignment[] Shards, ushort NextOriginator);
