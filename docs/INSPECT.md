@@ -8,6 +8,7 @@ debugger, without the application's assemblies, and without changing anything.
 ```
 melange inspect log    <source> [--from <lsn>] [--to <lsn>] [--reducer <name>] [--caller <hex>] [--table <name>] [--json]
 melange inspect record <source> --at-lsn <n> [--manifest melange-schema.json] [--json]
+melange inspect row    <source> --table <name> (--key <value> | --key-hex <hex>) [--from <lsn>] [--to <lsn>] [--json]
 ```
 
 `<source>` is one engine's data directory (the directory `CommitLog:Path` names, or one shard's
@@ -127,10 +128,44 @@ application's own encoding, with nothing on disk that describes it.
 **Archive-tier writes are marked.** An archive-tier table's rows ride the log like any other write
 and then live only in Postgres. The inspector shows them for as long as the log holds them.
 
+## `inspect row`: who mutated this row, and when
+
+Every commit in the window whose write set touched one key, oldest first, with the reducer and the
+caller that did it. The first version shows every column, and each later one shows only what
+changed from the version before:
+
+```
+row       Creature  Id = 77  (encoded 0x800000000000004d)
+history   3 commits touched it
+
+LSN 40112  2026-11-27 09:02:11.410022Z  insert  by SpawnCreature  caller 0000000000000000...
+      Id      77
+      X       12.5
+      Health  30
+LSN 41201  2026-11-27 09:13:58.004127Z  update  by Attack  caller 560827fa6cb1578f...
+      Health  12   (was 30)
+LSN 41377  2026-11-27 09:15:40.920553Z  delete  by Attack  caller 560827fa6cb1578f...
+      (deleted)
+```
+
+- `--table <name>` names the table, case-sensitive, as the shape sidecar records it.
+- `--key <value>` is the primary key, parsed by the key column's kind: a number, a string, `true`
+  or `false`, hex for bytes and identities (64 hex digits), and microseconds or an ISO 8601 time
+  for a timestamp. A key printed by any verb is accepted back as written.
+- `--key-hex <hex>` is the encoded key a write set carries (`--json` prints it as `key.hex`), for a
+  source with no shape sidecar, or a table no shape names.
+
+It is a scan of write sets rather than an index lookup: it reads every record in the window, so
+`--from` and `--to` are what make it fast on a long log. The history begins at the source's floor.
+An archive's snapshot sits exactly at its floor, so for an archive the row's version in the
+snapshot is printed first, as the state the history starts from. An archive-tier table's history
+stops where the log was truncated: older versions are in Postgres, not here.
+
 ## `--json`
 
 Every verb takes `--json` and writes one JSON document: `source` (the facts), the answer
-(`records` for `log`, `record` for `record`), `notes`, and `changedWhileRead`. Integers up to 32 bits
+(`records` for `log`, `record` for `record`, `row`, `snapshot` and `history` for `row`), `notes`,
+and `changedWhileRead`. Integers up to 32 bits
 and floats are JSON numbers. 64-bit integers are strings, because a JSON number past 2^53 loses
 digits in most parsers and AutoInc ids live up there. Bytes are hex, identities are hex, and
 timestamps are ISO 8601. An argument is `{ "name"?, "type", "value" }`.

@@ -48,6 +48,7 @@ internal static class InspectCommand
     {
         ["log"] = ["--engine", "--json", "--from", "--to", "--reducer", "--caller", "--table"],
         ["record"] = ["--engine", "--json", "--at-lsn", "--manifest"],
+        ["row"] = ["--engine", "--json", "--table", "--key", "--key-hex", "--from", "--to"],
     };
 
     private static readonly string[] ValueFlags =
@@ -76,6 +77,7 @@ internal static class InspectCommand
             {
                 "log" => RunLog(source, options, output, error),
                 "record" => RunRecord(source, options, output, error),
+                "row" => InspectRow.Run(source, options, output, error),
                 _ => 2,
             };
         }
@@ -91,6 +93,7 @@ internal static class InspectCommand
     {
         error.WriteLine("usage: melange inspect log <source> [--from <lsn>] [--to <lsn>] [--reducer <name>] [--caller <hex>] [--table <name>] [--json]");
         error.WriteLine("       melange inspect record <source> --at-lsn <n> [--manifest melange-schema.json] [--json]");
+        error.WriteLine("       melange inspect row <source> --table <name> (--key <value> | --key-hex <hex>) [--from <lsn>] [--to <lsn>] [--json]");
         error.WriteLine("  <source> is a data directory (CommitLog:Path, or a shard's) or a .mbak archive; --engine <key> picks an archive's engine.");
         error.WriteLine("  Read-only and lock-free: safe against a live engine's directory. See docs/INSPECT.md.");
     }
@@ -206,6 +209,12 @@ internal static class InspectCommand
         if (options.Verb == "record" && options.AtLsn is null)
         {
             error.WriteLine("melange inspect record takes --at-lsn <n>: the commit to show.");
+            return false;
+        }
+
+        if (options.Verb == "row" && (options.Table is null || (options.Key is null) == (options.KeyHex is null)))
+        {
+            error.WriteLine("melange inspect row takes --table <name> and one of --key <value> or --key-hex <hex>.");
             return false;
         }
 

@@ -27,6 +27,9 @@ All packages ship together at one version; there is no per-package versioning. S
   full: its decoded arguments, every row it wrote with its key, and its events. `--manifest` names
   the arguments of client-callable reducers. Both print the source's facts before the answer,
   take `--json`, and read a live server's directory safely.
+- **`melange inspect row --table <t> --key <k>`**: who mutated this row, and when. Every commit
+  that touched one key, with the reducer and caller that did it, and what each version changed
+  from the one before. An archive starts from the row's version in its snapshot.
 
 ### Fixed
 
