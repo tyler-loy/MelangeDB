@@ -23,8 +23,17 @@ public static class SchemaKeyCodec
         ArgumentNullException.ThrowIfNull(value);
         if (column.IsEnum)
             value = Convert.ChangeType(value, Enum.GetUnderlyingType(column.ClrType));
+        return Encode(column.Kind, value);
+    }
 
-        return column.Kind switch
+    /// <summary>
+    /// Encodes a value by its column's kind alone: the inverse of <see cref="Decode(ColumnKind, in RowKey)"/>.
+    /// The value must already be the kind's own CLR type (an enum as its underlying integer).
+    /// </summary>
+    public static RowKey Encode(ColumnKind kind, object value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        return kind switch
         {
             ColumnKind.Bool => KeyCodec.EncodeBool((bool)value),
             ColumnKind.Int8 => KeyCodec.EncodeInt8((sbyte)value),
@@ -39,7 +48,7 @@ public static class SchemaKeyCodec
             ColumnKind.Bytes => KeyCodec.EncodeBytes((byte[])value),
             ColumnKind.Identity => KeyCodec.EncodeIdentity((Identity)value),
             ColumnKind.Timestamp => KeyCodec.EncodeTimestamp((Timestamp)value),
-            _ => throw new NotSupportedException($"Column kind {column.Kind} is not key-encodable."),
+            _ => throw new NotSupportedException($"Column kind {kind} is not key-encodable."),
         };
     }
 
@@ -52,8 +61,19 @@ public static class SchemaKeyCodec
     public static object Decode(ColumnSchema column, in RowKey key)
     {
         ArgumentNullException.ThrowIfNull(column);
+        var value = Decode(column.Kind, key);
+        return column.IsEnum ? Enum.ToObject(column.ClrType, value) : value;
+    }
+
+    /// <summary>
+    /// Decodes a key by its column's kind alone, for a reader with a persisted shape and no
+    /// schema (the inspector). Enum columns come back as their underlying integer, since a shape
+    /// records the wire kind, not the enum.
+    /// </summary>
+    public static object Decode(ColumnKind kind, in RowKey key)
+    {
         var span = key.Span;
-        object value = column.Kind switch
+        return kind switch
         {
             ColumnKind.Bool => span[0] != 0,
             ColumnKind.Int8 => (sbyte)(span[0] ^ 0x80),
@@ -68,8 +88,7 @@ public static class SchemaKeyCodec
             ColumnKind.Bytes => span.ToArray(),
             ColumnKind.Identity => new Identity(span),
             ColumnKind.Timestamp => new Timestamp((long)BinaryPrimitives.ReadUInt64BigEndian(span) ^ long.MinValue),
-            _ => throw new NotSupportedException($"Column kind {column.Kind} is not key-encodable."),
+            _ => throw new NotSupportedException($"Column kind {kind} is not key-encodable."),
         };
-        return column.IsEnum ? Enum.ToObject(column.ClrType, value) : value;
     }
 }

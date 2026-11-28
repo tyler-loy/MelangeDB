@@ -14,7 +14,24 @@ namespace MelangeDB.Core;
 internal static class LogFileFormat
 {
     /// <summary>One surviving record: its LSN and its verbatim codec payload.</summary>
-    public readonly record struct RawRecord(ulong Lsn, byte[] Payload);
+    public readonly record struct RawRecord(ulong Lsn, byte[] Payload)
+    {
+        /// <summary>The byte offset of the record's frame in its file: where a later walk can resume.</summary>
+        public long Offset { get; init; }
+    }
+
+    /// <summary>
+    /// Where a walk stopped, for a caller that has to say so. A walk that ends on a torn tail
+    /// stops before the file's end; <see cref="TrailingBytes"/> is how much it left unread.
+    /// </summary>
+    public sealed class WalkEnd
+    {
+        /// <summary>The offset just past the last intact record.</summary>
+        public long EndOffset { get; set; }
+
+        /// <summary>Bytes after <see cref="EndOffset"/> that were not an intact record: a torn tail, or an append still being written.</summary>
+        public long TrailingBytes { get; set; }
+    }
 
     public static void ValidateHeader(Stream stream, string path)
     {
@@ -33,17 +50,34 @@ internal static class LogFileFormat
     /// the walk silently; a CRC mismatch with intact records after it throws, mirroring the
     /// "corrupt beyond a torn tail" refusal. A file shorter than its header yields nothing — a
     /// created-but-never-recovered log is an empty engine, not an error.
+    /// <para>
+    /// <paramref name="start"/> resumes at a frame offset an earlier walk returned (a
+    /// <see cref="RawRecord.Offset"/>); <paramref name="end"/>, when given, says where the walk stopped.
+    /// The file's length is read once, so a file that grows during the walk is read to where it was.
+    /// </para>
     /// </summary>
-    public static IEnumerable<RawRecord> WalkRecords(Stream stream, string path)
+    public static IEnumerable<RawRecord> WalkRecords(Stream stream, string path, long start = 0, WalkEnd? end = null)
     {
-        if (stream.Length < FileCommitLog.HeaderSize)
+        var length = stream.Length;
+        if (end is not null)
+        {
+            end.EndOffset = Math.Min(length, FileCommitLog.HeaderSize);
+            end.TrailingBytes = 0;
+        }
+
+        if (length < FileCommitLog.HeaderSize)
             yield break;
         ValidateHeader(stream, path);
         var frame = new byte[FileCommitLog.FrameSize];
-        var length = stream.Length;
-        var position = (long)FileCommitLog.HeaderSize;
+        var position = Math.Max(start, FileCommitLog.HeaderSize);
         while (position < length)
         {
+            if (end is not null)
+            {
+                end.EndOffset = position;
+                end.TrailingBytes = length - position;
+            }
+
             if (position + FileCommitLog.FrameSize > length)
                 yield break; // Torn frame header.
             stream.Seek(position, SeekOrigin.Begin);
@@ -66,8 +100,14 @@ internal static class LogFileFormat
             }
 
             // The LSN sits at a fixed offset in every payload version: u16 format, then u64 LSN.
-            yield return new RawRecord(BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(2)), payload);
+            yield return new RawRecord(BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(2)), payload) { Offset = position };
             position += FileCommitLog.FrameSize + payloadLength;
+        }
+
+        if (end is not null)
+        {
+            end.EndOffset = position;
+            end.TrailingBytes = 0;
         }
     }
 

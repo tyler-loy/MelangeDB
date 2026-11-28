@@ -267,11 +267,22 @@ public sealed class ShapeHistory
     {
         if (!File.Exists(path))
             return null;
+        return Parse(File.ReadAllBytes(path), path);
+    }
 
+    /// <summary>
+    /// Parses a sidecar's bytes, read from wherever they are kept (a backup archive carries them
+    /// as a frame). <paramref name="source"/> names them in a refusal. Corruption refuses here as
+    /// <see cref="Load"/> does.
+    /// </summary>
+    public static ShapeHistory Parse(byte[] bytes, string source)
+    {
+        ArgumentNullException.ThrowIfNull(bytes);
+        var path = source;
         Persisted? persisted;
         try
         {
-            persisted = JsonSerializer.Deserialize<Persisted>(File.ReadAllBytes(path), JsonOptions);
+            persisted = JsonSerializer.Deserialize<Persisted>(bytes, JsonOptions);
         }
         catch (JsonException exception)
         {
