@@ -10,6 +10,18 @@ All packages ship together at one version; there is no per-package versioning. S
 
 ## [Unreleased]
 
+### Added
+
+- **A read-only reader for a world's history: `InspectSource`** (road-to-0.3 phase 21). It opens
+  a data directory or one engine of a `.mbak` archive and reads the commit log's records by LSN,
+  across every segment a change of owner left, plus the snapshot's rows. It decodes rows and
+  primary keys from the shape sidecar, each under the shape that governed its LSN, and reducer
+  arguments from their own tags. No application assemblies are needed (`RowDecoder`). It never
+  writes and takes no lock, so it reads a directory a live engine or another node owns. It reads
+  only up to the head it found at open, and reports what moved since (`CheckForChanges`). Its
+  facts (epoch, lineage, provenance, truncation base, snapshot LSN, head, torn tail) and
+  `ExplainUnreachable` say why an LSN cannot be read. The `melange inspect` verbs are built on it.
+
 ### Fixed
 
 - **A cluster restarted on its kept data refused every shard that had changed owner**
