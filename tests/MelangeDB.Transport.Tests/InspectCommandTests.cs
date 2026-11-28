@@ -122,6 +122,56 @@ public class InspectCommandTests
     }
 
     [Fact]
+    public async Task Row_shows_who_mutated_a_key_and_what_each_version_changed()
+    {
+        await using var host = await HostWithHistoryAsync();
+        var (code, output, error) = Inspect("row", LogDir(host), "--table", "Chunk", "--key", "1");
+        Assert.True(code == 0, error);
+        Assert.Contains("row       Chunk  Id = 1", output);
+        Assert.Contains("2 commits touched it", output);
+        Assert.Matches(@"LSN 1  .*  insert  by SetChunk  caller 560827fa", output);
+        Assert.Matches(@"X\s+10\r?\n", output);
+        Assert.Matches(@"X\s+11   \(was 10\)", output);
+        Assert.Matches(@"Data\s+0x0506   \(was 0x010203\)", output);
+
+        var deleted = Inspect("row", LogDir(host), "--table", "Chunk", "--key", "2", "--json");
+        Assert.True(deleted.Code == 0, deleted.Error);
+        using var json = JsonDocument.Parse(deleted.Output);
+        var history = json.RootElement.GetProperty("history");
+        Assert.Equal(["insert", "delete"], history.EnumerateArray().Select(static h => h.GetProperty("op").GetString()));
+        Assert.Equal(JsonValueKind.Null, history[1].GetProperty("row").ValueKind);
+        Assert.Equal("DeleteChunk", history[1].GetProperty("reducer").GetString());
+
+        // The encoded key a write set carries works too, and agrees.
+        var hex = json.RootElement.GetProperty("row").GetProperty("key").GetProperty("hex").GetString()!;
+        Assert.Contains("2 commits touched it", Inspect("row", LogDir(host), "--table", "Chunk", "--key-hex", hex).Output);
+
+        Assert.Contains("not a Int64 key for Chunk.Id", Inspect("row", LogDir(host), "--table", "Chunk", "--key", "one").Error);
+        var wrongCase = Inspect("row", LogDir(host), "--table", "chunk", "--key", "1");
+        Assert.Equal(1, wrongCase.Code);
+        Assert.Equal("melange inspect: no shape in this source names a table 'chunk'. Names are case-sensitive; inspect log lists the tables a commit wrote.", wrongCase.Error.Trim());
+        Assert.Contains("0 commits touched it", Inspect("row", LogDir(host), "--table", "Chunk", "--key", "42").Output);
+    }
+
+    [Fact]
+    public async Task Row_in_an_archive_starts_from_the_snapshots_version()
+    {
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?> { ["MelangeDb:Resume:RetentionWindowSeconds"] = "0" });
+        host.Call("SetChunk", 1L, 10L, new byte[] { 1 });
+        Assert.NotNull(host.Engine.TakeSnapshot());
+        host.Call("SetChunk", 1L, 12L, new byte[] { 1 });
+        var archive = Path.Combine(host.Root, "world.mbak");
+        await host.RestartAsync(whileStopped: () => MelangeBackup.Create(LogDir(host), archive));
+
+        var (code, output, error) = Inspect("row", archive, "--table", "Chunk", "--key", "1");
+        Assert.True(code == 0, error);
+        Assert.Contains("as of the snapshot at LSN 1:", output);
+        Assert.Contains("an archive holds only the log above its snapshot", output);
+        Assert.Matches(@"X\s+12   \(was 10\)", output);
+        Assert.Contains("1 commit touched it", output);
+    }
+
+    [Fact]
     public void Usage_errors_name_what_is_wrong()
     {
         Assert.Equal(2, Inspect().Code);
@@ -131,6 +181,8 @@ public class InspectCommandTests
         Assert.Contains("an LSN", Inspect("log", ".", "--from", "x").Error);
         Assert.Contains("past --to", Inspect("log", ".", "--from", "5", "--to", "4").Error);
         Assert.Contains("in hex", Inspect("log", ".", "--caller", "zz").Error);
+        Assert.Contains("one of --key", Inspect("row", ".", "--table", "Chunk").Error);
+        Assert.Contains("one of --key", Inspect("row", ".", "--table", "Chunk", "--key", "1", "--key-hex", "00").Error);
         var missing = Inspect("log", Path.Combine(Path.GetTempPath(), "melange-no-such-" + Guid.NewGuid().ToString("N")));
         Assert.Equal(1, missing.Code);
         Assert.Contains("does not exist", missing.Error);
