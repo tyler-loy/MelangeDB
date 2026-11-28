@@ -271,9 +271,12 @@ public class EventBusTests : IDisposable
         Assert.Contains("audit:after", probe.Received);
         Assert.Contains("failing:after", probe.Received);
 
-        // The next save after the handle closed caught the file up.
+        // The next save after the handle closed caught the file up, for the two subscribers that
+        // took the note. The gate subscriber takes no notes, so its checkpoint moves in memory
+        // without a save of its own and reaches the file only if another save follows it.
+        string[] noteSubscribers = [typeof(AuditNoteHandler).FullName!, typeof(FailingNoteHandler).FullName!];
         await EventProbe.WaitUntilAsync(
-            () => SidecarLsns(sidecar) is { } lsns && lsns.All(saved => saved >= lsn),
+            () => SidecarLsns(sidecar) is { } lsns && noteSubscribers.All(name => lsns.TryGetValue(name, out var saved) && saved >= lsn),
             "the sidecar never caught up after the reader let go");
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
@@ -293,13 +296,13 @@ public class EventBusTests : IDisposable
         }
     }
 
-    /// <summary>The sidecar's checkpoints, or null while a replace has it.</summary>
-    private static ulong[]? SidecarLsns(string path)
+    /// <summary>The sidecar's checkpoints by subscriber, or null while a replace has it.</summary>
+    private static Dictionary<string, ulong>? SidecarLsns(string path)
     {
         try
         {
-            return [.. JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllBytes(path))!
-                .Values.Select(entry => entry.GetProperty("Lsn").GetUInt64())];
+            return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(File.ReadAllBytes(path))!
+                .ToDictionary(static entry => entry.Key, static entry => entry.Value.GetProperty("Lsn").GetUInt64());
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
