@@ -12,6 +12,8 @@ using MelangeDB.Core;
 //   melange restore world.mbak -o ./data/log [--at-lsn 41200] [--check]
 //   melange clone world.mbak -o ./staging/log
 //   melange mcp https://game.example.com --token <jwt>
+//   melange inspect log ./data/log [--from 41000 --to 41200] [--reducer Attack] [--json]
+//   melange inspect record world.mbak --at-lsn 41207
 //
 // `schema` writes a module's client-visible schema manifest for the client binding generator;
 // its URL form fetches from a running server's schema endpoint. `generate` turns that manifest into
@@ -27,6 +29,9 @@ using MelangeDB.Core;
 // dropped and a provenance sidecar recording what it is a clone of. `restore --check` runs the
 // real recovery machinery against a scratch copy of what it just restored, and says plainly what
 // that proves and what only a host-side boot can. An unverified backup is a hope, not a backup.
+// `inspect` reads a data directory or an archive as a record of what happened: who called which
+// reducer when, and what it wrote. It is read-only and takes no lock, so a live engine's
+// directory is fair game, and it needs none of the application's assemblies (docs/INSPECT.md).
 if (args.Length == 0)
 {
     PrintUsage();
@@ -42,6 +47,7 @@ return args[0] switch
     "restore" => RunRestore(args.AsSpan(1).ToArray()),
     "clone" => RunClone(args.AsSpan(1).ToArray()),
     "mcp" => await RunMcpAsync(args.AsSpan(1).ToArray()),
+    "inspect" => InspectCommand.Run(args.AsSpan(1).ToArray(), Console.Out, Console.Error),
     _ => Usage(),
 };
 
@@ -343,4 +349,5 @@ static void PrintUsage()
     Console.Error.WriteLine("       melange restore <archive> -o <data-dir> [--at-lsn <n>] [--check]");
     Console.Error.WriteLine("       melange clone <archive> -o <data-dir>");
     Console.Error.WriteLine("       melange mcp <http(s)://host[:port][/path]> [--token <jwt>]   (stdio bridge to the host's MCP endpoint)");
+    Console.Error.WriteLine("       melange inspect log|record <data-dir | archive> ...   (read-only forensics; melange inspect --help)");
 }

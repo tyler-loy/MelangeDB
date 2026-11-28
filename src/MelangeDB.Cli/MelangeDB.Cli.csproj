@@ -7,7 +7,7 @@
     <ToolCommandName>melange</ToolCommandName>
     <!-- Roslyn ships a dozen resource languages; a CLI's messages are English. -->
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
-    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator, and `melange generate` turns a manifest into client bindings without a compiler (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md). `melange mcp` bridges a local agent's stdio to a running host's MCP endpoint (docs/MCP.md).</Description>
+    <Description>The MelangeDB command-line tool. `melange schema` writes a module's client-visible schema manifest for the client binding generator, and `melange generate` turns a manifest into client bindings without a compiler (docs/CLIENT-BINDINGS.md). `melange backup` captures a data directory into a .mbak archive, `melange backup verify` proves the archive good, and `melange restore` materializes a data directory a server boots from (docs/BACKUP.md). `melange inspect` reads a data directory or an archive as a record of who called what, when, and what it wrote, read-only (docs/INSPECT.md). `melange mcp` bridges a local agent's stdio to a running host's MCP endpoint (docs/MCP.md).</Description>
   </PropertyGroup>
 
   <ItemGroup>
