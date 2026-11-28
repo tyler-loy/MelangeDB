@@ -107,7 +107,7 @@ the measurement debt below, and three separate decisions are waiting on it.
 | Phase | Title | Status |
 | --- | --- | --- |
 | [20](road-to-0.3/plan-phase-20.md) | The measurement pass, decision-gating half: the reassignment window and the per-tick cost of scheduled reducers. The head-to-head comparison is split out and undecided | Carried into [0.4](road-to-0.4/README.md); **measured** there |
-| [21](road-to-0.3/plan-phase-21.md) | `melange inspect`: time-travel over the commit log — jump to an LSN, see the world, the reducer that produced it, and its write set | Planned; plan refreshed for 0.5 and decisions settled 2026-11-27 |
+| [21](road-to-0.3/plan-phase-21.md) | `melange inspect`: time-travel over the commit log — jump to an LSN, see the world, the reducer that produced it, and its write set | **Built** 2026-11-28: `inspect log`, `record`, `row` and `at`, with `--diff` and `--json`, over a public read-only reader in Core ([INSPECT.md](INSPECT.md)) |
 | [22](road-to-0.3/plan-phase-22.md) | `MelangeDB.Testing`: a published reducer test kit — ticks, time, identity, and write-set assertions as first-class | Carried into [0.4](road-to-0.4/README.md); **shipped** in 0.4.0 |
 | [23](road-to-0.3/plan-phase-23.md) | The TypeScript client, a written client-conformance definition, and `melange generate --lang` | Carried into [0.4](road-to-0.4/README.md); **shipped** in 0.4.0 |
 | 24 | Scheduler lane: simulation work yields to client-initiated work when they contend | [Design record](design/scheduler-lanes.md) written; conditional on a phase 20 measurement, and may close as a refusal |

@@ -12,6 +12,64 @@ melange inspect row    <source> --table <name> (--key <value> | --key-hex <hex>)
 melange inspect at     <source> --at-lsn <n> [--table <name> [--key <value> | --key-hex <hex>] [--all]] [--json]
 ```
 
+Three questions bring people here, and each has a verb:
+
+1. **What happened at this LSN?** `inspect record --at-lsn <n>` shows one commit in full. `inspect
+   log` finds the LSN when you know only a time, a reducer or a caller.
+2. **What happened to this row?** `inspect row --table <t> --key <k>` lists every commit that
+   touched it, with who did it.
+3. **What did the world look like then?** `inspect at --at-lsn <n>` rebuilds it.
+
+## A walkthrough
+
+A player reports that a deer teleported across the map around 09:14 UTC. Start with the commits in
+that minute that wrote the `Creature` table. The facts come first, then one line per commit:
+
+```
+$ melange inspect log ./data/log --table Creature --from 41100
+...
+  LSN  TIME (UTC)                   CALLER            WRITES  EVENTS  REDUCER
+41187  2026-11-27 09:13:57.103112Z  0000000000000000      40       0  TickCreatures
+41201  2026-11-27 09:13:58.004127Z  560827fa6cb1578f       3       1  Attack
+41244  2026-11-27 09:14:01.512930Z  560827fa6cb1578f       1       0  DebugMoveCreature
+```
+
+`DebugMoveCreature` from a player identity is suspicious. Ask what happened to the deer:
+
+```
+$ melange inspect row ./data/log --table Creature --key 77
+row       Creature  Id = 77  (encoded 0x000000000000004d)
+history   3 commits touched it
+...
+LSN 41244  2026-11-27 09:14:01.512930Z  update  by DebugMoveCreature  caller 560827fa6cb1578ff5ae...
+      X  1880.5   (was 212.25)
+      Y  -640     (was 96)
+```
+
+Then look at the call itself, with its arguments named from the schema manifest:
+
+```
+$ melange inspect record ./data/log --at-lsn 41244 --manifest melange-schema.json --diff
+...
+reducer   DebugMoveCreature
+arguments 3
+  [0] id = 77
+  [1] x = 1880.5
+  [2] y = -640
+```
+
+The full caller identity is on the `caller` line, and `inspect log --caller 560827fa` lists
+everything else that identity did. To see the area as it stood just before, `inspect at --at-lsn
+41243 --table Creature` prints every creature as of that commit.
+
+If the answer is older than the log reaches, every verb says so and names the floor. Point the
+same commands at the newest backup taken before it: `melange inspect row world.mbak ...` reads an
+archive exactly as it reads a directory. When you know what went wrong, `melange restore --at-lsn`
+(the LSN just before the mistake) and `melange clone` are where a finding leads; see
+[BACKUP.md](BACKUP.md).
+
+## Sources
+
 `<source>` is one engine's data directory (the directory `CommitLog:Path` names, or one shard's
 directory), a segment file inside one, or a `.mbak` archive. An archive from a cluster holds several
 engines (`hub`, `shard-1`, ...); `--engine <key>` picks one. Each engine has its own log and its own
@@ -36,8 +94,9 @@ failure with intact records after it is real corruption, and the inspector refus
 recovery would.
 
 It has no network surface. Reading the files is the authorization: the inspector reads past every
-row policy, private tables included, so who may read a data directory or an archive is the same
-question as who may run it.
+row and column policy, private tables included, so who may read a data directory or an archive is
+the same question as who may run it. [THREAT-MODEL.md](THREAT-MODEL.md#the-inspector-phase-21)
+states both properties.
 
 ## The facts come first
 
@@ -137,7 +196,7 @@ caller that did it. The first version shows every column, and each later one sho
 changed from the version before:
 
 ```
-row       Creature  Id = 77  (encoded 0x800000000000004d)
+row       Creature  Id = 77  (encoded 0x000000000000004d)
 history   3 commits touched it
 
 LSN 40112  2026-11-27 09:02:11.410022Z  insert  by SpawnCreature  caller 0000000000000000...

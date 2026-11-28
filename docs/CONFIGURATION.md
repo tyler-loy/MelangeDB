@@ -152,7 +152,8 @@ credentials, not a name.
 configuration at all: they act on files, and the archive format is versioned in the file, not in
 options. Phase 19's additions keep that posture — `restore --at-lsn`, `restore --check`, and
 `melange clone` are arguments to an invocation, not settings a deployment carries. See
-[BACKUP.md](BACKUP.md).
+[BACKUP.md](BACKUP.md). Phase 21's `melange inspect` has none either, for the same reason: it reads
+files, read-only, and every choice it makes is a flag ([INSPECT.md](INSPECT.md)).
 
 **Shipped with issue #31** (defaults verified against `BulkOptions`): `Bulk:Enabled` and `Bulk:OwnerRole` —
 the bulk ingestion gate. A behavior change from phases 03–12, where `/melange/bulk` answered any valid

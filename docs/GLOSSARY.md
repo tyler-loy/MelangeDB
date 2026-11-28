@@ -467,6 +467,15 @@ included so subjects from two token sources can never collide into one identity.
 streamed as chunks on the subscription's own bulk channel. The delta stream carries only LSNs above the
 anchor, which is what makes the boundary gap-free and duplicate-free.
 
+**Inspector (`melange inspect`, `InspectSource`)** — The read-only reader of a world's history (road-to-0.3
+phase 21): a data directory or one engine of a `.mbak`, read as a record of who called which reducer when, what
+it wrote, and the world as of a commit. It decodes rows from the shape history and arguments from their own
+tags, with no application assemblies; never writes; takes no lock, so it reads a live engine's directory; and
+reads past every policy, which makes file access its authorization model. Its view is of the moment it opened,
+and it reports what moved since. Its **floor** is the LSN at or below which a source holds no record (the
+truncation base, or an archive's snapshot LSN). Its `at` view is an in-memory projection, built forward from the
+snapshot or from empty, because the log holds no before-images. See [INSPECT.md](INSPECT.md).
+
 **Instance** — Under the instancing strategy, a shard identified by an explicit id column. Instances are
 causally disjoint — no interest overlap between them.
 

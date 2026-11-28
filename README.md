@@ -232,7 +232,7 @@ The project:
 | `src/MelangeDB.Cluster` | Hub and shard roles, placement routing, handoff, HA. |
 | `src/MelangeDB.CodeGen` | The Roslyn generator: registrations, serializers, typed clients. |
 | `src/MelangeDB.OpenTelemetry` | Registers MelangeDB's signal names with OpenTelemetry. |
-| `src/MelangeDB.Cli` | The `melange` tool: schema export, binding generation, backup and restore. |
+| `src/MelangeDB.Cli` | The `melange` tool: schema export, binding generation, backup and restore, and `inspect`. |
 | `src/MelangeDB.Mcp` | The MCP endpoint for agents, in the host's own pipeline. |
 | `src/MelangeDB.Testing` | The reducer test kit: a real engine on a hand-cranked clock. |
 | `clients/typescript` | `@melangedb/client`, the TypeScript client. |
