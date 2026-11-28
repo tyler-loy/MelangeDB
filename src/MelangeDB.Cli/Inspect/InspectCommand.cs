@@ -46,9 +46,10 @@ internal static class InspectCommand
 {
     private static readonly Dictionary<string, string[]> FlagsByVerb = new(StringComparer.Ordinal)
     {
-        ["log"] = ["--engine", "--json", "--from", "--to", "--reducer", "--caller", "--table"],
-        ["record"] = ["--engine", "--json", "--at-lsn", "--manifest"],
+        ["log"] = ["--engine", "--json", "--from", "--to", "--reducer", "--caller", "--table", "--diff", "--manifest"],
+        ["record"] = ["--engine", "--json", "--at-lsn", "--manifest", "--diff"],
         ["row"] = ["--engine", "--json", "--table", "--key", "--key-hex", "--from", "--to"],
+        ["at"] = ["--engine", "--json", "--at-lsn", "--table", "--key", "--key-hex", "--all"],
     };
 
     private static readonly string[] ValueFlags =
@@ -78,6 +79,7 @@ internal static class InspectCommand
                 "log" => RunLog(source, options, output, error),
                 "record" => RunRecord(source, options, output, error),
                 "row" => InspectRow.Run(source, options, output, error),
+                "at" => InspectAt.Run(source, options, output, error),
                 _ => 2,
             };
         }
@@ -91,9 +93,10 @@ internal static class InspectCommand
 
     public static void PrintUsage(TextWriter error)
     {
-        error.WriteLine("usage: melange inspect log <source> [--from <lsn>] [--to <lsn>] [--reducer <name>] [--caller <hex>] [--table <name>] [--json]");
-        error.WriteLine("       melange inspect record <source> --at-lsn <n> [--manifest melange-schema.json] [--json]");
+        error.WriteLine("usage: melange inspect log <source> [--from <lsn>] [--to <lsn>] [--reducer <name>] [--caller <hex>] [--table <name>] [--diff] [--json]");
+        error.WriteLine("       melange inspect record <source> --at-lsn <n> [--diff] [--manifest melange-schema.json] [--json]");
         error.WriteLine("       melange inspect row <source> --table <name> (--key <value> | --key-hex <hex>) [--from <lsn>] [--to <lsn>] [--json]");
+        error.WriteLine("       melange inspect at <source> --at-lsn <n> [--table <name> [--key <value> | --key-hex <hex>] [--all]] [--json]");
         error.WriteLine("  <source> is a data directory (CommitLog:Path, or a shard's) or a .mbak archive; --engine <key> picks an archive's engine.");
         error.WriteLine("  Read-only and lock-free: safe against a live engine's directory. See docs/INSPECT.md.");
     }
@@ -206,9 +209,29 @@ internal static class InspectCommand
             return false;
         }
 
-        if (options.Verb == "record" && options.AtLsn is null)
+        if (options.Verb is "record" or "at" && options.AtLsn is null)
         {
-            error.WriteLine("melange inspect record takes --at-lsn <n>: the commit to show.");
+            error.WriteLine(options.Verb == "record"
+                ? "melange inspect record takes --at-lsn <n>: the commit to show."
+                : "melange inspect at takes --at-lsn <n>: the commit to show the world as of.");
+            return false;
+        }
+
+        if (options.Verb == "at" && (options.Key is not null || options.KeyHex is not null || options.All) && options.Table is null)
+        {
+            error.WriteLine("melange inspect at: --key, --key-hex and --all go with --table <name>.");
+            return false;
+        }
+
+        if (options.Verb == "at" && options.Key is not null && options.KeyHex is not null)
+        {
+            error.WriteLine("melange inspect at: one of --key or --key-hex, not both.");
+            return false;
+        }
+
+        if (options.Verb == "log" && options.Manifest is not null && !options.Diff)
+        {
+            error.WriteLine("melange inspect log: --manifest names arguments, which only --diff prints.");
             return false;
         }
 
@@ -244,6 +267,9 @@ internal static class InspectCommand
             (options.Reducer is null || record.ReducerName == options.Reducer)
             && (options.Caller is null || record.Caller.ToString().StartsWith(options.Caller, StringComparison.Ordinal))
             && (table is not { } wanted || record.WriteSet.Any(op => op.Table == wanted));
+
+        if (options.Diff)
+            return RunLogDiff(source, options, from, to, Matches, notes, output, error);
 
         long shown = 0;
         if (options.Json)
@@ -302,6 +328,88 @@ internal static class InspectCommand
         return 0;
     }
 
+    /// <summary>
+    /// <c>log --diff</c>: every matching record in full, each write beside what it replaced. One
+    /// replay carried across the window, standing just before its first record, never a replay
+    /// per record; refused where <c>inspect at</c> would be, for the same reason.
+    /// </summary>
+    private static int RunLogDiff(
+        InspectSource source,
+        InspectOptions options,
+        ulong from,
+        ulong to,
+        Func<CommitRecord, bool> matches,
+        List<string> notes,
+        TextWriter output,
+        TextWriter error)
+    {
+        var first = Math.Max(from, source.Facts.FirstLsn);
+        if (source.Facts.RecordCount == 0 || first > Math.Min(to, source.Facts.HeadLsn))
+        {
+            error.WriteLine("melange inspect: the window holds no records to diff.");
+            return 1;
+        }
+
+        if (InspectProjection.ExplainUnbuildable(source, first - 1) is { } refusal)
+        {
+            error.WriteLine($"melange inspect: --diff needs the world as of LSN {first - 1}, just before the window. {refusal}");
+            return 1;
+        }
+
+        var parameters = options.Manifest is null ? null : ParameterNames.Load(options.Manifest);
+        var projection = InspectProjection.Build(source, first - 1);
+        long shown = 0;
+        if (options.Json)
+        {
+            using var json = new InspectJson(output);
+            var w = json.Writer;
+            w.WriteStartObject();
+            json.Facts(source.Facts);
+            w.WriteStartArray("records");
+            foreach (var record in source.Records(first, to))
+            {
+                if (matches(record))
+                {
+                    WriteRecordJson(json, source, record, RowDecoder.DecodeArguments(record.Arguments.Span), parameters?.For(record.ReducerName), InspectAt.Before(source, projection, record));
+                    shown++;
+                    json.FlushIfLarge();
+                }
+
+                projection.Apply(record);
+            }
+
+            w.WriteEndArray();
+            w.WriteNumber("shown", shown);
+            json.Notes(notes.Concat(InspectFormat.Notes(source.Facts)));
+            json.Changes(source.CheckForChanges());
+            w.WriteEndObject();
+            return 0;
+        }
+
+        InspectFormat.WriteFacts(output, source.Facts);
+        foreach (var note in notes)
+            output.WriteLine($"note      {note}");
+        output.WriteLine(projection.FromSnapshot
+            ? $"diff      against the world as of LSN {first - 1}, built from the snapshot at LSN {projection.StartLsn}"
+            : $"diff      against the world as of LSN {first - 1}, built from empty");
+        output.WriteLine();
+        foreach (var record in source.Records(first, to))
+        {
+            if (matches(record))
+            {
+                WriteRecordText(output, source, record, RowDecoder.DecodeArguments(record.Arguments.Span), parameters?.For(record.ReducerName), parameters is not null, InspectAt.Before(source, projection, record));
+                shown++;
+            }
+
+            projection.Apply(record);
+        }
+
+        output.WriteLine($"{InspectFormat.Count(shown, "record")} shown.");
+        foreach (var change in InspectFormat.Changes(source.CheckForChanges()))
+            output.WriteLine($"note      {change}");
+        return 0;
+    }
+
     // --- record -----------------------------------------------------------------------------
 
     private static int RunRecord(InspectSource source, InspectOptions options, TextWriter output, TextWriter error)
@@ -320,6 +428,18 @@ internal static class InspectCommand
             return 1;
         }
 
+        Dictionary<(TableId, RowKey), DecodedRow?>? before = null;
+        if (options.Diff)
+        {
+            if (InspectProjection.ExplainUnbuildable(source, lsn - 1) is { } refusal)
+            {
+                error.WriteLine($"melange inspect: --diff needs the world as of LSN {lsn - 1}, just before this record. {refusal}");
+                return 1;
+            }
+
+            before = InspectAt.Before(source, InspectProjection.Build(source, lsn - 1), record);
+        }
+
         var parameters = options.Manifest is null ? null : ParameterNames.Load(options.Manifest);
         var names = parameters?.For(record.ReducerName);
         var arguments = RowDecoder.DecodeArguments(record.Arguments.Span);
@@ -330,7 +450,7 @@ internal static class InspectCommand
             w.WriteStartObject();
             json.Facts(source.Facts);
             w.WritePropertyName("record");
-            WriteRecordJson(json, source, record, arguments, names);
+            WriteRecordJson(json, source, record, arguments, names, before);
             json.Notes(InspectFormat.Notes(source.Facts));
             json.Changes(source.CheckForChanges());
             w.WriteEndObject();
@@ -338,7 +458,7 @@ internal static class InspectCommand
         }
 
         InspectFormat.WriteFacts(output, source.Facts);
-        WriteRecordText(output, source, record, arguments, names, parameters is not null);
+        WriteRecordText(output, source, record, arguments, names, parameters is not null, before);
         foreach (var change in InspectFormat.Changes(source.CheckForChanges()))
             output.WriteLine($"note      {change}");
         return 0;

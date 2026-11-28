@@ -30,6 +30,12 @@ All packages ship together at one version; there is no per-package versioning. S
 - **`melange inspect row --table <t> --key <k>`**: who mutated this row, and when. Every commit
   that touched one key, with the reducer and caller that did it, and what each version changed
   from the one before. An archive starts from the row's version in its snapshot.
+- **`melange inspect at --at-lsn <n>`** shows the world as of a commit: every table's row count, a
+  table's rows (stopping at 10,000 unless `--all` is given), or one row by key. It is rebuilt in
+  memory from the snapshot or from empty. A state the log cannot be run back to is refused with the
+  reason. Archive-tier tables are left out and named. `record --diff` and `log --diff` show each
+  write beside what it replaced, with one replay across the window. `InspectProjection` is the
+  same replay as an API.
 
 ### Fixed
 
