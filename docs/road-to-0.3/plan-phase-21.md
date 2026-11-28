@@ -1,8 +1,9 @@
 # Phase 21 — `melange inspect`
 
-**Status: Planned; plan refreshed for 0.5 and decisions settled (2026-11-27).** Written 2026-08-18,
-before the 0.4 and 0.5 work it now has to read; [what changed](#what-changed-since-this-plan-was-written)
-says what that work changed, and the [build steps](#build-steps) are the order to land it.
+**Status: Built (2026-11-28).** Written 2026-08-18, before the 0.4 and 0.5 work it now has to read;
+[what changed](#what-changed-since-this-plan-was-written) says what that work changed, the
+[build steps](#build-steps) are the order it landed in, and [as built](#as-built) records where the
+build departed from the plan. The operator's documentation is [INSPECT.md](../INSPECT.md).
 
 **Goal:** the commit log stops being only a recovery mechanism and becomes a readable record. Open a
 data directory or a `.mbak`, jump to an LSN, see what the world looked like, see which reducer
@@ -238,8 +239,9 @@ never in its way, and it reads the segment manifest once, at the start. Two thin
 and both are reported, not hidden: the owner appending past the head it reached, and a new owner
 sealing the live segment (a failover or a move mid-read), which the reader notices when the manifest
 it read no longer matches and says that the shard changed owner while it read. A compaction that
-replaces a segment file mid-read ends that read at a record boundary with the same message, since
-`FileShare.Delete` keeps the old file readable until it is closed.
+replaces a segment file mid-read does not end the read: `FileShare.Delete` keeps the old file readable
+under the handle the reader already holds, so the read completes over the log as it stood, and the
+raised truncation base is reported with the answer (see [as built](#as-built)).
 
 ## Build steps
 
@@ -257,3 +259,30 @@ Each is one PR, and each leaves `main` with a usable tool.
    the honest refusals, the row guard.
 5. **Documentation**: `docs/INSPECT.md`, the glossary, and the threat model's read-only, no-network
    statement. Each earlier step documents its own flags as it lands; this step writes the walkthrough.
+
+## As built
+
+All five steps landed on 2026-11-28, one PR each, as planned. Where the build differs from the text
+above, or settles something it left open:
+
+- **The reader is `InspectSource`, with `RowDecoder` and `InspectProjection` beside it, all public in
+  Core.** The open makes one CRC-checked pass that finds the head and keeps a sparse LSN index (one
+  entry per 1,024 records), so `record --at-lsn` and windowed walks seek rather than scan. The
+  segment handles are held for the source's lifetime, so every walk sees the files as they were at
+  open, and nothing past the head that first pass reached is ever shown.
+- **What moved during a read is reported, not followed.** `CheckForChanges` re-reads the manifest
+  and the base and checks the live segment's length: a new owner, an append past the head, or a
+  truncation. Each verb prints them after its answer (`changedWhileRead` under `--json`). Gaps in
+  the LSNs and a torn tail's size are facts, not refusals; corruption with intact records after it
+  refuses, as recovery does.
+- **The floor is a fact of the source.** For a directory it is the truncation base. For an archive
+  it is the snapshot's LSN, since an archive carries only the log above its snapshot. `at` and
+  `--diff` are refused below it unless a snapshot sits at or below the asked LSN.
+- **`--diff` is on `record` and on `log`.** `log --diff` prints each matching record in full with
+  its before-values, so it is `record` over a window, carried by one replay.
+- **`row` starts from the snapshot where the snapshot sits at the floor** (always, for an archive),
+  printing the row's version there before the history.
+- **`--manifest` names the arguments of client-callable reducers and producers**, read with the
+  generator's own manifest parser. Scheduled reducers stay unnamed, as the plan expected.
+- **Text output is ASCII.** Strings print as escaped literals, so a row cannot rewrite the terminal.
+  Under `--json`, 64-bit integers are strings, so AutoInc ids past 2^53 survive every parser.

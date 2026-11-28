@@ -23,7 +23,8 @@ that they belong in the database.
 
 That last one is worth noticing: because the commit log records the reducer name and args as metadata
 alongside every write set, MelangeDB has a complete, ordered, tamper-evident record of who did what without
-anyone building an audit system. Investigating an exploit is a log replay.
+anyone building an audit system. Investigating an exploit is reading that record with `melange inspect`
+(phase 21, [INSPECT.md](INSPECT.md)), back to the log's truncation floor and, through backups, past it.
 
 ## Gap 1 — Column-level visibility
 
@@ -336,6 +337,31 @@ is nothing that writes. That is why reads are the default and every write is nam
 the IdP, as for any token); and an agent the operator deliberately pointed at a production world
 with a broad allowlist and `Mcp:AllowReducersInProduction` set. Both are configuration, stated
 here so they are choices rather than surprises.
+
+## The inspector (phase 21)
+
+`melange inspect` reads a data directory or a `.mbak` archive: every commit's caller, reducer,
+arguments and writes, and the world as of any commit it can rebuild. Two properties bound it, and
+both are by construction rather than by configuration.
+
+**It reads past every policy.** Row and column policies are server enforcement between a client and
+the data; the inspector is not a client. It decodes every table, private ones included, and every
+column, `[ServerOnly]` ones included. Whoever can read the files can read the world, as they always
+could with a copy of the directory and a hex editor. The inspector makes that legible rather than
+possible. Access to data directories and archives is the authorization model, so guard them as you
+guard the database: an archive in a shared bucket is the whole world, readable by anyone who can
+fetch it.
+
+**It is read-only and has no network surface.** It never writes a file, takes no lock, and
+listens on nothing. There is no `/melange/inspect` endpoint, deliberately: an HTTP surface over the
+whole log, past every policy, would need the full gating ladder the backup endpoint carries
+(`Enabled`, `OwnerRole`) and would still be the most privileged read the server offered. Pointing
+it at a live production directory cannot change that world or slow its writes. It does not even
+take `melange.lock`, so a running engine and the inspector never wait on each other.
+
+**Not defended against:** an operator who copies inspector output somewhere less protected than the
+directory it came from. `--json` makes the whole log scriptable, which is the point, and the output
+is exactly as sensitive as its source.
 
 ## Explicitly not defended against
 
