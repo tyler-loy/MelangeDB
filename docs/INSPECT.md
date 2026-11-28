@@ -6,9 +6,10 @@ that record. Point it at a data directory or a `.mbak` archive and it shows the 
 debugger, without the application's assemblies, and without changing anything.
 
 ```
-melange inspect log    <source> [--from <lsn>] [--to <lsn>] [--reducer <name>] [--caller <hex>] [--table <name>] [--json]
-melange inspect record <source> --at-lsn <n> [--manifest melange-schema.json] [--json]
+melange inspect log    <source> [--from <lsn>] [--to <lsn>] [--reducer <name>] [--caller <hex>] [--table <name>] [--diff] [--json]
+melange inspect record <source> --at-lsn <n> [--diff] [--manifest melange-schema.json] [--json]
 melange inspect row    <source> --table <name> (--key <value> | --key-hex <hex>) [--from <lsn>] [--to <lsn>] [--json]
+melange inspect at     <source> --at-lsn <n> [--table <name> [--key <value> | --key-hex <hex>] [--all]] [--json]
 ```
 
 `<source>` is one engine's data directory (the directory `CommitLog:Path` names, or one shard's
@@ -120,7 +121,8 @@ melange-schema.json` (the file `melange schema` writes) supplies names for the r
 can call. Scheduled reducers are not in the manifest, so their arguments stay unnamed.
 
 **A write shows what the commit wrote, not what it changed from.** The log records each row's new
-value and each delete's key. It has no before-images.
+value and each delete's key. It has no before-images. `--diff` rebuilds them: see
+[below](#--diff-what-each-write-replaced).
 
 **Event payloads are shown as bytes.** An event's type and depth are structural; its payload is the
 application's own encoding, with nothing on disk that describes it.
@@ -161,11 +163,71 @@ An archive's snapshot sits exactly at its floor, so for an archive the row's ver
 snapshot is printed first, as the state the history starts from. An archive-tier table's history
 stops where the log was truncated: older versions are in Postgres, not here.
 
+## `inspect at`: the world as of a commit
+
+```
+world     as of LSN 41201 (2026-11-27 09:13:58.004127Z)
+built     from the snapshot at LSN 41000, then 201 records replayed
+this is   raw rows decoded from the recorded shapes. No indexes, no SQL, no row policies, no residency: a row absent here is absent from the table.
+left out  AuditLog: archive-tier, so their rows live in Postgres, not here
+
+tables
+  Creature  1840 rows
+  Player     212 rows
+```
+
+The world is rebuilt in memory, forward: the snapshot replayed to the LSN when the snapshot is at
+or before it, or the whole log replayed from empty while it still reaches back to the first
+commit. Nothing else can be built. A state before the snapshot, with the log truncated below it,
+would have to be run backwards, and the log does not hold what a write replaced. The inspector
+says so, naming the snapshot's LSN and the truncation base, and a backup taken before that LSN is
+the remedy.
+
+- With no `--table`, it lists every table and its row count.
+- `--table <name>` prints the table's rows in primary-key order, each with the LSN that last wrote
+  it. It stops at 10,000 rows and says how many it left out; `--all` prints every row.
+- `--table <name> --key <value>` (or `--key-hex`) prints one row, never guarded, or says that no
+  row has the key as of that LSN.
+
+**What it is not.** It is the rows the log and the snapshot hold, decoded: correct names, kinds and
+values. There are no indexes (they are projections rebuilt from declarations, and the inspector
+has none), no SQL, no row policies and no residency. A row missing here is missing from the
+table, not just unreachable by an index. Each row decodes under the shape that governed the LSN
+that wrote it, so after a migration one table can show older rows with fewer columns. That is how
+the bytes are stored, until the engine rewrites them.
+
+**Archive-tier tables are never materialized.** Their rows live in Postgres, never in a snapshot
+or an archive, so a projection could only ever hold a fragment of them. `left out` names them, and
+asking for one by `--table` says to query Postgres.
+
+The replay is the cost: proportional to the snapshot's rows plus the records between the snapshot
+and the LSN. The row guard is about what lands on a terminal, not about the work.
+
+## `--diff`: what each write replaced
+
+`record --diff` and `log --diff` show each write beside the value it replaced:
+
+```
+  update Creature  Id = 77
+      Id      77
+      Health  12   (was 30)
+  delete Item  Id = 9
+      Owner   (was 77)
+```
+
+An insert says that no row had the key before; a delete lists the columns it removed. `log --diff`
+prints every matching record in full this way, so it is `record` over a window (and `--manifest`
+names arguments there too). It is one replay carried forward across the window, standing just
+before its first record, never a replay per record. It needs what `at` needs, a world it can build
+just before the window, and it is refused, for the same reason, where `at` would be. It is
+opt-in because it is slow, and that is what keeps `inspect log` fast.
+
 ## `--json`
 
 Every verb takes `--json` and writes one JSON document: `source` (the facts), the answer
-(`records` for `log`, `record` for `record`, `row`, `snapshot` and `history` for `row`), `notes`,
-and `changedWhileRead`. Integers up to 32 bits
+(`records` for `log`, `record` for `record`, `row`, `snapshot` and `history` for `row`, `world`
+with `rows` or `row` for `at`), `notes`, and `changedWhileRead`. Under `--diff`, each write carries
+`before`: the row it replaced, or `null`. Integers up to 32 bits
 and floats are JSON numbers. 64-bit integers are strings, because a JSON number past 2^53 loses
 digits in most parsers and AutoInc ids live up there. Bytes are hex, identities are hex, and
 timestamps are ISO 8601. An argument is `{ "name"?, "type", "value" }`.

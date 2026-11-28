@@ -172,6 +172,81 @@ public class InspectCommandTests
     }
 
     [Fact]
+    public async Task At_shows_the_world_as_of_a_commit_and_says_what_the_view_is_not()
+    {
+        await using var host = await HostWithHistoryAsync();
+        var (code, output, error) = Inspect("at", LogDir(host), "--at-lsn", "2");
+        Assert.True(code == 0, error);
+        Assert.Contains("world     as of LSN 2", output);
+        Assert.Contains("built     from empty, replaying 2 records", output);
+        Assert.Contains("No indexes, no SQL, no row policies", output);
+        Assert.Matches(@"Chunk\s+2 rows", output);
+
+        var table = Inspect("at", LogDir(host), "--at-lsn", "2", "--table", "Chunk", "--all");
+        Assert.Contains("Chunk: 2 rows", table.Output);
+        Assert.Contains("Chunk  Id = 1  (written at LSN 1)", table.Output);
+        Assert.Contains("Chunk  Id = 2  (written at LSN 2)", table.Output);
+
+        var head = Inspect("at", LogDir(host), "--at-lsn", "4", "--table", "Chunk", "--key", "1", "--json");
+        using var json = JsonDocument.Parse(head.Output);
+        var row = json.RootElement.GetProperty("row");
+        Assert.Equal(3UL, row.GetProperty("writtenAt").GetUInt64());
+        Assert.Equal("11", row.GetProperty("row").GetProperty("columns").GetProperty("X").GetString());
+        Assert.Equal("empty", json.RootElement.GetProperty("world").GetProperty("builtFrom").GetString());
+
+        Assert.Contains("no row has this key as of LSN 4", Inspect("at", LogDir(host), "--at-lsn", "4", "--table", "Chunk", "--key", "2").Output);
+        Assert.Contains("past the head", Inspect("at", LogDir(host), "--at-lsn", "99").Error);
+    }
+
+    [Fact]
+    public async Task Diff_shows_what_each_write_replaced_with_one_replay_across_the_window()
+    {
+        await using var host = await HostWithHistoryAsync();
+        var record = Inspect("record", LogDir(host), "--at-lsn", "3", "--diff");
+        Assert.True(record.Code == 0, record.Error);
+        Assert.Matches(@"X\s+11   \(was 10\)", record.Output);
+        Assert.Matches(@"Data\s+0x0506   \(was 0x010203\)", record.Output);
+        Assert.Matches(@"Id\s+1\r?\n", record.Output);
+
+        var window = Inspect("log", LogDir(host), "--from", "2", "--diff");
+        Assert.True(window.Code == 0, window.Error);
+        Assert.Contains("diff      against the world as of LSN 1, built from empty", window.Output);
+        Assert.Contains("(no row had this key before this commit)", window.Output);
+        Assert.Matches(@"X\s+11   \(was 10\)", window.Output);
+        Assert.Matches(@"delete Chunk  Id = 2\r?\n\s+Id\s+\(was 2\)", window.Output);
+        Assert.Contains("3 records shown.", window.Output);
+
+        var json = Inspect("log", LogDir(host), "--reducer", "DeleteChunk", "--diff", "--json");
+        using var document = JsonDocument.Parse(json.Output);
+        var delete = Assert.Single(document.RootElement.GetProperty("records").EnumerateArray());
+        Assert.Equal("20", delete.GetProperty("writes")[0].GetProperty("before").GetProperty("columns").GetProperty("X").GetString());
+    }
+
+    [Fact]
+    public async Task At_and_diff_refuse_a_state_the_log_cannot_run_back_to()
+    {
+        await using var host = await TransportTestHost.StartAsync(new Dictionary<string, string?> { ["MelangeDb:Resume:RetentionWindowSeconds"] = "0" });
+        host.Call("SetChunk", 1L, 10L, new byte[] { 1 });
+        host.Call("SetChunk", 1L, 11L, new byte[] { 1 });
+        Assert.NotNull(host.Engine.TakeSnapshot());
+        host.Call("SetChunk", 1L, 12L, new byte[] { 1 });
+        var archive = Path.Combine(host.Root, "world.mbak");
+        await host.RestartAsync(whileStopped: () => MelangeBackup.Create(LogDir(host), archive));
+
+        var below = Inspect("at", archive, "--at-lsn", "1");
+        Assert.Equal(1, below.Code);
+        Assert.Contains("cannot be built from this source: its snapshot is at LSN 2", below.Error);
+        Assert.Contains("never what it replaced", below.Error);
+
+        var fromSnapshot = Inspect("at", archive, "--at-lsn", "3", "--table", "Chunk", "--key", "1");
+        Assert.True(fromSnapshot.Code == 0, fromSnapshot.Error);
+        Assert.Contains("built     from the snapshot at LSN 2, then 1 record replayed", fromSnapshot.Output);
+        Assert.Matches(@"X\s+12", fromSnapshot.Output);
+
+        Assert.Matches(@"X\s+12   \(was 11\)", Inspect("record", archive, "--at-lsn", "3", "--diff").Output);
+    }
+
+    [Fact]
     public void Usage_errors_name_what_is_wrong()
     {
         Assert.Equal(2, Inspect().Code);
@@ -183,6 +258,9 @@ public class InspectCommandTests
         Assert.Contains("in hex", Inspect("log", ".", "--caller", "zz").Error);
         Assert.Contains("one of --key", Inspect("row", ".", "--table", "Chunk").Error);
         Assert.Contains("one of --key", Inspect("row", ".", "--table", "Chunk", "--key", "1", "--key-hex", "00").Error);
+        Assert.Contains("go with --table", Inspect("at", ".", "--at-lsn", "1", "--key", "1").Error);
+        Assert.Contains("takes --at-lsn", Inspect("at", ".").Error);
+        Assert.Contains("only --diff prints", Inspect("log", ".", "--manifest", "m.json").Error);
         var missing = Inspect("log", Path.Combine(Path.GetTempPath(), "melange-no-such-" + Guid.NewGuid().ToString("N")));
         Assert.Equal(1, missing.Code);
         Assert.Contains("does not exist", missing.Error);
